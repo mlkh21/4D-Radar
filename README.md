@@ -1,5 +1,9 @@
 # 4D Radar Diffusion Model
 
+[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/pytorch-1.7+-orange.svg)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 A diffusion model implementation for 4D radar data processing using consistency models and EDM (Elucidated Diffusion Models).
 
 ## Overview
@@ -148,6 +152,18 @@ The evaluation script computes:
 
 If you use this code in your research, please cite the relevant papers.
 
+## Code Quality
+
+This project follows best practices for research code:
+- ✅ Type hints for better code clarity
+- ✅ Comprehensive error handling
+- ✅ Logging instead of print statements
+- ✅ Unit tests for critical components
+- ✅ Example scripts for quick start
+- ✅ Configuration templates
+
+See [CODE_REVIEW_SUMMARY.md](CODE_REVIEW_SUMMARY.md) for detailed code review results.
+
 ## License
 
 Please check the original repository for license information.
@@ -159,6 +175,8 @@ Contributions are welcome! Please follow these guidelines:
 2. Create a feature branch
 3. Commit your changes
 4. Submit a pull request
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 
 ## Troubleshooting
 
