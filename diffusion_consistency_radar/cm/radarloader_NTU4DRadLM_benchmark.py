@@ -5,8 +5,16 @@ from torch.utils.data import Dataset
 import numpy as np
 from PIL import Image
 import bisect
+from typing import Optional, List, Tuple
+import logging
 
-def load_data_NTU4DRadLM(radarpath, lidarpath, seqname):
+logger = logging.getLogger(__name__)
+
+def load_data_NTU4DRadLM(
+    radarpath: str, 
+    lidarpath: str, 
+    seqname: str
+) -> Tuple[List, List, List]:
     """
     输入:
         radarpath: 雷达数据路径。
@@ -20,7 +28,7 @@ def load_data_NTU4DRadLM(radarpath, lidarpath, seqname):
     2. 读取激光雷达图像并转换为 RGB 图。
     3. 生成名称列表。
     """
-    print("seqname", seqname) 
+    logger.info(f"Loading sequence: {seqname}")
     files = os.listdir(radarpath) 
     files.sort() 
     radar = [] 

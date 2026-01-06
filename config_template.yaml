@@ -1,0 +1,184 @@
+# Configuration template for 4D Radar Diffusion Model Training
+
+# Dataset Configuration
+dataset:
+  # Path to the preprocessed NTU4DRadLM dataset
+  root_dir: "./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre"
+  
+  # Split configuration
+  split: "train"  # Options: "train", "val", "test"
+  
+  # Training/validation split ratio (0.8 = 80% train, 20% val)
+  train_ratio: 0.8
+
+# Model Configuration
+model:
+  # Input/output image size (voxel size)
+  image_size: 64
+  
+  # Number of channels in the model
+  num_channels: 128
+  
+  # Number of residual blocks per resolution
+  num_res_blocks: 2
+  
+  # Channel multipliers for each resolution level
+  channel_mult: [1, 2, 3, 4]
+  
+  # Attention resolutions
+  attention_resolutions: "32,16,8"
+  
+  # Number of attention heads
+  num_heads: 4
+  
+  # Dropout rate
+  dropout: 0.0
+  
+  # Use spatial transformer
+  use_spatial_transformer: false
+
+# Diffusion Configuration
+diffusion:
+  # Noise schedule
+  sigma_min: 0.002
+  sigma_max: 80.0
+  
+  # Noise schedule parameter
+  rho: 7.0
+  
+  # Number of diffusion steps
+  num_timesteps: 40
+  
+  # Weight schedule: "karras", "snr", "snr+1", "truncated-snr", "uniform"
+  weight_schedule: "karras"
+  
+  # Loss norm: "lpips", "l1", "l2", "l2-32"
+  loss_norm: "lpips"
+
+# Training Configuration
+training:
+  # Training mode: "progdist" or "consistency_distillation"
+  training_mode: "consistency_distillation"
+  
+  # Global batch size across all GPUs
+  global_batch_size: 4
+  
+  # Microbatch size for gradient accumulation (-1 for same as batch_size)
+  microbatch: -1
+  
+  # Learning rate
+  lr: 0.0001
+  
+  # EMA (Exponential Moving Average) rate
+  ema_rate: "0.9999,0.99994,0.999"
+  
+  # Target EMA mode
+  target_ema_mode: "fixed"
+  
+  # Start EMA value
+  start_ema: 0.95
+  
+  # Scale mode for multi-scale training
+  scale_mode: "fixed"
+  
+  # Start/end scales for multi-scale training
+  start_scales: 40
+  end_scales: 40
+  
+  # Total training steps
+  total_training_steps: 600000
+  
+  # Distillation steps per iteration
+  distill_steps_per_iter: 50000
+  
+  # Use mixed precision (FP16)
+  use_fp16: false
+  
+  # Weight decay
+  weight_decay: 0.0
+  
+  # Learning rate annealing steps
+  lr_anneal_steps: 0
+  
+  # Schedule sampler: "uniform", "loss-second-moment"
+  schedule_sampler: "uniform"
+  
+  # Logging interval (steps)
+  log_interval: 10
+  
+  # Model save interval (steps)
+  save_interval: 10000
+  
+  # Resume from checkpoint (path to checkpoint file)
+  resume_checkpoint: ""
+  
+  # Output directory for logs and checkpoints
+  out_dir: "./train_results"
+
+# Inference Configuration
+inference:
+  # Number of samples to generate
+  num_samples: 50
+  
+  # Batch size for inference
+  batch_size: 1
+  
+  # Output directory for generated samples
+  output_dir: "./results"
+  
+  # Model checkpoint to use for inference
+  model_path: ""
+  
+  # Sampling steps (fewer steps = faster but lower quality)
+  sampling_steps: 40
+  
+  # Random seed for reproducibility
+  seed: 42
+  
+  # Sampler type: "onestep", "multistep", "heun"
+  sampler: "heun"
+  
+  # Guidance scale (for conditional generation)
+  guidance_scale: 1.0
+
+# Hardware Configuration
+hardware:
+  # Number of GPUs to use
+  num_gpus: 1
+  
+  # CUDA visible devices (leave empty to use all available)
+  cuda_visible_devices: ""
+  
+  # Number of workers for data loading
+  num_workers: 4
+  
+  # Pin memory for faster data transfer
+  pin_memory: true
+
+# Logging and Monitoring
+logging:
+  # Logging level: "DEBUG", "INFO", "WARNING", "ERROR"
+  level: "INFO"
+  
+  # Log to file
+  log_to_file: true
+  
+  # Log file path
+  log_file: "./training.log"
+  
+  # Enable TensorBoard logging
+  use_tensorboard: false
+  
+  # TensorBoard log directory
+  tensorboard_dir: "./tensorboard_logs"
+
+# Evaluation Configuration
+evaluation:
+  # Metrics to compute: "chamfer", "hausdorff", "fscore"
+  metrics: ["chamfer", "hausdorff", "fscore"]
+  
+  # Distance threshold for F-score (in meters)
+  distance_threshold: 0.1
+  
+  # Evaluation output directory
+  eval_output_dir: "./evaluation_results"

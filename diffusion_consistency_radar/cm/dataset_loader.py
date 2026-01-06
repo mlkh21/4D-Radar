@@ -3,9 +3,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from typing import Optional, Callable, Tuple, List
+import logging
+
+logger = logging.getLogger(__name__)
 
 class NTU4DRadLM_VoxelDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None, return_path=False):
+    def __init__(
+        self, 
+        root_dir: str, 
+        split: str = 'train', 
+        transform: Optional[Callable] = None, 
+        return_path: bool = False
+    ) -> None:
         """
         输入:
             root_dir (str) - 数据集根目录，例如 ".../NTU4DRadLM_Pre"
@@ -29,7 +39,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         
         # 遍历所有场景目录
         if not os.path.exists(root_dir):
-            print(f"Warning: Root dir {root_dir} does not exist.")
+            logger.warning(f"Root dir {root_dir} does not exist.")
             return
 
         scenes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
@@ -39,7 +49,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         if len(scenes) == 1:
             # 如果只有一个场景，直接用于训练（或测试）
             target_scenes = scenes
-            print(f"Warning: Only 1 scene found. Using it for {split}.")
+            logger.warning(f"Only 1 scene found. Using it for {split}.")
         else:
             split_idx = int(len(scenes) * 0.8)
             if split_idx == 0: split_idx = 1 # 确保至少有一个场景用于训练
@@ -49,7 +59,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             else:
                 target_scenes = scenes[split_idx:]
             
-        print(f"Loading {split} dataset from {len(target_scenes)} scenes: {target_scenes}")
+        logger.info(f"Loading {split} dataset from {len(target_scenes)} scenes: {target_scenes}")
 
         for scene in target_scenes:
             radar_voxel_dir = os.path.join(root_dir, scene, "radar_voxel")
@@ -67,9 +77,9 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                 if os.path.exists(target_path):
                     self.samples.append((radar_path, target_path))
         
-        print(f"Found {len(self.samples)} samples for {split}.")
+        logger.info(f"Found {len(self.samples)} samples for {split}.")
 
-    def __len__(self):
+    def __len__(self) -> int:
         """
         输入:
             无
@@ -81,7 +91,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         """
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """
         输入:
             idx (int) - 样本索引
@@ -99,12 +109,16 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         """
         radar_path, target_path = self.samples[idx]
         
-        # 加载数据
-        # radar_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Var]
-        radar_voxel = np.load(radar_path).astype(np.float32)
-        
-        # target_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Mask]
-        target_voxel = np.load(target_path).astype(np.float32)
+        try:
+            # 加载数据
+            # radar_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Var]
+            radar_voxel = np.load(radar_path).astype(np.float32)
+            
+            # target_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Mask]
+            target_voxel = np.load(target_path).astype(np.float32)
+        except Exception as e:
+            logger.error(f"Error loading data from {radar_path} or {target_path}: {e}")
+            raise
         
         # 转换为 PyTorch 格式: (C, Z, H, W) 以适配 3D U-Net
         # 输入: (H, W, Z, 4)
