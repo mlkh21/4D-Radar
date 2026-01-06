@@ -1,8 +1,7 @@
 import os
+import sys
+import argparse
 import numpy as np
-
-RAW_DATA_PATH = "/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Raw"
-CALIB_PATH = "/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt"
 
 def load_calib(calib_file):
     R = np.eye(3)
@@ -37,8 +36,8 @@ def transform_pcl(pcl, R, T):
     pcl_trans[:, :3] = xyz_trans
     return pcl_trans
 
-def inspect_scene(scene_name):
-    scene_path = os.path.join(RAW_DATA_PATH, scene_name)
+def inspect_scene(scene_name, raw_data_path, calib_path):
+    scene_path = os.path.join(raw_data_path, scene_name)
     radar_path = os.path.join(scene_path, "radar_pcl")
     
     if not os.path.exists(radar_path):
@@ -48,7 +47,7 @@ def inspect_scene(scene_name):
 
     files = sorted([f for f in os.listdir(radar_path) if f.endswith('.npy')])
     
-    R, T = load_calib(CALIB_PATH)
+    R, T = load_calib(calib_path)
     print(f"R:\n{R}")
     print(f"T: {T}")
 
@@ -71,7 +70,37 @@ def inspect_scene(scene_name):
             print(f"  Max Azimuth: {np.max(np.abs(azimuth)):.4f} (Limit: {np.pi/2:.4f})")
             print(f"  Min/Max X: {data_trans[:, 0].min():.2f} / {data_trans[:, 0].max():.2f}")
 
-scenes = sorted([d for d in os.listdir(RAW_DATA_PATH) if os.path.isdir(os.path.join(RAW_DATA_PATH, d))])
-for scene in scenes:
-    print(f"Inspecting scene: {scene}")
-    inspect_scene(scene)
+def main():
+    """Main function to parse arguments and run inspection."""
+    parser = argparse.ArgumentParser(description='Inspect NTU4DRadLM radar data')
+    parser.add_argument(
+        '--data_path', 
+        type=str, 
+        default='./NTU4DRadLM_pre_processing/NTU4DRadLM_Raw',
+        help='Path to NTU4DRadLM_Raw directory'
+    )
+    parser.add_argument(
+        '--calib_path', 
+        type=str,
+        default='./NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt',
+        help='Path to calibration file'
+    )
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.data_path):
+        print(f"Error: Data path '{args.data_path}' does not exist")
+        sys.exit(1)
+    
+    if not os.path.exists(args.calib_path):
+        print(f"Warning: Calibration file '{args.calib_path}' not found")
+    
+    scenes = sorted([d for d in os.listdir(args.data_path) 
+                     if os.path.isdir(os.path.join(args.data_path, d))])
+    
+    for scene in scenes:
+        print(f"Inspecting scene: {scene}")
+        inspect_scene(scene, args.data_path, args.calib_path)
+
+if __name__ == '__main__':
+    main()

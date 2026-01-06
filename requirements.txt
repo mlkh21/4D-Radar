@@ -1,0 +1,35 @@
+# Core dependencies
+torch>=1.7.0
+numpy>=1.19.0
+scipy>=1.5.0
+pandas>=1.1.0
+
+# Training and optimization
+tqdm>=4.50.0
+piq==0.7.0
+einops>=0.3.0
+
+# Data processing
+Cython>=0.29.0
+albumentations==0.4.3
+lmdb>=1.0.0
+pillow>=8.0.0
+
+# Distributed training
+mpi4py>=3.0.0
+
+# Attention mechanisms
+flash-attn==0.2.8
+
+# Utilities
+blobfile>=1.0.0
+joblib>=0.17.0
+easydict>=1.9.0
+
+# Visualization and evaluation
+matplotlib>=3.3.0
+open3d>=0.13.0
+fvcore>=0.1.0
+
+# Optional: CLIP for feature extraction
+# git+https://github.com/openai/CLIP.git

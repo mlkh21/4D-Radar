@@ -6,7 +6,7 @@ import argparse
 import sys
 import os
 
-# Ç¿ÖÆ½«µ±Ç°ÏîÄ¿µÄÂ·¾¶Ìí¼Óµ½ sys.path µÄ×îÇ°Ãæ£¬ÒÔÓÅÏÈ¼ÓÔØµ±Ç°ÏîÄ¿µÄÄ£¿é
+# Ç¿ï¿½Æ½ï¿½ï¿½ï¿½Ç°ï¿½ï¿½Ä¿ï¿½ï¿½Â·ï¿½ï¿½ï¿½ï¿½ï¿½Óµï¿½ sys.path ï¿½ï¿½ï¿½ï¿½Ç°ï¿½æ£¬ï¿½ï¿½ï¿½ï¿½ï¿½È¼ï¿½ï¿½Øµï¿½Ç°ï¿½ï¿½Ä¿ï¿½ï¿½Ä£ï¿½ï¿½
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cm import dist_util, logger
@@ -31,7 +31,6 @@ import copy
 import os 
 
 from fvcore.nn import parameter_count_table
-os.environ['CUDA_VISIBLE_DEVICES'] = '0' 
 
 
 def main():
@@ -100,12 +99,12 @@ def main():
     print("batch_size", batch_size)
     data= th.utils.data.DataLoader(
         train_data,
-        num_workers=4, # ¼õÉÙ worker ÊıÁ¿ÒÔ±ÜÃâ OOM
+        num_workers=4, # ï¿½ï¿½ï¿½ï¿½ worker ï¿½ï¿½ï¿½ï¿½ï¿½Ô±ï¿½ï¿½ï¿½ OOM
         batch_size=batch_size,
         shuffle=True,
-        drop_last=True) # Ìí¼Ó drop_last
+        drop_last=True) # ï¿½ï¿½ï¿½ï¿½ drop_last
     print("args.teacher_model_path", args.teacher_model_path)
-    if len(args.teacher_model_path) > 0:  # ½ÌÊ¦ÆÀ·ÖÄ£ĞÍµÄÂ·¾¶
+    if len(args.teacher_model_path) > 0:  # ï¿½ï¿½Ê¦ï¿½ï¿½ï¿½ï¿½Ä£ï¿½Íµï¿½Â·ï¿½ï¿½
         # print("loading the teacher model from")
         logger.log(f"loading the teacher model from {args.teacher_model_path}")
         teacher_model_and_diffusion_kwargs = copy.deepcopy(model_and_diffusion_kwargs)
@@ -178,29 +177,29 @@ def main():
 
 def create_argparser():
     defaults = dict(
-        # --- ÔÚÕâÀïĞŞ¸ÄÄ¬ÈÏÖµ ---
-        teacher_model_path = "", # Ô¤Éè½ÌÊ¦Ä£ĞÍÂ·¾¶ (ĞèÌîÈëÔ¤ÑµÁ·ºÃµÄEDMÄ£ĞÍ)
+        # --- ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ş¸ï¿½Ä¬ï¿½ï¿½Öµ ---
+        teacher_model_path = "", # Ô¤ï¿½ï¿½ï¿½Ê¦Ä£ï¿½ï¿½Â·ï¿½ï¿½ (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¤Ñµï¿½ï¿½ï¿½Ãµï¿½EDMÄ£ï¿½ï¿½)
         schedule_sampler="uniform",
-        lr=0.00005, # ĞŞ¸ÄÑ§Ï°ÂÊ
+        lr=0.00005, # ï¿½Ş¸ï¿½Ñ§Ï°ï¿½ï¿½
         weight_decay=0.0,
         lr_anneal_steps=0,
-        global_batch_size=4, # Ô¤Éè Batch Size (×¢ÒâÕâÀï¸ÄµÄÊÇ global_batch_size)
+        global_batch_size=4, # Ô¤ï¿½ï¿½ Batch Size (×¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Äµï¿½ï¿½ï¿½ global_batch_size)
         batch_size=-1,
         microbatch=-1, 
-        ema_rate="0.999,0.9999,0.9999432189950708", # Ô¤Éè EMA Rate
+        ema_rate="0.999,0.9999,0.9999432189950708", # Ô¤ï¿½ï¿½ EMA Rate
         log_interval=100,
         save_interval=20000,
         resume_checkpoint="",
-        use_fp16=False, # Ô¤Éè¹Ø±Õ FP16
+        use_fp16=False, # Ô¤ï¿½ï¿½Ø±ï¿½ FP16
         fp16_scale_growth=1e-3,
-        in_ch = 4, # Ô¤ÉèÊäÈëÍ¨µÀ 4 (Radar Voxel)
-        out_ch = 4, # Ô¤ÉèÊä³öÍ¨µÀ 4 (Target Voxel)
-        out_dir='./diffusion_consistency_radar/train_results/radar_cd', # Ô¤ÉèÊä³öÄ¿Â¼
-        dataset_dir = '/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Pre', # Ö¸ÏòÔ¤´¦ÀíºóµÄÊı¾İ
-        dataloading_config = "./diffusion_consistency_radar/config/data_loading_config_train.yml", # È·±£Ö¸ÏòÕıÈ·µÄÅäÖÃÎÄ¼ş
+        in_ch = 4, # Ô¤ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¨ï¿½ï¿½ 4 (Radar Voxel)
+        out_ch = 4, # Ô¤ï¿½ï¿½ï¿½ï¿½ï¿½Í¨ï¿½ï¿½ 4 (Target Voxel)
+        out_dir='./diffusion_consistency_radar/train_results/radar_cd', # Ô¤ï¿½ï¿½ï¿½ï¿½ï¿½Ä¿Â¼
+        dataset_dir = '/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Pre', # Ö¸ï¿½ï¿½Ô¤ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        dataloading_config = "./diffusion_consistency_radar/config/data_loading_config_train.yml", # È·ï¿½ï¿½Ö¸ï¿½ï¿½ï¿½ï¿½È·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¼ï¿½
         
-        # --- ÆäËû²ÎÊı (À´×Ô cm_train_defaults ºÍ model_and_diffusion_defaults) ---
-        # ÄãÒ²¿ÉÒÔÔÚÕâÀï¸²¸ÇÆäËûÄ¬ÈÏÖµ£¬ÀıÈç£º
+        # --- ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (ï¿½ï¿½ï¿½ï¿½ cm_train_defaults ï¿½ï¿½ model_and_diffusion_defaults) ---
+        # ï¿½ï¿½Ò²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¸²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¬ï¿½ï¿½Öµï¿½ï¿½ï¿½ï¿½ï¿½ç£º
         training_mode="consistency_distillation",
         target_ema_mode="fixed",
         start_ema=0.95,
