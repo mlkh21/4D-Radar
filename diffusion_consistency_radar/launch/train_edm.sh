@@ -1,0 +1,1 @@
+python ./diffusion_consistency_radar/scripts/edm_train_radar.py --global_batch_size 4

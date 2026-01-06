@@ -1,0 +1,1 @@
+python ./diffusion_consistency_radar/scripts/cm_train_radar.py --global_batch_size 4

@@ -1,0 +1,11 @@
+#Accelerometer
+accelerometer_noise_density: 0.0022281160035059417 
+accelerometer_random_walk: 0.00011782392708033614 
+
+#Gyroscope
+gyroscope_noise_density: 0.00011667951042710442 
+gyroscope_random_walk: 2.616129872371749e-06 
+
+rostopic: '/vectornav/IMU' #Make sure this is correct
+update_rate: 200.0 #Make sure this is correct
+
