@@ -5,6 +5,33 @@ from torch.utils.data import Dataset
 import numpy as np
 from PIL import Image
 import bisect
+from abc import ABC, abstractmethod # abstractmethod 用于定义抽象方法（即必须在子类中实现的方法）
+
+class BaseRadarDataset(Dataset, ABC):
+    """雷达数据集基类"""
+    
+    def __init__(self, transform=None):
+        self.transform = transform
+        self._data = []
+    
+    def __len__(self):
+        return len(self._data)
+    
+    def apply_transform(self, data):
+        """应用变换"""
+        if self.transform:
+            return self.transform(data)
+        return data
+    
+    @abstractmethod 
+    def load_item(self, index):
+        """子类实现具体的加载逻辑"""
+        raise NotImplementedError
+    
+    def __getitem__(self, index):
+        data = self.load_item(index)
+        return self.apply_transform(data)
+
 
 def load_data_NTU4DRadLM(radarpath, lidarpath, seqname):
     """
@@ -157,144 +184,60 @@ def init_dataset(config, dataset_path, transform, mode):
 
     return dataset 
 
-class myDataset_coloradar(Dataset):
+class myDataset_coloradar(BaseRadarDataset):
     def __init__(self, radar, lidar, name, transform):
         """
-        输入:
-            radar: 雷达数据列表。
-            lidar: 激光雷达数据列表。
-            name: 名称列表。
-            transform: 变换函数。
-        输出:
-            无
-        作用: 初始化 Coloradar 数据集。
-        逻辑:
-        初始化变量。
+        初始化 Coloradar 数据集。
         """
+        super().__init__(transform)
         self.radar = radar 
         self.lidar = lidar 
         self.name = name 
-        self.len = len(radar) 
-        self.transform = transform 
+        self._data = radar # 用于 __len__
 
-    def __getitem__(self, index):
-        """
-        输入:
-            index: 索引。
-        输出:
-            tuple: (雷达数据, 激光雷达数据, 名称)。
-        作用: 获取数据项。
-        逻辑:
-        1. 获取数据。
-        2. 应用变换（如果存在）。
-        """
+    def load_item(self, index):
         radar = self.radar[index] 
         lidar = self.lidar[index] 
         name = self.name[index] 
-        
+        return (radar, lidar, name)
+
+    def apply_transform(self, data):
+        radar, lidar, name = data
         if self.transform: 
             radar = self.transform(radar) 
             lidar = self.transform(lidar) 
-
         return (radar, lidar, name) 
 
-    def __len__(self):
-        """
-        输入:
-            无
-        输出:
-            int: 数据集长度。
-        作用: 获取数据集长度。
-        逻辑:
-        返回 len。
-        """
-        return self.len
-    
-class myDataset_adc(Dataset): 
+class myDataset_adc(BaseRadarDataset): 
     def __init__(self, adc, data, label, name = None): 
         """
-        输入:
-            adc: ADC 数据。
-            data: 数据。
-            label: 标签。
-            name: 名称。
-        输出:
-            无
-        作用: 初始化 ADC 数据集。
-        逻辑:
-        初始化变量。
+        初始化 ADC 数据集。
         """
+        super().__init__(transform=None)
         self.data = data
         self.label = label
         self.adc = adc
         self.name = name
-        self.len = len(data)
+        self._data = data
 
-    def __getitem__(self, index): 
-        """
-        输入:
-            index: 索引。
-        输出:
-            tuple: (ADC 数据, 数据, 标签, 名称)。
-        作用: 获取数据项。
-        逻辑:
-        返回对应索引的数据。
-        """
+    def load_item(self, index): 
         return self.adc[index], self.data[index], self.label[index], self.name[index] 
 
-    def __len__(self): 
-        """
-        输入:
-            无
-        输出:
-            int: 数据集长度。
-        作用: 获取数据集长度。
-        逻辑:
-        返回 len。
-        """
-        return self.len
-
-class myDataset(Dataset):
+class myDataset(BaseRadarDataset):
     def __init__(self, data, label = None):
         """
-        输入:
-            data: 数据。
-            label: 标签。
-        输出:
-            无
-        作用: 初始化数据集。
-        逻辑:
-        初始化变量。
+        初始化数据集。
         """
+        super().__init__(transform=None)
         self.data = data
         self.label = label
-        self.len = len(data)
+        self._data = data
 
-    def __getitem__(self, index):
-        """
-        输入:
-            index: 索引。
-        输出:
-            数据项。
-        作用: 获取数据项。
-        逻辑:
-        如果有标签，返回 (数据, 标签)，否则返回数据。
-        """
+    def load_item(self, index):
         if self.label:
             return self.data[index], self.label[index] 
         return self.data[index] 
 
-    def __len__(self):
-        """
-        输入:
-            无
-        输出:
-            int: 数据集长度。
-        作用: 获取数据集长度。
-        逻辑:
-        返回 len。
-        """
-        return self.len
 
 # --- New Voxelization Logic ---
 
@@ -470,43 +413,25 @@ def load_data_voxel_seq_onthefly(radarpath, lidarpath, seqname):
             
     return radar_paths, lidar_paths, name_list
 
-class myDataset_voxel(Dataset):
-    def __init__(self, radar_paths, lidar_paths, names, transform=None):
+class myDataset_voxel(BaseRadarDataset):
+    DEFAULT_VOXEL_SIZE = np.array([0.2, 0.2, 0.2])
+    DEFAULT_GRID_SIZE = [500, 500]
+
+    def __init__(self, radar_paths, lidar_paths, names, transform=None, voxel_size=None, grid_size=None):
         """
-        输入:
-            radar_paths: 雷达路径列表。
-            lidar_paths: 激光雷达路径列表。
-            names: 名称列表。
-            transform: 变换函数。
-        输出:
-            无
-        作用: 初始化体素数据集。
-        逻辑:
-        初始化变量和体素化参数。
+        初始化体素数据集。
         """
+        super().__init__(transform)
         self.radar_paths = radar_paths
         self.lidar_paths = lidar_paths
         self.names = names
-        self.transform = transform
-        self.len = len(radar_paths)
+        self._data = radar_paths # For __len__
         
         # Voxelization parameters
-        self.voxel_size = np.array([0.2, 0.2, 0.2]) # 20cm voxel
-        self.grid_size = [500, 500] # 100m x 100m area
+        self.voxel_size = voxel_size if voxel_size is not None else self.DEFAULT_VOXEL_SIZE
+        self.grid_size = grid_size if grid_size is not None else self.DEFAULT_GRID_SIZE
         
-    def __getitem__(self, index):
-        """
-        输入:
-            index: 索引。
-        输出:
-            tuple: (雷达体素, 激光雷达体素, 名称)。
-        作用: 获取数据项。
-        逻辑:
-        1. 加载点云数据。
-        2. 确保 4 个通道。
-        3. 进行体素化。
-        4. 应用变换（如果存在）。
-        """
+    def load_item(self, index):
         r_path = self.radar_paths[index]
         l_path = self.lidar_paths[index]
         name = self.names[index]
@@ -522,24 +447,15 @@ class myDataset_voxel(Dataset):
              
         r_vox = voxelize_pcl(r_pcl, self.voxel_size, self.grid_size)
         l_vox = voxelize_pcl(l_pcl, self.voxel_size, self.grid_size)
-        
-        if self.transform:
-            r_vox = self.transform(r_vox)
-            l_vox = self.transform(l_vox)
             
         return (r_vox, l_vox, name)
 
-    def __len__(self):
-        """
-        输入:
-            无
-        输出:
-            int: 数据集长度。
-        作用: 获取数据集长度。
-        逻辑:
-        返回 len。
-        """
-        return self.len
+    def apply_transform(self, data):
+        r_vox, l_vox, name = data
+        if self.transform:
+            r_vox = self.transform(r_vox)
+            l_vox = self.transform(l_vox)
+        return (r_vox, l_vox, name)
 
 def init_dataset_voxel(config, dataset_path, transform, mode):
     """

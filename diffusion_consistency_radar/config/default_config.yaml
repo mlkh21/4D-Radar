@@ -1,0 +1,30 @@
+# 模型配置
+model:
+  image_size: 64
+  num_channels: 128
+  num_res_blocks: 2
+  attention_resolutions: "32,16,8"
+  in_ch: 8
+  out_ch: 3
+  dims: 3 # 3D UNet
+
+# 数据配置
+data:
+  voxel_size: [0.2, 0.2, 0.2]
+  grid_size: [500, 500]
+  max_range: 16.0
+  batch_size: 2
+  num_workers: 4
+
+# 训练配置
+training:
+  lr: 0.00005
+  weight_decay: 0.0
+  total_training_steps: 600000
+
+# 扩散配置
+diffusion:
+  sigma_min: 0.002
+  sigma_max: 80.0
+  rho: 7.0
+  weight_schedule: "karras"

@@ -3,15 +3,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+import logging
+
+logger = logging.getLogger(__name__)
 
 class NTU4DRadLM_VoxelDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None, return_path=False):
+    def __init__(self, root_dir, split='train', transform=None, return_path=False, alignment_size=32):
         """
         输入:
             root_dir (str) - 数据集根目录，例如 ".../NTU4DRadLM_Pre"
             split (str) - 'train', 'val', 或 'test' (目前简单实现为读取所有场景，后续可扩展)
             transform (callable, optional) - 可选的变换
             return_path (bool) - 是否返回文件路径
+            alignment_size (int) - 张量填充的对齐大小（U-Net要求32的倍数）
         输出:
             无
         作用: 初始化数据集，加载所有场景的文件路径。
@@ -25,6 +29,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.return_path = return_path
+        self.alignment_size = alignment_size
         self.samples = []
         
         # 遍历所有场景目录
@@ -100,11 +105,24 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         radar_path, target_path = self.samples[idx]
         
         # 加载数据
-        # radar_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Var]
-        radar_voxel = np.load(radar_path).astype(np.float32)
-        
-        # target_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Mask]
-        target_voxel = np.load(target_path).astype(np.float32)
+        try:
+            # radar_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Var]
+            radar_voxel = np.load(radar_path).astype(np.float32)
+            
+            # target_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Mask]
+            target_voxel = np.load(target_path).astype(np.float32)
+        except FileNotFoundError as e:
+            logger.error(f"文件未找到: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"加载数据失败 (idx={idx}): {e}")
+            raise RuntimeError(f"无法加载样本 {idx}") from e
+
+        # 数据验证
+        if radar_voxel.shape != target_voxel.shape:
+            logger.warning(
+                f"形状不匹配: radar={radar_voxel.shape}, target={target_voxel.shape}"
+            )
         
         # 转换为 PyTorch 格式: (C, Z, H, W) 以适配 3D U-Net
         # 输入: (H, W, Z, 4)
@@ -113,12 +131,13 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         # 目标: (C, Z, H, W)
         target_tensor = torch.from_numpy(target_voxel).permute(3, 2, 0, 1)
         
-        # 填充至 32 的倍数以确保与 U-Net 下采样兼容
+        # 填充至 alignment_size 的倍数以确保与 U-Net 下采样兼容
         # 输入形状: (C, Z, H, W)
         # F.pad 参数: (w_left, w_right, h_left, h_right, z_left, z_right)
-        pad_z = (32 - radar_tensor.shape[1] % 32) % 32
-        pad_h = (32 - radar_tensor.shape[2] % 32) % 32
-        pad_w = (32 - radar_tensor.shape[3] % 32) % 32
+        align = self.alignment_size
+        pad_z = (align - radar_tensor.shape[1] % align) % align
+        pad_h = (align - radar_tensor.shape[2] % align) % align
+        pad_w = (align - radar_tensor.shape[3] % align) % align
         
         if pad_h > 0 or pad_w > 0 or pad_z > 0:
             radar_tensor = F.pad(radar_tensor, (0, pad_w, 0, pad_h, 0, pad_z))

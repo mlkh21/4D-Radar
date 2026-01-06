@@ -8,6 +8,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn # 导入PyTorch的神经网络模块
 import torch.nn.functional as F # 导入PyTorch的函数式接口
+from typing import Tuple, Any
 from piq import LPIPS # 导入PIQ库中的LPIPS指标计算模块
 from . import dist_util
 
@@ -471,16 +472,25 @@ class KarrasDenoiser:
 
         return terms
 
-    def denoise(self, model, x_t, sigmas, **model_kwargs):
+    def denoise(
+        self,
+        model: nn.Module,
+        x_t: th.Tensor,
+        sigmas: th.Tensor,
+        **model_kwargs: Any
+    ) -> Tuple[th.Tensor, th.Tensor]:
         """
+        执行去噪操作。
+
         输入:
-            model: 扩散模型。
-            x_t: 噪声数据。
-            sigmas: 噪声标准差。
-            model_kwargs: 模型参数。
+            model: 扩散模型
+            x_t: 噪声数据，形状为 [B, C, D, H, W]
+            sigmas: 噪声标准差，形状为 [B]
+            **model_kwargs: 传递给模型的额外参数
+
         输出:
-            model_output: 模型原始输出。
-            denoised: 去噪后的数据。
+            model_output: 模型原始输出
+            denoised: 去噪后的数据
         作用: 执行去噪操作。
         逻辑:
         1. 计算缩放系数 (c_skip, c_out, c_in)。

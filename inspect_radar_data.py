@@ -1,8 +1,10 @@
 import os
 import numpy as np
+from pathlib import Path
 
-RAW_DATA_PATH = "/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Raw"
-CALIB_PATH = "/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt"
+PROJECT_ROOT = Path(__file__).resolve().parent
+RAW_DATA_PATH = os.environ.get('RAW_DATA_PATH', str(PROJECT_ROOT / 'NTU4DRadLM_pre_processing/NTU4DRadLM_Raw'))
+CALIB_PATH = os.environ.get('CALIB_PATH', str(PROJECT_ROOT / 'NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt'))
 
 def load_calib(calib_file):
     R = np.eye(3)

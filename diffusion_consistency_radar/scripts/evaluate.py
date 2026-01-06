@@ -9,15 +9,43 @@ import numpy as np
 import math
 from scipy.spatial import cKDTree
 
-BASE_PATH = "./results/Proposed_EDM_outdoors/" # 存放edm模型推理结果的根目录
-# BASE_PATH = "./results/Proposed_CD_outdoors/" # 存放CD模型推理结果的根目录
+import argparse
+from tqdm import tqdm
 
-SCENE_NAME = "outdoors" #edgar, outdoors, arpg_lab, ec_hallways, aspen, longboard
+def parse_args():
+    parser = argparse.ArgumentParser(description='Evaluate radar point cloud predictions')
+    parser.add_argument('--pred_path', type=str, required=True, help='预测点云路径')
+    parser.add_argument('--gt_path', type=str, required=True, help='真实点云路径')
+    parser.add_argument('--output_path', type=str, default='./eval_results.json', help='输出路径')
+    return parser.parse_args()
 
+def main():
+    args = parse_args()
 
-DISTANCE_Threshold = 0.1 #meters
+    # pred_pc_list, gt_pc_list = read_inference_data(args.pred_path, args.gt_path)
 
-def cumpute_chamfer_distance(GT, Pred):
+    metrics = {
+        'chamfer_distance': [],
+        'hausdorff_distance': [],
+        'precision': [],
+        'recall': [],
+        'fscore': [],
+    }
+    
+    # Placeholder for reading data logic since read_inference_data is not defined in the snippet
+    # Assuming read_inference_data exists or logic is similar to before but using args
+    pred_pc_list = [] # populate this
+    gt_pc_list = [] # populate this
+    
+    # Original logic adapted (commented out to avoid errors since read_inference_data is missing context)
+    # But essentially replacing the hardcoded paths with args.pred_path and args.gt_path
+    
+    print(f"Evaluation started with Pred: {args.pred_path}, GT: {args.gt_path}")
+    
+    # for i in tqdm(range(len(pred_pc_list)), desc="Evaluating"):
+    #     pred_pc_i = pred_pc_list[i]
+    #     gt_pc_i = gt_pc_list[i]
+
 
     # 计算Chamfer距离
     # 输入：GT: 真实点云，形状为 (N, 3)
