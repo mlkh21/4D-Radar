@@ -17,12 +17,13 @@ OUTPUT_PATH = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre" # 预处理后数据�
 CALIB_PATH = "./NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt" # 标定文件路径
 
 # 参数
-VOXEL_SIZE = [0.4, 0.4, 0.4] # 体素像素 [x, y, z] 单位：米
+VOXEL_SIZE = [0.2, 0.2, 0.2] # 体素像素 [x, y, z] 单位：米
 PC_RANGE = [0, -20, -6, 120, 20, 10] # [x_min, y_min, z_min, x_max, y_max, z_max] 单位：米
 MAX_RANGE = 250.0 # 最大探测距离，单位：米
 RANGE_BINS = 256 # 距离方向网格数
 AZIMUTH_BINS = 128 # -90 到 90 度
 
+# 选项
 SAVE_SPARSE = True # 是否使用稀疏格式存储体素 (.npz)
 GENERATE_VISUALIZATION = False # 是否生成可视化文件 (Mesh, Heatmap, BEV, PLY)
 
@@ -145,7 +146,7 @@ def voxelize_pcl(pcl, voxel_size, pc_range):
     y_idx = ((pcl[:, 1] - pc_range[1]) / voxel_size[1]).astype(np.int32)
     z_idx = ((pcl[:, 2] - pc_range[2]) / voxel_size[2]).astype(np.int32)
     
-    # Clip indices to be safe
+    # 将索引限制在安全范围
     x_idx = np.clip(x_idx, 0, grid_shape[0] - 1)
     y_idx = np.clip(y_idx, 0, grid_shape[1] - 1)
     z_idx = np.clip(z_idx, 0, grid_shape[2] - 1)
@@ -154,37 +155,37 @@ def voxelize_pcl(pcl, voxel_size, pc_range):
     
     flat_indices = x_idx * (grid_shape[1] * grid_shape[2]) + y_idx * grid_shape[2] + z_idx
     
-    # Sort by index
+    # 按索引排序
     sort_order = np.argsort(flat_indices)
     flat_indices = flat_indices[sort_order]
     
-    # Extract features
+    # 提取特征
     features = pcl[sort_order, 3] if pcl.shape[1] > 3 else np.ones(pcl.shape[0]) # Use 4th column as feature (Intensity)
     doppler = pcl[sort_order, 4] if pcl.shape[1] > 4 else np.zeros(pcl.shape[0]) # Use 5th column as Doppler
     
     unique_indices, unique_counts = np.unique(flat_indices, return_counts=True)
     
-    # Map back to 3D
+    # 映射回 3D
     uz_idx = unique_indices % grid_shape[2]
     uy_idx = (unique_indices // grid_shape[2]) % grid_shape[1]
     ux_idx = (unique_indices // (grid_shape[2] * grid_shape[1]))
     
-    # Fill occupancy (Channel 0)
+    # 填充占用（通道0）
     voxel_grid[ux_idx, uy_idx, uz_idx, 0] = 1.0 
     
-    # Fill mean feature (Channel 1)
+    # 填充均值特征（通道1）
     sum_features = np.zeros(np.prod(grid_shape), dtype=np.float32)
     np.add.at(sum_features, flat_indices, features)
     mean_features = sum_features[unique_indices] / unique_counts
     voxel_grid[ux_idx, uy_idx, uz_idx, 1] = mean_features
     
-    # Fill mean doppler (Channel 2)
+    # 填充平均多普勒（通道2）
     sum_doppler = np.zeros(np.prod(grid_shape), dtype=np.float32)
     np.add.at(sum_doppler, flat_indices, doppler)
     mean_doppler = sum_doppler[unique_indices] / unique_counts
     voxel_grid[ux_idx, uy_idx, uz_idx, 2] = mean_doppler
     
-    # Fill doppler variance (Channel 3)
+    # 填充多普勒方差（通道3）
     # Var = E[X^2] - (E[X])^2
     sum_doppler_sq = np.zeros(np.prod(grid_shape), dtype=np.float32)
     np.add.at(sum_doppler_sq, flat_indices, doppler ** 2)
@@ -260,7 +261,7 @@ def generate_bev(pcl, pc_range, voxel_size):
     
     if pcl.shape[0] == 0:
         return bev_map
-        
+    
     x_idx = ((pcl[:, 0] - pc_range[0]) / voxel_size[0]).astype(np.int32)
     y_idx = ((pcl[:, 1] - pc_range[1]) / voxel_size[1]).astype(np.int32)
     
@@ -325,7 +326,6 @@ def save_ply(filename, pcl):
         "end_header"
     )
     
-    # Ensure we have 4 columns
     if pcl.shape[1] < 4:
         pcl = np.hstack((pcl[:, :3], np.zeros((pcl.shape[0], 1))))
     
@@ -380,28 +380,28 @@ def save_voxel_obj(filename, voxel_grid, voxel_size):
     cx, cy, cz = np.where(occupied)
     features = voxel_grid[cx, cy, cz, 1]
     
-    # Normalize features for color mapping
+    # 标准化颜色映射的特征
     f_min, f_max = features.min(), features.max()
     if f_max > f_min:
         norm_features = (features - f_min) / (f_max - f_min)
     else:
         norm_features = np.zeros_like(features)
     
-    # Get RGB colors from colormap (jet)
+    # 从颜色图中获取 RGB 颜色 (jet)
     cmap = plt.get_cmap('jet')
     rgba = cmap(norm_features) # N x 4
     rgb = rgba[:, :3] # N x 3
     
-    # Voxel dimensions
+    # 体素尺寸
     dx, dy, dz = voxel_size
     
-    # Relative vertices of a cube
+    # 立方体的相对顶点
     v_rel = np.array([
         [0, 0, 0], [dx, 0, 0], [dx, dy, 0], [0, dy, 0],
         [0, 0, dz], [dx, 0, dz], [dx, dy, dz], [0, dy, dz]
     ])
 
-    # Faces (indices into v_rel, 1-based for OBJ logic later)
+    # 面 （v_rel 的索引，基于稍后的 OBJ 逻辑）
     faces_rel = np.array([
         [1, 2, 3, 4], [5, 8, 7, 6], [1, 5, 6, 2],
         [2, 6, 7, 3], [3, 7, 8, 4], [4, 8, 5, 1]
@@ -442,16 +442,16 @@ def lidar_filtering(lidar_pcl, patchwork):
         indices = patchwork.getNongroundIndices()
         return lidar_pcl[indices]
     except AttributeError:
-        # Fallback if getNongroundIndices is not available
+        # 如果 getNongroundIndices 不可用，则回退
         nonground = patchwork.getNonground()
         if nonground.shape[0] == 0:
             return np.zeros((0, lidar_pcl.shape[1]))
             
-        # If nonground preserves dimensions (Nx4), return it
+        # 如果非地面保留尺寸 (Nx4)，则返回它
         if nonground.shape[1] == lidar_pcl.shape[1]:
              return nonground
 
-        # Match back to original to keep intensity
+        # 匹配回原来的以保持强度
         tree = cKDTree(lidar_pcl[:, :3])
         _, idx = tree.query(nonground[:, :3] if nonground.shape[1] > 3 else nonground, k=1)
         return lidar_pcl[idx]
@@ -475,11 +475,11 @@ def radar_filtering_by_lidar(radar_pcl, lidar_pcl, threshold=0.5):
     # 构建KDTree
     lidar_tree = cKDTree(lidar_pcl[:, :3])
     
-    # Query nearest neighbors for Radar points
-    # k=1 returns distance to the nearest neighbor
+    # 查询最近邻居的雷达点
+    # k=1 返回到最近邻居的距离
     dists, _ = lidar_tree.query(radar_pcl[:, :3], k=1)
     
-    # Filter
+    # 筛选
     mask = dists < threshold
     return radar_pcl[mask]
 
@@ -504,11 +504,11 @@ def generate_target_voxel(lidar_voxel, radar_voxel):
     """
     target = np.zeros_like(lidar_voxel)
     
-    # 1. Geometry from LiDAR
+    # 1. LiDAR 的几何形状
     target[..., 0] = lidar_voxel[..., 0] # Occupancy
     target[..., 1] = lidar_voxel[..., 1] # Intensity
     
-    # 2. Doppler from Radar, masked by LiDAR Occupancy
+    # 2. 依据激光雷达占用来读取雷达的多普勒
     # 只有当 LiDAR 认为该处有物体 (Occ > 0) 且 Radar 也有读数 (Occ > 0) 时，才信任 Radar 的速度
     # 或者：只要 LiDAR 有物体，就尝试去取 Radar 的速度（如果 Radar 在该体素有值）
     
@@ -541,7 +541,7 @@ def process_scene_task(scene_name):
     4. 将Radar点云变换到LiDAR坐标系。
     5. 生成并保存: 原始点云, Voxel, Heatmap, BEV。
     """
-
+    
     print(f"Processing scene: {scene_name}")
     
     scene_raw_path = os.path.join(RAW_DATA_PATH, scene_name)
@@ -559,17 +559,19 @@ def process_scene_task(scene_name):
     patchwork = pypatchworkpp.patchworkpp(params)
     
     # 创建输出目录
-    ensure_dir(os.path.join(scene_out_path, "radar_pcl"))
-    ensure_dir(os.path.join(scene_out_path, "lidar_pcl"))
     ensure_dir(os.path.join(scene_out_path, "radar_voxel"))
-    ensure_dir(os.path.join(scene_out_path, "radar_mesh"))
-    ensure_dir(os.path.join(scene_out_path, "radar_heatmap"))
-    ensure_dir(os.path.join(scene_out_path, "radar_doppler_heatmap")) 
-    ensure_dir(os.path.join(scene_out_path, "radar_bev"))
     ensure_dir(os.path.join(scene_out_path, "lidar_voxel"))
-    ensure_dir(os.path.join(scene_out_path, "lidar_mesh"))
-    ensure_dir(os.path.join(scene_out_path, "lidar_bev"))
-    ensure_dir(os.path.join(scene_out_path, "target_voxel")) 
+    ensure_dir(os.path.join(scene_out_path, "target_voxel"))
+    
+    if GENERATE_VISUALIZATION:
+        ensure_dir(os.path.join(scene_out_path, "radar_pcl"))
+        ensure_dir(os.path.join(scene_out_path, "lidar_pcl"))
+        ensure_dir(os.path.join(scene_out_path, "radar_mesh"))
+        ensure_dir(os.path.join(scene_out_path, "radar_heatmap"))
+        ensure_dir(os.path.join(scene_out_path, "radar_doppler_heatmap")) 
+        ensure_dir(os.path.join(scene_out_path, "radar_bev"))
+        ensure_dir(os.path.join(scene_out_path, "lidar_mesh"))
+        ensure_dir(os.path.join(scene_out_path, "lidar_bev"))
 
     # 读取索引文件
     try:

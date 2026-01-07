@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 # 用于生成雷达和激光雷达时间戳的索引文件，以便对齐两种传感器的数据。
 
 import os
 import bisect
 
-"""时间戳索引辅助脚本"""
+"""时间戳索引生成脚本"""
 
 def find_nearest_index(timestamps, target):
     """在有序时间戳中查找与目标最接近的索引。"""
@@ -83,4 +82,4 @@ def generate_new_files(directory):
         print(f"Generated index files for {scene_dir}")
 
 if __name__ == "__main__":
-    generate_new_files('/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Raw')
+    generate_new_files('./NTU4DRadLM_pre_processing/NTU4DRadLM_Raw')
