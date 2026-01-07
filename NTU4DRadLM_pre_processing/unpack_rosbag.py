@@ -19,7 +19,7 @@ except ImportError:
     LIVOX_AVAILABLE = False
     print("[Warning] 'livox_ros_driver' not found. Will attempt generic parsing for LiDAR.")
 
-# 只导出关心的话题
+# 选择想要导出的主题
 ALLOWED_TOPICS = {
     "livox/lidar",
     "radar_pcl",
@@ -57,14 +57,14 @@ def save_pointcloud(msg, save_dir, timestamp):
     try:
         points_list = []
         
-        # Case 1: Livox CustomMsg
+        # 1: Livox CustomMsg
         # 结构: x, y, z, reflectivity, tag, line
         if LIVOX_AVAILABLE and 'CustomMsg' in str(type(msg)):
             for p in msg.points:
                 # 保存 x, y, z, reflectivity
                 points_list.append([p.x, p.y, p.z, float(p.reflectivity)])
         
-        # Case 2: Standard PointCloud2
+        # 2: Standard PointCloud2
         elif hasattr(msg, 'width'): # Duck typing for PointCloud2
             # 尝试读取常用字段
             # 注意：不同雷达的字段名可能不同，这里尝试读取 intensity 和 velocity/doppler
@@ -99,7 +99,7 @@ def save_pointcloud(msg, save_dir, timestamp):
                 # 后续处理时根据 shape 判断
                 points_list.append(point_data)
 
-        # Case 3: Standard PointCloud (v1) - 常见于 4D Radar
+        # 3: Standard PointCloud (v1) - 常见于 4D Radar
         # 结构: points[], channels[name, values[]]
         elif hasattr(msg, 'points') and msg.points and hasattr(msg.points[0], 'x'):
             # 提取 channels 数据
@@ -129,7 +129,7 @@ def save_pointcloud(msg, save_dir, timestamp):
                 
                 points_list.append([p.x, p.y, p.z, float(inten), float(vel)])
         
-        # Case 4: Fallback / Unknown
+        # 4: Fallback / Unknown
         else:
             print(f"[Warning] Unknown pointcloud type: {type(msg)} at {timestamp}")
             return
@@ -139,7 +139,7 @@ def save_pointcloud(msg, save_dir, timestamp):
 
         pc_np = np.array(points_list, dtype=np.float32)
         
-        # 保存为 .npy (推荐用于训练)
+        # 保存为 .npy 
         filename_npy = os.path.join(save_dir, f"{timestamp:.6f}.npy")
         np.save(filename_npy, pc_np)
         
@@ -150,7 +150,7 @@ def save_pointcloud(msg, save_dir, timestamp):
         # o3d.io.write_point_cloud(filename_pcd, pcd)
         
     except Exception as e:
-        # 打印错误信息以便调试
+        # 打印错误信息
         print(f"[Error] Failed to save pointcloud at {timestamp}: {e}")
         pass
 

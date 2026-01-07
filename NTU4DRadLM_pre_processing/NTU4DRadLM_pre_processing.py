@@ -23,6 +23,9 @@ MAX_RANGE = 250.0 # 最大探测距离，单位：米
 RANGE_BINS = 256 # 距离方向网格数
 AZIMUTH_BINS = 128 # -90 到 90 度
 
+SAVE_SPARSE = True # 是否使用稀疏格式存储体素 (.npz)
+GENERATE_VISUALIZATION = False # 是否生成可视化文件 (Mesh, Heatmap, BEV, PLY)
+
 def ensure_dir(path):
     """
     输入: path (str) - 需要创建的目录路径
@@ -94,6 +97,19 @@ def transform_pcl(pcl, R, T):
     pcl_trans = pcl.copy()
     pcl_trans[:, :3] = xyz_trans
     return pcl_trans
+
+def save_sparse_voxel(filename, voxel_grid):
+    """保存稀疏体素（只存储非空体素）"""
+    occupied = voxel_grid[..., 0] > 0
+    coords = np.column_stack(np.where(occupied))  # 获取非空体素坐标
+    features = voxel_grid[occupied]  # 获取对应特征
+    
+    np.savez_compressed(
+        filename,
+        coords=coords,
+        features=features,
+        shape=voxel_grid.shape
+    )
 
 def voxelize_pcl(pcl, voxel_size, pc_range):
     """
@@ -548,12 +564,12 @@ def process_scene_task(scene_name):
     ensure_dir(os.path.join(scene_out_path, "radar_voxel"))
     ensure_dir(os.path.join(scene_out_path, "radar_mesh"))
     ensure_dir(os.path.join(scene_out_path, "radar_heatmap"))
-    ensure_dir(os.path.join(scene_out_path, "radar_doppler_heatmap")) # 新增 Doppler 热图目录
+    ensure_dir(os.path.join(scene_out_path, "radar_doppler_heatmap")) 
     ensure_dir(os.path.join(scene_out_path, "radar_bev"))
     ensure_dir(os.path.join(scene_out_path, "lidar_voxel"))
     ensure_dir(os.path.join(scene_out_path, "lidar_mesh"))
     ensure_dir(os.path.join(scene_out_path, "lidar_bev"))
-    ensure_dir(os.path.join(scene_out_path, "target_voxel")) # 新增 target_voxel 目录
+    ensure_dir(os.path.join(scene_out_path, "target_voxel")) 
 
     # 读取索引文件
     try:
@@ -598,33 +614,49 @@ def process_scene_task(scene_name):
         # radar_pcl = radar_filtering_by_lidar(radar_pcl, lidar_pcl_raw, threshold=0.5)
 
         # 将处理后的点云数据保存为.ply格式
-        save_ply(os.path.join(scene_out_path, "radar_pcl", f"{i:06d}.ply"), radar_pcl)
-        save_ply(os.path.join(scene_out_path, "lidar_pcl", f"{i:06d}.ply"), lidar_pcl)
+        if GENERATE_VISUALIZATION:
+            save_ply(os.path.join(scene_out_path, "radar_pcl", f"{i:06d}.ply"), radar_pcl)
+            save_ply(os.path.join(scene_out_path, "lidar_pcl", f"{i:06d}.ply"), lidar_pcl)
         
         # 生成LiDAR和Radar的体素化、热图和BEV表示并保存 
         r_voxel = voxelize_pcl(radar_pcl, VOXEL_SIZE, PC_RANGE)
-        np.save(os.path.join(scene_out_path, "radar_voxel", f"{i:06d}.npy"), r_voxel)
-        save_voxel_obj(os.path.join(scene_out_path, "radar_mesh", f"{i:06d}.obj"), r_voxel, VOXEL_SIZE)
         
-        r_heatmap = generate_ra_heatmap(radar_pcl, MAX_RANGE, RANGE_BINS, AZIMUTH_BINS, feature_idx=3)
-        save_heatmap_png(os.path.join(scene_out_path, "radar_heatmap", f"{i:06d}.png"), r_heatmap)
+        if SAVE_SPARSE:
+            save_sparse_voxel(os.path.join(scene_out_path, "radar_voxel", f"{i:06d}.npz"), r_voxel)
+        else:
+            np.save(os.path.join(scene_out_path, "radar_voxel", f"{i:06d}.npy"), r_voxel)
+            
+        if GENERATE_VISUALIZATION:
+            save_voxel_obj(os.path.join(scene_out_path, "radar_mesh", f"{i:06d}.obj"), r_voxel, VOXEL_SIZE)
         
-        r_doppler_heatmap = generate_ra_heatmap(radar_pcl, MAX_RANGE, RANGE_BINS, AZIMUTH_BINS, feature_idx=4)
-        save_heatmap_png(os.path.join(scene_out_path, "radar_doppler_heatmap", f"{i:06d}.png"), r_doppler_heatmap)
-        
-        r_bev = generate_bev(radar_pcl, PC_RANGE, VOXEL_SIZE)
-        save_bev_png(os.path.join(scene_out_path, "radar_bev", f"{i:06d}.png"), r_bev)
+            r_heatmap = generate_ra_heatmap(radar_pcl, MAX_RANGE, RANGE_BINS, AZIMUTH_BINS, feature_idx=3)
+            save_heatmap_png(os.path.join(scene_out_path, "radar_heatmap", f"{i:06d}.png"), r_heatmap)
+            
+            r_doppler_heatmap = generate_ra_heatmap(radar_pcl, MAX_RANGE, RANGE_BINS, AZIMUTH_BINS, feature_idx=4)
+            save_heatmap_png(os.path.join(scene_out_path, "radar_doppler_heatmap", f"{i:06d}.png"), r_doppler_heatmap)
+            
+            r_bev = generate_bev(radar_pcl, PC_RANGE, VOXEL_SIZE)
+            save_bev_png(os.path.join(scene_out_path, "radar_bev", f"{i:06d}.png"), r_bev)
         
         l_voxel = voxelize_pcl(lidar_pcl, VOXEL_SIZE, PC_RANGE)
-        np.save(os.path.join(scene_out_path, "lidar_voxel", f"{i:06d}.npy"), l_voxel)
-        save_voxel_obj(os.path.join(scene_out_path, "lidar_mesh", f"{i:06d}.obj"), l_voxel, VOXEL_SIZE)
         
-        l_bev = generate_bev(lidar_pcl, PC_RANGE, VOXEL_SIZE)
-        save_bev_png(os.path.join(scene_out_path, "lidar_bev", f"{i:06d}.png"), l_bev)
+        if SAVE_SPARSE:
+             save_sparse_voxel(os.path.join(scene_out_path, "lidar_voxel", f"{i:06d}.npz"), l_voxel)
+        else:
+            np.save(os.path.join(scene_out_path, "lidar_voxel", f"{i:06d}.npy"), l_voxel)
+
+        if GENERATE_VISUALIZATION:
+            save_voxel_obj(os.path.join(scene_out_path, "lidar_mesh", f"{i:06d}.obj"), l_voxel, VOXEL_SIZE)
+        
+            l_bev = generate_bev(lidar_pcl, PC_RANGE, VOXEL_SIZE)
+            save_bev_png(os.path.join(scene_out_path, "lidar_bev", f"{i:06d}.png"), l_bev)
         
         # 生成训练目标 (Target Voxel)
         target_voxel = generate_target_voxel(l_voxel, r_voxel)
-        np.save(os.path.join(scene_out_path, "target_voxel", f"{i:06d}.npy"), target_voxel)
+        if SAVE_SPARSE:
+            save_sparse_voxel(os.path.join(scene_out_path, "target_voxel", f"{i:06d}.npz"), target_voxel)
+        else:
+            np.save(os.path.join(scene_out_path, "target_voxel", f"{i:06d}.npy"), target_voxel)
         
         if i % 100 == 0:
             print(f"Scene {scene_name}: Processed {i}/{min_len} frames")

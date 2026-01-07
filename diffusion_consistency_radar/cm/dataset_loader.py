@@ -7,6 +7,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def load_sparse_voxel(filename):
+    data = np.load(filename)
+    voxel_grid = np.zeros(data['shape'], dtype=np.float32)
+    coords = data['coords']
+    if coords.shape[0] > 0:
+        voxel_grid[coords[:, 0], coords[:, 1], coords[:, 2]] = data['features']
+    return voxel_grid
+
 class NTU4DRadLM_VoxelDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None, return_path=False, alignment_size=32):
         """
@@ -63,12 +72,19 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             if not os.path.exists(radar_voxel_dir) or not os.path.exists(target_voxel_dir):
                 continue
                 
-            files = sorted([f for f in os.listdir(radar_voxel_dir) if f.endswith('.npy')])
+            files = sorted([f for f in os.listdir(radar_voxel_dir) if f.endswith('.npy') or f.endswith('.npz')])
             
             for f in files:
                 radar_path = os.path.join(radar_voxel_dir, f)
                 target_path = os.path.join(target_voxel_dir, f)
                 
+                if not os.path.exists(target_path):
+                     # Try alternative extension if not found (e.g. mixed cleanup)
+                     if f.endswith('.npy'):
+                         target_path = os.path.join(target_voxel_dir, f.replace('.npy', '.npz'))
+                     elif f.endswith('.npz'):
+                         target_path = os.path.join(target_voxel_dir, f.replace('.npz', '.npy'))
+
                 if os.path.exists(target_path):
                     self.samples.append((radar_path, target_path))
         
@@ -100,17 +116,24 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         2. 加载 .npy 文件为 numpy 数组。
         3. 将维度从 (H, W, Z, C) 转换为 (C, Z, H, W)。
         4. 对 Z, H, W 维度进行 Padding，使其成为 32 的倍数。
-        5. 返回处理后的张量。
+        5. 返回目标张量和雷达张量（以及可选的路径）。
         """
+
         radar_path, target_path = self.samples[idx]
-        
+
         # 加载数据
         try:
             # radar_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Var]
-            radar_voxel = np.load(radar_path).astype(np.float32)
+            if radar_path.endswith('.npz'):
+                radar_voxel = load_sparse_voxel(radar_path)
+            else:
+                radar_voxel = np.load(radar_path).astype(np.float32)
             
             # target_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Mask]
-            target_voxel = np.load(target_path).astype(np.float32)
+            if target_path.endswith('.npz'):
+                target_voxel = load_sparse_voxel(target_path)
+            else:
+                target_voxel = np.load(target_path).astype(np.float32)
         except FileNotFoundError as e:
             logger.error(f"文件未找到: {e}")
             raise
@@ -156,7 +179,12 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 if __name__ == "__main__":
     # Test the dataset
     dataset_path = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre"
-    ds = NTU4DRadLM_VoxelDataset(dataset_path, split='train')
+    ds = NTU4DRadLM_VoxelDataset(dataset_path, split='train', return_path=True)
     if len(ds) > 0:
-        t, r = ds[0] # !注意: target, radar
-        print(f"Target shape: {t.shape}, Radar shape: {r.shape}")
+        t, r, p = ds[0] # !注意: 返回顺序依次是 target(GT), radar(Cond), path
+        print(f"成功! 加载样本 0。")
+        print(f"目标 (GT) 形状: {t.shape}") # Expect: (C, Z, H, W) e.g., (4, 16, 256, 256)
+        print(f"雷达 (Cond) 形状: {r.shape}")
+        print(f"路径: {p}")
+    else:
+        print("错误: 数据集为空。请检查 dataset_path。")
