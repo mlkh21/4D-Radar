@@ -11,10 +11,10 @@ from scipy.spatial import cKDTree
 import pypatchworkpp
 
 # 路径
-RAW_DATA_PATH = "/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Raw" # 原始数据存放路径
-INDEX_PATH = "/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Raw" # 时间戳索引文件存放路径
-OUTPUT_PATH = "/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Pre" # 预处理后数据存放路径
-CALIB_PATH = "/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt" # 标定文件路径
+RAW_DATA_PATH = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Raw" # 原始数据存放路径
+INDEX_PATH = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Raw" # 时间戳索引文件存放路径
+OUTPUT_PATH = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre" # 预处理后数据存放路径
+CALIB_PATH = "./NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt" # 标定文件路径
 
 # 参数
 VOXEL_SIZE = [0.4, 0.4, 0.4] # 体素像素 [x, y, z] 单位：米
