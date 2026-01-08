@@ -2,27 +2,36 @@ import subprocess
 import sys
 import os
 
+# 使用清华源加速下载，如果需要可以使用其他源，如阿里云: https://mirrors.aliyun.com/pypi/simple/
+PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
 def install_package(package):
-    """Install a package via pip."""
+    """通过 pip 安装包"""
     try:
         print(f"Installing {package}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-        print(f"Successfully installed {package}")
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", package,
+            "-i", PIP_INDEX_URL
+        ])
+        print(f"安装成功 {package}")
     except subprocess.CalledProcessError as e:
-        print(f"Failed to install {package}. Error: {e}")
+        print(f"安装失败 {package}. 错误: {e}")
         return False
     return True
 
 def main():
-    print("Starting configuration and installation...")
+    print("开始配置和安装")
 
-    # Ensure pip is up to date
+    # 确保 pip 是最新的
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--upgrade", "pip",
+            "-i", PIP_INDEX_URL
+        ])
     except Exception as e:
-        print(f"Warning: Could not upgrade pip: {e}")
+        print(f"警告：无法升级 pip： {e}")
 
-    # Core dependencies
+    # 核心依赖
     core_packages = [
         "torch>=1.12.0",
         "numpy>=1.21.0",
@@ -35,17 +44,17 @@ def main():
         "opencv-python>=4.5.0"
     ]
 
-    # Perception loss
+    # 感知丧失
     loss_packages = [
         "piq>=0.7.0"
     ]
 
-    # Distributed training
+    # 分布式训练
     dist_packages = [
         "mpi4py>=3.1.0"
     ]
 
-    # Development dependencies
+    # 开发依赖
     dev_packages = [
         "pytest>=7.0.0",
         "black>=22.0.0",
@@ -63,17 +72,17 @@ def main():
 
     if failed_packages:
         print("\n" + "="*50)
-        print("Installation finished with errors.")
-        print("The following packages failed to install:")
+        print("安装完成但出现错误")
+        print("以下软件包安装失败：")
         for pkg in failed_packages:
             print(f"- {pkg}")
-        print("Please check your network connection or system dependencies.")
-        print("For mpi4py, ensure you have MPI installed (e.g., 'sudo apt install libopenmpi-dev' on Ubuntu).")
+        print("请检查您的网络连接或系统依赖性")
+        print("对于 mpi4py，请确保安装了 MPI（例如，Ubuntu 上的“sudo apt install libopenmpi dev”）")
         print("="*50)
         sys.exit(1)
     else:
         print("\n" + "="*50)
-        print("All dependencies installed successfully!")
+        print("所有依赖项均已成功安装！")
         print("="*50)
         sys.exit(0)
 
