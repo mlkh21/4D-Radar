@@ -5,6 +5,8 @@ NTU4DRadLM_pre_processing/NTU4DRadLM_Raw/
 __pycache__/
 *.log
 .vscode/
+switch-cuda.sh
+sync_data.sh
 
 # Python
 *.py[cod]

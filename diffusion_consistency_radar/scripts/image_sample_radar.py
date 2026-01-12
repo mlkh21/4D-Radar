@@ -1,9 +1,11 @@
+# -*- coding: utf-8 -*-
 """
 从模型生成大量图像样本，并将它们保存为一个大型 numpy 数组。
 这可用于生成用于 FID 评估的样本。
 """
 
 import argparse
+# -*- coding: utf-8 -*-
 import os
 import sys
 
@@ -171,31 +173,34 @@ def polar_image_to_pcl (polar_image):
     
     return pcl, pcl_o3d
 
-from cm.config import Config
-
-# 主函数，程序入口，执行图像采样和保存
 def main():
+    defaults = model_and_diffusion_defaults()
+    defaults.update(dict(
+        image_size=64,
+        num_channels=128,
+        num_res_blocks=2,
+        attention_resolutions="32,16,8",
+        in_ch=8,
+        out_ch=3,
+        sigma_min=0.002,
+        sigma_max=80.0,
+        rho=7.0,
+        weight_schedule="karras",
+        batch_size=4,
+        num_workers=4,
+    ))
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to the config file (e.g., config/default_config.yaml)")
+    add_dict_to_argparser(parser, defaults)
+    
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained model checkpoint")
     parser.add_argument("--training_mode", type=str, default="edm", choices=["edm", "consistency_distillation"], help="Training mode")
     parser.add_argument("--gpu_id", type=str, default="0", help="GPU ID to use")
     
-    # 允许命令行覆盖配置项，这通常是 Config 类的高级用法，这里先只支持部分关键参数覆盖
-    # 或者直接使用 args 覆盖 cfg 对象中的属性
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num_samples", type=int, default=100, help="Number of samples to generate")
     
-    # 解析部分参数
     args = parser.parse_args()
     
-    # 从 YAML 加载配置
-    if not os.path.exists(args.config):
-        print(f"Error: Config file not found at {args.config}")
-        return
-        
-    cfg = Config.from_yaml(args.config)
-
     # 设置 GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
     
@@ -229,47 +234,19 @@ def main():
 
     datal= th.utils.data.DataLoader(
         test_data,
-        num_workers=cfg.data.num_workers,
-        batch_size=cfg.data.batch_size,
+        num_workers=args.num_workers,
+        batch_size=args.batch_size,
         shuffle=False)
 
     data = iter(datal)
 
     logger.log("creating model and diffusion...")
-    # 将 cfg 转换为字典形式传递给 factory functions，这需要原 create_model_and_diffusion 支持
-    # 或者我们手动构建 kwargs字典
     
-    model_kwargs = {
-        'image_size': cfg.model.image_size,
-        'in_ch': cfg.model.in_ch,
-        'out_ch': cfg.model.out_ch,
-        'num_channels': cfg.model.num_channels,
-        'num_res_blocks': cfg.model.num_res_blocks,
-        # ... 其他需要从 model_and_diffusion_defaults 映射的参数
-        'attention_resolutions': cfg.model.attention_resolutions,
-        'use_fp16': False, # 可以加到 ModelConfig
-        'num_heads': 4, # 默认值，或者加到 Config
-        'num_heads_upsample': -1,
-        'use_scale_shift_norm': True,
-        'dropout': 0.0,
-        'class_cond': False,
-        'use_checkpoint': False,
-        'num_classes': NUM_CLASSES,
-
-        # Diffusion kwargs
-        'sigma_min': cfg.diffusion.sigma_min,
-        'sigma_max': cfg.diffusion.sigma_max,
-        'rho': cfg.diffusion.rho,
-        'weight_schedule': cfg.diffusion.weight_schedule,
-        # ...
-    }
-    
-    # 注意：create_model_and_diffusion 需要很多默认参数，直接用 Config 替换所有 args 需要仔细核对参数名
-    # 这里演示的是核心思想：用 cfg 属性替代 args.属性
+    model_kwargs = args_to_dict(args, model_and_diffusion_defaults().keys())
+    model_kwargs['distillation'] = distillation
     
     model, diffusion = create_model_and_diffusion(
-        **model_kwargs,
-        distillation=distillation,
+        **model_kwargs
     )
     
     # ... 后续逻辑保持不变，但要注意 args.sampler 等参数需要从 cfg 或 argparse 获取

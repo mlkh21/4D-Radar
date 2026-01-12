@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # 训练一个扩散模型来生成雷达数据。
 
 import argparse
@@ -9,7 +10,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cm import dist_util, logger
 from mpi4py import MPI
-# from cm.config import Config # 引入统一配置
 # from cm.image_datasets import load_data
 from cm.resample import create_named_schedule_sampler
 from cm.script_util_cond import (
@@ -36,14 +36,10 @@ from easydict import EasyDict as edict
 def main():
     parser = create_argparser()
     # 添加配置文件参数
-    # parser.add_argument("--config", type=str, required=True, help="Path to the config file (e.g., config/default_config.yaml)")
     parser.add_argument("--gpu_id", type=str, default="0", help="GPU ID to use")
     args = parser.parse_args()
 
-    # 1. 加载 YAML 配置
-    # if not os.path.exists(args.config):
-    #     raise FileNotFoundError(f"Config file not found at {args.config}")
-    # cfg = Config.from_yaml(args.config)
+    # 1. (已移除) 加载 YAML 配置
 
     # 2. 设置环境
     # os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
@@ -55,30 +51,7 @@ def main():
     dist_util.setup_dist()
     logger.configure(dir = args.out_dir)
 
-    # 3. 用 Config 覆盖 Args (核心步骤)
-    # Model Config
-    # args.image_size = cfg.model.image_size
-    # args.num_channels = cfg.model.num_channels
-    # args.num_res_blocks = cfg.model.num_res_blocks
-    # args.attention_resolutions = cfg.model.attention_resolutions
-    # args.in_ch = cfg.model.in_ch
-    # args.out_ch = cfg.model.out_ch
-    
-    # Diffusion Config
-    # args.sigma_min = cfg.diffusion.sigma_min
-    # args.sigma_max = cfg.diffusion.sigma_max
-    # args.rho = cfg.diffusion.rho
-    # args.weight_schedule = cfg.diffusion.weight_schedule
-
-    # Training Config
-    # args.lr = cfg.training.lr
-    # args.weight_decay = cfg.training.weight_decay
-
-    # Data batch size
-    # if args.batch_size == -1: # 如果命令行没强制指定，优先用 config
-    #     args.batch_size = cfg.data.batch_size
-
-    # logger.log(f"Loaded config from {args.config}")
+    # 3. 使用 Args 代替 Config
 
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
@@ -96,20 +69,18 @@ def main():
     logger.log("creating data loader...")
     batch_size = args.batch_size
     
-    # dataset_config_path = args.dataloading_config 
-    # with open(dataset_config_path, 'r') as fid:
-    #     coloradar_config = edict(yaml.load(fid, Loader=yaml.FullLoader))
-    
-    # tran_list = [transforms.Lambda(lambda x: torch.from_numpy(x)), transforms.Resize((args.image_size,args.image_size))]
-    # transform_train = transforms.Compose(tran_list)
-    # train_data = init_dataset_voxel(coloradar_config, args.dataset_dir, transform_train, "train")
-    
-    # Load Dataset using our new VoxelDataset
+    # 数据集配置路径 = args 数据加载配置
+    # with open(数据集配置路径, 'r') 作为 fid:
+    # coloradar config = edict(yaml load(fid, Loader=yaml FullLoader))
+
+    # tran list = [转换 Lambda(lambda x: torch from numpy(x)), 转换 Resize((args 图像大小,args 图像大小))]
+    # 变换训练 = 变换 Compose(tran list)
+    # 训练数据 = 初始化数据集 voxel(coloradar config, args 数据集目录, 变换训练, "训练")
+
     from cm.dataset_loader import NTU4DRadLM_VoxelDataset
     train_data = NTU4DRadLM_VoxelDataset(
         root_dir=args.dataset_dir,
         split='train',
-        # alignment_size=cfg.data.alignment_size # 如有需要
     )
 
     print("batch_size", batch_size)

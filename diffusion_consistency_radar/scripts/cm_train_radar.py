@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Train a diffusion model on images.
 """
@@ -11,7 +12,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cm import dist_util, logger
 from mpi4py import MPI
-# from cm.config import Config # 引入统一配置
 # from cm.image_datasets import load_data
 from cm.resample import create_named_schedule_sampler
 from cm.script_util_cond import (
@@ -39,15 +39,11 @@ from fvcore.nn import parameter_count_table
 def main():
     parser = create_argparser()
     # 添加配置文件参数
-    # parser.add_argument("--config", type=str, required=True, help="Path to the config file (e.g., config/default_config.yaml)")
     parser.add_argument("--gpu_id", type=str, default="0", help="GPU ID to use")
     args = parser.parse_args()
 
-    # 1. 加载 YAML 配置
-    # if not os.path.exists(args.config):
-    #     raise FileNotFoundError(f"Config file not found at {args.config}")
-    # cfg = Config.from_yaml(args.config)
-    
+    # 1. (已移除) 加载 YAML 配置
+
     # 2. 设置环境
     # os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
     gpu_ids = [x.strip() for x in args.gpu_id.split(',')]
@@ -58,31 +54,7 @@ def main():
     dist_util.setup_dist()
     logger.configure(dir = args.out_dir)
 
-    # 3. 用 Config 覆盖 Args (核心步骤)
-    # Model Config
-    # args.image_size = cfg.model.image_size
-    # args.num_channels = cfg.model.num_channels
-    # args.num_res_blocks = cfg.model.num_res_blocks
-    # args.attention_resolutions = cfg.model.attention_resolutions
-    # args.in_ch = cfg.model.in_ch
-    # args.out_ch = cfg.model.out_ch
-    # # Data Config
-    # if args.batch_size == -1: # 如果命令行没强制指定，优先用 config
-    #     args.batch_size = cfg.data.batch_size
-    # # args.num_workers = cfg.data.num_workers # 训练脚本通常用 args.batch_size 控制
-    
-    # # Diffusion Config
-    # args.sigma_min = cfg.diffusion.sigma_min
-    # args.sigma_max = cfg.diffusion.sigma_max
-    # args.rho = cfg.diffusion.rho
-    # args.weight_schedule = cfg.diffusion.weight_schedule
-
-    # # Training Config
-    # args.lr = cfg.training.lr
-    # args.weight_decay = cfg.training.weight_decay
-    # args.total_training_steps = cfg.training.total_training_steps
-
-    # logger.log(f"Loaded config from {args.config}")
+    # 3. 使用 Args 代替 Config
     logger.log(f"Config config disabled, using args")
     logger.log("creating model and diffusion...")
     
@@ -116,14 +88,6 @@ def main():
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
     logger.log("creating data loader...")
-    # if args.batch_size == -1:
-    #     batch_size = args.global_batch_size // dist.get_world_size()
-    #     if args.global_batch_size % dist.get_world_size() != 0:
-    #         logger.log(
-    #             f"warning, using smaller global_batch_size of {dist.get_world_size()*batch_size} instead of {args.global_batch_size}"
-    #         )
-    # else:
-    #     batch_size = args.batch_size
     # 使用由 Config 覆盖后的 batch_size
     batch_size = args.batch_size
 
@@ -142,8 +106,6 @@ def main():
     train_data = NTU4DRadLM_VoxelDataset(
         root_dir=args.dataset_dir,
         split='train',
-        # 你也可以把 alignment_size 等其他 DataConfig 参数传进来
-        # alignment_size=cfg.data.alignment_size # 如果有的话
     )
 
     print("batch_size", batch_size)
