@@ -10,7 +10,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cm import dist_util, logger
-from cm.config import Config # 引入统一配置
+from mpi4py import MPI
+# from cm.config import Config # 引入统一配置
 # from cm.image_datasets import load_data
 from cm.resample import create_named_schedule_sampler
 from cm.script_util_cond import (
@@ -38,45 +39,51 @@ from fvcore.nn import parameter_count_table
 def main():
     parser = create_argparser()
     # 添加配置文件参数
-    parser.add_argument("--config", type=str, required=True, help="Path to the config file (e.g., config/default_config.yaml)")
+    # parser.add_argument("--config", type=str, required=True, help="Path to the config file (e.g., config/default_config.yaml)")
     parser.add_argument("--gpu_id", type=str, default="0", help="GPU ID to use")
     args = parser.parse_args()
 
     # 1. 加载 YAML 配置
-    if not os.path.exists(args.config):
-        raise FileNotFoundError(f"Config file not found at {args.config}")
-    cfg = Config.from_yaml(args.config)
+    # if not os.path.exists(args.config):
+    #     raise FileNotFoundError(f"Config file not found at {args.config}")
+    # cfg = Config.from_yaml(args.config)
     
     # 2. 设置环境
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+    # os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+    gpu_ids = [x.strip() for x in args.gpu_id.split(',')]
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids[rank % len(gpu_ids)]
+
     dist_util.setup_dist()
     logger.configure(dir = args.out_dir)
 
     # 3. 用 Config 覆盖 Args (核心步骤)
     # Model Config
-    args.image_size = cfg.model.image_size
-    args.num_channels = cfg.model.num_channels
-    args.num_res_blocks = cfg.model.num_res_blocks
-    args.attention_resolutions = cfg.model.attention_resolutions
-    args.in_ch = cfg.model.in_ch
-    args.out_ch = cfg.model.out_ch
-    # Data Config
-    if args.batch_size == -1: # 如果命令行没强制指定，优先用 config
-        args.batch_size = cfg.data.batch_size
-    # args.num_workers = cfg.data.num_workers # 训练脚本通常用 args.batch_size 控制
+    # args.image_size = cfg.model.image_size
+    # args.num_channels = cfg.model.num_channels
+    # args.num_res_blocks = cfg.model.num_res_blocks
+    # args.attention_resolutions = cfg.model.attention_resolutions
+    # args.in_ch = cfg.model.in_ch
+    # args.out_ch = cfg.model.out_ch
+    # # Data Config
+    # if args.batch_size == -1: # 如果命令行没强制指定，优先用 config
+    #     args.batch_size = cfg.data.batch_size
+    # # args.num_workers = cfg.data.num_workers # 训练脚本通常用 args.batch_size 控制
     
-    # Diffusion Config
-    args.sigma_min = cfg.diffusion.sigma_min
-    args.sigma_max = cfg.diffusion.sigma_max
-    args.rho = cfg.diffusion.rho
-    args.weight_schedule = cfg.diffusion.weight_schedule
+    # # Diffusion Config
+    # args.sigma_min = cfg.diffusion.sigma_min
+    # args.sigma_max = cfg.diffusion.sigma_max
+    # args.rho = cfg.diffusion.rho
+    # args.weight_schedule = cfg.diffusion.weight_schedule
 
-    # Training Config
-    args.lr = cfg.training.lr
-    args.weight_decay = cfg.training.weight_decay
-    args.total_training_steps = cfg.training.total_training_steps
+    # # Training Config
+    # args.lr = cfg.training.lr
+    # args.weight_decay = cfg.training.weight_decay
+    # args.total_training_steps = cfg.training.total_training_steps
 
-    logger.log(f"Loaded config from {args.config}")
+    # logger.log(f"Loaded config from {args.config}")
+    logger.log(f"Config config disabled, using args")
     logger.log("creating model and diffusion...")
     
     ema_scale_fn = create_ema_and_scales_fn(
@@ -142,7 +149,7 @@ def main():
     print("batch_size", batch_size)
     data= th.utils.data.DataLoader(
         train_data,
-        num_workers=cfg.data.num_workers, # 使用 Config 中的 num_workers
+        num_workers=args.num_workers, # 使用 Args 中的 num_workers
         batch_size=batch_size,
         shuffle=True,
         drop_last=True) # 添加 drop_last
@@ -226,8 +233,8 @@ def create_argparser():
         lr=0.00005, # 修改学习率
         weight_decay=0.0,
         lr_anneal_steps=0,
-        global_batch_size=4, # 预设 Batch Size (注意这里改的是 global_batch_size)
-        batch_size=-1,
+        global_batch_size=32, # 预设 Batch Size
+        batch_size=16,
         microbatch=-1, 
         ema_rate="0.999,0.9999,0.9999432189950708", # 预设 EMA Rate
         log_interval=100,
@@ -235,11 +242,12 @@ def create_argparser():
         resume_checkpoint="",
         use_fp16=False, # 预设关闭 FP16
         fp16_scale_growth=1e-3,
-        in_ch = 4, # 预设输入通道 4 (Radar Voxel)
-        out_ch = 4, # 预设输出通道 4 (Target Voxel)
+        in_ch = 8, # 预设输入通道
+        out_ch = 3, # 预设输出通道
         out_dir='./diffusion_consistency_radar/train_results/radar_cd', # 预设输出目录
-        dataset_dir = '/home/zxj/catkin_ws/src/4D-Radar-Diffusion/NTU4DRadLM_pre_processing/NTU4DRadLM_Pre', # 指向预处理后的数据
-        dataloading_config = "./diffusion_consistency_radar/config/data_loading_config_train.yml", # 确保指向正确的配置文件
+        dataset_dir = './NTU4DRadLM_pre_processing/NTU4DRadLM_Pre', # 指向预处理后的数据
+        dataloading_config = "./diffusion_consistency_radar/config/data_loading_config.yml", # 确保指向正确的配置文件
+        num_workers=4, # 数据加载线程数
         
         # --- 其他参数 (来自 cm_train_defaults 和 model_and_diffusion_defaults) ---
         # 你也可以在这里覆盖其他默认值，例如：
@@ -254,12 +262,15 @@ def create_argparser():
         use_scale_shift_norm=True,
         dropout=0.0,
         teacher_dropout=0.1,
-        image_size=128,
-        num_channels=64,
+        image_size=64,
+        num_channels=128,
         num_head_channels=64,
-        num_res_blocks=3,
+        num_res_blocks=2,
         resblock_updown=True,
-        weight_schedule="uniform",
+        weight_schedule="karras",
+        sigma_min=0.002,
+        sigma_max=80.0,
+        rho=7.0,
     )
     
     defaults.update(model_and_diffusion_defaults())

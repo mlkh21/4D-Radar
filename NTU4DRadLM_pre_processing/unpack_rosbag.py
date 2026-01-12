@@ -12,7 +12,8 @@ import cv2
 # 尝试导入 Livox 驱动消息类型
 try:
     import sys
-    sys.path.append('/home/zxj/catkin_ws/devel/lib/python3/dist-packages')
+    # 根据 ws_livox 工作空间路径，添加正确的 Python 包路径
+    sys.path.append('/home/ps/zxj_workspace/src/ws_livox/devel/lib/python3/dist-packages')
     from livox_ros_driver.msg import CustomMsg
     LIVOX_AVAILABLE = True
 except ImportError:
@@ -23,14 +24,11 @@ except ImportError:
 ALLOWED_TOPICS = {
     "livox/lidar",
     "radar_pcl",
-    "radar_enhanced_pcl",
     "thermal_cam/thermal_image/compressed",
     "ublox/fix",
     "ublox/fix_velocity",
     "vectornav/imu",
 }
-
-
 def _topic_key(topic_name: str) -> str:
     return topic_name.strip('/')
 
@@ -59,7 +57,7 @@ def save_pointcloud(msg, save_dir, timestamp):
         
         # 1: Livox CustomMsg
         # 结构: x, y, z, reflectivity, tag, line
-        if LIVOX_AVAILABLE and 'CustomMsg' in str(type(msg)):
+        if 'CustomMsg' in str(type(msg)) or 'livox_ros_driver' in str(type(msg)): # 只要名字匹配就尝试处理,不依赖 LIVOX_AVAILABLE
             for p in msg.points:
                 # 保存 x, y, z, reflectivity
                 points_list.append([p.x, p.y, p.z, float(p.reflectivity)])

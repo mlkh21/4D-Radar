@@ -2,36 +2,36 @@ import subprocess
 import sys
 import os
 
-# Ê¹ÓÃÇå»ªÔ´¼ÓËÙÏÂÔØ£¬Èç¹ûĞèÒª¿ÉÒÔÊ¹ÓÃÆäËûÔ´£¬Èç°¢ÀïÔÆ: https://mirrors.aliyun.com/pypi/simple/
+# ä½¿ç”¨æ¸…åæºåŠ é€Ÿä¸‹è½½ï¼Œå¯æ¢æˆå…¶ä»–æºï¼Œå¦‚é˜¿é‡Œäº‘: https://mirrors.aliyun.com/pypi/simple/
 PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 def install_package(package):
-    """Í¨¹ı pip °²×°°ü"""
+    """é€šè¿‡ pip å®‰è£…åŒ…"""
     try:
         print(f"Installing {package}...")
         subprocess.check_call([
             sys.executable, "-m", "pip", "install", package,
             "-i", PIP_INDEX_URL
         ])
-        print(f"°²×°³É¹¦ {package}")
+        print(f"å®‰è£…æˆåŠŸ {package}")
     except subprocess.CalledProcessError as e:
-        print(f"°²×°Ê§°Ü {package}. ´íÎó: {e}")
+        print(f"å®‰è£…å¤±è´¥ {package}. é”™è¯¯: {e}")
         return False
     return True
 
 def main():
-    print("¿ªÊ¼ÅäÖÃºÍ°²×°")
+    print("å¼€å§‹é…ç½®å’Œå®‰è£…")
 
-    # È·±£ pip ÊÇ×îĞÂµÄ
+    # ç¡®ä¿ pip æ˜¯æœ€æ–°çš„
     try:
         subprocess.check_call([
             sys.executable, "-m", "pip", "install", "--upgrade", "pip",
             "-i", PIP_INDEX_URL
         ])
     except Exception as e:
-        print(f"¾¯¸æ£ºÎŞ·¨Éı¼¶ pip£º {e}")
+        print(f"è­¦å‘Šï¼šæ— æ³•å‡çº§ pipï¼š {e}")
 
-    # ºËĞÄÒÀÀµ
+    # æ ¸å¿ƒä¾èµ–
     core_packages = [
         "torch>=1.12.0",
         "numpy>=1.21.0",
@@ -44,17 +44,17 @@ def main():
         "opencv-python>=4.5.0"
     ]
 
-    # ¸ĞÖªÉ¥Ê§
+    # æ„ŸçŸ¥ä¸§å¤±
     loss_packages = [
         "piq>=0.7.0"
     ]
 
-    # ·Ö²¼Ê½ÑµÁ·
+    # åˆ†å¸ƒå¼è®­ç»ƒ
     dist_packages = [
         "mpi4py>=3.1.0"
     ]
 
-    # ¿ª·¢ÒÀÀµ
+    # å¼€å‘ä¾èµ–
     dev_packages = [
         "pytest>=7.0.0",
         "black>=22.0.0",
@@ -72,17 +72,17 @@ def main():
 
     if failed_packages:
         print("\n" + "="*50)
-        print("°²×°Íê³Éµ«³öÏÖ´íÎó")
-        print("ÒÔÏÂÈí¼ş°ü°²×°Ê§°Ü£º")
+        print("å®‰è£…å®Œæˆä½†å‡ºç°é”™è¯¯")
+        print("ä»¥ä¸‹è½¯ä»¶åŒ…å®‰è£…å¤±è´¥ï¼š")
         for pkg in failed_packages:
             print(f"- {pkg}")
-        print("Çë¼ì²éÄúµÄÍøÂçÁ¬½Ó»òÏµÍ³ÒÀÀµĞÔ")
-        print("¶ÔÓÚ mpi4py£¬ÇëÈ·±£°²×°ÁË MPI£¨ÀıÈç£¬Ubuntu ÉÏµÄ¡°sudo apt install libopenmpi dev¡±£©")
+        print("è¯·æ£€æŸ¥æ‚¨çš„ç½‘ç»œè¿æ¥æˆ–ç³»ç»Ÿä¾èµ–æ€§")
+        print("å¯¹äº mpi4pyï¼Œè¯·ç¡®ä¿å®‰è£…äº† MPIï¼ˆä¾‹å¦‚ï¼ŒUbuntu ä¸Šçš„â€œsudo apt install libopenmpi devâ€ï¼‰")
         print("="*50)
         sys.exit(1)
     else:
         print("\n" + "="*50)
-        print("ËùÓĞÒÀÀµÏî¾ùÒÑ³É¹¦°²×°£¡")
+        print("æ‰€æœ‰ä¾èµ–é¡¹å‡å·²æˆåŠŸå®‰è£…ï¼")
         print("="*50)
         sys.exit(0)
 

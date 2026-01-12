@@ -67,7 +67,7 @@ def inspect_scene(scene_name):
         azimuth = np.arctan2(data_trans[:, 1], data_trans[:, 0])
         keep = (r < 250.0) & (np.abs(azimuth) < np.pi/2)
         
-        print(f"  Original Points: {data.shape[0]}")
+        print(f"Original Points: {data.shape[0]}")
         print(f"  Points kept after transform & filter: {np.sum(keep)} / {data.shape[0]}")
         if np.sum(keep) == 0:
             print(f"  Max Azimuth: {np.max(np.abs(azimuth)):.4f} (Limit: {np.pi/2:.4f})")

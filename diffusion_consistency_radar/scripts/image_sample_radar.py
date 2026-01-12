@@ -216,10 +216,7 @@ def main():
 
     logger.log("creating data loader...")
     # 使用配置中的数据参数
-    # 如果 args 中有指定 dataset_dir 等路径，建议也在 Config 类中定义，这里为了演示直接使用硬编码或原逻辑
-    # 假设 DataConfig 里会有 dataset_dir 属性，或者我们暂时从原 defaults 里取一个默认值，
-    # 但原代码 dataset_dir 是参数传入的。我们可以给 DataConfig 增加 dataset_dir 字段。
-    
+
     # 临时从环境变量或默认路径获取，因为 DataConfig 定义里没写 dataset_dir
     dataset_dir = os.environ.get("DATASET_DIR", './NTU4DRadLM_pre_processing/NTU4DRadLM_Pre') 
     

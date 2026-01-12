@@ -8,7 +8,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cm import dist_util, logger
-from cm.config import Config # 引入统一配置
+from mpi4py import MPI
+# from cm.config import Config # 引入统一配置
 # from cm.image_datasets import load_data
 from cm.resample import create_named_schedule_sampler
 from cm.script_util_cond import (
@@ -35,44 +36,49 @@ from easydict import EasyDict as edict
 def main():
     parser = create_argparser()
     # 添加配置文件参数
-    parser.add_argument("--config", type=str, required=True, help="Path to the config file (e.g., config/default_config.yaml)")
+    # parser.add_argument("--config", type=str, required=True, help="Path to the config file (e.g., config/default_config.yaml)")
     parser.add_argument("--gpu_id", type=str, default="0", help="GPU ID to use")
     args = parser.parse_args()
 
     # 1. 加载 YAML 配置
-    if not os.path.exists(args.config):
-        raise FileNotFoundError(f"Config file not found at {args.config}")
-    cfg = Config.from_yaml(args.config)
+    # if not os.path.exists(args.config):
+    #     raise FileNotFoundError(f"Config file not found at {args.config}")
+    # cfg = Config.from_yaml(args.config)
 
     # 2. 设置环境
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+    # os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+    gpu_ids = [x.strip() for x in args.gpu_id.split(',')]
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids[rank % len(gpu_ids)]
+
     dist_util.setup_dist()
     logger.configure(dir = args.out_dir)
 
     # 3. 用 Config 覆盖 Args (核心步骤)
     # Model Config
-    args.image_size = cfg.model.image_size
-    args.num_channels = cfg.model.num_channels
-    args.num_res_blocks = cfg.model.num_res_blocks
-    args.attention_resolutions = cfg.model.attention_resolutions
-    args.in_ch = cfg.model.in_ch
-    args.out_ch = cfg.model.out_ch
+    # args.image_size = cfg.model.image_size
+    # args.num_channels = cfg.model.num_channels
+    # args.num_res_blocks = cfg.model.num_res_blocks
+    # args.attention_resolutions = cfg.model.attention_resolutions
+    # args.in_ch = cfg.model.in_ch
+    # args.out_ch = cfg.model.out_ch
     
     # Diffusion Config
-    args.sigma_min = cfg.diffusion.sigma_min
-    args.sigma_max = cfg.diffusion.sigma_max
-    args.rho = cfg.diffusion.rho
-    args.weight_schedule = cfg.diffusion.weight_schedule
+    # args.sigma_min = cfg.diffusion.sigma_min
+    # args.sigma_max = cfg.diffusion.sigma_max
+    # args.rho = cfg.diffusion.rho
+    # args.weight_schedule = cfg.diffusion.weight_schedule
 
     # Training Config
-    args.lr = cfg.training.lr
-    args.weight_decay = cfg.training.weight_decay
+    # args.lr = cfg.training.lr
+    # args.weight_decay = cfg.training.weight_decay
 
     # Data batch size
-    if args.batch_size == -1: # 如果命令行没强制指定，优先用 config
-        args.batch_size = cfg.data.batch_size
+    # if args.batch_size == -1: # 如果命令行没强制指定，优先用 config
+    #     args.batch_size = cfg.data.batch_size
 
-    logger.log(f"Loaded config from {args.config}")
+    # logger.log(f"Loaded config from {args.config}")
 
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
@@ -109,7 +115,7 @@ def main():
     print("batch_size", batch_size)
     data= th.utils.data.DataLoader(
         train_data,
-        num_workers=cfg.data.num_workers, # 使用 Config 中的 num_workers
+        num_workers=args.num_workers, # 使用 Args 中的 num_workers
         batch_size=batch_size,
         shuffle=True,
         pin_memory=True, # 开启锁页内存，加速数据从 CPU 到 GPU 的传输
@@ -144,8 +150,8 @@ def create_argparser():
         lr=0.00005, # 学习率。影响模型收敛速度和稳定性。过大可能导致震荡，过小收敛慢。通常在 1e-4 到 1e-5 之间。
         weight_decay=0.0, # 权重衰减（L2 正则化）。防止过拟合。通常设为 0 或很小的值（如 1e-4）。
         lr_anneal_steps=0, # 学习率退火步数。0 表示不退火（常数学习率）。如果设置，学习率会在这些步数内衰减到 0。
-        global_batch_size=8, # 全局批量大小（所有 GPU 总和）。影响梯度估计的准确性和显存占用。越大梯度越稳，但显存需求越高。
-        batch_size=-1, # 单个 GPU 的批量大小。-1 表示自动根据 global_batch_size 和 GPU 数量计算。
+        global_batch_size=32, # 全局批量大小（所有 GPU 总和）。针对 2x 4090 调整 (16 * 2 = 32)。
+        batch_size=16, # 单个 GPU 的批量大小。针对 RTX 4090 (24GB) 优化，预计占用 ~22GB 显存。
         microbatch=-1,  # 微批量大小。用于梯度累积。-1 表示禁用（即 microbatch = batch_size）。如果显存不足，可以设小一点（如 1 或 2），通过多次前向传播累积梯度来模拟大 batch_size。
         ema_rate="0.999,0.9999,0.9999432189950708",  # 指数移动平均（EMA）的衰减率列表。用于平滑模型参数，通常能获得更好的生成质量。逗号分隔表示维护多个 EMA 版本。值越接近 1，平滑程度越高。
         log_interval=100, # 日志打印间隔（步数）。影响控制台输出频率。
@@ -153,23 +159,27 @@ def create_argparser():
         resume_checkpoint="", # 恢复训练的 checkpoint 路径。为空表示从头训练。填入路径可继续训练。
         use_fp16=False, # 是否使用混合精度（FP16）训练。True 可以减少显存占用并加速，但可能导致数值不稳定。
         fp16_scale_growth=1e-3, # FP16 训练时 Loss Scale 的增长速率。仅在 use_fp16=True 时有效。
-        in_ch = 4, # 模型输入通道数。4 (Radar Voxel)
-        out_ch = 4, # 模型输出通道数。4 (Target Voxel)
+        in_ch = 8, # 模型输入通道数。
+        out_ch = 3, # 模型输出通道数。
         out_dir='./diffusion_consistency_radar/train_results/radar_edm', # 输出目录。存放日志和模型权重。
         dataset_dir = './NTU4DRadLM_pre_processing/NTU4DRadLM_Pre', # 数据集根目录路径。
         dataloading_config = "./diffusion_consistency_radar/config/data_loading_config.yml", # 数据加载配置文件路径。
+        num_workers=4, # 数据加载线程数
 
         # Model params (模型架构参数)
         attention_resolutions="32,16,8", # 在哪些分辨率层级使用自注意力机制。逗号分隔。通常在低分辨率层使用以捕捉全局依赖，高分辨率层使用计算代价过大。
         class_cond=False, # 是否使用类别条件控制（Class Conditioning）。True 则模型会接收类别标签作为输入。
         use_scale_shift_norm=True, # 是否使用 Scale-Shift Normalization（通常用于条件注入，如时间步嵌入）。True 通常效果更好。
         dropout=0.1, # Dropout 概率。防止过拟合。0.1 表示丢弃 10% 的神经元。
-        image_size=128, # 输入图像的分辨率（宽/高）。必须与数据预处理一致。
-        num_channels=64, # 基础通道数（第一层的宽度）。控制模型容量。越大模型越强，但计算量和显存占用越大。
+        image_size=64, # 输入图像的分辨率（宽/高）。必须与数据预处理一致。
+        num_channels=128, # 基础通道数（第一层的宽度）。控制模型容量。越大模型越强，但计算量和显存占用越大。
         num_head_channels=64, # 注意力机制中每个头的通道数。-1 表示使用固定数量的头。
-        num_res_blocks=3, # 每个分辨率层级的残差块数量。越多模型越深，容量越大。
+        num_res_blocks=2, # 每个分辨率层级的残差块数量。越多模型越深，容量越大。
         resblock_updown=True, # 是否在上下采样层使用残差块。True 通常能保留更多信息。
         weight_schedule="karras", # 权重调度策略。影响不同噪声水平下 Loss 的权重分配。Karras 策略通常用于 EDM，旨在平衡不同噪声等级的学习。
+        sigma_min=0.002, 
+        sigma_max=80.0,
+        rho=7.0,
     ))
     
     parser = argparse.ArgumentParser()
