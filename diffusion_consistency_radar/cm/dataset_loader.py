@@ -5,6 +5,14 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 import logging
 
+# 导入数据增强模块
+try:
+    from .augmentation import ComposedAugmentation, VoxelAugmentation, MixupAugmentation
+except ImportError:
+    ComposedAugmentation = None
+    VoxelAugmentation = None
+    MixupAugmentation = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,7 +25,8 @@ def load_sparse_voxel(filename):
     return voxel_grid
 
 class NTU4DRadLM_VoxelDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None, return_path=False, alignment_size=32):
+    def __init__(self, root_dir, split='train', transform=None, return_path=False, alignment_size=32,
+                 use_augmentation=True, augmentation_config=None):
         """
         输入:
             root_dir (str) - 数据集根目录，例如 ".../NTU4DRadLM_Pre"
@@ -25,6 +34,8 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             transform (callable, optional) - 可选的变换
             return_path (bool) - 是否返回文件路径
             alignment_size (int) - 张量填充的对齐大小（U-Net要求32的倍数）
+            use_augmentation (bool) - 是否使用数据增强（仅训练集）
+            augmentation_config (dict) - 数据增强配置
         输出:
             无
         作用: 初始化数据集，加载所有场景的文件路径。
@@ -40,6 +51,28 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         self.return_path = return_path
         self.alignment_size = alignment_size
         self.samples = []
+        self.split = split
+        
+        # 初始化数据增强
+        self.augmentation = None
+        if use_augmentation and split == 'train' and ComposedAugmentation is not None:
+            default_config = {
+                'flip_prob': 0.5,
+                'rotate_prob': 0.3,
+                'noise_prob': 0.2,
+                'noise_std': 0.02,
+                'dropout_prob': 0.1,
+                'point_dropout_rate': 0.05,
+                'intensity_jitter_prob': 0.1,
+                'doppler_jitter_prob': 0.05
+            }
+            if augmentation_config:
+                default_config.update(augmentation_config)
+            
+            self.augmentation = ComposedAugmentation([
+                VoxelAugmentation(**default_config)
+            ])
+            logger.info(f"数据增强已启用: {default_config}")
         
         # 遍历所有场景目录
         if not os.path.exists(root_dir):
@@ -169,6 +202,11 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         if self.transform:
             # 如果有变换，则应用变换
             pass
+        
+        # 应用数据增强（仅训练集）
+        if self.augmentation is not None:
+            # target_tensor 和 radar_tensor 分开传入，增强内部会处理一致性
+            target_tensor, radar_tensor = self.augmentation(target_tensor, radar_tensor)
             
         # 先返回目标（作为 batch），然后返回雷达（作为条件）
         if self.return_path:

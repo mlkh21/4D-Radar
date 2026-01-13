@@ -1,7 +1,13 @@
 import argparse # 导入参数解析库，用于处理命令行参数
 
 from .karras_diffusion import KarrasDenoiser # 导入 Karras 扩散过程类（核心算法）
-from .unet import UNetModel # 导入 U-Net 模型类（神经网络架构）
+from .unet import UNetModel # 导入原始 U-Net 模型类
+from .unet_optimized import (  # 导入优化版 U-Net
+    OptimizedUNetModel,
+    create_lightweight_unet_config,
+    create_ultra_lightweight_unet_config,
+    create_balanced_unet_config,
+)
 import numpy as np # 导入 NumPy 库
 
 NUM_CLASSES = 1000 # 定义默认类别数（ImageNet 标准），但在雷达任务中可能未被实际使用
@@ -41,33 +47,52 @@ def model_and_diffusion_defaults():
     作用: 提供 U-Net 模型和扩散过程所需的默认超参数。
     逻辑:
     1. 返回一个包含 image_size, num_channels, num_res_blocks, in_ch, out_ch 等键值对的字典。
-    """
-    """
-    Defaults for image training.
+    
+    === 优化更新 ===
+    新增参数:
+    - attention_type: 注意力类型 ("flash", "window", "linear", "sparse", "none")
+    - norm_type: 归一化类型 ("group", "layer", "instance", "rms")
+    - downsample_type: 下采样类型 ("asymmetric", "standard")
+    - downsample_stride: 下采样步长 ("xy_only", "z_half", "full", "adaptive")
+    - use_optimized_unet: 是否使用优化版 UNet
+    - use_depthwise: 是否使用深度可分离卷积
+    - window_size: 窗口注意力的窗口大小
+    - initial_z_size: 初始Z轴大小（用于自适应下采样）
     """
     res = dict(
+        # === 基础参数 ===
         sigma_min=0.002, # 最小噪声标准差
         sigma_max=80.0, # 最大噪声标准差
-        image_size=64, # 图像尺寸（默认64，但在训练脚本中会被覆盖为128）
-        num_channels=128, # U-Net 基础通道数
+        image_size=128, # 图像尺寸（默认128）
+        num_channels=64, # U-Net 基础通道数 (优化: 128 -> 64)
         num_res_blocks=2, # 每个分辨率层级的残差块数量
         num_heads=4, # 注意力机制的头数
-        in_ch = 3, # 输入通道数（默认3，但在雷达任务中会被改为2）
-        out_ch = 6, # 输出通道数（默认6，但在雷达任务中会被改为1）
-        num_heads_upsample=-1, # 上采样层的注意力头数（-1表示不使用）
-        num_head_channels=-1, # 每个头的通道数（-1表示自动计算）
+        in_ch=8, # 输入通道数（雷达任务中为8：4通道雷达+4通道目标）
+        out_ch=4, # 输出通道数（预测4通道目标体素）
+        num_heads_upsample=-1, # 上采样层的注意力头数（-1表示与num_heads相同）
+        num_head_channels=64, # 每个头的通道数
         attention_resolutions="32,16,8", # 在哪些分辨率层级使用注意力机制
-        channel_mult="", # 通道倍增系数（控制每层通道数的变化）
-        dropout=0.0, # Dropout 率
+        channel_mult="", # 通道倍增系数（空则自动设置）
+        dropout=0.1, # Dropout 率 (优化: 0.0 -> 0.1)
         class_cond=False, # 是否使用类别条件（Class Conditioning）
-        use_checkpoint=False, # 是否使用梯度检查点（节省显存）
+        use_checkpoint=True, # 是否使用梯度检查点（优化: False -> True，节省显存）
         use_scale_shift_norm=True, # 是否使用 Scale-Shift Normalization
-        resblock_updown=False, # 是否在残差块内进行上下采样
-        use_fp16=False, # 是否使用混合精度训练
+        resblock_updown=True, # 是否在残差块内进行上下采样 (优化: False -> True)
+        use_fp16=True, # 是否使用混合精度训练 (优化: False -> True)
         use_new_attention_order=False, # 是否使用新的注意力顺序
-        learn_sigma=False, # 是否学习方差（通常用于改进的 DDPM）
-        weight_schedule="karras", # 权重调度策略（Karras 论文推荐）
+        learn_sigma=False, # 是否学习方差
+        weight_schedule="karras", # 权重调度策略
         dims=3, # 维度 (2 for 2D, 3 for 3D)
+        
+        # === 新增优化参数 ===
+        attention_type="flash", # 注意力类型: flash/window/linear/sparse/height/none
+        norm_type="group", # 归一化类型: group/layer/instance/rms/adaptive
+        downsample_type="asymmetric", # 下采样类型: asymmetric/standard
+        downsample_stride="xy_only", # 下采样步长: xy_only/z_half/full/adaptive
+        use_optimized_unet=True, # 是否使用优化版 UNet
+        use_depthwise=False, # 是否使用深度可分离卷积
+        window_size="4,4,4", # 窗口注意力的窗口大小
+        initial_z_size=32, # 初始Z轴大小
     )
     return res
 
@@ -96,6 +121,15 @@ def create_model_and_diffusion(
     sigma_min=0.002,
     sigma_max=80.0,
     distillation=False,
+    # === 新增优化参数 ===
+    attention_type="flash",
+    norm_type="group",
+    downsample_type="asymmetric",
+    downsample_stride="xy_only",
+    use_optimized_unet=True,
+    use_depthwise=False,
+    window_size="4,4,4",
+    initial_z_size=32,
 ):
     """
     输入:
@@ -122,24 +156,28 @@ def create_model_and_diffusion(
         sigma_min (float) - 最小噪声标准差
         sigma_max (float) - 最大噪声标准差
         distillation (bool) - 是否蒸馏模式
+        
+        # 新增优化参数
+        attention_type (str) - 注意力类型
+        norm_type (str) - 归一化类型
+        downsample_type (str) - 下采样类型
+        downsample_stride (str) - 下采样步长
+        use_optimized_unet (bool) - 是否使用优化版 UNet
+        use_depthwise (bool) - 是否使用深度可分离卷积
+        window_size (str) - 窗口大小
+        initial_z_size (int) - 初始Z轴大小
+        
     输出:
-        model (UNetModel) - 创建的 U-Net 模型
+        model (UNetModel/OptimizedUNetModel) - 创建的 U-Net 模型
         diffusion (KarrasDenoiser) - 创建的扩散过程对象
     作用: 创建并初始化 U-Net 模型和 Karras 扩散器。
-    逻辑:
-    1. 调用 create_model 创建 U-Net 模型。
-    2. 初始化 KarrasDenoiser 对象。
-    3. 返回模型和扩散器。
     """
-    # print("in_ch", in_ch)
-    # print("out_ch", out_ch) # 打印输出通道数（调试用）
-    # print("dims", dims)
-    model = create_model( # 调用 create_model 函数创建 U-Net 模型
+    model = create_model(
         image_size,
         num_channels,
         num_res_blocks,
-        in_ch = in_ch, # 传递输入通道数
-        out_ch = out_ch, # 传递输出通道数
+        in_ch=in_ch,
+        out_ch=out_ch,
         channel_mult=channel_mult,
         learn_sigma=learn_sigma,
         class_cond=class_cond,
@@ -153,17 +191,26 @@ def create_model_and_diffusion(
         resblock_updown=resblock_updown,
         use_fp16=use_fp16,
         use_new_attention_order=use_new_attention_order,
-        dims=dims, # 传递维度
+        dims=dims,
+        # 新增参数
+        attention_type=attention_type,
+        norm_type=norm_type,
+        downsample_type=downsample_type,
+        downsample_stride=downsample_stride,
+        use_optimized_unet=use_optimized_unet,
+        use_depthwise=use_depthwise,
+        window_size=window_size,
+        initial_z_size=initial_z_size,
     )
-    diffusion = KarrasDenoiser( # 创建 KarrasDenoiser 对象（负责扩散过程的数学计算）
-        sigma_data=0.5, # 数据分布的标准差假设
-        sigma_max=sigma_max, # 最大噪声
-        sigma_min=sigma_min, # 最小噪声
-        distillation=distillation, # 是否蒸馏模式
-        weight_schedule=weight_schedule, # 权重调度
+    diffusion = KarrasDenoiser(
+        sigma_data=0.5,
+        sigma_max=sigma_max,
+        sigma_min=sigma_min,
+        distillation=distillation,
+        weight_schedule=weight_schedule,
         loss_norm="lpips",
     )
-    return model, diffusion # 返回模型和扩散对象
+    return model, diffusion
 
 
 def create_model(
@@ -186,27 +233,39 @@ def create_model(
     use_fp16=False,
     use_new_attention_order=False,
     dims=3,
+    # === 新增优化参数 ===
+    attention_type="flash",
+    norm_type="group",
+    downsample_type="asymmetric",
+    downsample_stride="xy_only",
+    use_optimized_unet=True,
+    use_depthwise=False,
+    window_size="4,4,4",
+    initial_z_size=32,
 ):
     """
     输入:
         (同 create_model_and_diffusion 中的对应参数)
     输出:
-        (UNetModel) - 实例化的 U-Net 模型
+        (UNetModel/OptimizedUNetModel) - 实例化的 U-Net 模型
     作用: 根据配置参数构建 U-Net 模型。
     逻辑:
-    1. 解析 channel_mult 参数，如果为空则根据 image_size 设置默认值。
+    1. 解析 channel_mult 参数。
     2. 解析 attention_resolutions 参数。
-    3. 实例化并返回 UNetModel。
+    3. 根据 use_optimized_unet 选择模型类型。
+    4. 实例化并返回模型。
     """
+    # 解析 channel_mult
     if channel_mult == "":
         if dims == 3 and image_size == 128:
-             channel_mult = (1, 2, 4, 8) # 3D U-Net default for 128x128xZ
+            # 优化的通道倍增：更保守以节省显存
+            channel_mult = (1, 2, 2, 4)  # 原: (1, 2, 4, 8)
         elif image_size == 512:
             channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
         elif image_size == 256:
             channel_mult = (1, 1, 2, 2, 4, 4)
-        elif image_size == 128: # 你的项目用的是 128
-            channel_mult = (1, 1, 2, 3, 4) # 通道数变化：1x -> 1x -> 2x -> 3x -> 4x
+        elif image_size == 128:
+            channel_mult = (1, 2, 2, 4)  # 优化: (1, 1, 2, 3, 4) -> (1, 2, 2, 4)
         elif image_size == 64:
             channel_mult = (1, 2, 3, 4)
         elif image_size == 32:
@@ -214,33 +273,86 @@ def create_model(
         else:
             raise ValueError(f"unsupported image size: {image_size}")
     else:
-        channel_mult = tuple(int(ch_mult) for ch_mult in channel_mult.split(",")) # 解析字符串格式的倍增系数
+        channel_mult = tuple(int(ch_mult) for ch_mult in channel_mult.split(","))
 
-    attention_ds = [] # 解析注意力分辨率
-    for res in attention_resolutions.split(","):
-        attention_ds.append(image_size // int(res)) # 将分辨率转换为下采样倍数
+    # 解析 attention_resolutions
+    attention_ds = []
+    if attention_resolutions != "-1":  # -1 表示不使用注意力
+        for res in attention_resolutions.split(","):
+            res = int(res)
+            if res > 0:
+                attention_ds.append(image_size // res)
+    
+    # 解析窗口大小
+    if isinstance(window_size, str):
+        window_size = tuple(int(x) for x in window_size.split(","))
+    
+    print(f"\n{'='*60}")
+    print(f"Model Configuration:")
+    print(f"  - use_optimized_unet: {use_optimized_unet}")
+    print(f"  - num_channels: {num_channels}")
+    print(f"  - channel_mult: {channel_mult}")
+    print(f"  - attention_resolutions: {attention_ds}")
+    print(f"  - attention_type: {attention_type}")
+    print(f"  - norm_type: {norm_type}")
+    print(f"  - downsample_type: {downsample_type}")
+    print(f"  - downsample_stride: {downsample_stride}")
+    print(f"  - use_fp16: {use_fp16}")
+    print(f"  - use_checkpoint: {use_checkpoint}")
+    print(f"{'='*60}\n")
 
-    return UNetModel( # 实例化 UNetModel
-        image_size=image_size,
-        in_channels = in_ch, # 设置输入通道（雷达任务中为2）
-        model_channels=num_channels,
-        # out_channels=(3 if not learn_sigma else 6), # 原版代码（注释掉）
-        out_channels = out_ch, # 设置输出通道（雷达任务中为1）
-        num_res_blocks=num_res_blocks,
-        attention_resolutions=tuple(attention_ds),
-        dropout=dropout,
-        channel_mult=channel_mult,
-        num_classes=(NUM_CLASSES if class_cond else None),
-        use_checkpoint=use_checkpoint,
-        use_fp16=use_fp16,
-        num_heads=num_heads,
-        num_head_channels=num_head_channels,
-        num_heads_upsample=num_heads_upsample,
-        use_scale_shift_norm=use_scale_shift_norm,
-        resblock_updown=resblock_updown,
-        use_new_attention_order=use_new_attention_order,
-        dims=dims, # Pass dims
-    )
+    # 创建模型
+    if use_optimized_unet:
+        return OptimizedUNetModel(
+            image_size=image_size,
+            in_channels=in_ch,
+            model_channels=num_channels,
+            out_channels=out_ch,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=tuple(attention_ds),
+            dropout=dropout,
+            channel_mult=channel_mult,
+            num_classes=(NUM_CLASSES if class_cond else None),
+            use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample,
+            use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown,
+            use_new_attention_order=use_new_attention_order,
+            dims=dims,
+            # 新增优化参数
+            attention_type=attention_type,
+            norm_type=norm_type,
+            downsample_type=downsample_type,
+            downsample_stride=downsample_stride,
+            use_depthwise=use_depthwise,
+            window_size=window_size,
+            initial_z_size=initial_z_size,
+        )
+    else:
+        # 使用原始 UNet
+        return UNetModel(
+            image_size=image_size,
+            in_channels=in_ch,
+            model_channels=num_channels,
+            out_channels=out_ch,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=tuple(attention_ds),
+            dropout=dropout,
+            channel_mult=channel_mult,
+            num_classes=(NUM_CLASSES if class_cond else None),
+            use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample,
+            use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown,
+            use_new_attention_order=use_new_attention_order,
+            dims=dims,
+        )
 
 
 def create_ema_and_scales_fn(

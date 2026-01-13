@@ -9,7 +9,16 @@ import torch as th
 import torch.nn as nn # 导入PyTorch的神经网络模块
 import torch.nn.functional as F # 导入PyTorch的函数式接口
 from typing import Tuple, Any
-from piq import LPIPS # 导入PIQ库中的LPIPS指标计算模块
+
+# 尝试导入3D感知损失，如果失败则使用2D LPIPS作为后备
+try:
+    from .losses_3d import Perceptual3DLoss, CompositeLoss3D
+    USE_3D_LOSS = True
+except ImportError:
+    from piq import LPIPS # 导入PIQ库中的LPIPS指标计算模块
+    USE_3D_LOSS = False
+    print("警告: 无法导入3D损失模块，使用2D LPIPS作为后备")
+
 from . import dist_util
 
 from .nn import mean_flat, append_dims, append_zero
@@ -79,8 +88,18 @@ class KarrasDenoiser:
         self.rho = rho
         self.num_timesteps = 40
 
-        self.lpips_loss = LPIPS(replace_pooling=True, reduction="none")
-        self.lpips_loss.cuda()
+        # 使用3D感知损失或2D LPIPS
+        if USE_3D_LOSS:
+            self.perceptual_loss = Perceptual3DLoss(
+                in_channels=4, 
+                base_channels=32,
+                use_checkpoint=True  # 使用梯度检查点节省显存
+            ).cuda()
+            print("使用3D感知损失")
+        else:
+            self.perceptual_loss = LPIPS(replace_pooling=True, reduction="none")
+            self.perceptual_loss.cuda()
+            print("使用2D LPIPS损失（后备模式）")
         
     def get_snr(self, sigmas):
         """
@@ -182,7 +201,25 @@ class KarrasDenoiser:
         weights = append_dims(
             get_weightings(self.weight_schedule, snrs, self.sigma_data), dims
         )
-        terms["perceptual_loss"] = self.lpips_loss(x_start, denoised) # 0 ~ 1
+        
+        # 计算感知损失 (支持3D和2D模式)
+        if USE_3D_LOSS:
+            # 3D感知损失 - 直接处理5D张量 (B, C, Z, H, W)
+            terms["perceptual_loss"] = self.perceptual_loss(x_start, denoised)
+        else:
+            # 2D LPIPS - 需要将3D数据转换为2D切片
+            # 输入形状: (B, C, Z, H, W) -> 取中间切片 -> (B, C, H, W)
+            if x_start.dim() == 5:
+                mid_z = x_start.shape[2] // 2
+                x_start_2d = x_start[:, :, mid_z, :, :]
+                denoised_2d = denoised[:, :, mid_z, :, :]
+                # LPIPS 需要3通道输入，取前3通道
+                if x_start_2d.shape[1] > 3:
+                    x_start_2d = x_start_2d[:, :3, :, :]
+                    denoised_2d = denoised_2d[:, :3, :, :]
+                terms["perceptual_loss"] = self.perceptual_loss(x_start_2d, denoised_2d)
+            else:
+                terms["perceptual_loss"] = self.perceptual_loss(x_start, denoised)
         
         terms["mse"] = mean_flat(weights * (denoised - x_start) ** 2)
         # terms["loss"] = terms["mse"]

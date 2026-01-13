@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -- coding: utf-8 --
 # 训练一个扩散模型来生成雷达数据。
 
 import argparse
@@ -39,9 +39,6 @@ def main():
     parser.add_argument("--gpu_id", type=str, default="0", help="GPU ID to use")
     args = parser.parse_args()
 
-    # 1. (已移除) 加载 YAML 配置
-
-    # 2. 设置环境
     # os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
     gpu_ids = [x.strip() for x in args.gpu_id.split(',')]
     comm = MPI.COMM_WORLD
@@ -49,14 +46,16 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids[rank % len(gpu_ids)]
 
     dist_util.setup_dist()
+    if th.cuda.is_available():
+        th.cuda.set_device(0)
     logger.configure(dir = args.out_dir)
-
-    # 3. 使用 Args 代替 Config
 
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
+    print("Model created, moving to device...")
     model.to(dist_util.dev())
+    print("Model moved to device.")
     print("dist_util.dev()", dist_util.dev())
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
@@ -117,40 +116,50 @@ def main():
 def create_argparser():
     defaults = model_and_diffusion_defaults()
     defaults.update(dict(
-        schedule_sampler="lognormal", # 采样时间步的调度器。影响训练过程中噪声水平的采样分布。可选 "uniform", "lognormal" 等。Lognormal 通常用于 EDM 训练，强调中间噪声水平。
-        lr=0.00005, # 学习率。影响模型收敛速度和稳定性。过大可能导致震荡，过小收敛慢。通常在 1e-4 到 1e-5 之间。
-        weight_decay=0.0, # 权重衰减（L2 正则化）。防止过拟合。通常设为 0 或很小的值（如 1e-4）。
-        lr_anneal_steps=0, # 学习率退火步数。0 表示不退火（常数学习率）。如果设置，学习率会在这些步数内衰减到 0。
-        global_batch_size=32, # 全局批量大小（所有 GPU 总和）。针对 2x 4090 调整 (16 * 2 = 32)。
-        batch_size=16, # 单个 GPU 的批量大小。针对 RTX 4090 (24GB) 优化，预计占用 ~22GB 显存。
-        microbatch=-1,  # 微批量大小。用于梯度累积。-1 表示禁用（即 microbatch = batch_size）。如果显存不足，可以设小一点（如 1 或 2），通过多次前向传播累积梯度来模拟大 batch_size。
-        ema_rate="0.999,0.9999,0.9999432189950708",  # 指数移动平均（EMA）的衰减率列表。用于平滑模型参数，通常能获得更好的生成质量。逗号分隔表示维护多个 EMA 版本。值越接近 1，平滑程度越高。
-        log_interval=100, # 日志打印间隔（步数）。影响控制台输出频率。
-        save_interval=40000, # 模型保存间隔（步数）。影响 checkpoint 文件的生成频率。
-        resume_checkpoint="", # 恢复训练的 checkpoint 路径。为空表示从头训练。填入路径可继续训练。
-        use_fp16=False, # 是否使用混合精度（FP16）训练。True 可以减少显存占用并加速，但可能导致数值不稳定。
-        fp16_scale_growth=1e-3, # FP16 训练时 Loss Scale 的增长速率。仅在 use_fp16=True 时有效。
-        in_ch = 8, # 模型输入通道数。
-        out_ch = 3, # 模型输出通道数。
-        out_dir='./diffusion_consistency_radar/train_results/radar_edm', # 输出目录。存放日志和模型权重。
-        dataset_dir = './NTU4DRadLM_pre_processing/NTU4DRadLM_Pre', # 数据集根目录路径。
-        dataloading_config = "./diffusion_consistency_radar/config/data_loading_config.yml", # 数据加载配置文件路径。
-        num_workers=4, # 数据加载线程数
+        schedule_sampler="lognormal", # 采样时间步的调度器。影响训练过程中噪声水平的采样分布。
+        lr=0.0001, # 学习率 (优化: 0.00005 -> 0.0001)
+        weight_decay=0.0, # 权重衰减（L2 正则化）
+        lr_anneal_steps=0, # 学习率退火步数
+        global_batch_size=32, # 全局批量大小
+        batch_size=4, # 单个 GPU 的批量大小
+        microbatch=-1, # 微批量大小（梯度累积）
+        ema_rate="0.999,0.9999,0.9999432189950708", # EMA 衰减率
+        log_interval=100, # 日志打印间隔
+        save_interval=40000, # 模型保存间隔
+        resume_checkpoint="", # 恢复训练的 checkpoint 路径
+        use_fp16=True, # 混合精度训练 (优化: False -> True)
+        fp16_scale_growth=1e-3, # FP16 Loss Scale 增长速率
+        in_ch=8, # 模型输入通道数
+        out_ch=4, # 模型输出通道数
+        out_dir='./diffusion_consistency_radar/train_results/radar_edm', # 输出目录
+        dataset_dir='./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre', # 数据集目录
+        dataloading_config="./diffusion_consistency_radar/config/data_loading_config.yml", # 数据配置
+        num_workers=4, # 数据加载线程数 (优化: 2 -> 4)
 
-        # Model params (模型架构参数)
-        attention_resolutions="32,16,8", # 在哪些分辨率层级使用自注意力机制。逗号分隔。通常在低分辨率层使用以捕捉全局依赖，高分辨率层使用计算代价过大。
-        class_cond=False, # 是否使用类别条件控制（Class Conditioning）。True 则模型会接收类别标签作为输入。
-        use_scale_shift_norm=True, # 是否使用 Scale-Shift Normalization（通常用于条件注入，如时间步嵌入）。True 通常效果更好。
-        dropout=0.1, # Dropout 概率。防止过拟合。0.1 表示丢弃 10% 的神经元。
-        image_size=64, # 输入图像的分辨率（宽/高）。必须与数据预处理一致。
-        num_channels=128, # 基础通道数（第一层的宽度）。控制模型容量。越大模型越强，但计算量和显存占用越大。
-        num_head_channels=64, # 注意力机制中每个头的通道数。-1 表示使用固定数量的头。
-        num_res_blocks=2, # 每个分辨率层级的残差块数量。越多模型越深，容量越大。
-        resblock_updown=True, # 是否在上下采样层使用残差块。True 通常能保留更多信息。
-        weight_schedule="karras", # 权重调度策略。影响不同噪声水平下 Loss 的权重分配。Karras 策略通常用于 EDM，旨在平衡不同噪声等级的学习。
-        sigma_min=0.002, 
+        # === 模型架构参数 (优化后的默认值) ===
+        attention_resolutions="8,4", # 注意力分辨率 (优化: "32,16,8" -> "8,4")
+        class_cond=False, # 类别条件
+        use_scale_shift_norm=True, # Scale-Shift Normalization
+        dropout=0.1, # Dropout 率
+        image_size=128, # 输入分辨率
+        num_channels=64, # 基础通道数 (优化: 128 -> 64)
+        num_head_channels=64, # 每头通道数
+        num_res_blocks=2, # 残差块数
+        resblock_updown=True, # 残差块上下采样 (优化: False -> True)
+        weight_schedule="karras", # 权重调度
+        sigma_min=0.002,
         sigma_max=80.0,
         rho=7.0,
+        
+        # === 新增优化参数 ===
+        attention_type="flash", # 注意力类型
+        norm_type="group", # 归一化类型
+        downsample_type="asymmetric", # 下采样类型
+        downsample_stride="xy_only", # 下采样步长
+        use_optimized_unet=True, # 使用优化版 UNet
+        use_depthwise=False, # 深度可分离卷积
+        window_size="4,4,4", # 窗口大小
+        initial_z_size=32, # 初始 Z 轴大小
     ))
     
     parser = argparse.ArgumentParser()

@@ -1,5 +1,11 @@
 """
 Various utilities for neural networks.
+
+优化版本 - 添加多种 Normalization 选项
+- GroupNorm (默认，适合小 batch size)
+- LayerNorm3D (逐样本归一化)
+- InstanceNorm3D (适合点云/稀疏数据)
+- RMSNorm (更高效的归一化)
 """
 
 import math
@@ -9,6 +15,30 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
+
+# ==============================================================================
+# 全局配置 - 可通过环境变量或配置文件修改
+# ==============================================================================
+NORM_TYPE = "group"  # 可选: "group", "layer", "instance", "rms", "batch"
+NORM_GROUPS = 32     # GroupNorm 的组数
+NORM_EPS = 1e-6      # 归一化的 epsilon
+
+
+def set_norm_type(norm_type: str):
+    """设置全局归一化类型"""
+    global NORM_TYPE
+    NORM_TYPE = norm_type
+
+
+def set_norm_groups(num_groups: int):
+    """设置 GroupNorm 的组数"""
+    global NORM_GROUPS
+    NORM_GROUPS = num_groups
+
+
+# ==============================================================================
+# 激活函数
+# ==============================================================================
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
 class SiLU(nn.Module):
@@ -25,7 +55,12 @@ class SiLU(nn.Module):
         return x * th.sigmoid(x)
 
 
+# ==============================================================================
+# 归一化层
+# ==============================================================================
+
 class GroupNorm32(nn.GroupNorm):
+    """32组归一化，适合小batch size训练"""
     def forward(self, x):
         """
         输入:
@@ -37,6 +72,159 @@ class GroupNorm32(nn.GroupNorm):
         转换为 float 进行归一化，然后转回原类型。
         """
         return super().forward(x.float()).type(x.dtype)
+
+
+class LayerNorm3D(nn.Module):
+    """
+    3D LayerNorm - 对每个样本的所有通道和空间维度进行归一化
+    
+    适用场景：
+    - 极小的 batch size (1-2)
+    - 需要样本独立归一化
+    
+    优点：完全不依赖 batch 统计量
+    """
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+        self.gamma = nn.Parameter(th.ones(1, channels, 1, 1, 1))
+        self.beta = nn.Parameter(th.zeros(1, channels, 1, 1, 1))
+        
+    def forward(self, x):
+        # x: (B, C, D, H, W)
+        # 对 C, D, H, W 维度归一化
+        mean = x.mean(dim=[1, 2, 3, 4], keepdim=True)
+        var = x.var(dim=[1, 2, 3, 4], keepdim=True, unbiased=False)
+        x_norm = (x - mean) / th.sqrt(var + self.eps)
+        return x_norm * self.gamma + self.beta
+
+
+class InstanceNorm3D(nn.Module):
+    """
+    3D InstanceNorm - 对每个样本的每个通道独立归一化
+    
+    适用场景：
+    - 点云/稀疏数据处理
+    - 风格迁移类任务
+    - 雷达数据（每个通道可能有不同的物理含义）
+    
+    优点：
+    - 不依赖 batch 统计量
+    - 保持通道间的独立性
+    """
+    def __init__(self, channels: int, eps: float = 1e-6, affine: bool = True):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+        self.affine = affine
+        
+        if affine:
+            self.gamma = nn.Parameter(th.ones(1, channels, 1, 1, 1))
+            self.beta = nn.Parameter(th.zeros(1, channels, 1, 1, 1))
+        else:
+            self.register_parameter('gamma', None)
+            self.register_parameter('beta', None)
+            
+    def forward(self, x):
+        # x: (B, C, D, H, W)
+        # 对 D, H, W 维度归一化（每个 channel 独立）
+        mean = x.mean(dim=[2, 3, 4], keepdim=True)
+        var = x.var(dim=[2, 3, 4], keepdim=True, unbiased=False)
+        x_norm = (x - mean) / th.sqrt(var + self.eps)
+        
+        if self.affine:
+            return x_norm * self.gamma + self.beta
+        return x_norm
+
+
+class RMSNorm3D(nn.Module):
+    """
+    3D RMSNorm - Root Mean Square Layer Normalization
+    
+    优点：
+    - 比 LayerNorm 更高效（省略均值计算）
+    - 在 LLM 中证明有效（如 LLaMA）
+    - 计算更稳定
+    
+    论文: Root Mean Square Layer Normalization (https://arxiv.org/abs/1910.07467)
+    """
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+        self.scale = nn.Parameter(th.ones(1, channels, 1, 1, 1))
+        
+    def forward(self, x):
+        # x: (B, C, D, H, W)
+        # 计算 RMS
+        rms = th.sqrt(x.pow(2).mean(dim=[1, 2, 3, 4], keepdim=True) + self.eps)
+        x_norm = x / rms
+        return x_norm * self.scale
+
+
+class AdaptiveNorm3D(nn.Module):
+    """
+    自适应归一化 - 根据输入稀疏度自动调整
+    
+    针对雷达数据的特殊设计：
+    - 当输入大部分为零时，使用 InstanceNorm 保持稀疏性
+    - 当输入较密集时，使用 GroupNorm 获得更好的统计
+    """
+    def __init__(self, channels: int, num_groups: int = 32, sparsity_threshold: float = 0.7):
+        super().__init__()
+        self.channels = channels
+        self.sparsity_threshold = sparsity_threshold
+        
+        self.group_norm = GroupNorm32(num_groups, channels)
+        self.instance_norm = InstanceNorm3D(channels)
+        
+    def forward(self, x):
+        # 计算稀疏度（零值比例）
+        with th.no_grad():
+            sparsity = (x.abs() < 1e-6).float().mean()
+        
+        # 根据稀疏度选择归一化方式
+        if sparsity > self.sparsity_threshold:
+            return self.instance_norm(x)
+        else:
+            return self.group_norm(x)
+
+
+class ConditionalNorm3D(nn.Module):
+    """
+    条件归一化 - 用于条件生成（如时间步条件）
+    
+    类似 AdaIN，但针对 3D 数据优化
+    """
+    def __init__(self, channels: int, cond_channels: int, num_groups: int = 32):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups, channels, affine=False)
+        
+        # 条件投影
+        self.cond_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_channels, channels * 2),
+        )
+        
+    def forward(self, x, cond):
+        """
+        Args:
+            x: (B, C, D, H, W) 输入特征
+            cond: (B, cond_channels) 条件嵌入
+        """
+        # 归一化
+        x = self.norm(x)
+        
+        # 获取条件 scale 和 shift
+        cond_out = self.cond_proj(cond)
+        scale, shift = cond_out.chunk(2, dim=1)
+        
+        # 扩展维度以匹配 x
+        scale = scale.view(scale.shape[0], -1, 1, 1, 1)
+        shift = shift.view(shift.shape[0], -1, 1, 1, 1)
+        
+        return x * (1 + scale) + shift
 
 
 def conv_nd(dims, *args, **kwargs):
@@ -195,17 +383,38 @@ def append_zero(x):
     return th.cat([x, x.new_zeros([1])])
 
 
-def normalization(channels):
+def normalization(channels, norm_type: str = None, num_groups: int = None):
     """
     输入:
         channels: 输入通道数。
+        norm_type: 归一化类型，可选 "group", "layer", "instance", "rms", "adaptive"
+        num_groups: GroupNorm 的组数
     输出:
         归一化模块。
     作用: 创建标准归一化层。
     逻辑:
-    返回 GroupNorm32。
+    根据 norm_type 返回对应的归一化层。
     """
-    return GroupNorm32(32, channels)
+    # 使用全局配置或参数覆盖
+    _norm_type = norm_type or NORM_TYPE
+    _num_groups = num_groups or NORM_GROUPS
+    
+    # 确保 num_groups 不超过通道数
+    _num_groups = min(_num_groups, channels)
+    
+    if _norm_type == "group":
+        return GroupNorm32(_num_groups, channels)
+    elif _norm_type == "layer":
+        return LayerNorm3D(channels)
+    elif _norm_type == "instance":
+        return InstanceNorm3D(channels)
+    elif _norm_type == "rms":
+        return RMSNorm3D(channels)
+    elif _norm_type == "adaptive":
+        return AdaptiveNorm3D(channels, _num_groups)
+    else:
+        # 默认使用 GroupNorm
+        return GroupNorm32(_num_groups, channels)
 
 
 def timestep_embedding(timesteps, dim, max_period=10000):
