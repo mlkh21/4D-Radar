@@ -1,34 +1,37 @@
 #!/bin/bash
 # ==============================================================================
-# Latent Diffusion —µ¡∑Ω≈±æ
+# Latent Diffusion ËÆ≠ÁªÉËÑöÊú¨
 # ==============================================================================
 #
-# ’‚ «÷’º´”≈ªØ∑Ω∞∏£¨∑÷¡ΩΩ◊∂Œ—µ¡∑£∫
+# ËøôÊòØÁªàÊûÅ‰ºòÂåñÊñπÊ°àÔºåÂàÜ‰∏§Èò∂ÊÆµËÆ≠ÁªÉÔºö
 #
-# Ω◊∂Œ 1: —µ¡∑ VAE
-#   Ω´ 3D ÃÂÀÿ (4, 32, 128, 128) —πÀıµΩ«±ø’º‰ (4, 8, 32, 32)
-#   —πÀı±»: 4x4x4 = 64 ±∂
+# Èò∂ÊÆµ 1: ËÆ≠ÁªÉ VAE
+#   Â∞Ü 3D ‰ΩìÁ¥† (4, 32, 128, 128) ÂéãÁº©Âà∞ÊΩúÁ©∫Èó¥ (4, 8, 32, 32)
+#   ÂéãÁº©ÊØî: 4x4x4 = 64 ÂÄç
 #
-# Ω◊∂Œ 2: —µ¡∑ Latent Diffusion
-#   ‘⁄«±ø’º‰÷–Ω¯––¿©…¢—µ¡∑
-#   œ‘¥Ê π”√ΩµµÕ 8-16 ±∂
+# Èò∂ÊÆµ 2: ËÆ≠ÁªÉ Latent Diffusion
+#   Âú®ÊΩúÁ©∫Èó¥‰∏≠ËøõË°åÊâ©Êï£ËÆ≠ÁªÉ
+#   ÊòæÂ≠ò‰ΩøÁî®Èôç‰Ωé 8-16 ÂÄç
 #
-#  π”√∑Ω∑®:
-#   1. —µ¡∑ VAE:
+# ‰ΩøÁî®ÊñπÊ≥ï:
+#   1. ËÆ≠ÁªÉ VAE:
 #      CUDA_VISIBLE_DEVICES=0,1 sh diffusion_consistency_radar/launch/train_latent_diffusion.sh vae
 #
-#   2. —µ¡∑ Latent Diffusion:
+#   2. VAEÈ¢ÑÁºñÁ†Å:
+#      CUDA_VISIBLE_DEVICES=0 python diffusion_consistency_radar/scripts/precompute_latents.py
+# 
+#   3. ËÆ≠ÁªÉ Latent Diffusion:
 #      sh diffusion_consistency_radar/launch/train_latent_diffusion.sh ldm
 #
 # ==============================================================================
 
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32
 
-# «Â¿ÌGPUª∫¥Ê
+# Ê∏ÖÁêÜGPUÁºìÂ≠ò
 python -c "import torch; torch.cuda.empty_cache()" 2>/dev/null
 
-MODE=${1:-vae}  # ƒ¨»œ—µ¡∑ VAE
-VAE_TYPE=${2:-ultra_lightweight}  # ƒ¨»œ π”√≥¨«·¡øº∂≈‰÷√
+MODE=${1:-vae}  # ÈªòËÆ§ËÆ≠ÁªÉ VAE
+VAE_TYPE=${2:-ultra_lightweight}  # ÈªòËÆ§‰ΩøÁî®Ë∂ÖËΩªÈáèÁ∫ßÈÖçÁΩÆ
 
 if [ "$MODE" = "vae" ]; then
     echo "=========================================="
@@ -36,7 +39,7 @@ if [ "$MODE" = "vae" ]; then
     echo "VAE Type: $VAE_TYPE"
     echo "=========================================="
     
-    python diffusion_consistency_radar/scripts/train_latent_diffusion.py \
+    CUDA_VISIBLE_DEVICES=0,1 python diffusion_consistency_radar/scripts/train_latent_diffusion.py \
         --mode train_vae \
         --vae_type $VAE_TYPE \
         --batch_size 2 \
@@ -55,7 +58,7 @@ elif [ "$MODE" = "ldm" ]; then
     echo "Stage 2: Training Latent Diffusion"
     echo "=========================================="
     
-    # »∑±£“—”–—µ¡∑∫√µƒ VAE
+    # Á°Æ‰øùÂ∑≤ÊúâËÆ≠ÁªÉÂ•ΩÁöÑ VAE
     VAE_CKPT="./diffusion_consistency_radar/train_results/vae/vae_best.pt"
     
     if [ ! -f "$VAE_CKPT" ]; then
@@ -64,16 +67,17 @@ elif [ "$MODE" = "ldm" ]; then
         exit 1
     fi
     
-    python diffusion_consistency_radar/scripts/train_latent_diffusion.py \
+    CUDA_VISIBLE_DEVICES=0,1 python diffusion_consistency_radar/scripts/train_latent_diffusion.py \
         --mode train_ldm \
-        --vae_type lightweight \
+        --vae_type ultra_lightweight \
         --vae_ckpt $VAE_CKPT \
-        --batch_size 16 \
+        --batch_size 1 \
+        --gradient_accumulation_steps 16 \
         --ldm_epochs 200 \
-        --model_channels 64 \
+        --model_channels 32 \
         --lr 1e-4 \
         --save_every 5000 \
-        --num_workers 4 \
+        --num_workers 2 \
         --dataset_dir ./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre \
         --ldm_save_dir ./diffusion_consistency_radar/train_results/ldm
 

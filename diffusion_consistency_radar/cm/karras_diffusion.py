@@ -91,9 +91,7 @@ class KarrasDenoiser:
         # 使用3D感知损失或2D LPIPS
         if USE_3D_LOSS:
             self.perceptual_loss = Perceptual3DLoss(
-                in_channels=4, 
-                base_channels=32,
-                use_checkpoint=True  # 使用梯度检查点节省显存
+                in_channels=4
             ).cuda()
             print("使用3D感知损失")
         else:

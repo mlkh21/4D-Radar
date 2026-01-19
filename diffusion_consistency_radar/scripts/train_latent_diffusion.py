@@ -395,13 +395,25 @@ def train_latent_diffusion(args):
     if not args.vae_ckpt:
         raise ValueError("Must provide --vae_ckpt for latent diffusion training")
     
-    if args.vae_type == "lightweight":
+    if args.vae_type == "ultra_lightweight" and create_ultra_lightweight_vae_config is not None:
+        config = create_ultra_lightweight_vae_config()
+        print("Using ultra-lightweight VAE config for LDM")
+    elif args.vae_type == "lightweight":
         config = create_lightweight_vae_config()
     else:
         config = create_standard_vae_config()
-    
+
     vae = VAE3D(**config)
-    vae.load_state_dict(torch.load(args.vae_ckpt, map_location='cpu'))
+    
+    # 加载 checkpoint（兼容完整字典和纯state_dict）
+    ckpt = torch.load(args.vae_ckpt, map_location='cpu')
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        vae.load_state_dict(ckpt['model_state_dict'])
+        print(f"Loaded VAE from checkpoint (epoch {ckpt.get('epoch', 'unknown')})")
+    else:
+        vae.load_state_dict(ckpt)
+        print("Loaded VAE from raw state_dict")
+    
     vae = vae.to(args.device)
     vae.eval()
     
@@ -426,31 +438,39 @@ def train_latent_diffusion(args):
     diffusion_model = OptimizedUNetModel(
         image_size=latent_size[1],  # H 维度
         in_channels=latent_channels * 2,  # 条件 + 噪声
-        model_channels=args.model_channels,
+        model_channels=32,  # 从64降到32
         out_channels=latent_channels,
-        num_res_blocks=2,
-        attention_resolutions=(4, 2),  # 潜空间更小，可以用更多注意力
-        dropout=0.1,
-        channel_mult=(1, 2, 4),
+        num_res_blocks=1,  # 从2降到1
+        attention_resolutions=(),  # 完全禁用attention
+        dropout=0.0,  # 降低dropout节省显存
+        channel_mult=(1, 2, 3),  # 从(1,2,4)降到(1,2,3)
         use_checkpoint=True,
-        use_fp16=True,
+        use_fp16=False,
         num_heads=4,
-        attention_type="flash",
         norm_type="group",
         downsample_type="asymmetric",
         initial_z_size=latent_size[0],
     ).to(args.device)
     
+    # 多GPU支持
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for LDM training!")
+        diffusion_model = nn.DataParallel(diffusion_model)
+    
+    # Karras采样器参数
     denoiser = KarrasDenoiser(
         sigma_data=0.5,
         sigma_max=80.0,
         sigma_min=0.002,
+        loss_norm="l2",  # 使用 L2 损失，避免感知损失初始化错误
+
     )
     
-    # 加载数据
+    # 加载数据（禁用数据增强，因为已经在潜空间）
     train_dataset = NTU4DRadLM_VoxelDataset(
         root_dir=args.dataset_dir,
         split='train',
+        use_augmentation=False,  # 禁用增强，避免尺寸不一致
     )
     train_loader = DataLoader(
         train_dataset,
@@ -475,6 +495,7 @@ def train_latent_diffusion(args):
     for epoch in range(1, args.ldm_epochs + 1):
         diffusion_model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        optimizer.zero_grad()  # 移到外层
         
         for batch_idx, (target, cond) in enumerate(pbar):
             target = target.to(args.device)
@@ -495,24 +516,25 @@ def train_latent_diffusion(args):
             noise = torch.randn_like(z_target)
             noised_z = z_target + noise * sigmas.view(-1, 1, 1, 1, 1)
             
-            # 预测去噪
-            optimizer.zero_grad()
-            
             # 拼接条件
             model_input = torch.cat([noised_z, z_cond], dim=1)
             
             # 模型输出
             denoised = diffusion_model(model_input, sigmas)
             
-            # 损失
-            loss = F.mse_loss(denoised, z_target)
+            # 损失（除以累积步数）
+            loss = F.mse_loss(denoised, z_target) / args.gradient_accumulation_steps
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), 1.0)
-            optimizer.step()
+            
+            # 每N步更新一次
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
             
             global_step += 1
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            pbar.set_postfix({'loss': f'{loss.item() * args.gradient_accumulation_steps:.4f}'})
             
             # 定期保存
             if global_step % args.save_every == 0:

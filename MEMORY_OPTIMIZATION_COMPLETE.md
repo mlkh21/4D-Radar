@@ -1,150 +1,169 @@
-# 显存优化最终方案总结
+# 项目介绍
 
-## 问题诊断
+此项目是通过使用开源项目[clash](https://github.com/Dreamacro/clash)作为核心程序，再结合脚本实现简单的代理功能。
 
-1. **原始问题**: VAE训练显存OOM（需要21.43GB，实际23.64GB）
-2. **根本原因**: 模型参数过多 + 激活显存大 + 输入分辨率高
-3. **失败尝试**: 输入下采样导致前后向尺寸不匹配
+主要是为了解决我们在服务器上下载GitHub等一些国外资源速度慢的问题。
 
-## 实施的优化方案
+<br>
 
-### 1. 超轻量级VAE配置 ?
+# 使用须知
 
-**参数缩减**:
-```python
-create_ultra_lightweight_vae_config():
-  - base_channels: 32 → 16 (减少2倍)
-  - channel_mult: (1,2,4) → (1,2,2) (减少高层通道)
-  - 结果: 7.65M 参数 → 0.69M 参数 (减少90%)
-```
+- 运行本项目建议使用root用户，或者使用 sudo 提权。
+- 使用过程中如遇到问题，请优先查已有的 [issues](https://github.com/wanhebin/clash-for-linux/issues)。
+- 在进行issues提交前，请替换提交内容中是敏感信息（例如：订阅地址）。
+- 本项目是基于 [clash](https://github.com/Dreamacro/clash) 、[yacd](https://github.com/haishanh/yacd) 进行的配置整合，关于clash、yacd的详细配置请去原项目查看。
+- 此项目不提供任何订阅信息，请自行准备Clash订阅地址。
+- 运行前请手动更改`.env`文件中的`CLASH_URL`变量值，否则无法正常运行。
+- 当前在RHEL系列和Debian系列Linux系统中测试过，其他系列可能需要适当修改脚本。
+- 支持 x86_64/aarch64 平台
 
-**显存节省**: 参数显存减少约90%
+> **注意**：当你在使用此项目时，遇到任何无法独自解决的问题请优先前往 [Issues](https://github.com/wanhebin/clash-for-linux/issues) 寻找解决方法。由于空闲时间有限，后续将不再对Issues中 “已经解答”、“已有解决方案” 的问题进行重复性的回答。
 
-### 2. 批次大小优化 ?
+<br>
 
-```
-batch_size: 8 → 1
-gradient_accumulation: 4 → 8
-有效batch: 8 (保持梯度噪声小)
-```
+# 使用教程
 
-**显存节省**: 激活显存减少约8倍
+## 下载项目
 
-### 3. 混合精度训练 (AMP) ?
-
-```python
---use_amp
-with autocast():
-    outputs = model(inputs)
-```
-
-**显存节省**: 激活显存减少约40-50%
-
-### 4. 梯度检查点 ?
-
-```python
-use_checkpoint=True
-for ResBlock3D, VAE3DEncoder, VAE3DDecoder
-```
-
-**显存节省**: 激活显存减少约60-70%
-
-### 5. 数据加载器优化 ?
-
-```python
-pin_memory=False      # 禁用以节省主机内存
-persistent_workers=False
-num_workers=1         # 减少worker进程
-use_augmentation=False  # VAE训练时禁用增强
-```
-
-**显存节省**: 主机内存减少约2GB
-
-### 6. CUDA内存分配优化 ?
+下载项目
 
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+$ git clone https://github.com/wanhebin/clash-for-linux.git
 ```
 
-**效果**: 减少显存碎片化
-
-## 预期显存使用
-
-| 配置阶段 | 显存使用 | 可行性 |
-|---------|---------|-------|
-| 标准配置 batch=8 | 20+ GB | ? (OOM) |
-| lightweight batch=2 | 18+ GB | ? (OOM) |
-| ultra_lightweight batch=1 | **8-12 GB** | ? |
-| ultra_lightweight batch=1 + AMP | **6-9 GB** | ?? |
-
-## 使用方法
-
-### 训练超轻量级VAE (推荐)
+进入到项目目录，编辑`.env`文件，修改变量`CLASH_URL`的值。
 
 ```bash
-sh diffusion_consistency_radar/launch/train_latent_diffusion.sh vae
+$ cd clash-for-linux
+$ vim .env
 ```
 
-这会自动使用:
-- ultra_lightweight配置
-- batch_size=1
-- gradient_accumulation=8
-- 混合精度AMP
-- num_workers=1
+> **注意：** `.env` 文件中的变量 `CLASH_SECRET` 为自定义 Clash Secret，值为空时，脚本将自动生成随机字符串。
 
-### 完整命令
+<br>
+
+## 启动程序
+
+直接运行脚本文件`start.sh`
+
+- 进入项目目录
 
 ```bash
-python diffusion_consistency_radar/scripts/train_latent_diffusion.py \
-    --mode train_vae \
-    --vae_type ultra_lightweight \
-    --batch_size 1 \
-    --gradient_accumulation_steps 8 \
-    --use_amp \
-    --vae_epochs 100 \
-    --dataset_dir ./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre
+$ cd clash-for-linux
 ```
 
-## 已修复的问题
+- 运行启动脚本
 
-| 问题 | 原因 | 解决方案 |
-|------|------|---------|
-| 数据增强参数错误 | 参数名不匹配 | 更新参数名称 |
-| LPIPS不适配3D | 2D损失用于3D | 创建Perceptual3DLoss |
-| VAE OOM | 模型过大 | 创建超轻量级配置 |
-| 下采样尺寸不匹配 | 前后向尺寸不一致 | 移除下采样包装器 |
+```bash
+$ sudo bash start.sh
 
-## 显存节省总结
+正在检测订阅地址...
+Clash订阅地址可访问！                                      [  OK  ]
 
-| 优化项 | 单项节省 | 累积效果 |
-|-------|---------|---------|
-| 超轻量级配置 | 90% 参数 | 90% |
-| batch=1 + 梯度累积 | 8x激活 | 720% |
-| 梯度检查点 | 60% 激活 | 480% |
-| 混合精度 | 40% 激活 | 192% |
-| **总体效果** | - | **~25-30倍** |
+正在下载Clash配置文件...
+配置文件config.yaml下载成功！                              [  OK  ]
 
-**预计显存使用**: 从21.43GB → **0.8-1.0GB (推理)** 或 **6-9GB (训练)**
+正在启动Clash服务...
+服务启动成功！                                             [  OK  ]
 
-## 后续优化建议
+Clash Dashboard 访问地址：http://<ip>:9090/ui
+Secret：xxxxxxxxxxxxx
 
-1. **如果仍然OOM**:
-   - 进一步减少num_res_blocks: 1→0
-   - 使用VQ-VAE替代标准VAE
-   - 启用更激进的量化
+请执行以下命令加载环境变量: source /etc/profile.d/clash.sh
 
-2. **性能改进**:
-   - 在验证集上评估超轻量级模型质量
-   - 如有空余显存，逐步提升配置
+请执行以下命令开启系统代理: proxy_on
 
-3. **下一阶段**:
-   - VAE训练完成后进行Latent Diffusion训练
-   - 在潜空间中训练显存需求大幅降低
+若要临时关闭系统代理，请执行: proxy_off
 
-## 文件修改清单
+```
 
-- [vae_3d.py](cm/vae_3d.py) - 添加超轻量级配置
-- [train_latent_diffusion.py](scripts/train_latent_diffusion.py) - 移除下采样，优化数据加载
-- [train_latent_diffusion.sh](launch/train_latent_diffusion.sh) - 更新参数和环境变量
-- [dataset_loader.py](cm/dataset_loader.py) - 修复数据增强参数
-- [config_manager.py](cm/config_manager.py) - 更新配置
+```bash
+$ source /etc/profile.d/clash.sh
+$ proxy_on
+```
+
+- 检查服务端口
+
+```bash
+$ netstat -tln | grep -E '9090|789.'
+tcp        0      0 127.0.0.1:9090          0.0.0.0:*               LISTEN     
+tcp6       0      0 :::7890                 :::*                    LISTEN     
+tcp6       0      0 :::7891                 :::*                    LISTEN     
+tcp6       0      0 :::7892                 :::*                    LISTEN
+```
+
+- 检查环境变量
+
+```bash
+$ env | grep -E 'http_proxy|https_proxy'
+http_proxy=http://127.0.0.1:7890
+https_proxy=http://127.0.0.1:7890
+```
+
+以上步鄹如果正常，说明服务clash程序启动成功，现在就可以体验高速下载github资源了。
+
+<br>
+
+## 重启程序
+
+如果需要对Clash配置进行修改，请修改 `conf/config.yaml` 文件。然后运行 `restart.sh` 脚本进行重启。
+
+> **注意：**
+> 重启脚本 `restart.sh` 不会更新订阅信息。
+
+<br>
+
+## 停止程序
+
+- 进入项目目录
+
+```bash
+$ cd clash-for-linux
+```
+
+- 关闭服务
+
+```bash
+$ sudo bash shutdown.sh
+
+服务关闭成功，请执行以下命令关闭系统代理：proxy_off
+
+```
+
+```bash
+$ proxy_off
+```
+
+然后检查程序端口、进程以及环境变量`http_proxy|https_proxy`，若都没则说明服务正常关闭。
+
+
+<br>
+
+## Clash Dashboard
+
+- 访问 Clash Dashboard
+
+通过浏览器访问 `start.sh` 执行成功后输出的地址，例如：http://192.168.0.1:9090/ui
+
+- 登录管理界面
+
+在`API Base URL`一栏中输入：http://\<ip\>:9090 ，在`Secret(optional)`一栏中输入启动成功后输出的Secret。
+
+点击Add并选择刚刚输入的管理界面地址，之后便可在浏览器上进行一些配置。
+
+- 更多教程
+
+此 Clash Dashboard 使用的是[yacd](https://github.com/haishanh/yacd)项目，详细使用方法请移步到yacd上查询。
+
+
+<br>
+
+# 常见问题
+
+1. 部分Linux系统默认的 shell `/bin/sh` 被更改为 `dash`，运行脚本会出现报错（报错内容一般会有 `-en [ OK ]`）。建议使用 `bash xxx.sh` 运行脚本。
+
+2. 部分用户在UI界面找不到代理节点，基本上是因为厂商提供的clash配置文件是经过base64编码的，且配置文件格式不符合clash配置标准。
+
+   目前此项目已集成自动识别和转换clash配置文件的功能。如果依然无法使用，则需要通过自建或者第三方平台（不推荐，有泄露风险）对订阅地址转换。
+   
+3. 程序日志中出现`error: unsupported rule type RULE-SET`报错，解决方法查看官方[WIKI](https://github.com/Dreamacro/clash/wiki/FAQ#error-unsupported-rule-type-rule-set)
