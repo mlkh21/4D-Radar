@@ -187,17 +187,24 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         # 目标: (C, Z, H, W)
         target_tensor = torch.from_numpy(target_voxel).permute(3, 2, 0, 1)
         
-        # 填充至 alignment_size 的倍数以确保与 U-Net 下采样兼容
-        # 输入形状: (C, Z, H, W)
-        # F.pad 参数: (w_left, w_right, h_left, h_right, z_left, z_right)
-        align = self.alignment_size
-        pad_z = (align - radar_tensor.shape[1] % align) % align
-        pad_h = (align - radar_tensor.shape[2] % align) % align
-        pad_w = (align - radar_tensor.shape[3] % align) % align
+        # Resize to fixed size to handle inconsistent H/W dimensions
+        # Target size: (C, 32, 128, 128) - suitable for VAE/UNet
+        target_size = (32, 128, 128)  # (Z, H, W)
         
-        if pad_h > 0 or pad_w > 0 or pad_z > 0:
-            radar_tensor = F.pad(radar_tensor, (0, pad_w, 0, pad_h, 0, pad_z))
-            target_tensor = F.pad(target_tensor, (0, pad_w, 0, pad_h, 0, pad_z))
+        # Resize each tensor
+        radar_tensor = F.interpolate(
+            radar_tensor.unsqueeze(0),  # Add batch dim: (1, C, Z, H, W)
+            size=target_size,
+            mode='trilinear',
+            align_corners=False
+        ).squeeze(0)  # Remove batch dim: (C, Z, H, W)
+        
+        target_tensor = F.interpolate(
+            target_tensor.unsqueeze(0),
+            size=target_size,
+            mode='trilinear',
+            align_corners=False
+        ).squeeze(0)
 
         if self.transform:
             # 如果有变换，则应用变换

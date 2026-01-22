@@ -126,15 +126,6 @@ from .losses_3d import (
     CompositeLoss3D,
 )
 
-# 增强训练工具
-from .train_utils_enhanced import (
-    ValidationMonitor,
-    TrainingStateManager,
-    MemoryEfficientTrainLoop,
-    create_enhanced_train_loop,
-    GradientAccumulator,
-)
-
 __all__ = [
     # NN 工具
     "SiLU", "GroupNorm32", "LayerNorm3D", "InstanceNorm3D", "RMSNorm3D",
@@ -178,8 +169,4 @@ __all__ = [
     
     # 3D损失
     "Perceptual3DLoss", "StructurePreservingLoss", "OccupancyAwareLoss", "CompositeLoss3D",
-    
-    # 增强训练
-    "ValidationMonitor", "TrainingStateManager", "MemoryEfficientTrainLoop",
-    "create_enhanced_train_loop", "GradientAccumulator",
 ]

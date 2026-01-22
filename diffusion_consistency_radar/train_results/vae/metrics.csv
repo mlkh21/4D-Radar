@@ -1,0 +1,2 @@
+epoch,loss,recon_loss,kl_loss,lr,time_seconds
+1,0.075452,0.075450,1.90058272,0.00009998,194.33

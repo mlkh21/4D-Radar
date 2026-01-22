@@ -1,1 +1,0 @@
-mpirun -n 2 python ./diffusion_consistency_radar/scripts/cm_train_radar.py --global_batch_size 32 --gpu_id 2,3
