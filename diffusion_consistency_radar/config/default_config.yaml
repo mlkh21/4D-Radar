@@ -43,9 +43,9 @@ ldm:
   sigma_min: 0.002
   rho: 7.0
   # Training parameters
-  epochs: 200
+  epochs: 200  # Number of training epochs
   lr: 1.0e-4
-  save_every: 5000
+  save_every: 10  # Save checkpoint every N epochs
   save_dir: "./diffusion_consistency_radar/train_results/ldm"
 
 # --- Consistency Distillation Configuration ---
@@ -59,12 +59,12 @@ cd:
   scale_mode: "fixed"
   start_scales: 40
   end_scales: 40
-  total_training_steps: 100000
+  epochs: 200  # Number of training epochs (100 epochs * 2007 batches ≈ 200k steps)
   distill_steps_per_iter: 50000
   loss_norm: "l2"  # l1 / l2 / lpips
   # Training parameters
   lr: 5.0e-5
-  save_every: 20000
+  save_every: 10  # Save checkpoint every N epochs
   save_dir: "./diffusion_consistency_radar/train_results/cd"
 
 # --- Optimization Configuration ---

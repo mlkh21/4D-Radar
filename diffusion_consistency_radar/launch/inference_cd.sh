@@ -1,1 +1,12 @@
-python ./diffusion_consistency_radar/scripts/image_sample_radar.py --training_mode consistency_distillation --sampler onestep --attention_resolutions 32,16,8  --class_cond False --dropout 0.0 --image_size 128 --num_channels 64 --num_heads 4 --num_res_blocks 3 --resblock_updown True --use_fp16 False --use_scale_shift_norm True --weight_schedule uniform --in_ch 2 --out_ch 1 --model_path ./diffusion_consistency_radar/checkpoint/consistency_distillation_140K_Step.pt --output_dir Proposed_CD_outdoors/
+#!/bin/bash
+# CD 推理脚本 - 一步快速生成
+
+python scripts/inference.py \
+    --vae_ckpt train_results/vae/best_model.pth \
+    --model_ckpt train_results/cd/best_model.pth \
+    --model_type cd \
+    --steps 1 \
+    --sampler euler \
+    --num_samples 10 \
+    --output_dir inference_results/cd \
+    --device cuda

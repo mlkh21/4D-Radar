@@ -1,4 +1,4 @@
 data:
-  train: [“loop3”]
+  train: [“gardan”]
 
-  test: ["gardan"]
+  test: ["loop3"]

@@ -46,10 +46,22 @@ case "$MODE" in
             exit 1
         fi
         
-        CUDA_VISIBLE_DEVICES=0,1 python ${SCRIPT_DIR}/unified_train.py \
-            --mode ldm \
-            --config ${CONFIG_PATH} \
-            --vae_ckpt ${VAE_CKPT}
+        # 检查是否存在 LDM 检查点以便断点续训
+        LDM_RESUME="${RESULTS_DIR}/ldm/ldm_best.pt"
+        if [ -f "$LDM_RESUME" ]; then
+            echo "Found existing LDM checkpoint, resuming from: $LDM_RESUME"
+            CUDA_VISIBLE_DEVICES=0,1 python ${SCRIPT_DIR}/unified_train.py \
+                --mode ldm \
+                --config ${CONFIG_PATH} \
+                --vae_ckpt ${VAE_CKPT} \
+                --resume ${LDM_RESUME}
+        else
+            echo "Starting LDM training from scratch"
+            CUDA_VISIBLE_DEVICES=0,1 python ${SCRIPT_DIR}/unified_train.py \
+                --mode ldm \
+                --config ${CONFIG_PATH} \
+                --vae_ckpt ${VAE_CKPT}
+        fi
         ;;
         
     cd)

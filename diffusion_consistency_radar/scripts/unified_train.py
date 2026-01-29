@@ -18,7 +18,9 @@ import torch.nn as nn
 from pathlib import Path
 from typing import Dict, Optional, Any
 from torch.utils.data import DataLoader
-from torch.amp import autocast, GradScaler
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
+from torch.optim.adamw import AdamW
 import gc
 from tqdm import tqdm
 import time
@@ -107,7 +109,7 @@ class OptimizedVAETrainer:
         model: nn.Module,
         config: ConfigManager,
         memory_opt: MemoryOptimizer,
-        resume_path: str = None,
+        resume_path: Optional[str] = None,
     ):
         self.config = config
         self.memory_opt = memory_opt
@@ -117,7 +119,7 @@ class OptimizedVAETrainer:
         self.model = model.to(self.device)
         
         # 训练参数
-        self.vae_config = config.get('vae', {})
+        self.vae_config = config.get('vae', {}) or {}
         self.lr = self.vae_config.get('lr', 1e-4)
         self.epochs = self.vae_config.get('epochs', 100)
         self.save_dir = self.vae_config.get('save_dir', './results/vae')
@@ -125,7 +127,7 @@ class OptimizedVAETrainer:
         os.makedirs(self.save_dir, exist_ok=True)
         
         # 优化器和调度器
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        self.optimizer = AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=self.epochs, eta_min=1e-6
         )
@@ -135,42 +137,49 @@ class OptimizedVAETrainer:
         self.best_loss = float('inf')
         
         # 设置日志
-        self.log_file = os.path.join(self.save_dir, 'training.log')
-        self.csv_file = os.path.join(self.save_dir, 'metrics.csv')
-        self._setup_logging()
-        
-        # 恢复训练
-        if resume_path and os.path.exists(resume_path):
-            self._resume_from_checkpoint(resume_path)
-        
         # 初始化训练状态
         self.start_epoch = 1
         self.best_loss = float('inf')
+        self.is_resumed = False
         
-        # 设置日志
+        # 检查是否恢复训练
+        if resume_path and os.path.exists(resume_path):
+            self.is_resumed = True
+        
+        # 设置日志（恢复训练时追加，新训练时清空）
         self.log_file = os.path.join(self.save_dir, 'training.log')
         self.csv_file = os.path.join(self.save_dir, 'metrics.csv')
         self._setup_logging()
         
         # 恢复训练
-        if resume_path and os.path.exists(resume_path):
+        if self.is_resumed:
             self._resume_from_checkpoint(resume_path)
     
     def _setup_logging(self):
         """设置日志系统"""
+        # 确定日志文件模式：恢复训练时追加，新训练时覆盖
+        log_mode = 'a' if self.is_resumed else 'w'
+        
         # 配置文本日志
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(self.log_file),
+                logging.FileHandler(self.log_file, mode=log_mode),
                 logging.StreamHandler()
-            ]
+            ],
+            force=True  # 强制重新配置
         )
         self.logger = logging.getLogger(__name__)
         
+        # 添加训练会话分隔符
+        if self.is_resumed:
+            self.logger.info("\n" + "="*70)
+            self.logger.info("RESUMING TRAINING SESSION")
+            self.logger.info("="*70)
+        
         # 初始化 CSV 文件
-        if not os.path.exists(self.csv_file):
+        if not os.path.exists(self.csv_file) or not self.is_resumed:
             with open(self.csv_file, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['epoch', 'loss', 'recon_loss', 'kl_loss', 'lr', 'time_seconds'])
@@ -276,9 +285,13 @@ class OptimizedVAETrainer:
     
     def train(self, train_loader: DataLoader):
         """完整训练流程"""
+        estimated_total_steps = self.epochs * len(train_loader)
+        
         msg = "=" * 70 + "\n"
         msg += f"Starting VAE Training\n"
         msg += f"  Total epochs: {self.epochs}\n"
+        msg += f"  Batches per epoch: {len(train_loader)}\n"
+        msg += f"  Estimated total steps: {estimated_total_steps:,}\n"
         msg += f"  Start epoch: {self.start_epoch}\n"
         msg += f"  Batch size: {train_loader.batch_size}\n"
         msg += f"  Gradient accumulation: {self.memory_opt.grad_accum_steps}\n"
@@ -360,7 +373,7 @@ class OptimizedLDMTrainer:
         vae: nn.Module,
         config: ConfigManager,
         memory_opt: MemoryOptimizer,
-        resume_path: str = None,
+        resume_path: Optional[str] = None,
     ):
         self.vae = vae.to(memory_opt.device)
         self.vae.eval()
@@ -390,7 +403,7 @@ class OptimizedLDMTrainer:
         ).to(self.device)
         
         # 优化器
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = AdamW(
             self.model.parameters(),
             lr=ldm_config.get('lr', 1e-4),
             weight_decay=1e-4,
@@ -408,29 +421,46 @@ class OptimizedLDMTrainer:
         self.start_epoch = 1
         self.global_step = 0
         self.best_loss = float('inf')
+        self.is_resumed = False
         
-        # 设置日志
+        # 检查是否恢复训练
+        if resume_path and os.path.exists(resume_path):
+            self.is_resumed = True
+        
+        # 设置日志（恢复训练时追加，新训练时清空）
         self.log_file = os.path.join(self.save_dir, 'training.log')
         self.csv_file = os.path.join(self.save_dir, 'metrics.csv')
         self._setup_logging()
         
         # 恢复训练
-        if resume_path and os.path.exists(resume_path):
+        if self.is_resumed:
             self._resume_from_checkpoint(resume_path)
     
     def _setup_logging(self):
         """设置日志系统"""
+        # 确定日志文件模式：恢复训练时追加，新训练时覆盖
+        log_mode = 'a' if self.is_resumed else 'w'
+        
+        # 配置文本日志
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(self.log_file),
+                logging.FileHandler(self.log_file, mode=log_mode),
                 logging.StreamHandler()
-            ]
+            ],
+            force=True  # 强制重新配置
         )
         self.logger = logging.getLogger(__name__ + '_ldm')
         
-        if not os.path.exists(self.csv_file):
+        # 添加训练会话分隔符
+        if self.is_resumed:
+            self.logger.info("\n" + "="*70)
+            self.logger.info("RESUMING TRAINING SESSION")
+            self.logger.info("="*70)
+        
+        # 初始化 CSV 文件
+        if not os.path.exists(self.csv_file) or not self.is_resumed:
             with open(self.csv_file, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['epoch', 'step', 'loss', 'lr', 'time_seconds'])
@@ -535,9 +565,14 @@ class OptimizedLDMTrainer:
         epochs = self.ldm_config.get('epochs', 200)
         save_every = self.ldm_config.get('save_every', 5000)
         
+        # 计算预估总步数
+        estimated_total_steps = epochs * len(train_loader)
+        
         msg = "=" * 70 + "\n"
         msg += f"Starting LDM Training\n"
         msg += f"  Total epochs: {epochs}\n"
+        msg += f"  Batches per epoch: {len(train_loader)}\n"
+        msg += f"  Estimated total steps: {estimated_total_steps:,}\n"
         msg += f"  Start epoch: {self.start_epoch}\n"
         msg += f"  Batch size: {train_loader.batch_size}\n"
         msg += f"  Gradient accumulation: {self.memory_opt.grad_accum_steps}\n"
@@ -581,8 +616,9 @@ class OptimizedLDMTrainer:
                 print(msg)
                 self.logger.info(msg)
             
-            if self.global_step % save_every == 0:
-                ckpt_path = os.path.join(self.save_dir, f"ldm_step{self.global_step:06d}.pt")
+            # 定期按epoch保存
+            if epoch % save_every == 0:
+                ckpt_path = os.path.join(self.save_dir, f"ldm_epoch{epoch:04d}.pt")
                 torch.save({
                     'epoch': epoch,
                     'step': self.global_step,
@@ -671,7 +707,7 @@ def main():
         else:
             vae.load_state_dict(ckpt)
         
-        trainer = OptimizedLDMTrainer(vae, config, memory_opt)
+        trainer = OptimizedLDMTrainer(vae, config, memory_opt, resume_path=args.resume)
         trainer.train(train_loader)
     
     print("Training completed!")
