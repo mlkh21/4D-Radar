@@ -1,35 +1,29 @@
-NTU4DRadLM
-NTU4DRadLM_pre_processing/NTU4DRadLM_Pre/
-NTU4DRadLM_pre_processing/NTU4DRadLM_Raw/
-*.pyc
-__pycache__/
 *.log
 .vscode/
 switch-cuda.sh
 sync_data.sh
 
 # Python
+*.pyc
+__pycache__/
 *.py[cod]
 *.so
 .Python
 *.egg-info/
 
 # 训练输出
-results/
-checkpoints/
-logs/
+diffusion_consistency_radar/train_results/
+diffusion_consistency_radar/inference_results/
+diffusion_consistency_radar/visualizations/
+
 *.pt
 *.pth
 
 # 数据
-data/
+NTU4DRadLM
+NTU4DRadLM_pre_processing/NTU4DRadLM_Pre/
+NTU4DRadLM_pre_processing/NTU4DRadLM_Raw/
 *.npy
 *.npz
 
-# IDE
-.idea/
-*.swp
 
-# 系统文件
-.DS_Store
-Thumbs.db
