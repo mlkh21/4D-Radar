@@ -8,6 +8,8 @@ import argparse
 import csv
 import os
 import sys
+import time
+from datetime import datetime
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -25,6 +27,21 @@ try:
     from scipy.spatial import cKDTree
 except Exception:
     cKDTree = None
+
+
+def safe_torch_load(path, map_location):
+    """Load checkpoint with a warning-safe strategy across PyTorch versions."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        # Older PyTorch versions do not support the weights_only argument.
+        return torch.load(path, map_location=map_location)
+    except Exception as exc:
+        # Some checkpoints may contain objects not accepted by weights_only=True.
+        msg = str(exc)
+        if "Weights only load failed" in msg or "Unsupported global" in msg:
+            return torch.load(path, map_location=map_location)
+        raise
 
 
 class RadarGenerator:
@@ -67,7 +84,7 @@ class RadarGenerator:
         vae_config = create_ultra_lightweight_vae_config()
         vae = VAE3D(**vae_config).to(self.device)
         
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        ckpt = safe_torch_load(ckpt_path, map_location=self.device)
         if 'model_state_dict' in ckpt:
             vae.load_state_dict(ckpt['model_state_dict'])
         else:
@@ -89,7 +106,7 @@ class RadarGenerator:
             attention_type="linear",
         ).to(self.device)
         
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        ckpt = safe_torch_load(ckpt_path, map_location=self.device)
         if 'model_state_dict' in ckpt:
             model.load_state_dict(ckpt['model_state_dict'])
         else:
@@ -98,7 +115,7 @@ class RadarGenerator:
         return model
     
     @torch.no_grad()
-    def generate(self, condition, num_samples=1, steps=40, sampler='heun'):
+    def generate(self, condition, num_samples=1, steps=40, sampler='heun', show_sampling_progress=False):
         """
         生成雷达数据
         
@@ -111,18 +128,22 @@ class RadarGenerator:
         Returns:
             generated: 生成的雷达数据 (B, 4, 32, 128, 128)
         """
-        print(f"\nGenerating {num_samples} samples with {steps} steps ({sampler} sampler)...")
+        if show_sampling_progress:
+            print(f"\nGenerating {num_samples} samples with {steps} steps ({sampler} sampler)...")
         
         # 编码条件到潜空间
         if condition is not None:
             condition = condition.to(self.device)
             z_cond = self.vae.get_latent(condition)
+            # 关键修复: 噪声潜变量必须与条件潜变量同形状
+            z_shape = tuple(z_cond.shape)
+            num_samples = z_shape[0]
         else:
             # 无条件生成
-            z_cond = torch.zeros(num_samples, 4, 8, 32, 32, device=self.device)
+            z_shape = (num_samples, 4, 8, 32, 32)
+            z_cond = torch.zeros(z_shape, device=self.device)
         
         # 初始化随机噪声
-        z_shape = (num_samples, 4, 8, 32, 32)
         z_T = torch.randn(z_shape, device=self.device) * self.denoiser.sigma_max
         
         # 采样
@@ -131,7 +152,7 @@ class RadarGenerator:
             z_0 = self._cd_sample(z_T, z_cond)
         else:
             # LDM 多步采样
-            z_0 = self._ldm_sample(z_T, z_cond, steps, sampler)
+            z_0 = self._ldm_sample(z_T, z_cond, steps, sampler, show_sampling_progress)
         
         # 解码到原始空间
         generated = self.vae.decode(z_0)
@@ -145,13 +166,17 @@ class RadarGenerator:
         z_0 = self.model(model_input, sigma)
         return z_0
     
-    def _ldm_sample(self, z_T, z_cond, steps, sampler):
+    def _ldm_sample(self, z_T, z_cond, steps, sampler, show_sampling_progress=False):
         """LDM 多步采样 (Heun/Euler)"""
         # 生成时间步调度
         sigmas = self._get_sigmas(steps)
         z_t = z_T
         
-        for i in tqdm(range(len(sigmas) - 1), desc="Sampling"):
+        iterator = range(len(sigmas) - 1)
+        if show_sampling_progress:
+            iterator = tqdm(iterator, desc="Sampling")
+
+        for i in iterator:
             sigma_t = sigmas[i]
             sigma_next = sigmas[i + 1]
             
@@ -221,13 +246,27 @@ def load_radar_voxel_as_tensor(path, device):
     return radar_tensor.to(device)
 
 
-def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.5):
+def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.5, empty_fallback_topk=0):
     # voxel: (C, Z, H, W)
     occ = voxel[0]
     intensity = voxel[1]
     occ_mask = occ > occ_threshold
+    used_topk_fallback = False
     if not np.any(occ_mask):
-        return np.zeros((0, 4), dtype=np.float32)
+        if empty_fallback_topk <= 0:
+            return np.zeros((0, 4), dtype=np.float32), used_topk_fallback
+
+        used_topk_fallback = True
+        flat_occ = occ.reshape(-1)
+        k = int(min(max(empty_fallback_topk, 1), flat_occ.shape[0]))
+        topk_idx = np.argpartition(flat_occ, -k)[-k:]
+        z_idx, x_idx, y_idx = np.unravel_index(topk_idx, occ.shape)
+        x = pc_range[0] + (x_idx + 0.5) * voxel_size[0]
+        y = pc_range[1] + (y_idx + 0.5) * voxel_size[1]
+        z = pc_range[2] + (z_idx + 0.5) * voxel_size[2]
+        inten = intensity[z_idx, x_idx, y_idx]
+        pcl = np.stack([x, y, z, inten], axis=1).astype(np.float32)
+        return pcl, used_topk_fallback
 
     z_idx, x_idx, y_idx = np.where(occ_mask)
     x = pc_range[0] + (x_idx + 0.5) * voxel_size[0]
@@ -235,7 +274,7 @@ def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.5):
     z = pc_range[2] + (z_idx + 0.5) * voxel_size[2]
     inten = intensity[z_idx, x_idx, y_idx]
 
-    return np.stack([x, y, z, inten], axis=1).astype(np.float32)
+    return np.stack([x, y, z, inten], axis=1).astype(np.float32), used_topk_fallback
 
 
 def compute_chamfer(pcl_a, pcl_b):
@@ -260,6 +299,8 @@ def main():
                         help="Dataset directory for condition data")
     parser.add_argument("--radar_voxel_dir", type=str, default="",
                         help="If set, load radar_voxel files from this directory and run per-sample inference")
+    parser.add_argument("--max_files", type=int, default=0,
+                        help="Max number of radar files to run in per-sample mode (0 means all)")
     parser.add_argument("--raw_livox_dir", type=str, default="",
                         help="Raw livox_lidar directory for comparison")
     parser.add_argument("--lidar_index_file", type=str, default="",
@@ -274,6 +315,8 @@ def main():
     parser.add_argument("--save_voxel", action="store_true", help="Save voxel .npy per sample")
     parser.add_argument("--compare_with_lidar", action="store_true", help="Compare with raw livox point clouds")
     parser.add_argument("--occ_threshold", type=float, default=0.5, help="Occupancy threshold for point cloud")
+    parser.add_argument("--empty_fallback_topk", type=int, default=0,
+                        help="If threshold yields empty point cloud, fallback to top-k occupancy voxels (0 disables)")
     parser.add_argument("--voxel_size", type=float, nargs=3, default=[0.2, 0.2, 0.2],
                         help="Voxel size used in preprocessing")
     parser.add_argument("--pc_range", type=float, nargs=6, default=[0, -20, -6, 120, 20, 10],
@@ -296,6 +339,9 @@ def main():
             f for f in os.listdir(args.radar_voxel_dir)
             if f.endswith('.npy') or f.endswith('.npz')
         ])
+
+        if args.max_files > 0:
+            radar_files = radar_files[:args.max_files]
 
         if not radar_files:
             raise RuntimeError(f"No radar voxel files found in {args.radar_voxel_dir}")
@@ -320,31 +366,74 @@ def main():
             csv_writer = csv.writer(csv_file)
             csv_writer.writerow(["index", "radar_file", "lidar_file", "chamfer"])
 
-        for i, fname in enumerate(radar_files):
+        timing_csv_path = os.path.join(args.output_dir, "inference_timing.csv")
+        timing_file = open(timing_csv_path, 'w', newline='')
+        timing_writer = csv.writer(timing_file)
+        timing_writer.writerow(["index", "radar_file", "inference_seconds"])
+
+        log_path = os.path.join(args.output_dir, "inference_runtime.log")
+        log_file = open(log_path, 'w', encoding='utf-8')
+        log_file.write("=== Inference Runtime Log ===\n")
+        log_file.write(f"time: {datetime.now().isoformat()}\n")
+        log_file.write(f"model_type: {args.model_type}\n")
+        log_file.write(f"vae_ckpt: {args.vae_ckpt}\n")
+        log_file.write(f"model_ckpt: {args.model_ckpt}\n")
+        log_file.write(f"device: {args.device}\n")
+        log_file.write(f"steps: {args.steps}\n")
+        log_file.write(f"sampler: {args.sampler}\n")
+        log_file.write(f"max_files: {args.max_files}\n")
+        log_file.write(f"empty_fallback_topk: {args.empty_fallback_topk}\n")
+        log_file.write(f"num_files: {len(radar_files)}\n")
+        log_file.write("\n")
+
+        total_infer_sec = 0.0
+        fallback_count = 0
+
+        file_pbar = tqdm(
+            enumerate(radar_files),
+            total=len(radar_files),
+            desc="Inferring files",
+            unit="file",
+        )
+
+        for i, fname in file_pbar:
             radar_path = os.path.join(args.radar_voxel_dir, fname)
             condition_data = load_radar_voxel_as_tensor(radar_path, generator.device)
             condition_data = condition_data.unsqueeze(0)
+
+            file_start = time.perf_counter()
 
             generated = generator.generate(
                 condition=condition_data,
                 num_samples=1,
                 steps=args.steps,
                 sampler=args.sampler,
+                show_sampling_progress=False,
             )
 
+            file_infer_sec = time.perf_counter() - file_start
+            total_infer_sec += file_infer_sec
+            timing_writer.writerow([i, fname, f"{file_infer_sec:.6f}"])
+            log_file.write(f"file[{i + 1}/{len(radar_files)}] {fname} infer_sec={file_infer_sec:.6f}\n")
+            file_pbar.set_postfix_str(f"{i + 1}/{len(radar_files)} | {file_infer_sec:.3f}s")
+
             sample = generated[0].detach().cpu().numpy()
+            pcl = np.zeros((0, 4), dtype=np.float32)
 
             if args.save_voxel:
                 out_voxel = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_voxel.npy")
                 np.save(out_voxel, sample)
 
             if args.save_pointcloud or args.compare_with_lidar:
-                pcl = voxel_to_pointcloud(
+                pcl, used_topk_fallback = voxel_to_pointcloud(
                     sample,
                     voxel_size=args.voxel_size,
                     pc_range=args.pc_range,
                     occ_threshold=args.occ_threshold,
+                    empty_fallback_topk=args.empty_fallback_topk,
                 )
+                if used_topk_fallback:
+                    fallback_count += 1
                 if args.save_pointcloud:
                     out_pcl = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_pcl.npy")
                     np.save(out_pcl, pcl)
@@ -363,14 +452,26 @@ def main():
                     lidar_path = os.path.join(args.raw_livox_dir, lidar_file)
                     lidar_pcl = np.load(lidar_path).astype(np.float32)
                     chamfer = compute_chamfer(pcl, lidar_pcl)
-                    csv_writer.writerow([i, fname, lidar_file, f"{chamfer:.6f}"])
+                    if csv_writer is not None:
+                        csv_writer.writerow([i, fname, lidar_file, f"{chamfer:.6f}"])
 
-            if i % 20 == 0:
-                print(f"Processed {i + 1}/{len(radar_files)}")
+        timing_file.flush()
+        avg_infer_sec = total_infer_sec / max(len(radar_files), 1)
+        log_file.write("\n")
+        log_file.write(f"total_infer_sec: {total_infer_sec:.6f}\n")
+        log_file.write(f"avg_infer_sec_per_file: {avg_infer_sec:.6f}\n")
+        log_file.write(f"topk_fallback_frames: {fallback_count}\n")
+        log_file.flush()
+        file_pbar.close()
 
         if csv_file:
             csv_file.close()
             print(f"Saved metrics to {csv_path}")
+
+        timing_file.close()
+        log_file.close()
+        print(f"Saved timing csv to {timing_csv_path}")
+        print(f"Saved runtime log to {log_path}")
 
     else:
         # 准备条件数据

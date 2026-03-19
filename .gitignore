@@ -11,10 +11,9 @@ __pycache__/
 .Python
 *.egg-info/
 
-# 训练输出
+# 训练、推理输出
 diffusion_consistency_radar/train_results/
 diffusion_consistency_radar/inference_results/
-diffusion_consistency_radar/visualizations/
 
 *.pt
 *.pth

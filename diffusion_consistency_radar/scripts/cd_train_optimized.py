@@ -32,6 +32,21 @@ from cm.vae_3d import VAE3D, create_ultra_lightweight_vae_config
 from cm.dataset_loader import NTU4DRadLM_VoxelDataset
 
 
+def safe_torch_load(path, map_location):
+    """Load checkpoint with a warning-safe strategy across PyTorch versions."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        # Older PyTorch versions do not support the weights_only argument.
+        return torch.load(path, map_location=map_location)
+    except Exception as exc:
+        # Some checkpoints may contain objects not accepted by weights_only=True.
+        msg = str(exc)
+        if "Weights only load failed" in msg or "Unsupported global" in msg:
+            return torch.load(path, map_location=map_location)
+        raise
+
+
 class ConsistencyDistillationTrainer:
     """
     Consistency Distillation 训练器
@@ -146,7 +161,7 @@ class ConsistencyDistillationTrainer:
         
         sys.stdout = old_stdout
         
-        ckpt = torch.load(ckpt_path, map_location='cpu')
+        ckpt = safe_torch_load(ckpt_path, map_location='cpu')
         if 'model_state_dict' in ckpt:
             model.load_state_dict(ckpt['model_state_dict'])
         else:
@@ -219,7 +234,7 @@ class ConsistencyDistillationTrainer:
     def _resume_from_checkpoint(self, ckpt_path: str):
         """从检查点恢复训练"""
         print(f"Resuming CD from checkpoint: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        ckpt = safe_torch_load(ckpt_path, map_location=self.device)
         
         # 加载模型
         self.cd_model.load_state_dict(ckpt['model_state_dict'])
@@ -477,7 +492,7 @@ def main():
     # 加载 VAE
     vae_config = create_ultra_lightweight_vae_config()
     vae = VAE3D(**vae_config)
-    ckpt = torch.load(args.vae_ckpt, map_location='cpu')
+    ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
     if 'model_state_dict' in ckpt:
         vae.load_state_dict(ckpt['model_state_dict'])
     else:

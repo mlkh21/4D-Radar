@@ -87,3 +87,10 @@ logging:
   sample_interval: 1000
   tensorboard: true
   wandb: false
+
+# --- Inference Configuration ---
+inference:
+  # Per-scene file cap for batch inference scripts (0 means all files)
+  max_infer_files: 0
+  # If thresholded occupancy is empty, keep top-k occupancy voxels as fallback (0 disables)
+  empty_fallback_topk: 0

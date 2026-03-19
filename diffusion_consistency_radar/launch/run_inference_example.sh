@@ -8,12 +8,47 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
+DEFAULT_CONFIG="${PROJECT_DIR}/config/default_config.yaml"
 PREPROCESSED_ROOT="${ROOT_DIR}/NTU4DRadLM_pre_processing/NTU4DRadLM_Pre"
 RAW_ROOT="${ROOT_DIR}/NTU4DRadLM_pre_processing/NTU4DRadLM_Raw"
 
+INFER_DEFAULTS=$(python - "${DEFAULT_CONFIG}" <<'PY'
+import sys
+import yaml
+
+cfg_path = sys.argv[1]
+defaults = {
+    'max_infer_files': 0,
+    'empty_fallback_topk': 0,
+}
+
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f) or {}
+    infer = cfg.get('inference') or {}
+    max_files = int(infer.get('max_infer_files', 0) or 0)
+    topk = int(infer.get('empty_fallback_topk', 0) or 0)
+except Exception:
+    max_files = defaults['max_infer_files']
+    topk = defaults['empty_fallback_topk']
+
+print(max_files)
+print(topk)
+PY
+)
+
+DEFAULT_MAX_INFER_FILES=$(echo "${INFER_DEFAULTS}" | sed -n '1p')
+DEFAULT_EMPTY_FALLBACK_TOPK=$(echo "${INFER_DEFAULTS}" | sed -n '2p')
+
+MAX_INFER_FILES="${MAX_INFER_FILES:-${DEFAULT_MAX_INFER_FILES}}"
+EMPTY_FALLBACK_TOPK="${EMPTY_FALLBACK_TOPK:-${DEFAULT_EMPTY_FALLBACK_TOPK}}"
+
 echo "=========================================="
-echo "4D Radar 推理示例（固定逐文件模式）"
+echo "4D Radar 推理"
 echo "=========================================="
+echo "default config: ${DEFAULT_CONFIG}"
+echo "max files per scene: ${MAX_INFER_FILES} (0 means all)"
+echo "empty fallback top-k: ${EMPTY_FALLBACK_TOPK} (0 means disabled)"
 
 # 检查模型是否存在
 VAE_CKPT="${PROJECT_DIR}/train_results/vae/vae_best.pt"
@@ -91,6 +126,8 @@ if [ "$RUN_LDM" = true ]; then
             --steps 40 \
             --sampler heun \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
+            --max_files "${MAX_INFER_FILES}" \
+            --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --save_pointcloud \
             --compare_with_lidar \
             --raw_livox_dir "${RAW_LIVOX_DIR}" \
@@ -123,6 +160,8 @@ if [ "$RUN_CD" = true ]; then
             --steps 1 \
             --sampler euler \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
+            --max_files "${MAX_INFER_FILES}" \
+            --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --save_pointcloud \
             --compare_with_lidar \
             --raw_livox_dir "${RAW_LIVOX_DIR}" \
@@ -153,6 +192,8 @@ if [ "$RUN_CD" = true ]; then
             --steps 4 \
             --sampler euler \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
+            --max_files "${MAX_INFER_FILES}" \
+            --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --save_pointcloud \
             --compare_with_lidar \
             --raw_livox_dir "${RAW_LIVOX_DIR}" \

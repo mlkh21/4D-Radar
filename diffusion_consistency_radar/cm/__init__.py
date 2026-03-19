@@ -118,6 +118,15 @@ from .augmentation import (
     ComposedAugmentation,
 )
 
+# 概率地图与查询模块
+from .probabilistic_mapping import (
+    GridMapConfig,
+    DSEvidenceFusion,
+    SlidingProbabilisticGridMap,
+    LazyLocalMapQuery,
+    load_sparse_voxel_npz,
+)
+
 # 3D损失函数
 from .losses_3d import (
     Perceptual3DLoss,
