@@ -5,11 +5,10 @@
 """
 
 import argparse
-# -*- coding: utf-8 -*-
 import os
 import sys
 
-# 强制将当前项目的路径添加到 sys.path 的最前面，以优先加载当前项目的模块
+# NOTE: 强制将当前项目的路径添加到 sys.path 的最前面，以优先加载当前项目的模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -42,7 +41,7 @@ import cv2
 import open3d as o3d
 import math
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Moved to main with args
+# NOTE: 旧版本通过此处硬编码 GPU；现改为命令行参数 --gpu_id 控制。
 
 
 from pathlib import Path
@@ -51,25 +50,24 @@ def get_base_store_path():
     """从环境变量或配置文件获取存储路径"""
     return os.environ.get('RADAR_RESULT_PATH', './diffusion_consistency_radar/results/')
 
-# 全局变量定义
+# NOTE: 全局变量定义
 BASE_STORE_PATH = get_base_store_path() # 保存路径
 MAX_RANGE = 16.0 # 最大范围(米)
 IMAGE_SHAPE = 160 # 图像尺寸(像素)
 RANGE_RESOLUTION = 0.125 # 距离分辨率(米/像素)
 
-# 将激光雷达点云转换为鸟瞰图
+# NOTE: 将激光雷达点云转换为鸟瞰图
 def pcl_to_cartesian_image (lidar_pcl, save_path):
 
-    # 输入： lidar_pcl: 激光雷达点云数据
-    #       save_path: 保存路径
-    # 输出： 无，直接保存图像文件
+    # NOTE: 输入： lidar_pcl: 激光雷达点云数据
+    # NOTE: 输出图像路径参数 save_path
+    # NOTE: 输出： 无，直接保存图像文件
 
     X_pixel = int((MAX_RANGE - 0)/ RANGE_RESOLUTION) # x方向像素数
     Y_pixel = int((MAX_RANGE - (-MAX_RANGE)) / (RANGE_RESOLUTION * 2)) # y方向像素数
     lidar_bev_image = np.zeros((X_pixel, Y_pixel)) # 初始化BEV图像
 
     x_grid = np.linspace(0, MAX_RANGE, X_pixel + 1) # x方向网格坐标,linspace(start, stop, num)生成在[start, stop]范围内的num个均匀分布的样本
-    # print("x_grid", x_grid)
     y_grid = np.linspace(-MAX_RANGE, MAX_RANGE, Y_pixel + 1) # y方向网格坐标
 
     if lidar_pcl.shape[0] == 0: # 如果点云为空，直接保存空图像，shape是点云的维度信息
@@ -82,61 +80,47 @@ def pcl_to_cartesian_image (lidar_pcl, save_path):
     y = lidar_pcl[:, 1] # 提取点云的y坐标
 
 
-    # 直接通过公式计算索引，避免循环
+    # NOTE: 直接通过公式计算索引，避免循环
     x_indices = ((x - 0) / RANGE_RESOLUTION).astype(int)
-    # 注意 y 的范围是从 -MAX_RANGE 开始，且分辨率是 RANGE_RESOLUTION * 2
+    # NOTE: 注意 y 的范围是从 -MAX_RANGE 开始，且分辨率是 RANGE_RESOLUTION * 2
     y_indices = ((y - (-MAX_RANGE)) / (RANGE_RESOLUTION * 2)).astype(int)
-    # 过滤掉超出图像范围的点
+    # NOTE: 过滤掉超出图像范围的点
     valid_mask = (x_indices >= 0) & (x_indices < X_pixel) & \
                  (y_indices >= 0) & (y_indices < Y_pixel)
     x_indices = x_indices[valid_mask]
     y_indices = y_indices[valid_mask]
-    # 直接利用 numpy 的索引赋值
+    # NOTE: 直接利用 numpy 的索引赋值
     lidar_bev_image[x_indices, y_indices] = 1
  
-    # for i in range(lidar_pcl.shape[0]): # lidar_pcl.shape[0]是指lidar_pcl的行数
-    #     x_diff = np.abs(x_grid - x[i]) # 计算x坐标与网格坐标的差值
-    #     y_diff = np.abs(y_grid - y[i]) # 计算y坐标与网格坐标的差值
-    #     # print("y_diff", y_grid - y[i])
-    #     x_i = np.argmin(x_diff) # 找到最小差值对应的索引
-    #     y_i = np.argmin(y_diff) 
-
-    #     if(x_i >= lidar_bev_image.shape[0]) or (y_i >= lidar_bev_image.shape[1]): # 越界检查，如果索引超出图像范围则跳过该点
-    #         continue 
-    #     lidar_bev_image[x_i,y_i] = 1 # 在BEV图像中标记该点
-
-
-    # print("lidar_bev_image", lidar_bev_image.shape)
     im = Image.fromarray(np.fliplr((np.flipud(lidar_bev_image)*255)).astype(np.uint8)) # Image.fromarray()将数组转换为图像对象,np.flipud()上下翻转图像，np.fliplr()左右翻转图像
     im = im.resize((IMAGE_SHAPE * 2, IMAGE_SHAPE)) # 调整图像尺寸
     im.save(save_path) # 保存图像文件
-    # return im
 
-# 将极坐标图像转换为点云
+# NOTE: 将极坐标图像转换为点云
 def polar_image_to_pcl (polar_image):
 
-    # 输入： polar_image: 极坐标图像 (H, W, 3) BGR format if read by cv2
-    # 输出： pcl: 点云数据（numpy数组格式）
-    #       pcl_o3d: 点云数据（Open3D格式）
+    # NOTE: 输入： polar_image: 极坐标图像 (H, W, 3)，由 cv2 读取时通常为 BGR 排布
+    # NOTE: 输出： pcl: 点云数据（numpy数组格式）
+    # NOTE: 输出中的 pcl_o3d 为 Open3D 点云对象
 
-    # Handle 3-channel input (Representation Expansion)
+    # NOTE: 处理 3 通道输入（表示扩展）。
     if len(polar_image.shape) == 3:
-        # Assuming BGR format from cv2.imread
-        # Red (Index 2) = Occupancy
-        # Green (Index 1) = Height
-        # Blue (Index 0) = Reserved (0)
+        # NOTE: 默认按 cv2.imread 的 BGR 通道顺序解析。
+        # NOTE: 红色通道（索引 2）表示占据概率。
+        # NOTE: 绿色通道（索引 1）表示高度信息。
+        # NOTE: 蓝色通道（索引 0）预留。
         occupancy_map = polar_image[:, :, 2]
         height_map = polar_image[:, :, 1]
     else:
-        # Fallback for legacy 1-channel
+        # NOTE: 向后兼容旧版单通道输入。
         occupancy_map = polar_image
         height_map = np.zeros_like(polar_image)
 
-    width, height = occupancy_map.shape # Note: width=Rows, height=Cols based on original logic
+    width, height = occupancy_map.shape
 
     point_cloud = []
 
-    # 设定与生成时相同的参数
+    # NOTE: 设定与生成时相同的参数
     Z_MIN = -3.0
     Z_MAX = 7.0
     
@@ -145,7 +129,7 @@ def polar_image_to_pcl (polar_image):
             
             pixel_val = occupancy_map[column, row]
             
-            # 阈值过滤，例如大于 0 或某个噪声阈值
+            # NOTE: 阈值过滤，例如大于 0 或某个噪声阈值
             if pixel_val > 5: 
 
                 column_true = width - column 
@@ -157,7 +141,7 @@ def polar_image_to_pcl (polar_image):
                 x = distance * math.cos(angle)
                 y = distance * math.sin(angle)
 
-                # 从 Green 通道解码高度
+                # NOTE: 从 Green 通道解码高度
                 h_val = height_map[column, row]
                 z = (h_val / 255.0) * (Z_MAX - Z_MIN) + Z_MIN
 
@@ -201,10 +185,10 @@ def main():
     
     args = parser.parse_args()
     
-    # 设置 GPU
+    # NOTE: 设置 GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
     
-    # 设置随机种子
+    # NOTE: 设置随机种子
     seed = args.seed
     th.manual_seed(seed)
     th.cuda.manual_seed_all(seed)
@@ -220,10 +204,10 @@ def main():
         distillation = False
 
     logger.log("creating data loader...")
-    # 使用配置中的数据参数
+    # NOTE: 使用配置中的数据参数
 
-    # 临时从环境变量或默认路径获取，因为 DataConfig 定义里没写 dataset_dir
-    dataset_dir = os.environ.get("DATASET_DIR", './NTU4DRadLM_pre_processing/NTU4DRadLM_Pre') 
+    # NOTE: 临时从环境变量或默认路径获取，因为 DataConfig 定义里没写 dataset_dir
+    dataset_dir = os.environ.get("DATASET_DIR", './Data/NTU4DRadLM_Pre') 
     
     test_data = NTU4DRadLM_VoxelDataset(
         root_dir=dataset_dir,
@@ -249,14 +233,14 @@ def main():
         **model_kwargs
     )
     
-    # ... 后续逻辑保持不变，但要注意 args.sampler 等参数需要从 cfg 或 argparse 获取
+    # NOTE: ... 后续逻辑保持不变，但要注意 args.sampler 等参数需要从 cfg 或 argparse 获取
     
     model.load_state_dict(
         dist_util.load_state_dict(args.model_path, map_location="cpu")
     )
-    # ...
+    # NOTE: ...
 
-    # model.to("cpu")
+    # NOTE: 可切换到 CPU 推理：model.to("cpu")
     model.to(dist_util.dev())
     if args.use_fp16:
         model.convert_to_fp16()
@@ -280,7 +264,6 @@ def main():
         os.mkdir(BASE_STORE_PATH + args.output_dir)
         
 
-    # i = 0
 
     start = th.cuda.Event(enable_timing=True)
     end = th.cuda.Event(enable_timing=True)
@@ -295,26 +278,18 @@ def main():
             )
             model_kwargs["y"] = classes
 
-        # b, m, path = next(data)  # 应该从数据加载器 "data" 返回一个图像
-        # 在 NTU4DRadLM_VoxelDataset 中: b=target, m=radar, path=path
-        
-        # c = th.randn_like(b)
-        # img = th.cat((b, c), dim=1)     # 添加一个噪声通道
+        # NOTE: 数据集 NTU4DRadLM_VoxelDataset 返回顺序为 (target, radar, path)。
 
         b = b.to(dist_util.dev())
         m = m.to(dist_util.dev()) # 雷达条件
 
         radar_condition_dict = {"y": m} # 使用雷达作为条件
         
-        # 从批次确定形状
-        # b shape: (B, C, Z, H, W)
+        # NOTE: 从批次确定形状
+        # NOTE: 张量 b 的形状为 (B, C, Z, H, W)
         sample_shape = (b.shape[0], b.shape[1], b.shape[2], b.shape[3], b.shape[4])
 
-        # start.record()：用于记录时间的开始点
-        # sample = karras_sample(...)：调用karras_sample函数生成样本,传入扩散模型、形状、步骤数等参数
-        # end.record()：用于记录时间的结束点
-        # th.cuda.synchronize()：确保所有CUDA操作完成，防止时间测量不准确
-        # print('time for 1 sample', start.elapsed_time(end))：计算并打印生成样本所用的时间
+        # NOTE: 调用 karras_sample 在潜空间生成当前批次样本。
         start.record()
         sample = karras_sample(
             diffusion = diffusion,
@@ -339,16 +314,16 @@ def main():
         th.cuda.synchronize()
         print('time for 1 sample', start.elapsed_time(end))  #time measurement for the generation of 1 sample
 
-        # cnt： 计数器，用于跟踪已处理的样本数量
+        # NOTE: 计数器 cnt 用于统计已处理样本数量。
         cnt = cnt + args.batch_size
         print("cnt", cnt)
         
-        # 保存样本
+        # NOTE: 保存样本
         sample = sample.cpu().numpy()
         for i in range(args.batch_size):
-            # path[i] 是目标体素文件的绝对路径
-            # 提取场景名称和文件名
-            # 例如 .../scene1/target_voxel/0001.npy
+            # NOTE: 当前样本路径 path[i] 为目标体素文件绝对路径。
+            # NOTE: 提取场景名称和文件名
+            # NOTE: 例如 .../scene1/target_voxel/0001.npy
             
             file_name = os.path.basename(path[i])
             scene_name = os.path.basename(os.path.dirname(os.path.dirname(path[i])))
@@ -359,7 +334,7 @@ def main():
             
             save_path = os.path.join(save_dir, file_name)
             
-            # 保存为 .npy
+            # NOTE: 保存为 .npy
             np.save(save_path, sample[i])
             print(f"Saved sample to {save_path}")
             polar_image_path = save_path + "/pre_polar_image/"
@@ -389,7 +364,7 @@ def main():
             if not os.path.exists(gt_bev_pcl_path):
                 os.mkdir(gt_bev_pcl_path)                   
 
-            #save gt
+            # NOTE: 保存真值结果
             gt = (m[i] * 255).clamp(0, 255).to(th.uint8)
 
             gt_numpy = gt.cpu().numpy()
@@ -409,7 +384,7 @@ def main():
             pcl_to_cartesian_image(pcl_gt, gt_cartesian_save_path)
             np.save(gt_bev_pcl_path + image_id +'.npy', pcl_gt)
 
-            #radar prediction
+            # NOTE: 保存预测结果
 
             sample_i = (sample[i] * 255).clamp(0, 255).to(th.uint8)
 
@@ -422,7 +397,7 @@ def main():
             im1_file_name = polar_image_path + image_id +'.png'
             img_numpy_img.save(im1_file_name)
 
-            #save as pcl and mesh
+            # NOTE: 导出点云与网格
             image_i = cv2.imread(im1_file_name, cv2.IMREAD_COLOR)
 
             pcl, pcl_o3d = polar_image_to_pcl(image_i)
@@ -442,7 +417,7 @@ def main():
 
 def create_argparser(): # 定义命令行参数解析器，判断据不同的参数设置执行不同的操作
     defaults = dict(
-        # data_dir="/home/ubuntu/coloradar_ws/consistency_model_coloradar/cmu_dataset/",
+        # NOTE: 历史数据路径示例（仅作参考）。
         training_mode="edm", # 训练模式，支持"edm"和"consistency_distillation"
         image_size=160,  # 图像尺寸
         use_fp16=False,  # 是否使用半精度浮点数

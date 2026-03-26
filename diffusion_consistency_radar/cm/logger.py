@@ -85,7 +85,7 @@ class HumanOutputFormat(KVWriter, SeqWriter):
         3. 写入表格形式的数据。
         4. 刷新文件。
         """
-        # Create strings for printing
+        # NOTE: 构建用于终端输出的字符串
         key2str = {}
         for (key, val) in sorted(kvs.items()):
             if hasattr(val, "__float__"):
@@ -94,7 +94,7 @@ class HumanOutputFormat(KVWriter, SeqWriter):
                 valstr = str(val)
             key2str[self._truncate(key)] = self._truncate(valstr)
 
-        # Find max widths
+        # NOTE: 计算各列输出所需的最大宽度
         if len(key2str) == 0:
             print("WARNING: tried to write empty key-value dict")
             return
@@ -102,7 +102,7 @@ class HumanOutputFormat(KVWriter, SeqWriter):
             keywidth = max(map(len, key2str.keys()))
             valwidth = max(map(len, key2str.values()))
 
-        # Write out the data
+        # NOTE: 将当前行写入输出流
         dashes = "-" * (keywidth + valwidth + 7)
         lines = [dashes]
         for (key, val) in sorted(key2str.items(), key=lambda kv: kv[0].lower()):
@@ -113,7 +113,7 @@ class HumanOutputFormat(KVWriter, SeqWriter):
         lines.append(dashes)
         self.file.write("\n".join(lines) + "\n")
 
-        # Flush the output to the file
+        # NOTE: 立即刷新到文件，避免异常时日志丢失
         self.file.flush()
 
     def _truncate(self, s):
@@ -232,7 +232,7 @@ class CSVOutputFormat(KVWriter):
         2. 如果有新键，重写表头和旧数据。
         3. 写入新数据。
         """
-        # Add our current row to the history
+        # NOTE: 将当前行追加到历史缓冲区
         extra_keys = list(kvs.keys() - self.keys)
         extra_keys.sort()
         if extra_keys:
@@ -357,9 +357,9 @@ def make_output_format(format, ev_dir, log_suffix=""):
         raise ValueError("Unknown format specified: %s" % (format,))
 
 
-# ================================================================
-# API
-# ================================================================
+# NOTE: ================================================================
+# NOTE: 对外接口
+# NOTE: ================================================================
 
 
 def logkv(key, val):
@@ -592,9 +592,9 @@ def profile(n):
     return decorator_with_name
 
 
-# ================================================================
-# Backend
-# ================================================================
+# NOTE: ================================================================
+# NOTE: 后端实现
+# NOTE: ================================================================
 
 
 def get_current():
@@ -615,7 +615,7 @@ def get_current():
 
 class Logger(object):
     DEFAULT = None  # A logger with no output files. (See right below class definition)
-    # So that you can still log to the terminal without setting up any output files
+    # NOTE: 即使未配置输出文件，也保留终端日志输出
     CURRENT = None  # Current logger being used by the free functions above
 
     def __init__(self, dir, output_formats, comm=None):
@@ -637,8 +637,8 @@ class Logger(object):
         self.output_formats = output_formats
         self.comm = comm
 
-    # Logging API, forwarded
-    # ----------------------------------------
+    # NOTE: 日志接口转发
+    # NOTE: ----------------------------------------
     def logkv(self, key, val):
         """
         输入:
@@ -713,8 +713,8 @@ class Logger(object):
         if self.level <= level:
             self._do_log(args)
 
-    # Configuration
-    # ----------------------------------------
+    # NOTE: 配置项
+    # NOTE: ----------------------------------------
     def set_level(self, level):
         """
         输入:
@@ -764,8 +764,8 @@ class Logger(object):
         for fmt in self.output_formats:
             fmt.close()
 
-    # Misc
-    # ----------------------------------------
+    # NOTE: 其他工具
+    # NOTE: ----------------------------------------
     def _do_log(self, args):
         """
         输入:

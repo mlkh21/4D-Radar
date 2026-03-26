@@ -33,14 +33,14 @@ from cm.dataset_loader import NTU4DRadLM_VoxelDataset
 
 
 def safe_torch_load(path, map_location):
-    """Load checkpoint with a warning-safe strategy across PyTorch versions."""
+    """兼容不同 PyTorch 版本的 checkpoint 加载逻辑。"""
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
-        # Older PyTorch versions do not support the weights_only argument.
+        # HACK: 低版本 PyTorch 不支持 weights_only，回退到兼容模式。
         return torch.load(path, map_location=map_location)
     except Exception as exc:
-        # Some checkpoints may contain objects not accepted by weights_only=True.
+        # NOTE: 某些历史权重包含自定义对象，weights_only=True 会拒绝加载。
         msg = str(exc)
         if "Weights only load failed" in msg or "Unsupported global" in msg:
             return torch.load(path, map_location=map_location)
@@ -68,7 +68,7 @@ class ConsistencyDistillationTrainer:
         self.config = config or {}
         
         # 设置保存目录和日志
-        self.save_dir = config.get('save_dir', './results/cd')
+        self.save_dir = config.get('save_dir', './Result/train_results/cd')
         os.makedirs(self.save_dir, exist_ok=True)
         
         # 初始化训练状态
@@ -295,7 +295,8 @@ class ConsistencyDistillationTrainer:
         model_input = torch.cat([x_t, cond], dim=1)
         denoised = model(model_input, t)
         
-        # ODE: dx/dt = (x - denoised) / t
+        # NOTE: 这里使用显式 Euler，对应一致性蒸馏中的教师推进步骤。
+        # NOTE: 常微分方程（ODE）形式：dx/dt = (x - denoised) / t。
         d = (x_t - denoised) / t.view(-1, 1, 1, 1, 1)
         
         # Euler 步进
@@ -321,7 +322,7 @@ class ConsistencyDistillationTrainer:
         batch_size = z_target.shape[0]
         device = z_target.device
         
-        # 随机采样时间步对 (t_n, t_{n+1})
+        # NOTE: 随机采样相邻时间步对 (t_n, t_{n+1})，覆盖不同噪声区间。
         indices = torch.randint(0, num_scales - 1, (batch_size,), device=device)
         
         # 计算噪声水平
@@ -360,7 +361,7 @@ class ConsistencyDistillationTrainer:
             teacher_input = torch.cat([x_t_next, z_cond], dim=1)
             teacher_denoised = self.cd_model_ema(teacher_input, t_next)
         
-        # 一致性损失：学生的直接预测应该接近教师的多步预测
+        # NOTE: 一致性目标：学生一步输出逼近教师多步推进后的输出。
         loss = F.mse_loss(student_denoised, teacher_denoised)
         
         return loss
@@ -395,7 +396,7 @@ class ConsistencyDistillationTrainer:
             # 反向传播
             loss.backward()
             
-            # 梯度累积更新
+            # NOTE: 梯度累积用于控制显存；每 grad_accum_steps 次小步做一次参数更新。
             if (batch_idx + 1) % grad_accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(self.cd_model.parameters(), 1.0)
                 self.optimizer.step()
@@ -481,10 +482,10 @@ def main():
     parser = argparse.ArgumentParser(description="Consistency Distillation Training")
     parser.add_argument("--ldm_ckpt", type=str, required=True, help="LDM checkpoint path")
     parser.add_argument("--vae_ckpt", type=str, required=True, help="VAE checkpoint path")
-    parser.add_argument("--dataset_dir", type=str, default="./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre")
+    parser.add_argument("--dataset_dir", type=str, default="./Data/NTU4DRadLM_Pre")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--save_dir", type=str, default="./diffusion_consistency_radar/train_results/cd")
+    parser.add_argument("--save_dir", type=str, default="./Result/train_results/cd")
     parser.add_argument("--lr", type=float, default=5e-5)
     
     args = parser.parse_args()

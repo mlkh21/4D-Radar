@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 """
 显存高效模块 - 整体逻辑层面的显存优化策略
 
@@ -80,13 +80,13 @@ class SparsityAwareProcessor:
         Returns:
             d_slice, h_slice, w_slice: 各维度的有效范围
         """
-        # 计算占用掩码 (假设第一个通道是占用率)
+        # NOTE: 计算占用掩码 (假设第一个通道是占用率)
         occupancy = (voxel[:, 0:1] > 0).float()
         
-        # 沿batch维度合并
+        # NOTE: 沿batch维度合并
         occupancy_any = occupancy.any(dim=0).squeeze()  # (D, H, W)
         
-        # 找到各维度的有效范围
+        # NOTE: 找到各维度的有效范围
         d_valid = occupancy_any.any(dim=(1, 2))  # (D,)
         h_valid = occupancy_any.any(dim=(0, 2))  # (H,)
         w_valid = occupancy_any.any(dim=(0, 1))  # (W,)
@@ -96,12 +96,12 @@ class SparsityAwareProcessor:
         w_indices = torch.where(w_valid)[0]
         
         if len(d_indices) == 0 or len(h_indices) == 0 or len(w_indices) == 0:
-            # 全空，返回原始尺寸
+            # NOTE: 全空，返回原始尺寸
             return slice(None), slice(None), slice(None)
         
         D, H, W = occupancy_any.shape
         
-        # 添加padding并限制范围
+        # NOTE: 添加padding并限制范围
         d_start = max(0, d_indices[0].item() - self.padding)
         d_end = min(D, d_indices[-1].item() + self.padding + 1)
         h_start = max(0, h_indices[0].item() - self.padding)
@@ -162,7 +162,7 @@ class DynamicResolutionProcessor:
         occupancy = (voxel[:, 0:1] > 0).float()
         occupancy_rate = occupancy.mean().item()
         
-        # 计算空间分布的熵 (简化版)
+        # NOTE: 计算空间分布的熵 (简化版)
         spatial_std = occupancy.std(dim=(2, 3, 4)).mean().item()
         
         complexity = occupancy_rate * (1 + spatial_std)
@@ -172,7 +172,7 @@ class DynamicResolutionProcessor:
         """根据复杂度获取缩放因子"""
         complexity = self.compute_complexity(voxel)
         
-        # 线性映射复杂度到缩放因子
+        # NOTE: 线性映射复杂度到缩放因子
         if complexity < self.complexity_threshold:
             scale = self.min_scale
         else:
@@ -264,7 +264,7 @@ class ChunkedProcessor:
             result[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += chunk
             weight[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += 1
         
-        # 平均重叠区域
+        # NOTE: 平均重叠区域
         result = result / weight.clamp(min=1)
         
         return result
@@ -353,7 +353,7 @@ class MemoryEfficientTrainingWrapper:
         """
         restore_info = {'original_shape': batch.shape}
         
-        # 1. 渐进式分辨率
+        # NOTE: 1. 渐进式分辨率
         if self.progressive_trainer is not None:
             scale = self.progressive_trainer.get_current_scale(step)
             if scale < 1.0:
@@ -361,14 +361,14 @@ class MemoryEfficientTrainingWrapper:
                 cond = F.interpolate(cond, scale_factor=scale, mode='trilinear', align_corners=False)
                 restore_info['progressive_scale'] = scale
         
-        # 2. 稀疏感知裁剪
+        # NOTE: 2. 稀疏感知裁剪
         if self.sparse_processor is not None:
             batch, bbox_info_batch = self.sparse_processor.crop(batch)
             cond, bbox_info_cond = self.sparse_processor.crop(cond)
             restore_info['bbox_batch'] = bbox_info_batch
             restore_info['bbox_cond'] = bbox_info_cond
         
-        # 3. 动态分辨率
+        # NOTE: 3. 动态分辨率
         if self.dynamic_processor is not None:
             scale = self.dynamic_processor.get_scale(batch)
             if scale < 1.0:
@@ -386,19 +386,19 @@ class MemoryEfficientTrainingWrapper:
     ) -> torch.Tensor:
         """后处理 - 恢复原始尺寸"""
         
-        # 按相反顺序恢复
+        # NOTE: 按相反顺序恢复
         
-        # 3. 恢复动态分辨率
+        # NOTE: 3. 恢复动态分辨率
         if 'dynamic_scale' in restore_info:
             output = self.dynamic_processor.restore_resolution(
                 output, restore_info['pre_dynamic_shape']
             )
         
-        # 2. 恢复稀疏裁剪
+        # NOTE: 2. 恢复稀疏裁剪
         if 'bbox_batch' in restore_info:
             output = self.sparse_processor.restore(output, restore_info['bbox_batch'])
         
-        # 1. 恢复渐进式分辨率
+        # NOTE: 1. 恢复渐进式分辨率
         if 'progressive_scale' in restore_info:
             output = F.interpolate(
                 output,
@@ -420,19 +420,19 @@ class MemoryEfficientTrainingWrapper:
 def apply_memory_optimizations():
     """应用全局显存优化设置"""
     if torch.cuda.is_available():
-        # 启用 TF32 加速（Ampere 架构）
+        # NOTE: 启用 TF32 加速（Ampere 架构）
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         
-        # 启用 cuDNN benchmark
+        # NOTE: 启用 cuDNN benchmark
         torch.backends.cudnn.benchmark = True
         
-        # 设置显存分配策略
+        # NOTE: 设置显存分配策略
         import os
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
-# 便捷函数
+# NOTE: 便捷函数
 def create_memory_efficient_wrapper(
     gpu_memory_gb: float = 24.0,
 ) -> MemoryEfficientTrainingWrapper:
@@ -443,7 +443,7 @@ def create_memory_efficient_wrapper(
         gpu_memory_gb: GPU 显存大小 (GB)
     """
     if gpu_memory_gb < 12:
-        # 小显存: 启用所有优化
+        # NOTE: 小显存: 启用所有优化
         return MemoryEfficientTrainingWrapper(
             enable_sparse_processing=True,
             enable_dynamic_resolution=True,
@@ -452,7 +452,7 @@ def create_memory_efficient_wrapper(
             clear_cache_interval=20,
         )
     elif gpu_memory_gb < 24:
-        # 中等显存: 启用部分优化
+        # NOTE: 中等显存: 启用部分优化
         return MemoryEfficientTrainingWrapper(
             enable_sparse_processing=True,
             enable_dynamic_resolution=True,
@@ -461,7 +461,7 @@ def create_memory_efficient_wrapper(
             clear_cache_interval=50,
         )
     else:
-        # 大显存: 基本优化
+        # NOTE: 大显存: 基本优化
         return MemoryEfficientTrainingWrapper(
             enable_sparse_processing=True,
             enable_dynamic_resolution=False,

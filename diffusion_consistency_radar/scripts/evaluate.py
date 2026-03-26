@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 
-# 此脚本用于评估EDM模型推理结果的点云质量
-# 计算Chamfer距离、Hausdorff距离、F-score等指标
-# 评估点云之间的匹配情况
+# NOTE: 此脚本用于评估EDM模型推理结果的点云质量
+# NOTE: 计算Chamfer距离、Hausdorff距离、F-score等指标
+# NOTE: 评估点云之间的匹配情况
 
 import os
 import numpy as np
@@ -22,7 +22,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # pred_pc_list, gt_pc_list = read_inference_data(args.pred_path, args.gt_path)
+    # FIXME: 这里仍是评估脚手架，尚未接入实际的输入读取与指标汇总流程。
 
     metrics = {
         'chamfer_distance': [],
@@ -32,27 +32,21 @@ def main():
         'fscore': [],
     }
     
-    # Placeholder for reading data logic since read_inference_data is not defined in the snippet
-    # Assuming read_inference_data exists or logic is similar to before but using args
-    pred_pc_list = [] # populate this
-    gt_pc_list = [] # populate this
-    
-    # Original logic adapted (commented out to avoid errors since read_inference_data is missing context)
-    # But essentially replacing the hardcoded paths with args.pred_path and args.gt_path
+    # TODO: 将 pred_path / gt_path 读入逻辑接入为实际实现。
+    pred_pc_list = []  # TODO: 填充预测点云列表
+    gt_pc_list = []  # TODO: 填充真值点云列表
     
     print(f"Evaluation started with Pred: {args.pred_path}, GT: {args.gt_path}")
     
-    # for i in tqdm(range(len(pred_pc_list)), desc="Evaluating"):
-    #     pred_pc_i = pred_pc_list[i]
-    #     gt_pc_i = gt_pc_list[i]
+    # NOTE: 评估主循环应按索引对齐遍历 pred_pc_list 与 gt_pc_list。
 
 
-    # 计算Chamfer距离
-    # 输入：GT: 真实点云，形状为 (N, 3)
-    #      Pred: 预测点云，形状为 (M, 3)
-    # 输出：chamfer_dist: Chamfer距离，即两点云之间的平均距离之和
-    #       distance_GT_to_Pred: 真实点云到预测点云的距离
-    #       distance_Pred_to_GT: 预测点云到真实点云的距离
+    # NOTE: 计算Chamfer距离
+    # NOTE: 输入：GT: 真实点云，形状为 (N, 3)
+    # NOTE: 预测点云，形状为 (M, 3)
+    # NOTE: 输出：chamfer_dist: Chamfer距离，即两点云之间的平均距离之和
+    # NOTE: 真值到预测距离 distance_GT_to_Pred: 真值点云到预测点云的最近邻距离
+    # NOTE: 预测到真值距离 distance_Pred_to_GT: 预测点云到真值点云的最近邻距离
 
     kdtree_GT = cKDTree(GT)
     kdtree_Pred = cKDTree(Pred)
@@ -66,16 +60,16 @@ def main():
 
 def evaluate_matches(distance_A_to_B, distance_B_to_A, threshold):
 
-    # 评估点云匹配情况
-    # 输入：distance_A_to_B: 真实点云到预测点云的距离
-    #      distance_B_to_A: 预测点云到真实点云的距离
-    #      threshold: 距离阈值
-    # 输出：TP: True Positive数量
-    #       FN: False Negative数量
-    #       FP: False Positive数量
-    #       TN: True Negative数量
-    #       precision: 精确率
-    #       recall: 召回率
+    # NOTE: 评估点云匹配情况
+    # NOTE: 输入：distance_A_to_B: 真实点云到预测点云的距离
+    # NOTE: 预测到真值距离 distance_B_to_A
+    # NOTE: 判定匹配阈值 threshold
+    # NOTE: 输出：真正例（TP）数量
+    # NOTE: 漏检点（FN）数量
+    # NOTE: 误检点（FP）数量
+    # NOTE: 真负例（TN）在点云评估中通常不定义
+    # NOTE: 精确率 precision
+    # NOTE: 召回率 recall
 
     TP = np.sum(distance_B_to_A <= threshold) # True Positive: 预测点云中距离真实点云小于阈值的点数
     FP = np.sum(distance_B_to_A > threshold) # False Positive: 预测点云中距离真实点云大于阈值的点数
@@ -88,11 +82,11 @@ def evaluate_matches(distance_A_to_B, distance_B_to_A, threshold):
 
 def read_inference_data(pcl_np_pred_path, pcl_np_gt_path):
 
-    # 读取推理结果点云数据
-    # 输入：pcl_np_pred_path: 预测点云的相对路径
-    #      pcl_np_gt_path: 真实点云的相对路径
-    # 输出：pred_pc_list: 预测点云列表
-    #       gt_pc_list: 真实点云列表    
+    # NOTE: 读取推理结果点云数据
+    # NOTE: 输入：pcl_np_pred_path: 预测点云的相对路径
+    # NOTE: 真值点云相对路径 pcl_np_gt_path
+    # NOTE: 输出：pred_pc_list: 预测点云列表
+    # NOTE: 真值点云列表 gt_pc_list
 
     pred_pc_list = []
     gt_pc_list = []
@@ -119,7 +113,7 @@ def read_inference_data(pcl_np_pred_path, pcl_np_gt_path):
     
 def main():
 
-    # 主函数，执行评估流程
+    # NOTE: 主函数，执行评估流程
 
     pcl_np_pred_path =  "/pre_pcl_np/"
     pcl_np_gt_path = "/gt_bev_pcl/"

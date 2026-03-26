@@ -1,21 +1,21 @@
 """
 Based on: https://github.com/crowsonkb/k-diffusion
 """
-# 导入所需的库
-import random # 用于生成随机数
+# NOTE: 扩散训练与采样核心实现，覆盖 CD/LDM 主要数学过程。
+import random  # NOTE: 用于随机化训练尺度与噪声注入。
 
 import numpy as np
 import torch as th
-import torch.nn as nn # 导入PyTorch的神经网络模块
-import torch.nn.functional as F # 导入PyTorch的函数式接口
+import torch.nn as nn
+import torch.nn.functional as F
 from typing import Tuple, Any
 
-# 尝试导入3D感知损失，如果失败则使用2D LPIPS作为后备
+# NOTE: 优先使用 3D 感知损失；缺失依赖时回退到 2D LPIPS。
 try:
     from .losses_3d import Perceptual3DLoss, CompositeLoss3D
     USE_3D_LOSS = True
 except ImportError:
-    from piq import LPIPS # 导入PIQ库中的LPIPS指标计算模块
+    from piq import LPIPS
     USE_3D_LOSS = False
     print("警告: 无法导入3D损失模块，使用2D LPIPS作为后备")
 
@@ -36,6 +36,7 @@ def get_weightings(weight_schedule, snrs, sigma_data):
     逻辑:
     根据 weight_schedule 的值选择不同的计算公式。
     """
+    # NOTE: 不同权重策略会显著影响高/低噪声区间的学习重心。
     if weight_schedule == "snr":
         weightings = snrs
     elif weight_schedule == "snr+1":
@@ -88,7 +89,7 @@ class KarrasDenoiser:
         self.rho = rho
         self.num_timesteps = 40
 
-        # 使用3D感知损失或2D LPIPS
+        # NOTE: 感知损失分支：3D 直接作用体素，2D 为兼容兜底。
         if USE_3D_LOSS:
             self.perceptual_loss = Perceptual3DLoss(
                 in_channels=4
@@ -188,10 +189,8 @@ class KarrasDenoiser:
 
         terms = {}
 
+        # NOTE: 按 batch 内样本噪声级别构建 noisy 输入并计算加权损失。
         dims = x_start.ndim
-        # print("sigmas", sigmas)
-        # print("dims", dims)
-        # print("append_dims(sigmas, dims)", append_dims(sigmas, dims))
         x_t = x_start + noise * append_dims(sigmas, dims)
         model_output, denoised = self.denoise(model, x_t, sigmas, **model_kwargs)
 
@@ -200,18 +199,17 @@ class KarrasDenoiser:
             get_weightings(self.weight_schedule, snrs, self.sigma_data), dims
         )
         
-        # 计算感知损失 (支持3D和2D模式)
+        # NOTE: 感知项支持 3D/2D 两条路径，保证不同环境下都可训练。
         if USE_3D_LOSS:
-            # 3D感知损失 - 直接处理5D张量 (B, C, Z, H, W)
+            # NOTE: 3D 感知损失直接处理 5D 体素张量 (B, C, Z, H, W)。
             terms["perceptual_loss"] = self.perceptual_loss(x_start, denoised)
         else:
-            # 2D LPIPS - 需要将3D数据转换为2D切片
-            # 输入形状: (B, C, Z, H, W) -> 取中间切片 -> (B, C, H, W)
+            # NOTE: 2D LPIPS 通过中间切片近似 3D 感知一致性。
             if x_start.dim() == 5:
                 mid_z = x_start.shape[2] // 2
                 x_start_2d = x_start[:, :, mid_z, :, :]
                 denoised_2d = denoised[:, :, mid_z, :, :]
-                # LPIPS 需要3通道输入，取前3通道
+                # HACK: 感知指标 LPIPS 默认 3 通道输入，这里截取前 3 个语义通道。
                 if x_start_2d.shape[1] > 3:
                     x_start_2d = x_start_2d[:, :3, :, :]
                     denoised_2d = denoised_2d[:, :3, :, :]
@@ -220,18 +218,12 @@ class KarrasDenoiser:
                 terms["perceptual_loss"] = self.perceptual_loss(x_start, denoised)
         
         terms["mse"] = mean_flat(weights * (denoised - x_start) ** 2)
-        # terms["loss"] = terms["mse"]
-        # terms["dice_loss"] =  dice_loss((denoised + 1.0 ) / 2.0, (x_start + 1.0 ) / 2.0)
+        # NOTE: 历史实验曾尝试纯 MSE 方案。
+        # NOTE: 历史实验也尝试过 Dice 约束。
+        # TODO: 当前 0.8/0.2 为经验配比，后续可做自动权重搜索。
         terms["loss"] = terms["mse"] * 0.8 + terms["perceptual_loss"] * 0.2
-        # print("mse", terms["xs_mse"])
-        # print("mseweights", terms["mse"])
-        # print("weights", weights)
-        # if "vb" in terms:
-        #     print("vb")
-        #     terms["loss"] = terms["mse"] + terms["vb"]
-        # else:
-        #     print("novb")
-        #     terms["loss"] = terms["mse"]
+        # NOTE: 旧版还尝试过将 vb 项并入总损失。
+        # NOTE: 当前默认仅使用 MSE + 感知损失组合。
 
         return terms
 
@@ -273,7 +265,6 @@ class KarrasDenoiser:
         if noise is None:
             noise = th.randn_like(x_start)
 
-        # print("consistency model!!")
         dims = x_start.ndim
 
         def denoise_fn(x, t):
@@ -547,16 +538,12 @@ class KarrasDenoiser:
 
         rescaled_t = 1000 * 0.25 * th.log(sigmas + 1e-44)
 
-        # start = th.cuda.Event(enable_timing=True)
-        # end = th.cuda.Event(enable_timing=True)
+        # NOTE: 如需性能剖析，可在此开启 CUDA Event 计时。
+        
 
-        # start.record()
 
         model_output = model(c_in * x_t, rescaled_t, **model_kwargs)
 
-        # end.record()
-        # th.cuda.synchronize()
-        # print('time for 1 sample', start.elapsed_time(end))  #time measurement for the generation of 1 sample
 
         denoised = c_out * model_output + c_skip * x_t
         return model_output, denoised
@@ -630,7 +617,6 @@ def karras_sample(
         sigmas = get_sigmas_karras(steps + 1, sigma_min, sigma_max, rho, device=device)
     else:
         sigmas = get_sigmas_karras(steps, sigma_min, sigma_max, rho, device=device)
-    # print("sigmas", sigmas)
     
     
     if prior_sample == False:
@@ -646,12 +632,9 @@ def karras_sample(
             
             pure_noise = generator.randn(*shape, device=device)
             prior_guidance = 1 * prior_noised + 0 * pure_noise
-            # x_noisy = torch.cat((img[:, :Channel_num//2, :, :], prior_guidance), dim=1)
             x_T = prior_guidance
-            # print("x_T_prior", x_T.shape)
         else:
             x_T = generator.randn(*shape, device=device) * sigma_max
-            # print("x_T", x_T.shape)
                  
     sample_fn = {
         "heun": sample_heun,
@@ -793,9 +776,10 @@ def sample_euler_ancestral(model, x, sigmas, generator, progress=False, callback
                 }
             )
         d = to_d(x, sigmas[i], denoised)
-        # Euler method
+        # NOTE: 欧拉（Euler）更新漂移项。
         dt = sigma_down - sigmas[i]
         x = x + d * dt
+        # NOTE: 祖先采样额外注入随机项，恢复随机性。
         x = x + generator.randn_like(x) * sigma_up
     return x
 
@@ -870,6 +854,7 @@ def sample_heun(
     4. 如果是最后一步，使用 Euler 更新。
     5. 否则，使用 Heun 方法 (二阶 Runge-Kutta) 更新。
     """
+    # NOTE: 海恩（Heun）采样是默认高质量路径；与欧拉（Euler）相比误差更小但计算更重。
     s_in = x.new_ones([x.shape[0]])
     indices = range(len(sigmas) - 1)
     if progress:
@@ -877,7 +862,6 @@ def sample_heun(
 
         indices = tqdm(indices)
 
-    # print("indices", indices)
     for i in indices:
         gamma = (
             min(s_churn / (len(sigmas) - 1), 2**0.5 - 1)
@@ -886,7 +870,6 @@ def sample_heun(
         )
         eps = generator.randn_like(x) * s_noise
         sigma_hat = sigmas[i] * (gamma + 1)
-        # print("sigmas", sigmas)
         if gamma > 0:
             x = x + eps * (sigma_hat**2 - sigmas[i] ** 2) ** 0.5
         denoised = denoiser(x, sigma_hat * s_in)
@@ -903,12 +886,11 @@ def sample_heun(
             )
         dt = sigmas[i + 1] - sigma_hat
         if sigmas[i + 1] == 0:
-            # Euler method
+            # NOTE: 最后一步直接退化为 Euler 更新。
             x = x + d * dt
         else:
-            # Heun's method
+            # NOTE: 海恩（Heun）二阶校正，使用两次导数平均值更新。
             x_2 = x + d * dt
-            # print("asdf")
             denoised_2 = denoiser(x_2, sigmas[i + 1] * s_in)
             d_2 = to_d(x_2, sigmas[i + 1], denoised_2)
             d_prime = (d + d_2) / 2
@@ -941,6 +923,7 @@ def sample_euler(
     2. 计算导数 d。
     3. 使用 Euler 公式更新 x。
     """
+    # NOTE: 欧拉（Euler）采样速度快，适合调试与快速对比实验。
     s_in = x.new_ones([x.shape[0]])
     indices = range(len(sigmas) - 1)
     if progress:
@@ -1031,7 +1014,7 @@ def sample_dpm(
                     "denoised": denoised,
                 }
             )
-        # Midpoint method, where the midpoint is chosen according to a rho=3 Karras schedule
+        # NOTE: 中点法：中点时间按 rho=3 的 Karras 调度计算。
         sigma_mid = ((sigma_hat ** (1 / 3) + sigmas[i + 1] ** (1 / 3)) / 2) ** 3
         dt_1 = sigma_mid - sigma_hat
         dt_2 = sigmas[i + 1] - sigma_hat
@@ -1238,19 +1221,19 @@ def iterative_inpainting(
 
     image_size = x.shape[-1]
 
-    # create a blank image with a white background
+    # NOTE: 创建白底空白图像。
     img = Image.new("RGB", (image_size, image_size), color="white")
 
-    # get a drawing context for the image
+    # NOTE: 获取图像绘制上下文。
     draw = ImageDraw.Draw(img)
 
-    # load a font
+    # NOTE: 加载字体资源。
     font = ImageFont.truetype("arial.ttf", 250)
 
-    # draw the letter "C" in black
+    # NOTE: 以黑色绘制字母图案。
     draw.text((50, 0), "S", font=font, fill=(0, 0, 0))
 
-    # convert the image to a numpy array
+    # NOTE: 将图像转换为 numpy 数组。
     img_np = np.array(img)
     img_np = img_np.transpose(2, 0, 1)
     img_th = th.from_numpy(img_np).to(dist_util.dev())

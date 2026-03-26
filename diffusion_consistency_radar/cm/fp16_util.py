@@ -101,8 +101,8 @@ def master_params_to_model_params(param_groups_and_shapes, master_params):
     2. 解展平主参数。
     3. 将数据复制到模型参数。
     """
-    # Without copying to a list, if a generator is passed, this will
-    # silently not copy any parameters.
+    # NOTE: 若不先转成列表，传入生成器时这里不会真正复制参数。
+    # NOTE: 该行为是静默发生的，排查时不易察觉。
     for master_param, (param_group, _) in zip(master_params, param_groups_and_shapes):
         for (_, param), unflat_master_param in zip(
             param_group, unflatten_master_params(param_group, master_param.view(-1))
@@ -230,7 +230,7 @@ def zero_grad(model_params):
     遍历模型参数，将 grad 置零。
     """
     for param in model_params:
-        # Taken from https://pytorch.org/docs/stable/_modules/torch/optim/optimizer.html#Optimizer.add_param_group
+        # NOTE: 逻辑参考 PyTorch Optimizer 的 add_param_group 实现。.add_param_group
         if param.grad is not None:
             param.grad.detach_()
             param.grad.zero_()
@@ -381,7 +381,6 @@ class MixedPrecisionTrainer:
         2. 执行 step。
         """
         grad_norm, param_norm = self._compute_norms()
-        # print("grad_norm", grad_norm)
         logger.logkv_mean("grad_norm", grad_norm)
         logger.logkv_mean("param_norm", param_norm)
         opt.step()

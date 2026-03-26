@@ -20,9 +20,7 @@ from .fp16_util import (
 )
 import numpy as np
 
-# For ImageNet experiments, this was a good default value.
-# We found that the lg_loss_scale quickly climbed to
-# 20-21 within the first ~1K steps of training.
+# NOTE: 经验初始值；混合精度训练早期 loss scale 会在前 1k step 内快速上升。
 INITIAL_LOG_LOSS_SCALE = 20.0
 
  
@@ -112,8 +110,7 @@ class TrainLoop:
         )
         if self.resume_step:
             self._load_optimizer_state()
-            # Model was resumed, either due to a restart or a checkpoint
-            # being specified at the command line.
+            # NOTE: 断点恢复场景下需同步加载 EMA 轨迹，避免训练状态漂移。
             self.ema_params = [
                 self._load_ema_parameters(rate) for rate in self.ema_rate
             ]
@@ -131,7 +128,7 @@ class TrainLoop:
                 output_device=dist_util.dev(),
                 broadcast_buffers=False,
                 bucket_cap_mb=128,
-                # find_unused_parameters=True,
+                # NOTE: 分布式并行（DDP）可按需启用 find_unused_parameters=True
             )
         else:
             if dist.get_world_size() > 1:
@@ -235,28 +232,22 @@ class TrainLoop:
         """
         data_iter = iter(self.data)
         while not self.lr_anneal_steps or self.step < self.lr_anneal_steps:
-            # batch, cond = next(self.data)
-            ## zrb fanle
+            # NOTE: 训练数据约定返回顺序为 (batch, cond)。
             try:
-                    # print(f"data_iter:{data_iter}")
-                    ## zrb fanle
                     cond, batch = next(data_iter)
-                    # print(f"batch, cond, name:({batch}, {cond}, {name})")
             except StopIteration:
-                    # StopIteration is thrown if dataset ends
-                    # reinitialize data loader
+                # NOTE: 数据迭代结束后重建迭代器，继续训练。
                     data_iter = iter(self.data)
-                    # batch, cond, name = next(data_iter)
-            # self.run_step(batch, cond)
+                # FIXME: 当前分支未立即重新取一个 batch，可能复用上次 batch/cond。
             self.run_step(batch, cond)
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
             if self.step % self.save_interval == 0:
                 self.save()
-                # Run for a finite amount of time in integration tests.
+                # NOTE: 集成测试场景可通过环境变量提前退出。
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
-        # Save the last checkpoint if it wasn't already saved.
+        # NOTE: 若循环结束时尚未命中保存步，补存最后一次权重。
         if (self.step - 1) % self.save_interval != 0:
             self.save()
 
@@ -289,14 +280,9 @@ class TrainLoop:
         self.mp_trainer.zero_grad()
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            #zrb
+            # NOTE: 条件分支统一封装为 model_kwargs['y'] 传入扩散模型。
             micro_cond = cond[i : i + self.microbatch].to(dist_util.dev())
             micro_cond_dict = {"y": micro_cond}
-            # micro_cond = {
-            #     k: v[i : i + self.microbatch].to(dist_util.dev())
-            #     for k, v in cond.items()
-            # }
-            # micro_cond = {cond[i : i + self.microbatch].to(dist_util.dev())}
 
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
@@ -319,9 +305,6 @@ class TrainLoop:
                 self.schedule_sampler.update_with_local_losses(
                     t, losses["loss"].detach()
                 )
-            # print("losses", losses["loss"].mean())
-            # print("weightsoutside", weights)
-            # print("lossesweight", (losses["loss"] * weights).mean())
 
             loss = (losses["loss"] * weights).mean()
             log_loss_dict(
@@ -410,8 +393,7 @@ class TrainLoop:
             ) as f:
                 th.save(self.opt.state_dict(), f)
 
-        # Save model parameters last to prevent race conditions where a restart
-        # loads model at step N, but opt/ema state isn't saved for step N.
+        # NOTE: 主模型最后保存，避免重启时出现 model 与 opt/ema 步数不一致。
         save_checkpoint(0, self.mp_trainer.master_params)
         dist.barrier()
 
@@ -561,14 +543,10 @@ class CMTrainLoop(TrainLoop):
             or self.global_step < self.total_training_steps
         ):
             try:
-                    # print('data_iter', data_iter)
-                    ## zrb fanle
-                    # cond, batch, name = next(data_iter)
+                    # NOTE: 一致性训练同样依赖 (batch, cond) 返回约定。
                     batch, cond = next(data_iter)
-                    # print(batch, cond, name)
             except StopIteration:
-                    # 如果数据集结束，则抛出 StopIteration
-                    # 重新初始化数据加载器
+                    # NOTE: 迭代结束后重建迭代器。
                     data_iter = iter(self.data)
             self.run_step(batch, cond)
             saved = False
@@ -580,14 +558,14 @@ class CMTrainLoop(TrainLoop):
                 self.save()
                 saved = True
                 th.cuda.empty_cache()
-                # 在集成测试中运行有限的时间。
+                # NOTE: 集成测试场景可提前结束训练。
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
 
             if self.global_step % self.log_interval == 0:
                 logger.dumpkvs()
 
-        # Save the last checkpoint if it wasn't already saved.
+        # NOTE: 兜底保存最后一个 checkpoint。
         if not saved:
             self.save()
 
@@ -646,7 +624,7 @@ class CMTrainLoop(TrainLoop):
                         self.model.parameters(),
                         0.0,
                     )
-                # reset optimizer
+                # NOTE: 重置优化器状态
                 self.opt = RAdam(
                     self.mp_trainer.master_params,
                     lr=self.lr,
@@ -664,16 +642,11 @@ class CMTrainLoop(TrainLoop):
 
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
-        #zrb
+        # NOTE: 微批（microbatch）逐段反传，兼顾显存占用与吞吐。
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            #zrb
             micro_cond = cond[i : i + self.microbatch].to(dist_util.dev())
             micro_cond_dict = {"y": micro_cond}
-            # micro_cond = {
-            #     k: v[i : i + self.microbatch].to(dist_util.dev())
-            #     for k, v in cond.items()
-            # }
 
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
@@ -700,7 +673,6 @@ class CMTrainLoop(TrainLoop):
                         target_diffusion=self.diffusion,
                         model_kwargs=micro_cond_dict,
                     )
-            #zrb
             elif self.training_mode == "consistency_distillation":
                 compute_losses = functools.partial(
                     self.diffusion.consistency_losses,
@@ -737,7 +709,7 @@ class CMTrainLoop(TrainLoop):
 
             loss = (losses["loss"] * weights).mean()
             
-            # print("loss", loss)
+            # NOTE: 记录加权后的多项损失统计，用于训练监控。
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
@@ -782,8 +754,7 @@ class CMTrainLoop(TrainLoop):
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(self.teacher_model.state_dict(), f)
 
-        # Save model parameters last to prevent race conditions where a restart
-        # loads model at step N, but opt/ema state isn't saved for step N.
+        # NOTE: 主模型最后保存，避免重启时读到不完整状态。
         save_checkpoint(0, self.mp_trainer.master_params)
         dist.barrier()
 
@@ -795,8 +766,7 @@ class CMTrainLoop(TrainLoop):
 
 def parse_resume_step_from_filename(filename):
     """
-    Parse filenames of the form path/to/modelNNNNNN.pt, where NNNNNN is the
-    checkpoint's number of steps.
+    NOTE: 解析 path/to/modelNNNNNN.pt 中的步数 NNNNNN。
     """
     split = filename.split("model")
     if len(split) < 2:
@@ -809,14 +779,12 @@ def parse_resume_step_from_filename(filename):
 
 
 def get_blob_logdir():
-    # You can change this to be a separate path to save checkpoints to
-    # a blobstore or some external drive.
+    # TODO: 如需远端存储 checkpoint，可在此改为对象存储/挂载盘路径。
     return logger.get_dir()
 
 
 def find_resume_checkpoint():
-    # On your infrastructure, you may want to override this to automatically
-    # discover the latest checkpoint on your blob storage, etc.
+    # TODO: 可按业务基础设施改造成“自动发现最新 checkpoint”。
     return None
 
 
@@ -833,7 +801,7 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
 def log_loss_dict(diffusion, ts, losses):
     for key, values in losses.items():
         logger.logkv_mean(key, values.mean().item())
-        # Log the quantiles (four quartiles, in particular).
+        # NOTE: 按时间步记录 4 分位损失，便于观察不同噪声区间训练质量。
         for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
             logger.logkv_mean(f"{key}_q{quartile}", sub_loss)

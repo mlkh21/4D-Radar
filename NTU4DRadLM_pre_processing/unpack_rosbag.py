@@ -9,7 +9,12 @@ import glob
 import re
 import cv2
 
-# 尝试导入 Livox 驱动消息类型
+"""NTU4DRadLM 解包脚本。
+
+NOTE: 该脚本会把多分卷 bag 按场景归并到统一目录，并按 topic 拆分输出。
+"""
+
+# NOTE: 优先尝试导入 Livox 自定义消息类型；失败时回退到通用点云解析。
 try:
     import sys
     # 根据 ws_livox 工作空间路径，添加正确的 Python 包路径
@@ -20,7 +25,7 @@ except ImportError:
     LIVOX_AVAILABLE = False
     print("[Warning] 'livox_ros_driver' not found. Will attempt generic parsing for LiDAR.")
 
-# 选择想要导出的主题
+# NOTE: 白名单主题控制导出范围，避免无关 topic 占用磁盘。
 ALLOWED_TOPICS = {
     "livox/lidar",
     "radar_pcl",
@@ -41,8 +46,8 @@ def get_scene_name(bag_path):
     carpark_2022-06-03.bag -> carpark
     """
     filename = os.path.basename(bag_path)
-    # 简单粗暴：取第一个下划线前的名字作为场景名
-    # 如果你的命名规则不同，可以在这里修改
+    # HACK: 这里依赖文件命名规则（第一个下划线前即场景名）。
+    # TODO: 后续可改为通过目录结构或配置文件确定场景名，减少命名耦合。
     scene_name = filename.split('_')[0]
     return scene_name
 
@@ -55,14 +60,14 @@ def save_pointcloud(msg, save_dir, timestamp):
     try:
         points_list = []
         
-        # 1: Livox CustomMsg
+        # NOTE: 1) Livox CustomMsg
         # 结构: x, y, z, reflectivity, tag, line
         if 'CustomMsg' in str(type(msg)) or 'livox_ros_driver' in str(type(msg)): # 只要名字匹配就尝试处理,不依赖 LIVOX_AVAILABLE
             for p in msg.points:
                 # 保存 x, y, z, reflectivity
                 points_list.append([p.x, p.y, p.z, float(p.reflectivity)])
         
-        # 2: Standard PointCloud2
+        # NOTE: 2) 标准 PointCloud2
         elif hasattr(msg, 'width'): # Duck typing for PointCloud2
             # 尝试读取常用字段
             # 注意：不同雷达的字段名可能不同，这里尝试读取 intensity 和 velocity/doppler
@@ -97,7 +102,7 @@ def save_pointcloud(msg, save_dir, timestamp):
                 # 后续处理时根据 shape 判断
                 points_list.append(point_data)
 
-        # 3: Standard PointCloud (v1) - 常见于 4D Radar
+        # NOTE: 3) 标准 PointCloud (v1) - 常见于 4D Radar
         # 结构: points[], channels[name, values[]]
         elif hasattr(msg, 'points') and msg.points and hasattr(msg.points[0], 'x'):
             # 提取 channels 数据
@@ -127,7 +132,7 @@ def save_pointcloud(msg, save_dir, timestamp):
                 
                 points_list.append([p.x, p.y, p.z, float(inten), float(vel)])
         
-        # 4: Fallback / Unknown
+        # FIXME: 4) 未识别点云类型当前仅打印并跳过，可能导致该帧数据缺失。
         else:
             print(f"[Warning] Unknown pointcloud type: {type(msg)} at {timestamp}")
             return
@@ -167,7 +172,7 @@ def save_compressed_image(msg, save_dir, timestamp):
         pass
 
 def process_ntu_dataset(input_root, output_root):
-    # 1. 递归查找所有 .bag 文件
+    # NOTE: 1) 递归查找所有 .bag 文件。
     search_pattern = os.path.join(input_root, "**", "*.bag")
     bag_files = glob.glob(search_pattern, recursive=True)
     bag_files.sort()
@@ -179,7 +184,7 @@ def process_ntu_dataset(input_root, output_root):
     print(f"Found {len(bag_files)} bag files. Starting processing...")
     print(f"Output Root: {output_root}\n")
 
-    # 2. 遍历处理每个 Bag
+    # NOTE: 2) 遍历处理每个 Bag，并把同场景分卷归并到同一输出目录。
     for i, bag_path in enumerate(bag_files):
         # 确定该 bag 属于哪个场景 (loop1, carpark, etc.)
         scene_name = get_scene_name(bag_path)
@@ -302,8 +307,8 @@ def process_ntu_dataset(input_root, output_root):
 
 if __name__ == "__main__":
     # 在这里修改默认路径，或者通过命令行参数传入
-    default_input = "./NTU4DRadLM_pre_processing/NTU4DRadLM"
-    default_output = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Raw"
+    default_input = "./Data/NTU4DRadLM"
+    default_output = "./Data/NTU4DRadLM_Raw"
     
     parser = argparse.ArgumentParser(description="Unpack NTU4DRadLM Bags (No Visual/Thermal)")
     parser.add_argument("--input", default=default_input, help="Input dataset root directory")

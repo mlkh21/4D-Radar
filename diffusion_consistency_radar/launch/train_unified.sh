@@ -22,10 +22,10 @@ ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 SCRIPT_DIR="${PROJECT_DIR}/scripts"
 DEFAULT_CONFIG_PATH="${PROJECT_DIR}/config/default_config.yaml"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
-PREPROCESSED_ROOT="${ROOT_DIR}/NTU4DRadLM_pre_processing/NTU4DRadLM_Pre"
+PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
 TRAIN_DATASET_DIR="${PROJECT_DIR}/.tmp_train_dataset"
 CONFIG_PATH="${PROJECT_DIR}/config/.default_config.train_override.yaml"
-RESULTS_DIR="${PROJECT_DIR}/train_results"
+RESULTS_DIR="${ROOT_DIR}/Result/train_results"
 
 if [ ! -f "${DATA_LOADING_CONFIG}" ]; then
     echo "Error: data loading config not found: ${DATA_LOADING_CONFIG}"

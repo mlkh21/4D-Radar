@@ -60,7 +60,7 @@ def model_and_diffusion_defaults():
     - initial_z_size: 初始Z轴大小（用于自适应下采样）
     """
     res = dict(
-        # === 基础参数 ===
+        # NOTE: === 基础参数 ===
         sigma_min=0.002, # 最小噪声标准差
         sigma_max=80.0, # 最大噪声标准差
         image_size=128, # 图像尺寸（默认128）
@@ -84,7 +84,7 @@ def model_and_diffusion_defaults():
         weight_schedule="karras", # 权重调度策略
         dims=3, # 维度 (2 for 2D, 3 for 3D)
         
-        # === 新增优化参数 ===
+        # NOTE: === 新增优化参数 ===
         attention_type="flash", # 注意力类型: flash/window/linear/sparse/height/none
         norm_type="group", # 归一化类型: group/layer/instance/rms/adaptive
         downsample_type="asymmetric", # 下采样类型: asymmetric/standard
@@ -121,7 +121,7 @@ def create_model_and_diffusion(
     sigma_min=0.002,
     sigma_max=80.0,
     distillation=False,
-    # === 新增优化参数 ===
+    # NOTE: === 新增优化参数 ===
     attention_type="flash",
     norm_type="group",
     downsample_type="asymmetric",
@@ -157,7 +157,7 @@ def create_model_and_diffusion(
         sigma_max (float) - 最大噪声标准差
         distillation (bool) - 是否蒸馏模式
         
-        # 新增优化参数
+        # NOTE: 新增优化参数
         attention_type (str) - 注意力类型
         norm_type (str) - 归一化类型
         downsample_type (str) - 下采样类型
@@ -192,7 +192,7 @@ def create_model_and_diffusion(
         use_fp16=use_fp16,
         use_new_attention_order=use_new_attention_order,
         dims=dims,
-        # 新增参数
+        # NOTE: 新增参数
         attention_type=attention_type,
         norm_type=norm_type,
         downsample_type=downsample_type,
@@ -233,7 +233,7 @@ def create_model(
     use_fp16=False,
     use_new_attention_order=False,
     dims=3,
-    # === 新增优化参数 ===
+    # NOTE: === 新增优化参数 ===
     attention_type="flash",
     norm_type="group",
     downsample_type="asymmetric",
@@ -255,10 +255,10 @@ def create_model(
     3. 根据 use_optimized_unet 选择模型类型。
     4. 实例化并返回模型。
     """
-    # 解析 channel_mult
+    # NOTE: 解析 channel_mult
     if channel_mult == "":
         if dims == 3 and image_size == 128:
-            # 优化的通道倍增：更保守以节省显存
+            # NOTE: 优化的通道倍增：更保守以节省显存
             channel_mult = (1, 2, 2, 4)  # 原: (1, 2, 4, 8)
         elif image_size == 512:
             channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
@@ -275,7 +275,7 @@ def create_model(
     else:
         channel_mult = tuple(int(ch_mult) for ch_mult in channel_mult.split(","))
 
-    # 解析 attention_resolutions
+    # NOTE: 解析 attention_resolutions
     attention_ds = []
     if attention_resolutions != "-1":  # -1 表示不使用注意力
         for res in attention_resolutions.split(","):
@@ -283,7 +283,7 @@ def create_model(
             if res > 0:
                 attention_ds.append(image_size // res)
     
-    # 解析窗口大小
+    # NOTE: 解析窗口大小
     if isinstance(window_size, str):
         window_size = tuple(int(x) for x in window_size.split(","))
     
@@ -301,7 +301,7 @@ def create_model(
     print(f"  - use_checkpoint: {use_checkpoint}")
     print(f"{'='*60}\n")
 
-    # 创建模型
+    # NOTE: 创建模型
     if use_optimized_unet:
         return OptimizedUNetModel(
             image_size=image_size,
@@ -322,7 +322,7 @@ def create_model(
             resblock_updown=resblock_updown,
             use_new_attention_order=use_new_attention_order,
             dims=dims,
-            # 新增优化参数
+            # NOTE: 新增优化参数
             attention_type=attention_type,
             norm_type=norm_type,
             downsample_type=downsample_type,
@@ -332,7 +332,7 @@ def create_model(
             initial_z_size=initial_z_size,
         )
     else:
-        # 使用原始 UNet
+        # NOTE: 使用原始 UNet
         return UNetModel(
             image_size=image_size,
             in_channels=in_ch,

@@ -16,9 +16,9 @@ import numpy as np
 import torch.nn.functional as F
 
 
-# ==============================================================================
-# 全局配置 - 可通过环境变量或配置文件修改
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 全局配置 - 可通过环境变量或配置文件修改
+# NOTE: ==============================================================================
 NORM_TYPE = "group"  # 可选: "group", "layer", "instance", "rms", "batch"
 NORM_GROUPS = 32     # GroupNorm 的组数
 NORM_EPS = 1e-6      # 归一化的 epsilon
@@ -36,11 +36,11 @@ def set_norm_groups(num_groups: int):
     NORM_GROUPS = num_groups
 
 
-# ==============================================================================
-# 激活函数
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 激活函数
+# NOTE: ==============================================================================
 
-# PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
+# NOTE: 新版 PyTorch 提供 SiLU，但此实现需兼容较旧版本。
 class SiLU(nn.Module):
     def forward(self, x):
         """
@@ -55,9 +55,9 @@ class SiLU(nn.Module):
         return x * th.sigmoid(x)
 
 
-# ==============================================================================
-# 归一化层
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 归一化层
+# NOTE: ==============================================================================
 
 class GroupNorm32(nn.GroupNorm):
     """32组归一化，适合小batch size训练"""
@@ -92,8 +92,8 @@ class LayerNorm3D(nn.Module):
         self.beta = nn.Parameter(th.zeros(1, channels, 1, 1, 1))
         
     def forward(self, x):
-        # x: (B, C, D, H, W)
-        # 对 C, D, H, W 维度归一化
+        # NOTE: 输入张量 x: (B, C, D, H, W)
+        # NOTE: 对 C, D, H, W 维度归一化
         mean = x.mean(dim=[1, 2, 3, 4], keepdim=True)
         var = x.var(dim=[1, 2, 3, 4], keepdim=True, unbiased=False)
         x_norm = (x - mean) / th.sqrt(var + self.eps)
@@ -127,8 +127,8 @@ class InstanceNorm3D(nn.Module):
             self.register_parameter('beta', None)
             
     def forward(self, x):
-        # x: (B, C, D, H, W)
-        # 对 D, H, W 维度归一化（每个 channel 独立）
+        # NOTE: 输入张量 x: (B, C, D, H, W)
+        # NOTE: 对 D, H, W 维度归一化（每个 channel 独立）
         mean = x.mean(dim=[2, 3, 4], keepdim=True)
         var = x.var(dim=[2, 3, 4], keepdim=True, unbiased=False)
         x_norm = (x - mean) / th.sqrt(var + self.eps)
@@ -156,8 +156,8 @@ class RMSNorm3D(nn.Module):
         self.scale = nn.Parameter(th.ones(1, channels, 1, 1, 1))
         
     def forward(self, x):
-        # x: (B, C, D, H, W)
-        # 计算 RMS
+        # NOTE: 输入张量 x: (B, C, D, H, W)
+        # NOTE: 计算 RMS
         rms = th.sqrt(x.pow(2).mean(dim=[1, 2, 3, 4], keepdim=True) + self.eps)
         x_norm = x / rms
         return x_norm * self.scale
@@ -180,11 +180,11 @@ class AdaptiveNorm3D(nn.Module):
         self.instance_norm = InstanceNorm3D(channels)
         
     def forward(self, x):
-        # 计算稀疏度（零值比例）
+        # NOTE: 计算稀疏度（零值比例）
         with th.no_grad():
             sparsity = (x.abs() < 1e-6).float().mean()
         
-        # 根据稀疏度选择归一化方式
+        # NOTE: 根据稀疏度选择归一化方式
         if sparsity > self.sparsity_threshold:
             return self.instance_norm(x)
         else:
@@ -201,7 +201,7 @@ class ConditionalNorm3D(nn.Module):
         super().__init__()
         self.norm = nn.GroupNorm(num_groups, channels, affine=False)
         
-        # 条件投影
+        # NOTE: 条件投影
         self.cond_proj = nn.Sequential(
             nn.SiLU(),
             nn.Linear(cond_channels, channels * 2),
@@ -213,14 +213,14 @@ class ConditionalNorm3D(nn.Module):
             x: (B, C, D, H, W) 输入特征
             cond: (B, cond_channels) 条件嵌入
         """
-        # 归一化
+        # NOTE: 归一化
         x = self.norm(x)
         
-        # 获取条件 scale 和 shift
+        # NOTE: 获取条件 scale 和 shift
         cond_out = self.cond_proj(cond)
         scale, shift = cond_out.chunk(2, dim=1)
         
-        # 扩展维度以匹配 x
+        # NOTE: 扩展维度以匹配 x
         scale = scale.view(scale.shape[0], -1, 1, 1, 1)
         shift = shift.view(shift.shape[0], -1, 1, 1, 1)
         
@@ -295,16 +295,8 @@ def update_ema(target_params, source_params, rate=0.99):
     逻辑:
     target = target * rate + source * (1 - rate)。
     """
-    # print("aaa")
-    # for targ in target_params:
-    #     print("targ", targ.shape)
     for targ, src in zip(target_params, source_params):
-        # print("targ", targ.detach().shape)
-        # print(" targ.detach().mul_(rate)",  targ.detach().mul_(rate).shape)
-        # print("src", src.shape)
-        # print("rate", rate)
         targ.detach().mul_(rate).add_(src, alpha=1 - rate)
-    # print("asdfsdf", src.shape)
 
 
 def zero_module(module):
@@ -395,11 +387,11 @@ def normalization(channels, norm_type: str = None, num_groups: int = None):
     逻辑:
     根据 norm_type 返回对应的归一化层。
     """
-    # 使用全局配置或参数覆盖
+    # NOTE: 使用全局配置或参数覆盖
     _norm_type = norm_type or NORM_TYPE
     _num_groups = num_groups or NORM_GROUPS
     
-    # 确保 num_groups 不超过通道数
+    # NOTE: 确保 num_groups 不超过通道数
     _num_groups = min(_num_groups, channels)
     
     if _norm_type == "group":
@@ -413,7 +405,7 @@ def normalization(channels, norm_type: str = None, num_groups: int = None):
     elif _norm_type == "adaptive":
         return AdaptiveNorm3D(channels, _num_groups)
     else:
-        # 默认使用 GroupNorm
+        # NOTE: 默认使用 GroupNorm
         return GroupNorm32(_num_groups, channels)
 
 
@@ -501,9 +493,9 @@ class CheckpointFunction(th.autograd.Function):
         """
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
         with th.enable_grad():
-            # Fixes a bug where the first op in run_function modifies the
-            # Tensor storage in place, which is not allowed for detach()'d
-            # Tensors.
+            # NOTE: 修复 run_function 首个算子原地修改存储导致的错误。
+            # NOTE: 该问题会触发 detach() 后张量的非法原地写入。
+            # NOTE: 因而这里要避免直接改写底层存储。
             shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
             output_tensors = ctx.run_function(*shallow_copies)
         input_grads = th.autograd.grad(

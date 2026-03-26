@@ -24,9 +24,9 @@ def default(val, d):
     return val if exists(val) else d
 
 
-# ==============================================================================
-# 1. 3D Window Attention (Swin Transformer 风格) - 核心优化
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 1. 3D Window Attention (Swin Transformer 风格) - 核心优化
+# NOTE: ==============================================================================
 
 class Window3DAttention(nn.Module):
     """
@@ -65,13 +65,13 @@ class Window3DAttention(nn.Module):
         head_dim = channels // num_heads
         self.scale = head_dim ** -0.5
         
-        # 归一化层
+        # NOTE: 归一化层
         self.norm = normalization(channels)
         
-        # QKV 投影
+        # NOTE: 查询键值（QKV）投影
         self.qkv = nn.Linear(channels, channels * 3, bias=qkv_bias)
         
-        # 相对位置编码
+        # NOTE: 相对位置编码
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros(
                 (2 * window_size[0] - 1) * (2 * window_size[1] - 1) * (2 * window_size[2] - 1),
@@ -80,7 +80,7 @@ class Window3DAttention(nn.Module):
         )
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
         
-        # 计算相对位置索引
+        # NOTE: 计算相对位置索引
         coords_d = torch.arange(window_size[0])
         coords_h = torch.arange(window_size[1])
         coords_w = torch.arange(window_size[2])
@@ -97,10 +97,10 @@ class Window3DAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # (DHW, DHW)
         self.register_buffer("relative_position_index", relative_position_index)
         
-        # Dropout
+        # NOTE: 随机失活层
         self.attn_drop = nn.Dropout(attn_drop)
         
-        # 输出投影
+        # NOTE: 输出投影
         self.proj = nn.Linear(channels, channels)
         self.proj_drop = nn.Dropout(proj_drop)
         
@@ -113,11 +113,11 @@ class Window3DAttention(nn.Module):
         """
         B, C, D, H, W = x.shape
         
-        # 归一化并转换格式
+        # NOTE: 归一化并转换格式
         x_norm = self.norm(x)
         x_norm = x_norm.permute(0, 2, 3, 4, 1).contiguous()  # (B, D, H, W, C)
         
-        # Pad 到窗口大小的整数倍
+        # NOTE: 补齐到窗口大小的整数倍
         pad_d = (self.window_size[0] - D % self.window_size[0]) % self.window_size[0]
         pad_h = (self.window_size[1] - H % self.window_size[1]) % self.window_size[1]
         pad_w = (self.window_size[2] - W % self.window_size[2]) % self.window_size[2]
@@ -127,7 +127,7 @@ class Window3DAttention(nn.Module):
         
         _, Dp, Hp, Wp, _ = x_norm.shape
         
-        # 窗口移位 (Shifted Window)
+        # NOTE: 窗口移位 (Shifted Window)
         if any(s > 0 for s in self.shift_size):
             shifted_x = torch.roll(
                 x_norm,
@@ -137,16 +137,16 @@ class Window3DAttention(nn.Module):
         else:
             shifted_x = x_norm
         
-        # 将输入划分为窗口
+        # NOTE: 将输入划分为窗口
         x_windows = self._window_partition(shifted_x)  # (B*nW, Wd*Wh*Ww, C)
         
-        # 窗口内注意力
+        # NOTE: 窗口内注意力
         attn_windows = self._window_attention(x_windows)  # (B*nW, Wd*Wh*Ww, C)
         
-        # 合并窗口
+        # NOTE: 合并窗口
         shifted_x = self._window_reverse(attn_windows, (Dp, Hp, Wp))  # (B, Dp, Hp, Wp, C)
         
-        # 反向移位
+        # NOTE: 反向移位
         if any(s > 0 for s in self.shift_size):
             x_out = torch.roll(
                 shifted_x,
@@ -156,14 +156,14 @@ class Window3DAttention(nn.Module):
         else:
             x_out = shifted_x
         
-        # 去除 padding
+        # NOTE: 去除 padding
         if pad_d > 0 or pad_h > 0 or pad_w > 0:
             x_out = x_out[:, :D, :H, :W, :].contiguous()
         
-        # 转回 (B, C, D, H, W) 格式
+        # NOTE: 转回 (B, C, D, H, W) 格式
         x_out = x_out.permute(0, 4, 1, 2, 3).contiguous()
         
-        # 残差连接
+        # NOTE: 残差连接
         return x + x_out
     
     def _window_partition(self, x: torch.Tensor) -> torch.Tensor:
@@ -210,16 +210,16 @@ class Window3DAttention(nn.Module):
         """
         B_nW, N, C = x.shape
         
-        # QKV 投影
+        # NOTE: 查询键值（QKV）投影
         qkv = self.qkv(x).reshape(B_nW, N, 3, self.num_heads, C // self.num_heads)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B*nW, num_heads, N, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # 缩放点积注意力
+        # NOTE: 缩放点积注意力
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)  # (B*nW, num_heads, N, N)
         
-        # 添加相对位置偏置
+        # NOTE: 添加相对位置偏置
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)
         ].view(N, N, -1)
@@ -229,7 +229,7 @@ class Window3DAttention(nn.Module):
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
         
-        # 应用注意力权重
+        # NOTE: 应用注意力权重
         x = (attn @ v).transpose(1, 2).reshape(B_nW, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -237,9 +237,9 @@ class Window3DAttention(nn.Module):
         return x
 
 
-# ==============================================================================
-# 2. PyTorch 2.0 原生 Flash Attention (显存最优)
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 2. PyTorch 2.0 原生 Flash Attention (显存最优)
+# NOTE: ==============================================================================
 
 class FlashAttention3D(nn.Module):
     """
@@ -285,17 +285,17 @@ class FlashAttention3D(nn.Module):
         """
         B, C, D, H, W = x.shape
         
-        # 归一化
+        # NOTE: 归一化
         h = self.norm(x)
         
-        # QKV 投影
+        # NOTE: 查询键值（QKV）投影
         qkv = self.qkv(h)  # (B, 3*C, D, H, W)
         qkv = qkv.reshape(B, 3, self.num_heads, self.head_dim, D * H * W)
         qkv = qkv.permute(1, 0, 2, 4, 3)  # (3, B, num_heads, N, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each: (B, num_heads, N, head_dim)
         
-        # PyTorch 2.0 Flash Attention (自动选择最优实现)
-        # 支持: FlashAttention-2, Memory-Efficient Attention, 或标准实现
+        # NOTE: 使用 PyTorch 2.0 Flash Attention（自动选择最优实现）
+        # NOTE: 支持: FlashAttention-2, Memory-Efficient Attention, 或标准实现
         with torch.backends.cuda.sdp_kernel(
             enable_flash=True,
             enable_math=True,
@@ -307,17 +307,17 @@ class FlashAttention3D(nn.Module):
                 is_causal=False
             )  # (B, num_heads, N, head_dim)
         
-        # 重塑回原始形状
+        # NOTE: 重塑回原始形状
         attn_out = attn_out.permute(0, 1, 3, 2)  # (B, num_heads, head_dim, N)
         attn_out = attn_out.reshape(B, C, D, H, W)
         
-        # 输出投影 + 残差
+        # NOTE: 输出投影 + 残差
         return x + self.proj_out(attn_out)
 
 
-# ==============================================================================
-# 3. Linear Attention (线性复杂度)
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 3. Linear Attention (线性复杂度)
+# NOTE: ==============================================================================
 
 class LinearAttention3D(nn.Module):
     """
@@ -363,35 +363,35 @@ class LinearAttention3D(nn.Module):
         h = self.norm(x)
         qkv = self.to_qkv(h)  # (B, 3*C, D, H, W)
         
-        # 重塑为 (B, heads, head_dim, N)
+        # NOTE: 重塑为 (B, heads, head_dim, N)
         qkv = qkv.reshape(B, 3, self.num_heads, self.head_dim, D * H * W)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # Each: (B, heads, head_dim, N)
         
-        # 特征映射 (elu + 1 确保非负)
+        # NOTE: 特征映射 (elu + 1 确保非负)
         q = F.elu(q) + 1
         k = F.elu(k) + 1
         
-        # 线性注意力计算
-        # 先计算 K^T @ V，复杂度 O(D * N)
+        # NOTE: 线性注意力计算
+        # NOTE: 先计算 K^T @ V，复杂度 O(D * N)
         k = k / k.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         kv = torch.einsum('bhdn,bhen->bhde', k, v)  # (B, heads, head_dim, head_dim)
         
-        # 再计算 Q @ (K^T @ V)
+        # NOTE: 再计算 Q @ (K^T @ V)
         out = torch.einsum('bhdn,bhde->bhen', q, kv)  # (B, heads, head_dim, N)
         
-        # 归一化
+        # NOTE: 归一化
         normalizer = torch.einsum('bhdn,bhd->bhn', q, k.sum(dim=-1)).unsqueeze(2)
         out = out / normalizer.clamp(min=1e-6)
         
-        # 重塑回 (B, C, D, H, W)
+        # NOTE: 重塑回 (B, C, D, H, W)
         out = out.reshape(B, C, D, H, W)
         
         return x + self.to_out(out)
 
 
-# ==============================================================================
-# 4. 稀疏注意力 (Sparse Attention) - 针对雷达数据优化
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 4. 稀疏注意力 (Sparse Attention) - 针对雷达数据优化
+# NOTE: ==============================================================================
 
 class SparseAttention3D(nn.Module):
     """
@@ -443,34 +443,34 @@ class SparseAttention3D(nn.Module):
         k = k.transpose(-1, -2)  # (B, heads, N, head_dim)
         v = v.transpose(-1, -2)  # (B, heads, N, head_dim)
         
-        # 如果提供了掩码，使用稀疏注意力
+        # NOTE: 如果提供了掩码，使用稀疏注意力
         if mask is not None:
             mask_flat = mask.view(B, 1, N)
-            # 找出有效位置
+            # NOTE: 找出有效位置
             valid_indices = mask_flat.squeeze(1).nonzero(as_tuple=True)
-            # 这里简化处理，实际应用中可以更精细
+            # NOTE: 这里简化处理，实际应用中可以更精细
         
-        # Top-K 稀疏注意力
-        # 计算注意力分数
+        # NOTE: 前K（Top-K）稀疏注意力计算
+        # NOTE: 计算注意力分数
         attn_scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # (B, heads, N, N)
         
-        # 只保留 Top-K 个最高分数
+        # NOTE: 只保留 Top-K 个最高分数
         topk_val, topk_idx = attn_scores.topk(min(self.topk, N), dim=-1)  # (B, heads, N, topk)
         
-        # 创建稀疏注意力权重
+        # NOTE: 创建稀疏注意力权重
         sparse_attn = torch.zeros_like(attn_scores)
         sparse_attn.scatter_(-1, topk_idx, F.softmax(topk_val, dim=-1))
         
-        # 应用注意力
+        # NOTE: 应用注意力
         out = torch.matmul(sparse_attn, v)  # (B, heads, N, head_dim)
         out = out.transpose(-1, -2).reshape(B, C, D, H, W)
         
         return x + self.proj_out(out)
 
 
-# ==============================================================================
-# 5. 高度自注意力 (Height Self-Attention) - 针对雷达Z轴优化
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 5. 高度自注意力 (Height Self-Attention) - 针对雷达Z轴优化
+# NOTE: ==============================================================================
 
 class HeightSelfAttention3D(nn.Module):
     """
@@ -500,7 +500,7 @@ class HeightSelfAttention3D(nn.Module):
         self.qkv = nn.Linear(channels, channels * 3)
         self.proj_out = nn.Linear(channels, channels)
         
-        # 可学习的高度位置编码
+        # NOTE: 可学习的高度位置编码
         self.height_pos = nn.Parameter(torch.randn(1, 1, 1, 64, channels) * 0.02)  # 最大Z=64
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -512,36 +512,36 @@ class HeightSelfAttention3D(nn.Module):
         """
         B, C, D, H, W = x.shape
         
-        # 转换格式并加入位置编码
+        # NOTE: 转换格式并加入位置编码
         h = self.norm(x).permute(0, 3, 4, 2, 1)  # (B, H, W, D, C)
         
-        # 添加高度位置编码
+        # NOTE: 添加高度位置编码
         if D <= self.height_pos.shape[3]:
             h = h + self.height_pos[:, :, :, :D, :]
         
-        # 在 D 维度上做注意力
+        # NOTE: 在 D 维度上做注意力
         h_flat = h.reshape(B * H * W, D, C)  # (B*H*W, D, C)
         
         qkv = self.qkv(h_flat).reshape(B * H * W, D, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B*H*W, heads, D, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # 注意力计算（D维度通常很小，可以直接计算）
+        # NOTE: 注意力计算（D维度通常很小，可以直接计算）
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
         
         out = (attn @ v).transpose(1, 2).reshape(B * H * W, D, C)
         out = self.proj_out(out)
         
-        # 重塑回原始形状
+        # NOTE: 重塑回原始形状
         out = out.reshape(B, H, W, D, C).permute(0, 4, 3, 1, 2)  # (B, C, D, H, W)
         
         return x + out
 
 
-# ==============================================================================
-# 6. 统一的注意力工厂
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 6. 统一的注意力工厂
+# NOTE: ==============================================================================
 
 def create_attention_block(
     channels: int,
@@ -603,7 +603,7 @@ def create_attention_block(
     elif attention_type == "none" or attention_type == "false":
         return nn.Identity()
     else:
-        # 默认使用 Flash Attention
+        # NOTE: 默认使用 Flash Attention
         print(f"Warning: Unknown attention type '{attention_type}', using FlashAttention3D")
         return FlashAttention3D(
             channels=channels,
@@ -612,9 +612,9 @@ def create_attention_block(
         )
 
 
-# ==============================================================================
-# 7. 分组的混合注意力 (Hybrid Attention)
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 7. 分组的混合注意力 (Hybrid Attention)
+# NOTE: ==============================================================================
 
 class HybridAttention3D(nn.Module):
     """
@@ -655,14 +655,14 @@ class HybridAttention3D(nn.Module):
         self.local_channels = local_channels
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 分割通道
+        # NOTE: 分割通道
         x_local = x[:, :self.local_channels]
         x_global = x[:, self.local_channels:]
         
-        # 分别处理
+        # NOTE: 分别处理
         x_local = self.local_attn(x_local)
         x_global = self.global_attn(x_global)
         
-        # 合并
+        # NOTE: 合并
         out = torch.cat([x_local, x_global], dim=1)
         return self.proj(out)

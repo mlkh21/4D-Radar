@@ -33,8 +33,8 @@ def load_voxel(path: str) -> np.ndarray:
     else:
         arr = np.load(path).astype(np.float32)
 
-    # Some inference outputs are batched: (N, C, Z, X, Y).
-    # For streaming smoke tests we use the first sample.
+    # NOTE: 部分推理输出带批次维度：(N, C, Z, X, Y)。
+    # NOTE: 流式冒烟测试仅取批次中的第一个样本。
     if arr.ndim == 5:
         arr = arr[0]
 

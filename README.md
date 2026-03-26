@@ -133,7 +133,7 @@ ldm:
 python diffusion_consistency_radar/scripts/unified_train.py \
   --mode ldm \
   --config diffusion_consistency_radar/config/default_config.yaml \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt
+  --vae_ckpt Result/train_results/vae/vae_best.pt
 ```
 
 #### 优势
@@ -157,9 +157,9 @@ Teacher(LDM) provides denoising targets -> Student(CD) learns consistent mapping
 #### 蒸馏流程
 ```bash
 python diffusion_consistency_radar/scripts/cd_train_optimized.py \
-  --ldm_ckpt diffusion_consistency_radar/train_results/ldm/ldm_best.pt \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt \
-  --dataset_dir ./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre
+  --ldm_ckpt Result/train_results/ldm/ldm_best.pt \
+  --vae_ckpt Result/train_results/vae/vae_best.pt \
+  --dataset_dir ./Data/NTU4DRadLM_Pre
 ```
 
 #### 采样对比
@@ -213,8 +213,8 @@ bash diffusion_consistency_radar/launch/run_inference_example.sh
 
 ```bash
 python diffusion_consistency_radar/scripts/inference.py \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt \
-  --model_ckpt diffusion_consistency_radar/train_results/ldm/ldm_best.pt \
+  --vae_ckpt Result/train_results/vae/vae_best.pt \
+  --model_ckpt Result/train_results/ldm/ldm_best.pt \
   --model_type ldm \
   --steps 40 \
   --sampler heun \
@@ -227,8 +227,8 @@ python diffusion_consistency_radar/scripts/inference.py \
 
 ```bash
 python diffusion_consistency_radar/scripts/streaming_map_update.py \
-  --radar_voxel_dir diffusion_consistency_radar/inference_results/cd_4step \
-  --output_dir diffusion_consistency_radar/inference_results/streaming_map \
+  --radar_voxel_dir Result/inference_results/cd_4step \
+  --output_dir Result/inference_results/streaming_map \
   --dt 0.05
 ```
 
@@ -242,7 +242,7 @@ bash diffusion_consistency_radar/launch/inference_edm.sh
 
 ```bash
 python diffusion_consistency_radar/scripts/visualize_results.py \
-  --input diffusion_consistency_radar/inference_results/ldm/ldm_samples_40steps.npy \
+  --input Result/inference_results/ldm/ldm_samples_40steps.npy \
   --output_dir diffusion_consistency_radar/visualizations/ldm \
   --num_samples 5
 ```
@@ -282,12 +282,12 @@ python diffusion_consistency_radar/scripts/unified_train.py \
 python diffusion_consistency_radar/scripts/unified_train.py \
   --mode ldm \
   --config diffusion_consistency_radar/config/default_config.yaml \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt
+  --vae_ckpt Result/train_results/vae/vae_best.pt
 
 python diffusion_consistency_radar/scripts/cd_train_optimized.py \
-  --ldm_ckpt diffusion_consistency_radar/train_results/ldm/ldm_best.pt \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt \
-  --dataset_dir ./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre
+  --ldm_ckpt Result/train_results/ldm/ldm_best.pt \
+  --vae_ckpt Result/train_results/vae/vae_best.pt \
+  --dataset_dir ./Data/NTU4DRadLM_Pre
 ```
 
 ### 断点续训
@@ -296,13 +296,13 @@ python diffusion_consistency_radar/scripts/cd_train_optimized.py \
 python diffusion_consistency_radar/scripts/unified_train.py \
   --mode vae \
   --config diffusion_consistency_radar/config/default_config.yaml \
-  --resume diffusion_consistency_radar/train_results/vae/vae_best.pt
+  --resume Result/train_results/vae/vae_best.pt
 
 python diffusion_consistency_radar/scripts/unified_train.py \
   --mode ldm \
   --config diffusion_consistency_radar/config/default_config.yaml \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt \
-  --resume diffusion_consistency_radar/train_results/ldm/ldm_best.pt
+  --vae_ckpt Result/train_results/vae/vae_best.pt \
+  --resume Result/train_results/ldm/ldm_best.pt
 ```
 
 ### 推理
@@ -315,7 +315,7 @@ python diffusion_consistency_radar/scripts/unified_train.py \
 
 ```yaml
 data:
-  dataset_dir: "./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre"
+  dataset_dir: "./Data/NTU4DRadLM_Pre"
   batch_size: 2
   num_workers: 4
 
@@ -323,19 +323,19 @@ vae:
   config_type: "ultra_lightweight"
   epochs: 100
   lr: 1.0e-4
-  save_dir: "./diffusion_consistency_radar/train_results/vae"
+  save_dir: "./Result/train_results/vae"
 
 ldm:
   model_channels: 32
   channel_mult: [1, 2, 3]
   epochs: 200
   lr: 1.0e-4
-  save_dir: "./diffusion_consistency_radar/train_results/ldm"
+  save_dir: "./Result/train_results/ldm"
 
 cd:
   epochs: 200
   lr: 5.0e-5
-  save_dir: "./diffusion_consistency_radar/train_results/cd"
+  save_dir: "./Result/train_results/cd"
 
 optimization:
   use_amp: false
@@ -350,7 +350,7 @@ optimization:
 训练结果通常保存在：
 
 ```
-diffusion_consistency_radar/train_results/
+Result/train_results/
 ├── vae/
 │   ├── training.log
 │   ├── metrics.csv

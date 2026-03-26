@@ -124,7 +124,7 @@ class LossAwareSampler(ScheduleSampler):
             th.tensor([len(local_ts)], dtype=th.int32, device=local_ts.device),
         )
 
-        # Pad all_gather batches to be the maximum batch size.
+        # NOTE: 将 all_gather 的批大小补齐到全局最大值，便于跨卡拼接。
         batch_sizes = [x.item() for x in batch_sizes]
         max_bs = max(batch_sizes)
 
@@ -207,7 +207,7 @@ class LossSecondMomentResampler(LossAwareSampler):
         """
         for t, loss in zip(ts, losses):
             if self._loss_counts[t] == self.history_per_term:
-                # Shift out the oldest loss term.
+                # NOTE: 滑动窗口中弹出最旧损失项。
                 self._loss_history[t, :-1] = self._loss_history[t, 1:]
                 self._loss_history[t, -1] = loss
             else:
@@ -262,7 +262,7 @@ class LogNormalSampler:
         3. 计算 sigma 和权重。
         """
         if self.even:
-            # buckets = [1/G]
+            # NOTE: 历史实验：将分桶初始化为 [1/G]。
             start_i, end_i = self.rank * bs, (self.rank + 1) * bs
             global_batch_size = self.size * bs
             locs = (th.arange(start_i, end_i) + th.rand(bs)) / global_batch_size

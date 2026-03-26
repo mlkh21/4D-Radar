@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 import logging
 
-# 导入数据增强模块
+# NOTE: 可选数据增强模块；当依赖缺失时退化为不增强模式。
 try:
     from .augmentation import ComposedAugmentation, VoxelAugmentation, MixupAugmentation
 except ImportError:
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_sparse_voxel(filename):
+    # NOTE: 稀疏存储格式恢复为稠密体素网格，便于后续统一插值与张量变换。
     data = np.load(filename)
     voxel_grid = np.zeros(data['shape'], dtype=np.float32)
     coords = data['coords']
@@ -53,10 +54,15 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         self.samples = []
         self.split = split
         
-        # 初始化数据增强
+        # NOTE: 仅训练集启用增强，验证/测试保持数据分布稳定。
         self.augmentation = None
-        if use_augmentation and split == 'train' and ComposedAugmentation is not None:
-            default_config = {
+        if (
+            use_augmentation
+            and split == 'train'
+            and ComposedAugmentation is not None
+            and VoxelAugmentation is not None
+        ):
+            default_config: dict = {
                 'flip_prob': 0.5,
                 'rotate_prob': 0.3,
                 'noise_prob': 0.2,
@@ -74,22 +80,22 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             ])
             logger.info(f"数据增强已启用: {default_config}")
         
-        # 遍历所有场景目录
+        # NOTE: 扫描场景目录并构建样本索引。
         if not os.path.exists(root_dir):
             print(f"Warning: Root dir {root_dir} does not exist.")
             return
 
         scenes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
         
-        # 简单的划分逻辑示例 (80% train, 20% val)
-        # 实际使用时建议手动指定场景列表
+        # TODO: 当前按 8:2 自动切分场景，后续建议改为可配置的显式场景列表。
         if len(scenes) == 1:
-            # 如果只有一个场景，直接用于训练（或测试）
+            # NOTE: 单场景数据集无法切分，直接复用同一场景。
             target_scenes = scenes
             print(f"Warning: Only 1 scene found. Using it for {split}.")
         else:
             split_idx = int(len(scenes) * 0.8)
-            if split_idx == 0: split_idx = 1 # 确保至少有一个场景用于训练
+            if split_idx == 0:
+                split_idx = 1  # NOTE: 保证训练集至少包含 1 个场景。
             
             if split == 'train':
                 target_scenes = scenes[:split_idx]
@@ -112,7 +118,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                 target_path = os.path.join(target_voxel_dir, f)
                 
                 if not os.path.exists(target_path):
-                     # Try alternative extension if not found (e.g. mixed cleanup)
+                     # HACK: 兼容历史数据清洗后 .npy/.npz 扩展名不一致的情况。
                      if f.endswith('.npy'):
                          target_path = os.path.join(target_voxel_dir, f.replace('.npy', '.npz'))
                      elif f.endswith('.npz'):
@@ -154,15 +160,15 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 
         radar_path, target_path = self.samples[idx]
 
-        # 加载数据
+        # NOTE: 加载输入体素与目标体素，支持 .npy/.npz 两种格式。
         try:
-            # radar_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Var]
+            # NOTE: 雷达体素 radar_voxel 形状为 (H, W, Z, 4)，通道为 [Occ, Int, Dop, Var]。
             if radar_path.endswith('.npz'):
                 radar_voxel = load_sparse_voxel(radar_path)
             else:
                 radar_voxel = np.load(radar_path).astype(np.float32)
             
-            # target_voxel 形状: (H, W, Z, 4) -> [Occ, Int, Dop, Mask]
+            # NOTE: 目标体素 target_voxel 形状为 (H, W, Z, 4)，通道为 [Occ, Int, Dop, Mask]。
             if target_path.endswith('.npz'):
                 target_voxel = load_sparse_voxel(target_path)
             else:
@@ -174,30 +180,26 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             logger.error(f"加载数据失败 (idx={idx}): {e}")
             raise RuntimeError(f"无法加载样本 {idx}") from e
 
-        # 数据验证
+        # NOTE: 形状不一致时仅告警，仍继续走统一插值流程。
         if radar_voxel.shape != target_voxel.shape:
             logger.warning(
                 f"形状不匹配: radar={radar_voxel.shape}, target={target_voxel.shape}"
             )
         
-        # 转换为 PyTorch 格式: (C, Z, H, W) 以适配 3D U-Net
-        # 输入: (H, W, Z, 4)
+        # NOTE: 转为 (C, Z, H, W) 以匹配 3D UNet/VAE 的通道优先输入。
         radar_tensor = torch.from_numpy(radar_voxel).permute(3, 2, 0, 1)
         
-        # 目标: (C, Z, H, W)
         target_tensor = torch.from_numpy(target_voxel).permute(3, 2, 0, 1)
         
-        # Resize to fixed size to handle inconsistent H/W dimensions
-        # Target size: (C, 32, 128, 128) - suitable for VAE/UNet
+        # NOTE: 统一重采样到固定空间尺寸，避免不同场景分辨率导致 batch 拼接失败。
         target_size = (32, 128, 128)  # (Z, H, W)
         
-        # Resize each tensor
         radar_tensor = F.interpolate(
-            radar_tensor.unsqueeze(0),  # Add batch dim: (1, C, Z, H, W)
+            radar_tensor.unsqueeze(0),  # NOTE: 临时增加 batch 维度进行 3D 插值。
             size=target_size,
             mode='trilinear',
             align_corners=False
-        ).squeeze(0)  # Remove batch dim: (C, Z, H, W)
+        ).squeeze(0)  # NOTE: 还原为 (C, Z, H, W)。
         
         target_tensor = F.interpolate(
             target_tensor.unsqueeze(0),
@@ -207,28 +209,32 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         ).squeeze(0)
 
         if self.transform:
-            # 如果有变换，则应用变换
+            # TODO: 预留 transform 钩子；当前分支尚未接入具体变换实现。
             pass
         
-        # 应用数据增强（仅训练集）
+        # NOTE: 训练阶段做成对增强，保持 target 与 condition 的空间一致性。
         if self.augmentation is not None:
-            # target_tensor 和 radar_tensor 分开传入，增强内部会处理一致性
             target_tensor, radar_tensor = self.augmentation(target_tensor, radar_tensor)
             
-        # 先返回目标（作为 batch），然后返回雷达（作为条件）
+        # NOTE: 返回顺序固定为 (target, radar[, path])，训练代码依赖该约定。
         if self.return_path:
             return target_tensor, radar_tensor, target_path
         else:
             return target_tensor, radar_tensor
 
 if __name__ == "__main__":
-    # Test the dataset
-    dataset_path = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre"
+    # NOTE: 最小化自检入口，用于验证数据路径与输出形状。
+    dataset_path = "./Data/NTU4DRadLM_Pre"
     ds = NTU4DRadLM_VoxelDataset(dataset_path, split='train', return_path=True)
     if len(ds) > 0:
-        t, r, p = ds[0] # !注意: 返回顺序依次是 target(GT), radar(Cond), path
+        sample = ds[0]
+        if len(sample) == 3:
+            t, r, p = sample
+        else:
+            t, r = sample
+            p = ""
         print(f"成功! 加载样本 0。")
-        print(f"目标 (GT) 形状: {t.shape}") # Expect: (C, Z, H, W) e.g., (4, 16, 256, 256)
+        print(f"目标 (GT) 形状: {t.shape}")
         print(f"雷达 (Cond) 形状: {r.shape}")
         print(f"路径: {p}")
     else:

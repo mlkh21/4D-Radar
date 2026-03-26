@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 
 """
 Codebase for "Improved Denoising Diffusion Probabilistic Models".
@@ -17,7 +17,7 @@ Codebase for "Improved Denoising Diffusion Probabilistic Models".
 - vae_3d: 3D VAE 用于潜空间扩散
 """
 
-# 核心模块
+# NOTE: 核心模块
 from .nn import (
     SiLU,
     GroupNorm32,
@@ -42,7 +42,7 @@ from .nn import (
     set_norm_groups,
 )
 
-# 优化的注意力机制
+# NOTE: 优化的注意力机制
 from .attention_optimized import (
     Window3DAttention,
     FlashAttention3D,
@@ -53,7 +53,7 @@ from .attention_optimized import (
     create_attention_block,
 )
 
-# 优化的采样模块
+# NOTE: 优化的采样模块
 from .sampling_optimized import (
     AsymmetricDownsample3D,
     AsymmetricUpsample3D,
@@ -64,7 +64,7 @@ from .sampling_optimized import (
     create_upsample_block,
 )
 
-# 模型
+# NOTE: 模型
 from .unet import UNetModel
 from .unet_optimized import (
     OptimizedUNetModel,
@@ -74,7 +74,7 @@ from .unet_optimized import (
     create_balanced_unet_config,
 )
 
-# 3D VAE
+# NOTE: 3D VAE
 from .vae_3d import (
     VAE3D,
     VQVAE3D,
@@ -86,10 +86,10 @@ from .vae_3d import (
     create_standard_vae_config,
 )
 
-# 扩散过程
+# NOTE: 扩散过程
 from .karras_diffusion import KarrasDenoiser
 
-# 工具函数
+# NOTE: 工具函数
 from .script_util_cond import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
@@ -100,7 +100,7 @@ from .script_util_cond import (
     str2bool,
 )
 
-# 显存优化模块
+# NOTE: 显存优化模块
 from .memory_efficient import (
     MemoryManager,
     SparsityAwareProcessor,
@@ -110,7 +110,7 @@ from .memory_efficient import (
     MemoryEfficientTrainingWrapper,
 )
 
-# 数据增强模块
+# NOTE: 数据增强模块
 from .augmentation import (
     VoxelAugmentation,
     MixupAugmentation,
@@ -118,7 +118,7 @@ from .augmentation import (
     ComposedAugmentation,
 )
 
-# 概率地图与查询模块
+# NOTE: 概率地图与查询模块
 from .probabilistic_mapping import (
     GridMapConfig,
     DSEvidenceFusion,
@@ -127,7 +127,7 @@ from .probabilistic_mapping import (
     load_sparse_voxel_npz,
 )
 
-# 3D损失函数
+# NOTE: 3D损失函数
 from .losses_3d import (
     Perceptual3DLoss,
     StructurePreservingLoss,
@@ -136,46 +136,46 @@ from .losses_3d import (
 )
 
 __all__ = [
-    # NN 工具
+    # NOTE: 神经网络（NN）工具
     "SiLU", "GroupNorm32", "LayerNorm3D", "InstanceNorm3D", "RMSNorm3D",
     "AdaptiveNorm3D", "ConditionalNorm3D",
     "conv_nd", "linear", "avg_pool_nd", "normalization", "timestep_embedding",
     "checkpoint", "zero_module", "scale_module", "mean_flat", "append_dims",
     "append_zero", "update_ema", "set_norm_type", "set_norm_groups",
     
-    # 注意力
+    # NOTE: 注意力
     "Window3DAttention", "FlashAttention3D", "LinearAttention3D",
     "SparseAttention3D", "HeightSelfAttention3D", "HybridAttention3D",
     "create_attention_block",
     
-    # 采样
+    # NOTE: 采样
     "AsymmetricDownsample3D", "AsymmetricUpsample3D", "AdaptiveDownsampleScheduler",
     "DepthWiseDownsample3D", "MultiScaleDownsample3D",
     "create_downsample_block", "create_upsample_block",
     
-    # 模型
+    # NOTE: 模型
     "UNetModel", "OptimizedUNetModel", "OptimizedResBlock",
     "create_lightweight_unet_config", "create_ultra_lightweight_unet_config",
     "create_balanced_unet_config",
     
-    # VAE
+    # NOTE: 变分自编码器（VAE）
     "VAE3D", "VQVAE3D", "VAE3DEncoder", "VAE3DDecoder", "VectorQuantizer",
     "create_ultra_lightweight_vae_config", "create_lightweight_vae_config", "create_standard_vae_config",
     
-    # 扩散
+    # NOTE: 扩散
     "KarrasDenoiser",
     
-    # 工具
+    # NOTE: 工具
     "model_and_diffusion_defaults", "create_model_and_diffusion", "create_model",
     "cm_train_defaults", "add_dict_to_argparser", "args_to_dict", "str2bool",
     
-    # 显存优化
+    # NOTE: 显存优化
     "MemoryManager", "SparsityAwareProcessor", "DynamicResolutionProcessor",
     "ChunkedProcessor", "ProgressiveTrainer", "MemoryEfficientTrainingWrapper",
     
-    # 数据增强
+    # NOTE: 数据增强
     "VoxelAugmentation", "MixupAugmentation", "CutoutAugmentation", "ComposedAugmentation",
     
-    # 3D损失
+    # NOTE: 3D损失
     "Perceptual3DLoss", "StructurePreservingLoss", "OccupancyAwareLoss", "CompositeLoss3D",
 ]

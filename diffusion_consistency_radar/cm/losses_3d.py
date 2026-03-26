@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 """
 3D 感知损失模块
 
@@ -46,7 +46,7 @@ class LightweightFeatureExtractor3D(nn.Module):
             ))
             ch = out_ch
         
-        # 冻结参数 (作为感知损失时不需要训练)
+        # NOTE: 冻结参数 (作为感知损失时不需要训练)
         for param in self.parameters():
             param.requires_grad = False
     
@@ -102,7 +102,7 @@ class Perceptual3DLoss(nn.Module):
         self.weights = weights or [1.0, 1.0, 1.0, 1.0]
         self.use_occupancy_weight = use_occupancy_weight
         
-        # 归一化权重
+        # NOTE: 归一化权重
         total_weight = sum(self.weights)
         self.weights = [w / total_weight for w in self.weights]
     
@@ -123,30 +123,30 @@ class Perceptual3DLoss(nn.Module):
         Returns:
             loss: 感知损失值
         """
-        # 提取特征
+        # NOTE: 提取特征
         pred_features = self.feature_extractor(pred)
         target_features = self.feature_extractor(target)
         
-        # 计算各层损失
+        # NOTE: 计算各层损失
         total_loss = 0.0
         
         for i, (pf, tf) in enumerate(zip(pred_features, target_features)):
             if i not in self.feature_layers:
                 continue
             
-            # L1 距离
+            # NOTE: 一范数（L1）距离
             diff = torch.abs(pf - tf)
             
-            # 可选的占用加权
+            # NOTE: 可选的占用加权
             if self.use_occupancy_weight and occupancy_mask is not None:
-                # 下采样掩码到当前分辨率
+                # NOTE: 下采样掩码到当前分辨率
                 mask = F.interpolate(
                     occupancy_mask.float(),
                     size=diff.shape[2:],
                     mode='trilinear',
                     align_corners=False,
                 )
-                # 加权
+                # NOTE: 加权
                 diff = diff * (mask + 0.1)  # 非占用区域也有小权重
             
             layer_loss = diff.mean()
@@ -166,7 +166,7 @@ class StructurePreservingLoss(nn.Module):
         super().__init__()
         self.edge_weight = edge_weight
         
-        # 3D Sobel 核
+        # NOTE: 3D Sobel 核
         self.register_buffer('sobel_x', self._create_sobel_kernel('x'))
         self.register_buffer('sobel_y', self._create_sobel_kernel('y'))
         self.register_buffer('sobel_z', self._create_sobel_kernel('z'))
@@ -196,7 +196,7 @@ class StructurePreservingLoss(nn.Module):
     
     def compute_edges(self, x: torch.Tensor) -> torch.Tensor:
         """计算边缘强度"""
-        # 只对占用通道计算边缘
+        # NOTE: 只对占用通道计算边缘
         occ = x[:, 0:1]
         
         edge_x = F.conv3d(occ, self.sobel_x, padding=1)
@@ -245,15 +245,15 @@ class OccupancyAwareLoss(nn.Module):
         Returns:
             weight_mask: (B, 1, D, H, W)
         """
-        # 占用掩码
+        # NOTE: 占用掩码
         occupied = (target[:, 0:1] > 0).float()
         
-        # 边界检测 (膨胀 - 原始)
+        # NOTE: 边界检测 (膨胀 - 原始)
         kernel = torch.ones(1, 1, 3, 3, 3, device=target.device)
         dilated = F.conv3d(occupied, kernel, padding=1)
         boundary = ((dilated > 0) & (dilated < 27)).float()
         
-        # 构建权重掩码
+        # NOTE: 构建权重掩码
         weight = torch.ones_like(occupied) * self.empty_weight
         weight = weight + occupied * (self.occupied_weight - self.empty_weight)
         weight = weight + boundary * self.boundary_weight
@@ -276,11 +276,11 @@ class OccupancyAwareLoss(nn.Module):
         weight_mask = self.compute_weight_mask(target)
         
         if base_loss is None:
-            # 计算加权 MSE
+            # NOTE: 计算加权 MSE
             diff = (pred - target) ** 2
             weighted_loss = (diff * weight_mask).mean()
         else:
-            # 对提供的损失加权
+            # NOTE: 对提供的损失加权
             weighted_loss = (base_loss * weight_mask).mean()
         
         return weighted_loss
@@ -311,7 +311,7 @@ class CompositeLoss3D(nn.Module):
         self.perceptual_weight = perceptual_weight
         self.structure_weight = structure_weight
         
-        # 子损失模块
+        # NOTE: 子损失模块
         self.perceptual_loss = Perceptual3DLoss(in_channels=in_channels)
         self.structure_loss = StructurePreservingLoss()
         self.occupancy_loss = OccupancyAwareLoss() if use_occupancy_weighting else None
@@ -330,10 +330,10 @@ class CompositeLoss3D(nn.Module):
         """
         loss_dict = {}
         
-        # 1. 基础 MSE 损失
+        # NOTE: 1. 基础 MSE 损失
         mse_loss = F.mse_loss(pred, target, reduction='none')
         
-        # 应用占用加权
+        # NOTE: 应用占用加权
         if self.occupancy_loss is not None:
             mse_loss = self.occupancy_loss(pred, target, mse_loss)
         else:
@@ -341,7 +341,7 @@ class CompositeLoss3D(nn.Module):
         
         loss_dict['mse'] = mse_loss
         
-        # 2. 3D 感知损失
+        # NOTE: 2. 3D 感知损失
         if self.perceptual_weight > 0:
             occupancy_mask = (target[:, 0:1] > 0).float()
             perceptual = self.perceptual_loss(pred, target, occupancy_mask)
@@ -349,14 +349,14 @@ class CompositeLoss3D(nn.Module):
         else:
             perceptual = 0.0
         
-        # 3. 结构保持损失
+        # NOTE: 3. 结构保持损失
         if self.structure_weight > 0:
             structure = self.structure_loss(pred, target)
             loss_dict['structure'] = structure
         else:
             structure = 0.0
         
-        # 组合
+        # NOTE: 组合
         total_loss = (
             self.mse_weight * mse_loss +
             self.perceptual_weight * perceptual +
@@ -373,9 +373,9 @@ def replace_lpips_with_3d_loss():
     返回用于替换 LPIPS 的 3D 感知损失
     
     使用示例:
-        # 在 karras_diffusion.py 中
-        # 替换: self.lpips_loss = LPIPS(...)
-        # 为: self.lpips_loss = Perceptual3DLoss(...)
+        # NOTE: 在 karras_diffusion.py 中
+        # NOTE: 替换: self.lpips_loss = LPIPS(...)
+        # NOTE: 为: self.lpips_loss = Perceptual3DLoss(...)
     """
     return Perceptual3DLoss(
         in_channels=4,

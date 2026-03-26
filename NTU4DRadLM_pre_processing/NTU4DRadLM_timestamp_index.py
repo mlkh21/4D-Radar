@@ -1,4 +1,4 @@
-# 用于生成雷达和激光雷达时间戳的索引文件，以便对齐两种传感器的数据。
+# NOTE: 生成雷达与激光雷达时间戳索引文件，用于跨传感器帧对齐。
 
 import os
 import bisect
@@ -7,7 +7,7 @@ import bisect
 
 def find_nearest_index(timestamps, target):
     """在有序时间戳中查找与目标最接近的索引。"""
-    # timestamps 必须是有序的
+    # NOTE: 二分插入函数 bisect 依赖输入有序；调用方需保证 timestamps 已排序。
     idx = bisect.bisect_left(timestamps, target)
     if idx == 0:
         return 0
@@ -20,7 +20,7 @@ def find_nearest_index(timestamps, target):
     else:
         return idx - 1
 
-# 生成新的索引文件
+# NOTE: 逐场景生成新的索引文件。
 def generate_new_files(directory):
     print("start!")
     # 遍历目录下的每个场景文件夹
@@ -38,8 +38,7 @@ def generate_new_files(directory):
             print(f"Skipping {scene_dir}: data directories not found")
             continue
 
-        # 根据文件名提取时间戳
-        # 文件名格式示例: 1645868413.022228.npy
+        # NOTE: 根据文件名提取时间戳，文件名格式示例: 1645868413.022228.npy。
         radar_files = sorted([f for f in os.listdir(radar_path) if f.endswith('.npy')])
         lidar_files = sorted([f for f in os.listdir(lidar_path) if f.endswith('.npy')])
         
@@ -61,7 +60,7 @@ def generate_new_files(directory):
             larger_timestamps = timestamps_lidar
             smaller_len = a
             
-            # 以Radar为参考（按顺序）
+            # NOTE: 以 Radar 帧序为主轴，给每帧匹配最近的 LiDAR 帧。
             with open(new_file_radar, 'w') as f_rad, open(new_file_lidar, 'w') as f_lid:
                 for i in range(smaller_len):
                     f_rad.write(str(i) + '\n')
@@ -72,7 +71,7 @@ def generate_new_files(directory):
             smaller_timestamps = timestamps_lidar
             larger_timestamps = timestamps_radar
             smaller_len = b
-            # 以Lidar为参考（按顺序）
+            # NOTE: 以 LiDAR 帧序为主轴，给每帧匹配最近的 Radar 帧。
             with open(new_file_radar, 'w') as f_rad, open(new_file_lidar, 'w') as f_lid:
                 for i in range(smaller_len):
                     f_lid.write(str(i) + '\n')
@@ -82,4 +81,4 @@ def generate_new_files(directory):
         print(f"Generated index files for {scene_dir}")
 
 if __name__ == "__main__":
-    generate_new_files('./NTU4DRadLM_pre_processing/NTU4DRadLM_Raw')
+    generate_new_files('./Data/NTU4DRadLM_Raw')

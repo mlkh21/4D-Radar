@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 
 """
 优化版 3D UNet 模型
@@ -95,9 +95,9 @@ class OptimizedResBlock(TimestepBlock):
         self.use_scale_shift_norm = use_scale_shift_norm
         self.dims = dims
         
-        # 输入层
+        # NOTE: 输入层
         if use_depthwise and dims == 3:
-            # 深度可分离卷积：减少参数量
+            # NOTE: 深度可分离卷积：减少参数量
             self.in_layers = nn.Sequential(
                 normalization(channels, norm_type),
                 nn.SiLU(),
@@ -111,7 +111,7 @@ class OptimizedResBlock(TimestepBlock):
                 conv_nd(dims, channels, self.out_channels, 3, padding=1),
             )
         
-        # 上下采样
+        # NOTE: 上下采样
         self.updown = up or down
         if up:
             self.h_upd = create_upsample_block(
@@ -134,7 +134,7 @@ class OptimizedResBlock(TimestepBlock):
         else:
             self.h_upd = self.x_upd = nn.Identity()
         
-        # 时间步嵌入层
+        # NOTE: 时间步嵌入层
         self.emb_layers = nn.Sequential(
             nn.SiLU(),
             linear(
@@ -143,7 +143,7 @@ class OptimizedResBlock(TimestepBlock):
             ),
         )
         
-        # 输出层
+        # NOTE: 输出层
         self.out_layers = nn.Sequential(
             normalization(self.out_channels, norm_type),
             nn.SiLU(),
@@ -151,7 +151,7 @@ class OptimizedResBlock(TimestepBlock):
             zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)),
         )
         
-        # 跳跃连接
+        # NOTE: 跳跃连接
         if self.out_channels == channels:
             self.skip_connection = nn.Identity()
         elif use_conv:
@@ -246,7 +246,7 @@ class OptimizedUNetModel(nn.Module):
         use_scale_shift_norm: bool = True,
         resblock_updown: bool = False,
         use_new_attention_order: bool = False,
-        # === 新增优化参数 ===
+        # NOTE: === 新增优化参数 ===
         attention_type: str = "flash",  # 注意力类型
         norm_type: str = "group",  # 归一化类型
         downsample_type: str = "asymmetric",  # 下采样类型
@@ -260,7 +260,7 @@ class OptimizedUNetModel(nn.Module):
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
         
-        # 设置全局归一化类型
+        # NOTE: 设置全局归一化类型
         set_norm_type(norm_type)
         
         self.image_size = image_size
@@ -284,7 +284,7 @@ class OptimizedUNetModel(nn.Module):
         self.downsample_stride = downsample_stride
         self.window_size = window_size
         
-        # 自适应下采样调度
+        # NOTE: 自适应下采样调度
         self.downsample_scheduler = AdaptiveDownsampleScheduler(
             initial_size=(initial_z_size, image_size, image_size),
             num_levels=len(channel_mult) - 1,
@@ -300,7 +300,7 @@ class OptimizedUNetModel(nn.Module):
         print(f"  - downsample_stride: {downsample_stride}")
         self.downsample_scheduler.print_schedule()
         
-        # 时间步嵌入
+        # NOTE: 时间步嵌入
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
@@ -308,11 +308,11 @@ class OptimizedUNetModel(nn.Module):
             linear(time_embed_dim, time_embed_dim),
         )
         
-        # 类别嵌入
+        # NOTE: 类别嵌入
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
         
-        # 输入块
+        # NOTE: 输入块
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList([
             TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))
@@ -338,9 +338,9 @@ class OptimizedUNetModel(nn.Module):
                 ]
                 ch = int(mult * model_channels)
                 
-                # 添加注意力层（根据分辨率）
+                # NOTE: 添加注意力层（根据分辨率）
                 if ds in attention_resolutions:
-                    # 计算头数
+                    # NOTE: 计算头数
                     if num_head_channels == -1:
                         n_heads = num_heads
                     else:
@@ -360,7 +360,7 @@ class OptimizedUNetModel(nn.Module):
                 self._feature_size += ch
                 input_block_chans.append(ch)
             
-            # 下采样
+            # NOTE: 下采样
             if level != len(channel_mult) - 1:
                 out_ch = ch
                 stride = self.downsample_scheduler.get_stride(level)
@@ -399,7 +399,7 @@ class OptimizedUNetModel(nn.Module):
                 ds *= 2
                 self._feature_size += ch
         
-        # 中间块
+        # NOTE: 中间块
         self.middle_block = TimestepEmbedSequential(
             OptimizedResBlock(
                 ch,
@@ -410,7 +410,7 @@ class OptimizedUNetModel(nn.Module):
                 use_scale_shift_norm=use_scale_shift_norm,
                 norm_type=norm_type,
             ),
-            # 中间块的注意力（可选）
+            # NOTE: 中间块的注意力（可选）
             create_attention_block(
                 channels=ch,
                 num_heads=num_heads if num_head_channels == -1 else ch // num_head_channels,
@@ -430,7 +430,7 @@ class OptimizedUNetModel(nn.Module):
         )
         self._feature_size += ch
         
-        # 输出块
+        # NOTE: 输出块
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
@@ -449,7 +449,7 @@ class OptimizedUNetModel(nn.Module):
                 ]
                 ch = int(model_channels * mult)
                 
-                # 添加注意力层
+                # NOTE: 添加注意力层
                 if ds in attention_resolutions:
                     if num_head_channels == -1:
                         n_heads = num_heads_upsample
@@ -466,7 +466,7 @@ class OptimizedUNetModel(nn.Module):
                         )
                     )
                 
-                # 上采样
+                # NOTE: 上采样
                 if level and i == num_res_blocks:
                     out_ch = ch
                     scale = self.downsample_scheduler.get_scale_factor(level - 1)
@@ -499,7 +499,7 @@ class OptimizedUNetModel(nn.Module):
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
         
-        # 输出层
+        # NOTE: 输出层
         self.out = nn.Sequential(
             normalization(ch, norm_type),
             nn.SiLU(),
@@ -525,7 +525,7 @@ class OptimizedUNetModel(nn.Module):
             timesteps: (B,) 时间步
             y: (B, C_cond, D, H, W) 可选的条件输入
         """
-        # 条件拼接
+        # NOTE: 条件拼接
         if y is not None:
             x = th.cat([x, y], dim=1)
         
@@ -547,9 +547,9 @@ class OptimizedUNetModel(nn.Module):
         return self.out(h)
 
 
-# ==============================================================================
-# 轻量级 UNet 配置预设
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 轻量级 UNet 配置预设
+# NOTE: ==============================================================================
 
 def create_lightweight_unet_config():
     """

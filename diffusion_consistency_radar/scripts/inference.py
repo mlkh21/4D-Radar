@@ -30,14 +30,14 @@ except Exception:
 
 
 def safe_torch_load(path, map_location):
-    """Load checkpoint with a warning-safe strategy across PyTorch versions."""
+    """兼容不同 PyTorch 版本的 checkpoint 加载逻辑。"""
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
-        # Older PyTorch versions do not support the weights_only argument.
+        # HACK: 低版本 PyTorch 不支持 weights_only 参数，回退到兼容加载路径。
         return torch.load(path, map_location=map_location)
     except Exception as exc:
-        # Some checkpoints may contain objects not accepted by weights_only=True.
+        # NOTE: 部分历史权重含有 weights_only=True 不接受的对象，按错误信息回退。
         msg = str(exc)
         if "Weights only load failed" in msg or "Unsupported global" in msg:
             return torch.load(path, map_location=map_location)
@@ -58,17 +58,17 @@ class RadarGenerator:
         self.device = torch.device(device)
         self.model_type = model_type
         
-        # 加载 VAE
+        # NOTE: 变分自编码器（VAE）负责体素空间与潜空间之间的编码/解码。
         print(f"Loading VAE from {vae_path}...")
         self.vae = self._load_vae(vae_path)
         self.vae.eval()
         
-        # 加载生成模型
+        # NOTE: 生成模型在潜空间进行去噪采样。
         print(f"Loading {model_type.upper()} from {model_path}...")
         self.model = self._load_model(model_path)
         self.model.eval()
         
-        # 创建 Denoiser
+        # NOTE: 复用训练时一致的噪声调度参数。
         self.denoiser = KarrasDenoiser(
             sigma_data=0.5,
             sigma_max=80.0,
@@ -80,7 +80,7 @@ class RadarGenerator:
     
     def _load_vae(self, ckpt_path):
         """加载 VAE 模型"""
-        # 尝试推断 VAE 配置
+        # TODO: 目前默认使用 ultra lightweight 配置，后续可从 checkpoint 元信息自动恢复。
         vae_config = create_ultra_lightweight_vae_config()
         vae = VAE3D(**vae_config).to(self.device)
         
@@ -131,30 +131,28 @@ class RadarGenerator:
         if show_sampling_progress:
             print(f"\nGenerating {num_samples} samples with {steps} steps ({sampler} sampler)...")
         
-        # 编码条件到潜空间
+        # NOTE: 条件分支将雷达观测编码到潜空间，保证与采样噪声同尺度。
         if condition is not None:
             condition = condition.to(self.device)
             z_cond = self.vae.get_latent(condition)
-            # 关键修复: 噪声潜变量必须与条件潜变量同形状
+            # FIXME: 噪声潜变量与条件潜变量形状必须严格一致，否则拼接后会在 UNet 前向报错。
             z_shape = tuple(z_cond.shape)
             num_samples = z_shape[0]
         else:
-            # 无条件生成
+            # NOTE: 无条件采样时使用固定潜空间尺寸。
             z_shape = (num_samples, 4, 8, 32, 32)
             z_cond = torch.zeros(z_shape, device=self.device)
         
-        # 初始化随机噪声
+        # NOTE: 按 sigma_max 初始化起始噪声，匹配 Karras 采样假设。
         z_T = torch.randn(z_shape, device=self.device) * self.denoiser.sigma_max
         
-        # 采样
+        # NOTE: 一致性蒸馏（CD）模式支持一步采样，潜扩散模型（LDM）走多步求解器。
         if self.model_type == 'cd' and steps == 1:
-            # CD 一步生成
             z_0 = self._cd_sample(z_T, z_cond)
         else:
-            # LDM 多步采样
             z_0 = self._ldm_sample(z_T, z_cond, steps, sampler, show_sampling_progress)
         
-        # 解码到原始空间
+        # NOTE: 将潜变量解码回体素空间输出。
         generated = self.vae.decode(z_0)
         
         return generated
@@ -168,7 +166,7 @@ class RadarGenerator:
     
     def _ldm_sample(self, z_T, z_cond, steps, sampler, show_sampling_progress=False):
         """LDM 多步采样 (Heun/Euler)"""
-        # 生成时间步调度
+        # NOTE: 生成单调递减的 sigma 序列，驱动 ODE 采样。
         sigmas = self._get_sigmas(steps)
         z_t = z_T
         
@@ -180,28 +178,28 @@ class RadarGenerator:
             sigma_t = sigmas[i]
             sigma_next = sigmas[i + 1]
             
-            # 预测噪声
+            # NOTE: 拼接条件潜变量后预测去噪结果。
             model_input = torch.cat([z_t, z_cond], dim=1)
             sigma_batch = torch.ones(z_t.shape[0], device=self.device) * sigma_t
             denoised = self.model(model_input, sigma_batch)
             
-            # 计算导数
+            # NOTE: 常微分方程（ODE）形式导数 d = (x - denoised) / sigma。
             d = (z_t - denoised) / sigma_t
             
             if sampler == 'heun' and i < len(sigmas) - 2:
-                # Heun 二阶方法
+                # NOTE: 海恩（Heun）二阶法：先欧拉预测，再做一次校正。
                 z_next = z_t + d * (sigma_next - sigma_t)
                 
-                # 二次预测
+                # NOTE: 在预测点重新估计导数。
                 model_input_2 = torch.cat([z_next, z_cond], dim=1)
                 sigma_batch_2 = torch.ones(z_t.shape[0], device=self.device) * sigma_next
                 denoised_2 = self.model(model_input_2, sigma_batch_2)
                 d_2 = (z_next - denoised_2) / sigma_next
                 
-                # 校正
+                # NOTE: 两次导数求均值完成校正。
                 z_t = z_t + (d + d_2) / 2 * (sigma_next - sigma_t)
             else:
-                # Euler 一阶方法
+                # NOTE: 欧拉（Euler）一阶法速度快但精度较低。
                 z_t = z_t + d * (sigma_next - sigma_t)
         
         return z_t
@@ -220,6 +218,7 @@ class RadarGenerator:
 
 
 def load_sparse_voxel(filename):
+    # NOTE: 历史数据可能以稀疏格式保存，这里恢复为稠密体素以复用统一推理流程。
     data = np.load(filename)
     voxel_grid = np.zeros(data['shape'], dtype=np.float32)
     coords = data['coords']
@@ -247,7 +246,7 @@ def load_radar_voxel_as_tensor(path, device):
 
 
 def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.5, empty_fallback_topk=0):
-    # voxel: (C, Z, H, W)
+    # NOTE: 输入 voxel 形状为 (C, Z, H, W)。
     occ = voxel[0]
     intensity = voxel[1]
     occ_mask = occ > occ_threshold
@@ -256,6 +255,7 @@ def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.5, empty_fa
         if empty_fallback_topk <= 0:
             return np.zeros((0, 4), dtype=np.float32), used_topk_fallback
 
+        # HACK: 当阈值筛选后为空点云时，回退到 top-k 占据体素避免评估中断。
         used_topk_fallback = True
         flat_occ = occ.reshape(-1)
         k = int(min(max(empty_fallback_topk, 1), flat_occ.shape[0]))
@@ -278,6 +278,7 @@ def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.5, empty_fa
 
 
 def compute_chamfer(pcl_a, pcl_b):
+    # NOTE: 倒角距离（Chamfer）用于衡量生成点云与激光雷达（LiDAR）真值点云的几何一致性。
     if cKDTree is None:
         raise RuntimeError("scipy is required for chamfer distance.")
     if pcl_a.shape[0] == 0 or pcl_b.shape[0] == 0:
@@ -295,7 +296,7 @@ def main():
     parser.add_argument("--vae_ckpt", type=str, required=True, help="Path to VAE checkpoint")
     parser.add_argument("--model_ckpt", type=str, required=True, help="Path to LDM/CD checkpoint")
     parser.add_argument("--model_type", type=str, default="ldm", choices=["ldm", "cd"], help="Model type")
-    parser.add_argument("--dataset_dir", type=str, default="./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre", 
+    parser.add_argument("--dataset_dir", type=str, default="./Data/NTU4DRadLM_Pre", 
                         help="Dataset directory for condition data")
     parser.add_argument("--radar_voxel_dir", type=str, default="",
                         help="If set, load radar_voxel files from this directory and run per-sample inference")
@@ -308,7 +309,7 @@ def main():
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate")
     parser.add_argument("--steps", type=int, default=40, help="Sampling steps (LDM: 40, CD: 1-4)")
     parser.add_argument("--sampler", type=str, default="heun", choices=["heun", "euler"], help="Sampler type")
-    parser.add_argument("--output_dir", type=str, default="./inference_results", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="./Result/inference_results", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--use_condition", action="store_true", help="Use condition data from dataset")
     parser.add_argument("--save_pointcloud", action="store_true", help="Save point cloud .npy per sample")
@@ -324,7 +325,7 @@ def main():
     
     args = parser.parse_args()
     
-    # 创建生成器
+    # NOTE: 初始化模型与采样器。
     generator = RadarGenerator(
         vae_path=args.vae_ckpt,
         model_path=args.model_ckpt,
@@ -335,6 +336,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.radar_voxel_dir:
+        # NOTE: 逐文件推理模式：每个 radar_voxel 输入生成一个对应输出。
         radar_files = sorted([
             f for f in os.listdir(args.radar_voxel_dir)
             if f.endswith('.npy') or f.endswith('.npz')
@@ -349,6 +351,7 @@ def main():
         lidar_files = []
         lidar_indices = []
         if args.compare_with_lidar:
+            # NOTE: 当开启对比评估时，按索引映射原始 LiDAR 帧并导出 CSV 指标。
             if not args.raw_livox_dir:
                 raise ValueError("--raw_livox_dir is required when --compare_with_lidar is set")
             lidar_files = sorted([
@@ -474,16 +477,17 @@ def main():
         print(f"Saved runtime log to {log_path}")
 
     else:
-        # 准备条件数据
+        # NOTE: 简单模式下可从验证集抽取一个条件样本。
         if args.use_condition:
             print(f"Loading dataset from {args.dataset_dir}...")
             dataset = NTU4DRadLM_VoxelDataset(args.dataset_dir, split='val')
             dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-            condition_data = next(iter(dataloader))[1]  # 获取条件
+            # FIXME: 当验证集为空时这里会触发 StopIteration，后续可改为显式空集检查。
+            condition_data = next(iter(dataloader))[1]
         else:
             condition_data = None
 
-        # 生成数据
+        # NOTE: 运行生成并保存体素结果。
         generated = generator.generate(
             condition=condition_data,
             num_samples=args.num_samples,
@@ -491,7 +495,6 @@ def main():
             sampler=args.sampler,
         )
 
-        # 保存结果
         output_path = os.path.join(args.output_dir, f"{args.model_type}_samples_{args.steps}steps.npy")
         np.save(output_path, generated.cpu().numpy())
         print(f"\nSaved {args.num_samples} samples to {output_path}")

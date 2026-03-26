@@ -4,7 +4,13 @@
 
 ## 一、准备工作
 
-### 1. 确认模型已训练
+### 1. 激活环境
+
+```bash
+conda activate Radar
+```
+
+### 2. 确认模型已训练
 
 ```bash
 cd /home/ps/zxj_workspace/src/4D-Radar/diffusion_consistency_radar
@@ -26,13 +32,6 @@ bash launch/train_unified.sh vae
 bash launch/train_unified.sh ldm
 bash launch/train_unified.sh cd
 ```
-
-### 2. 激活环境
-
-```bash
-conda activate Radar
-```
-
 ## 二、推理方法
 
 ### 方法 1：使用启动脚本（推荐）
@@ -48,7 +47,7 @@ bash diffusion_consistency_radar/launch/inference_ldm.sh
 ```
 
 输出目录示例：
-- `diffusion_consistency_radar/inference_results/<scene>_ldm_eval/`
+- `Result/inference_results/<scene>_ldm_eval/`
 
 主要输出文件：
 - `*_pcl.npy`：逐文件点云输出
@@ -61,7 +60,7 @@ bash diffusion_consistency_radar/launch/inference_cd.sh
 ```
 
 输出目录示例：
-- `diffusion_consistency_radar/inference_results/<scene>_cd_eval/`
+- `Result/inference_results/<scene>_cd_eval/`
 
 #### 完整推理示例
 
@@ -82,14 +81,14 @@ bash diffusion_consistency_radar/launch/run_inference_example.sh
 cd /home/ps/zxj_workspace/src/4D-Radar
 
 python diffusion_consistency_radar/scripts/inference.py \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt \
-  --model_ckpt diffusion_consistency_radar/train_results/ldm/ldm_best.pt \
+  --vae_ckpt Result/train_results/vae/vae_best.pt \
+  --model_ckpt Result/train_results/ldm/ldm_best.pt \
   --model_type ldm \
   --steps 40 \
   --sampler heun \
   --radar_voxel_dir /path/to/radar_voxel \
   --save_pointcloud \
-  --output_dir diffusion_consistency_radar/inference_results/custom_ldm_eval \
+  --output_dir Result/inference_results/custom_ldm_eval \
   --device cuda
 ```
 
@@ -102,17 +101,17 @@ python diffusion_consistency_radar/scripts/inference.py \
 
 ```bash
 python diffusion_consistency_radar/scripts/inference.py \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt \
-  --model_ckpt diffusion_consistency_radar/train_results/cd/cd_best.pt \
+  --vae_ckpt Result/train_results/vae/vae_best.pt \
+  --model_ckpt Result/train_results/cd/cd_best.pt \
   --model_type cd \
   --steps 1 \
   --sampler euler \
   --num_samples 10 \
-  --output_dir diffusion_consistency_radar/inference_results/cd
+  --output_dir Result/inference_results/cd
 ```
 
 该模式输出：
-- `diffusion_consistency_radar/inference_results/cd/cd_samples_1steps.npy`
+- `Result/inference_results/cd/cd_samples_1steps.npy`
 
 #### 参数说明
 
@@ -159,7 +158,7 @@ print(samples.shape)
 
 ```bash
 python diffusion_consistency_radar/scripts/visualize_results.py \
-  --input diffusion_consistency_radar/inference_results/cd/cd_samples_1steps.npy \
+  --input Result/inference_results/cd/cd_samples_1steps.npy \
   --output_dir diffusion_consistency_radar/visualizations/cd \
   --num_samples 5
 ```
@@ -168,8 +167,8 @@ python diffusion_consistency_radar/scripts/visualize_results.py \
 
 ```bash
 python diffusion_consistency_radar/scripts/visualize_results.py \
-  --input diffusion_consistency_radar/inference_results/ldm/ldm_samples_40steps.npy \
-  --compare diffusion_consistency_radar/inference_results/cd/cd_samples_1steps.npy \
+  --input Result/inference_results/ldm/ldm_samples_40steps.npy \
+  --compare Result/inference_results/cd/cd_samples_1steps.npy \
   --output_dir diffusion_consistency_radar/visualizations/comparison
 ```
 
@@ -184,8 +183,8 @@ python diffusion_consistency_radar/scripts/visualize_results.py \
 cd /home/ps/zxj_workspace/src/4D-Radar
 
 python diffusion_consistency_radar/scripts/streaming_map_update.py \
-  --radar_voxel_dir diffusion_consistency_radar/inference_results/cd_4step \
-  --output_dir diffusion_consistency_radar/inference_results/streaming_map \
+  --radar_voxel_dir Result/inference_results/cd_4step \
+  --output_dir Result/inference_results/streaming_map \
   --dt 0.05 \
   --window_size 12 \
   --save_every 20
@@ -195,10 +194,10 @@ python diffusion_consistency_radar/scripts/streaming_map_update.py \
 
 ```bash
 python diffusion_consistency_radar/scripts/streaming_map_update.py \
-  --radar_voxel_dir diffusion_consistency_radar/inference_results/cd_4step \
+  --radar_voxel_dir Result/inference_results/cd_4step \
   --infrared_bev_dir /path/to/infrared_bev \
   --prior_dem /path/to/prior_dem.npy \
-  --output_dir diffusion_consistency_radar/inference_results/streaming_map_fused
+  --output_dir Result/inference_results/streaming_map_fused
 ```
 
 输出文件：
@@ -223,9 +222,9 @@ python diffusion_consistency_radar/scripts/inference.py ... --device cpu
 请核对实际文件名：
 
 ```bash
-ls -lh diffusion_consistency_radar/train_results/vae/vae_best.pt
-ls -lh diffusion_consistency_radar/train_results/ldm/ldm_best.pt
-ls -lh diffusion_consistency_radar/train_results/cd/cd_best.pt
+ls -lh Result/train_results/vae/vae_best.pt
+ls -lh Result/train_results/ldm/ldm_best.pt
+ls -lh Result/train_results/cd/cd_best.pt
 ```
 
 ### 3. 推理速度慢
@@ -257,24 +256,24 @@ ls -lh diffusion_consistency_radar/train_results/cd/cd_best.pt
 
 ```bash
 python diffusion_consistency_radar/scripts/inference.py \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt \
-  --model_ckpt diffusion_consistency_radar/train_results/ldm/ldm_best.pt \
+  --vae_ckpt Result/train_results/vae/vae_best.pt \
+  --model_ckpt Result/train_results/ldm/ldm_best.pt \
   --model_type ldm \
   --steps 40 \
   --sampler heun \
   --num_samples 100 \
-  --output_dir diffusion_consistency_radar/inference_results/ldm_batch
+  --output_dir Result/inference_results/ldm_batch
 ```
 
 ```bash
 python diffusion_consistency_radar/scripts/inference.py \
-  --vae_ckpt diffusion_consistency_radar/train_results/vae/vae_best.pt \
-  --model_ckpt diffusion_consistency_radar/train_results/cd/cd_best.pt \
+  --vae_ckpt Result/train_results/vae/vae_best.pt \
+  --model_ckpt Result/train_results/cd/cd_best.pt \
   --model_type cd \
   --steps 1 \
   --sampler euler \
   --num_samples 100 \
-  --output_dir diffusion_consistency_radar/inference_results/cd_batch
+  --output_dir Result/inference_results/cd_batch
 ```
 
 ## 八、输出数据格式
@@ -286,7 +285,7 @@ python diffusion_consistency_radar/scripts/inference.py \
 ```python
 import numpy as np
 
-data = np.load('diffusion_consistency_radar/inference_results/cd/cd_samples_1steps.npy')
+data = np.load('Result/inference_results/cd/cd_samples_1steps.npy')
 print(data.shape)  # (num_samples, 4, 32, 128, 128)
 ```
 

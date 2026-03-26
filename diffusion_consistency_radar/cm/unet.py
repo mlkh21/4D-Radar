@@ -235,7 +235,6 @@ class ResBlock(TimestepBlock):
         """
         super().__init__()
         self.channels = channels
-        # print("channels", channels)
         self.emb_channels = emb_channels
         self.dropout = dropout
         self.out_channels = out_channels or channels
@@ -380,8 +379,6 @@ class AttentionBlock(nn.Module):
         """
         super().__init__()
         self.channels = channels
-        # print("num_heads", num_heads)
-        # print("num_head_channels", num_head_channels)
 
         if num_head_channels == -1:
             self.num_heads = num_heads
@@ -397,7 +394,7 @@ class AttentionBlock(nn.Module):
         if attention_type == "flash":
             self.attention = QKVFlashAttention(channels, self.num_heads)
         else:
-            # split heads before split qkv
+            # NOTE: 先拆分注意力头，再拆分 QKV
             self.attention = QKVAttentionLegacy(self.num_heads)
 
         self.use_attention_checkpoint = not (
@@ -488,16 +485,12 @@ class QKVFlashAttention(nn.Module):
         from einops import rearrange
         from flash_attn.flash_attention import FlashAttention
 
-        # print("asdf")
         assert batch_first
-        # factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.causal = causal
 
-        # print("self.embed_dim", self.embed_dim)
-        # print("num_heads", num_heads)
         assert (
             self.embed_dim % num_heads == 0
         ), "self.kdim must be divisible by num_heads"
@@ -530,8 +523,6 @@ class QKVFlashAttention(nn.Module):
         qkv = self.rearrange(
             qkv, "b (three h d) s -> b s three h d", three=3, h=self.num_heads
         )
-        #zrb
-        # qkv.to(th.float16)
         qkv, _ = self.inner_attn(
             qkv.contiguous().to(th.float16),
             key_padding_mask=key_padding_mask,
@@ -539,9 +530,6 @@ class QKVFlashAttention(nn.Module):
             causal=self.causal,
         )
         qkv = qkv.to(th.float32)
-        # print("qkv", qkv.dtype)
-        #zrb warning float16_32
-        # qkv.to(th.float16)
         return self.rearrange(qkv, "b s h d -> b (h d) s")
 
 
@@ -558,9 +546,9 @@ def count_flops_attn(model, _x, y):
     """
     b, c, *spatial = y[0].shape
     num_spatial = int(np.prod(spatial))
-    # We perform two matmuls with the same number of ops.
-    # The first computes the weight matrix, the second computes
-    # the combination of the value vectors.
+    # NOTE: 注意力 FLOPs 由两次同规模矩阵乘法构成：
+    # NOTE: 第一次计算权重矩阵，第二次完成 value 的加权聚合。
+    
     matmul_ops = 2 * b * (num_spatial**2) * c
     model.total_ops += th.DoubleTensor([matmul_ops])
 
@@ -636,26 +624,26 @@ class RadarHeightSelfAttention(nn.Module):
         self.z_dim = z_dim
         self.out_channels = out_channels
         
-        # 1. PointPillars Transformation (Simplified: Conv2d to process BEV input)
-        # 注意：这里假设输入已经是 BEV 特征（例如通过 PointPillars 预处理得到，或者输入是 BEV 图像）
-        # 如果输入是原始点云，需要先经过 Voxel Feature Encoder (VFE) 和 Scatter 操作
+        # NOTE: 1. PointPillars 变换（简化为 Conv2d 处理 BEV 输入）
+        # NOTE: 注意：这里假设输入已经是 BEV 特征（例如通过 PointPillars 预处理得到，或者输入是 BEV 图像）
+        # NOTE: 如果输入是原始点云，需要先经过 Voxel Feature Encoder (VFE) 和 Scatter 操作
         self.bev_encoder = nn.Sequential(
             conv_nd(2, in_channels, out_channels, 3, padding=1),
             normalization(out_channels),
             nn.SiLU() # 使用 SiLU 替代 ReLU 以保持一致性
         )
         
-        # 2. Height Positional Encoding (核心创新)
-        # 学习高度分布：引入可学习的高度位置编码 Ph
-        # Shape: (1, C, Z, 1, 1) 用于广播
+        # NOTE: 2. 高度位置编码（核心创新）
+        # NOTE: 学习高度分布：引入可学习的高度位置编码 Ph
+        # NOTE: 形状 (1, C, Z, 1, 1)，用于广播
         self.height_pos_enc = nn.Parameter(th.randn(1, out_channels, z_dim, 1, 1) * 0.02)
         
-        # 3. Self Attention (along Z axis)
-        # 通过计算自注意力权重，自适应地调整垂直方向上的注意力分配
+        # NOTE: 3. 沿 Z 轴执行自注意力
+        # NOTE: 通过计算自注意力权重，自适应地调整垂直方向上的注意力分配
         self.attention = nn.MultiheadAttention(embed_dim=out_channels, num_heads=num_heads, batch_first=True)
         
-        # 4. Radar Encoder (3D Conv with Softplus)
-        # 带有 Softplus 激活函数的多层 3D 卷积编码器
+        # NOTE: 4. 雷达编码器（3D Conv + Softplus）
+        # NOTE: 带有 Softplus 激活函数的多层 3D 卷积编码器
         self.radar_3d_encoder = nn.Sequential(
             conv_nd(3, out_channels, out_channels, 3, padding=1),
             nn.Softplus(),
@@ -670,34 +658,34 @@ class RadarHeightSelfAttention(nn.Module):
         Returns:
             out: 3D Radar Features (B, C_out, Z, H, W)
         """
-        # 1. PointPillars / BEV Encoding
+        # NOTE: 1. PointPillars / BEV 编码
         f_bev = self.bev_encoder(x) # (B, C_out, H, W)
         
-        # 2. Height Dimension Expansion
-        # 将 BEV 特征沿高度轴（Z 轴）重复 Z 次
-        # (B, C, H, W) -> (B, C, Z, H, W)
+        # NOTE: 2. 高度维扩展
+        # NOTE: 将 BEV 特征沿高度轴（Z 轴）重复 Z 次
+        # NOTE: (B, C, H, W) -> (B, C, Z, H, W)
         f_ini = f_bev.unsqueeze(2).repeat(1, 1, self.z_dim, 1, 1)
         
-        # 3. Add Height Positional Encoding
+        # NOTE: 3. 叠加高度位置编码
         f_ini = f_ini + self.height_pos_enc
         
-        # 4. Self Attention along Z
+        # NOTE: 4. 沿 Z 轴执行自注意力
         b, c, z, h, w = f_ini.shape
-        # Reshape to (Batch_Size * H * W, Z, C) for Attention
-        # Permute: (B, C, Z, H, W) -> (B, H, W, Z, C) -> (B*H*W, Z, C)
+        # NOTE: 重排为 (Batch_Size * H * W, Z, C) 以执行注意力
+        # NOTE: 维度变换：(B, C, Z, H, W) -> (B, H, W, Z, C) -> (B*H*W, Z, C)
         f_flat = f_ini.permute(0, 3, 4, 2, 1).reshape(-1, z, c)
         
-        # Self-attention
-        # attn_output: (B*H*W, Z, C)
+        # NOTE: 自注意力
+        # NOTE: 注意力输出形状：(B*H*W, Z, C)
         f_att, _ = self.attention(f_flat, f_flat, f_flat)
         
-        # Reshape back to (B, C, Z, H, W)
+        # NOTE: 再重排回 (B, C, Z, H, W)
         f_att = f_att.reshape(b, h, w, z, c).permute(0, 4, 3, 1, 2)
         
-        # Residual Connection: 结合初始特征与注意力特征
+        # NOTE: 残差连接：融合初始特征与注意力特征
         f_combined = f_ini + f_att
         
-        # 5. 3D Encoder & Activation
+        # NOTE: 5. 3D 编码与激活
         f_out = self.radar_3d_encoder(f_combined)
         
         return f_out
@@ -862,13 +850,6 @@ class UNetModel(nn.Module):
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
-            # AttentionBlock(
-            #     ch,
-            #     use_checkpoint=use_checkpoint,
-            #     num_heads=num_heads,
-            #     num_head_channels=num_head_channels,
-            #     use_new_attention_order=use_new_attention_order,
-            # ),
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -977,25 +958,15 @@ class UNetModel(nn.Module):
         5. 通过输出块，拼接中间特征。
         6. 通过输出层。
         """
-        # print("asdfasfd")
-        # assert (y is not None) == (
-        #     self.num_classes is not None
-        # ), "must specify y if and only if the model is class-conditional"
-
-        # print("y", y.shape)
-        # print("x", x.shape)
 
 
 
-        # zrb for radar-lidar concate
+
         if y is not None:
             x = th.cat([x, y], dim=1)
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 
-        # if self.num_classes is not None:
-        #     assert y.shape == (x.shape[0],)
-        #     emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)
         for module in self.input_blocks:

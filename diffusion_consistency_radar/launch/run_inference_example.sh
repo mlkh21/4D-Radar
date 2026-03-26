@@ -9,8 +9,8 @@ ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 DEFAULT_CONFIG="${PROJECT_DIR}/config/default_config.yaml"
-PREPROCESSED_ROOT="${ROOT_DIR}/NTU4DRadLM_pre_processing/NTU4DRadLM_Pre"
-RAW_ROOT="${ROOT_DIR}/NTU4DRadLM_pre_processing/NTU4DRadLM_Raw"
+PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
+RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
 
 INFER_DEFAULTS=$(python - "${DEFAULT_CONFIG}" <<'PY'
 import sys
@@ -51,9 +51,9 @@ echo "max files per scene: ${MAX_INFER_FILES} (0 means all)"
 echo "empty fallback top-k: ${EMPTY_FALLBACK_TOPK} (0 means disabled)"
 
 # 检查模型是否存在
-VAE_CKPT="${PROJECT_DIR}/train_results/vae/vae_best.pt"
-LDM_CKPT="${PROJECT_DIR}/train_results/ldm/ldm_best.pt"
-CD_CKPT="${PROJECT_DIR}/train_results/cd/cd_best.pt"
+VAE_CKPT="${ROOT_DIR}/Result/train_results/vae/vae_best.pt"
+LDM_CKPT="${ROOT_DIR}/Result/train_results/ldm/ldm_best.pt"
+CD_CKPT="${ROOT_DIR}/Result/train_results/cd/cd_best.pt"
 
 if [ ! -f "${DATA_LOADING_CONFIG}" ]; then
     echo "错误: 配置文件不存在: ${DATA_LOADING_CONFIG}"
@@ -116,7 +116,7 @@ if [ "$RUN_LDM" = true ]; then
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
         RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
         LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-        LDM_OUTPUT_DIR="${PROJECT_DIR}/inference_results/${SCENE}_ldm_eval"
+        LDM_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_ldm_eval"
 
         echo "  - 场景: ${SCENE}"
         python "${INFER_SCRIPT}" \
@@ -143,14 +143,14 @@ fi
 if [ "$RUN_CD" = true ]; then
     echo ""
     echo "=========================================="
-    echo "2. CD 推理 (1步快速生成)"
+    echo "2. CD 推理 (2步快速生成)"
     echo "=========================================="
     
     for SCENE in "${TEST_SCENES[@]}"; do
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
         RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
         LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-        CD_OUTPUT_DIR="${PROJECT_DIR}/inference_results/${SCENE}_cd_eval"
+        CD_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_2step_eval"
 
         echo "  - 场景: ${SCENE}"
         python "${INFER_SCRIPT}" \
@@ -170,7 +170,7 @@ if [ "$RUN_CD" = true ]; then
             --device cuda
     done
     
-    echo "✓ CD 推理完成"
+    echo "✓ CD 2步推理完成"
     
     # CD 4步推理（提升质量）
     echo ""
@@ -182,7 +182,7 @@ if [ "$RUN_CD" = true ]; then
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
         RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
         LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-        CD4_OUTPUT_DIR="${PROJECT_DIR}/inference_results/${SCENE}_cd_4step_eval"
+        CD4_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_4step_eval"
 
         echo "  - 场景: ${SCENE}"
         python "${INFER_SCRIPT}" \
@@ -211,6 +211,6 @@ echo "推理完成！"
 echo "=========================================="
 echo "test 场景列表: ${TEST_SCENES[*]}"
 echo "输入根目录: ${PREPROCESSED_ROOT}"
-echo "输出根目录: ${PROJECT_DIR}/inference_results"
+echo "输出根目录: ${ROOT_DIR}/Result/inference_results"
 echo "每个输出目录包含: *_pcl.npy + comparison_metrics.csv"
 echo ""

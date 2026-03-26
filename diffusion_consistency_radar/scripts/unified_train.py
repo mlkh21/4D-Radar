@@ -42,14 +42,14 @@ from cm.karras_diffusion import KarrasDenoiser
 
 
 def safe_torch_load(path, map_location):
-    """Load checkpoint with a warning-safe strategy across PyTorch versions."""
+    """兼容不同 PyTorch 版本的 checkpoint 加载逻辑。"""
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
-        # Older PyTorch versions do not support the weights_only argument.
+        # HACK: 低版本 PyTorch 不支持 weights_only，回退到兼容模式。
         return torch.load(path, map_location=map_location)
     except Exception as exc:
-        # Some checkpoints may contain objects not accepted by weights_only=True.
+        # NOTE: 某些历史权重包含自定义对象，weights_only=True 会拒绝加载。
         msg = str(exc)
         if "Weights only load failed" in msg or "Unsupported global" in msg:
             return torch.load(path, map_location=map_location)
@@ -137,7 +137,7 @@ class OptimizedVAETrainer:
         self.vae_config = config.get('vae', {}) or {}
         self.lr = self.vae_config.get('lr', 1e-4)
         self.epochs = self.vae_config.get('epochs', 100)
-        self.save_dir = self.vae_config.get('save_dir', './results/vae')
+        self.save_dir = self.vae_config.get('save_dir', './Result/train_results/vae')
         
         os.makedirs(self.save_dir, exist_ok=True)
         
@@ -151,8 +151,7 @@ class OptimizedVAETrainer:
         self.start_epoch = 1
         self.best_loss = float('inf')
         
-        # 设置日志
-        # 初始化训练状态
+        # NOTE: 日志与训练状态在恢复训练时必须共用同一目录。
         self.start_epoch = 1
         self.best_loss = float('inf')
         self.is_resumed = False
@@ -249,7 +248,7 @@ class OptimizedVAETrainer:
                 print(f"Warning: Batch {batch_idx} contains NaN")
                 continue
             
-            # 前向传播（混合精度）
+            # NOTE: 前向阶段使用 autocast，配合梯度累积降低显存峰值。
             with autocast('cuda', enabled=self.memory_opt.use_amp):
                 recon, (mean, logvar) = self.model(target)
                 loss, recon_loss, kl_loss = self.model.compute_loss(
@@ -263,7 +262,7 @@ class OptimizedVAETrainer:
             else:
                 loss.backward()
             
-            # 梯度累积更新
+            # NOTE: 仅在累计到指定步数后才执行一次 optimizer.step()。
             if (batch_idx + 1) % self.memory_opt.grad_accum_steps == 0:
                 if self.memory_opt.scaler:
                     self.memory_opt.scaler.unscale_(self.optimizer)
@@ -401,7 +400,7 @@ class OptimizedLDMTrainer:
         
         ldm_config: Dict[str, Any] = config.get('ldm', {}) or {}
         self.ldm_config = ldm_config
-        self.save_dir = ldm_config.get('save_dir', './results/ldm')
+        self.save_dir = ldm_config.get('save_dir', './Result/train_results/ldm')
         os.makedirs(self.save_dir, exist_ok=True)
         
         # 创建潜空间模型
@@ -524,7 +523,7 @@ class OptimizedLDMTrainer:
                 z_target = self.vae.get_latent(target)
                 z_cond = self.vae.get_latent(cond)
             
-            # 采样噪声水平
+            # NOTE: 按 Karras 噪声范围采样 sigma，覆盖高噪和低噪训练区间。
             batch_size = z_target.shape[0]
             sigmas = (
                 self.denoiser.sigma_max ** torch.rand(batch_size, device=self.device)
@@ -536,7 +535,7 @@ class OptimizedLDMTrainer:
             noise = torch.randn_like(z_target)
             noised_z = z_target + noise * sigmas.view(-1, 1, 1, 1, 1)
             
-            # 拼接条件
+            # NOTE: 条件与噪声样本在通道维拼接，输入到潜空间 UNet。
             model_input = torch.cat([noised_z, z_cond], dim=1)
             
             # 前向传播

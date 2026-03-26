@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 """
 3D VAE 模块 - 用于 Latent Diffusion
 
@@ -23,9 +23,9 @@ from einops import rearrange
 from .nn import normalization, conv_nd
 
 
-# ==============================================================================
-# 基础组件
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 基础组件
+# NOTE: ==============================================================================
 
 class ResBlock3D(nn.Module):
     """3D 残差块 - 支持梯度检查点"""
@@ -122,7 +122,7 @@ class SelfAttention3D(nn.Module):
         k = k.transpose(-1, -2)
         v = v.transpose(-1, -2)
         
-        # 使用 PyTorch 2.0 的高效注意力
+        # NOTE: 使用 PyTorch 2.0 的高效注意力
         with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
             attn_out = F.scaled_dot_product_attention(q, k, v)
         
@@ -130,9 +130,9 @@ class SelfAttention3D(nn.Module):
         return x + self.proj(attn_out)
 
 
-# ==============================================================================
-# VAE 编码器
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 变分自编码器（VAE）编码器
+# NOTE: ==============================================================================
 
 class VAE3DEncoder(nn.Module):
     """
@@ -170,14 +170,14 @@ class VAE3DEncoder(nn.Module):
         self.double_z = double_z
         self.use_checkpoint = use_checkpoint
         
-        # 默认下采样步长：Z 轴保守下采样
+        # NOTE: 默认下采样步长：Z 轴保守下采样
         if downsample_strides is None:
             downsample_strides = [(1, 2, 2), (2, 2, 2), (1, 2, 2)]
         
-        # 输入卷积
+        # NOTE: 输入卷积
         self.conv_in = nn.Conv3d(in_channels, base_channels, 3, padding=1)
         
-        # 下采样块
+        # NOTE: 下采样块
         self.down_blocks = nn.ModuleList()
         ch = base_channels
         
@@ -189,25 +189,25 @@ class VAE3DEncoder(nn.Module):
                 block.append(ResBlock3D(ch, out_ch, dropout, use_checkpoint=use_checkpoint))
                 ch = out_ch
             
-            # 在最后一层添加注意力
+            # NOTE: 在最后一层添加注意力
             if use_attention and i == len(channel_mult) - 1:
                 block.append(SelfAttention3D(ch))
             
-            # 下采样（除了最后一层）
+            # NOTE: 下采样（除了最后一层）
             if i < len(channel_mult) - 1:
                 stride = downsample_strides[i] if i < len(downsample_strides) else (1, 2, 2)
                 block.append(Downsample3D(ch, stride))
             
             self.down_blocks.append(block)
         
-        # 中间块
+        # NOTE: 中间块
         self.mid_block = nn.Sequential(
             ResBlock3D(ch, ch, dropout, use_checkpoint=use_checkpoint),
             SelfAttention3D(ch) if use_attention else nn.Identity(),
             ResBlock3D(ch, ch, dropout, use_checkpoint=use_checkpoint),
         )
         
-        # 输出卷积
+        # NOTE: 输出卷积
         self.norm_out = normalization(ch)
         self.conv_out = nn.Conv3d(
             ch, 
@@ -240,9 +240,9 @@ class VAE3DEncoder(nn.Module):
         return h
 
 
-# ==============================================================================
-# VAE 解码器
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 变分自编码器（VAE）解码器
+# NOTE: ==============================================================================
 
 class VAE3DDecoder(nn.Module):
     """
@@ -277,24 +277,24 @@ class VAE3DDecoder(nn.Module):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         
-        # 默认上采样因子
+        # NOTE: 默认上采样因子
         if upsample_scales is None:
             upsample_scales = [(1, 2, 2), (2, 2, 2), (1, 2, 2)]
         
-        # 初始通道数
+        # NOTE: 初始通道数
         ch = base_channels * channel_mult[0]
         
-        # 输入卷积
+        # NOTE: 输入卷积
         self.conv_in = nn.Conv3d(latent_dim, ch, 3, padding=1)
         
-        # 中间块
+        # NOTE: 中间块
         self.mid_block = nn.Sequential(
             ResBlock3D(ch, ch, dropout, use_checkpoint=use_checkpoint),
             SelfAttention3D(ch) if use_attention else nn.Identity(),
             ResBlock3D(ch, ch, dropout, use_checkpoint=use_checkpoint),
         )
         
-        # 上采样块
+        # NOTE: 上采样块
         self.up_blocks = nn.ModuleList()
         
         for i, mult in enumerate(channel_mult):
@@ -305,18 +305,18 @@ class VAE3DDecoder(nn.Module):
                 block.append(ResBlock3D(ch, out_ch, dropout, use_checkpoint=use_checkpoint))
                 ch = out_ch
             
-            # 在第一层添加注意力
+            # NOTE: 在第一层添加注意力
             if use_attention and i == 0:
                 block.append(SelfAttention3D(ch))
             
-            # 上采样（除了最后一层）
+            # NOTE: 上采样（除了最后一层）
             if i < len(channel_mult) - 1:
                 scale = upsample_scales[i] if i < len(upsample_scales) else (1, 2, 2)
                 block.append(Upsample3D(ch, scale))
             
             self.up_blocks.append(block)
         
-        # 输出卷积
+        # NOTE: 输出卷积
         self.norm_out = normalization(ch)
         self.conv_out = nn.Conv3d(ch, out_channels, 3, padding=1)
     
@@ -341,9 +341,9 @@ class VAE3DDecoder(nn.Module):
         return h
 
 
-# ==============================================================================
-# 完整 VAE 模型
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 完整 VAE 模型
+# NOTE: ==============================================================================
 
 class VAE3D(nn.Module):
     """
@@ -410,7 +410,7 @@ class VAE3D(nn.Module):
             use_checkpoint=use_checkpoint,
         )
         
-        # 量化层（用于 VQ-VAE）
+        # NOTE: 量化层（用于 VQ-VAE）
         self.quant_conv = nn.Conv3d(latent_dim, latent_dim, 1)
         self.post_quant_conv = nn.Conv3d(latent_dim, latent_dim, 1)
     
@@ -427,13 +427,13 @@ class VAE3D(nn.Module):
         """
         mean, logvar = self.encoder(x)
         
-        # [Fix] 数值稳定性保护：截断 logvar 防止爆炸
+        # NOTE: [Fix] 数值稳定性保护：截断 logvar 防止爆炸
         logvar = torch.clamp(logvar, -30.0, 20.0)
         
         if deterministic:
             z = mean
         else:
-            # 重参数化采样
+            # NOTE: 重参数化采样
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             z = mean + eps * std
@@ -489,13 +489,13 @@ class VAE3D(nn.Module):
         """
         mean, logvar = posterior
         
-        # 重建损失 (L1 或 L2)
+        # NOTE: 重建损失 (L1 或 L2)
         recon_loss = F.mse_loss(x_recon, x, reduction=reduction)
         
-        # KL 散度损失
+        # NOTE: 相对熵（KL）散度损失
         kl_loss = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
         
-        # 总损失
+        # NOTE: 总损失
         total_loss = recon_loss + self.kl_weight * kl_loss
         
         return total_loss, recon_loss, kl_loss
@@ -521,9 +521,9 @@ class VAE3D(nn.Module):
         )
 
 
-# ==============================================================================
-# VQ-VAE（向量量化变分自编码器）
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 向量量化变分自编码器（VQ-VAE）
+# NOTE: ==============================================================================
 
 class VectorQuantizer(nn.Module):
     """
@@ -547,11 +547,11 @@ class VectorQuantizer(nn.Module):
         self.decay = decay
         self.epsilon = epsilon
         
-        # 码本
+        # NOTE: 码本
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         self.embedding.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
         
-        # EMA 更新用
+        # NOTE: 指数滑动平均（EMA）更新用
         self.register_buffer('cluster_size', torch.zeros(num_embeddings))
         self.register_buffer('embed_avg', self.embedding.weight.data.clone())
     
@@ -564,31 +564,31 @@ class VectorQuantizer(nn.Module):
             loss: 量化损失
             indices: (B, D, H, W) 码本索引
         """
-        # 重塑为 (B*D*H*W, C)
+        # NOTE: 重塑为 (B*D*H*W, C)
         B, C, D, H, W = z.shape
         z_flat = rearrange(z, 'b c d h w -> (b d h w) c')
         
-        # 计算距离
+        # NOTE: 计算距离
         distances = (
             z_flat.pow(2).sum(1, keepdim=True)
             - 2 * z_flat @ self.embedding.weight.t()
             + self.embedding.weight.pow(2).sum(1, keepdim=True).t()
         )
         
-        # 找到最近的码本向量
+        # NOTE: 找到最近的码本向量
         indices = distances.argmin(dim=1)
         z_q_flat = self.embedding(indices)
         
-        # 重塑回原始形状
+        # NOTE: 重塑回原始形状
         z_q = rearrange(z_q_flat, '(b d h w) c -> b c d h w', b=B, d=D, h=H, w=W)
         indices = rearrange(indices, '(b d h w) -> b d h w', b=B, d=D, h=H, w=W)
         
-        # 计算损失
+        # NOTE: 计算损失
         commitment_loss = F.mse_loss(z_q.detach(), z)
         codebook_loss = F.mse_loss(z_q, z.detach())
         loss = codebook_loss + self.commitment_cost * commitment_loss
         
-        # Straight-through estimator
+        # NOTE: 直通估计器
         z_q = z + (z_q - z).detach()
         
         return z_q, loss, indices
@@ -659,9 +659,9 @@ class VQVAE3D(nn.Module):
         return z_q
 
 
-# ==============================================================================
-# 预设配置
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 预设配置
+# NOTE: ==============================================================================
 
 def create_ultra_lightweight_vae_config():
     """超轻量级 VAE 配置 - 极限显存优化 (适用于 <16GB GPU)"""

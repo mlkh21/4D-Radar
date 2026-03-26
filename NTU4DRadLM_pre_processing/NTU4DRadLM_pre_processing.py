@@ -10,20 +10,20 @@ from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial import cKDTree
 import pypatchworkpp
 
-# 路径
-RAW_DATA_PATH = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Raw" # 原始数据存放路径
-INDEX_PATH = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Raw" # 时间戳索引文件存放路径
-OUTPUT_PATH = "./NTU4DRadLM_pre_processing/NTU4DRadLM_Pre" # 预处理后数据存放路径
+# NOTE: 路径配置（统一使用仓库根目录下的 Data）。
+RAW_DATA_PATH = "./Data/NTU4DRadLM_Raw" # 原始数据存放路径
+INDEX_PATH = "./Data/NTU4DRadLM_Raw" # 时间戳索引文件存放路径
+OUTPUT_PATH = "./Data/NTU4DRadLM_Pre" # 预处理后数据存放路径
 CALIB_PATH = "./NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt" # 标定文件路径
 
-# 参数
+# NOTE: 体素化与投影参数。
 VOXEL_SIZE = [0.2, 0.2, 0.2] # 体素像素 [x, y, z] 单位：米
 PC_RANGE = [0, -20, -6, 120, 20, 10] # [x_min, y_min, z_min, x_max, y_max, z_max] 单位：米
 MAX_RANGE = 250.0 # 最大探测距离，单位：米
 RANGE_BINS = 256 # 距离方向网格数
 AZIMUTH_BINS = 128 # -90 到 90 度
 
-# 选项
+# NOTE: 处理选项。
 SAVE_SPARSE = True # 是否使用稀疏格式存储体素 (.npz)
 GENERATE_VISUALIZATION = False # 是否生成可视化文件 (Mesh, Heatmap, BEV, PLY)
 
@@ -47,7 +47,8 @@ def load_calib(calib_file):
     作用: 从标定文件中加载旋转和平移参数并返回。
     逻辑: 读取文件，解析以'R:'和'T:'开头的行，将数值转换为numpy数组。若文件不存在返回单位矩阵和零向量。
     """
-    print(f"Loading calibration from: {calib_file}") # 添加这一行
+    # NOTE: 打印标定文件路径便于排查路径错误。
+    print(f"Loading calibration from: {calib_file}")
     R = np.eye(3)
     T = np.zeros(3)
     
@@ -91,8 +92,7 @@ def transform_pcl(pcl, R, T):
         return pcl
         
     xyz = pcl[:, :3]
-    # R is 3x3, xyz is Nx3. Formula is R * p_r.
-    # So we need (R @ xyz.T).T + T  =>  xyz @ R.T + T
+    # NOTE: 旋转矩阵 R 为 3x3、坐标矩阵 xyz 为 Nx3，这里用 xyz @ R.T + T 等价于 (R @ xyz.T).T + T。
     xyz_trans = np.dot(xyz, R.T) + T
     
     pcl_trans = pcl.copy()
@@ -160,8 +160,8 @@ def voxelize_pcl(pcl, voxel_size, pc_range):
     flat_indices = flat_indices[sort_order]
     
     # 提取特征
-    features = pcl[sort_order, 3] if pcl.shape[1] > 3 else np.ones(pcl.shape[0]) # Use 4th column as feature (Intensity)
-    doppler = pcl[sort_order, 4] if pcl.shape[1] > 4 else np.zeros(pcl.shape[0]) # Use 5th column as Doppler
+    features = pcl[sort_order, 3] if pcl.shape[1] > 3 else np.ones(pcl.shape[0]) # NOTE: 第 4 列默认作为强度特征。
+    doppler = pcl[sort_order, 4] if pcl.shape[1] > 4 else np.zeros(pcl.shape[0]) # NOTE: 第 5 列默认作为多普勒特征。
     
     unique_indices, unique_counts = np.unique(flat_indices, return_counts=True)
     
@@ -357,7 +357,7 @@ def save_bev_png(filename, bev_map):
     逻辑:
         取bev_map[:, :, 1]并调用plt.imsave，使用灰度颜色映射。
     """
-    # Use channel 1 (Intensity) for visualization
+    # NOTE: 可视化默认使用通道 1（Intensity）。
     plt.imsave(filename, bev_map[:, :, 1], cmap='gray')
 
 def save_voxel_obj(filename, voxel_grid, voxel_size):
@@ -504,11 +504,11 @@ def generate_target_voxel(lidar_voxel, radar_voxel):
     """
     target = np.zeros_like(lidar_voxel)
     
-    # 1. LiDAR 的几何形状
+    # NOTE: 1) 几何占用与强度以 LiDAR 为主，保持空间精度。
     target[..., 0] = lidar_voxel[..., 0] # Occupancy
     target[..., 1] = lidar_voxel[..., 1] # Intensity
     
-    # 2. 依据激光雷达占用来读取雷达的多普勒
+    # NOTE: 2) Doppler 仅在 LiDAR 与 Radar 共同占用区域生效。
     # 只有当 LiDAR 认为该处有物体 (Occ > 0) 且 Radar 也有读数 (Occ > 0) 时，才信任 Radar 的速度
     # 或者：只要 LiDAR 有物体，就尝试去取 Radar 的速度（如果 Radar 在该体素有值）
     
@@ -548,11 +548,11 @@ def process_scene_task(scene_name):
     scene_index_path = os.path.join(INDEX_PATH, scene_name)
     scene_out_path = os.path.join(OUTPUT_PATH, scene_name)
     
-    # 加载标定参数
+    # NOTE: 每个场景都加载同一套外参用于 Radar->LiDAR 坐标对齐。
     R, T = load_calib(CALIB_PATH)
     print(f"Loaded calibration for {scene_name}")
 
-    # 使用 Patchwork++ 初始化地面移除器
+    # NOTE: 地面分割算法（Patchwork++）先滤除地面点，减少体素化噪声。
     params = pypatchworkpp.Parameters()
     params.verbose = False
     params.enable_RNR = True
@@ -612,7 +612,7 @@ def process_scene_task(scene_name):
         # 移除LiDAR地面点
         lidar_pcl = lidar_filtering(lidar_pcl, patchwork)
         
-        # ? 通过原始LiDAR数据对Radar点云进行过滤（判断Radar点云的是否在LiDAR点云附近）
+        # TODO: 可选 Radar 近邻过滤，当前默认关闭以保留原始雷达回波密度。
         # radar_pcl = radar_filtering_by_lidar(radar_pcl, lidar_pcl_raw, threshold=0.5)
 
         # 将处理后的点云数据保存为.ply格式
@@ -667,8 +667,8 @@ if __name__ == "__main__":
     scenes = [d for d in os.listdir(RAW_DATA_PATH) if os.path.isdir(os.path.join(RAW_DATA_PATH, d))]
     print(f"Found scenes: {scenes}")
     
-    # 调试模式：单进程运行，以便捕获错误和防止内存溢出
-    # 如果需要并行，请取消注释下方的 Pool 代码
+    # NOTE: 默认单进程便于调试；并行处理可按机器资源开启。
+    # TODO: 后续可增加命令行参数控制并行进程数。
     for scene in scenes:
         try:
             process_scene_task(scene)

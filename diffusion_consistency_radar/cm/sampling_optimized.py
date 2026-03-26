@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 
 """
 优化的采样模块 - 非对称下采样/上采样
@@ -39,7 +39,7 @@ class AsymmetricDownsample3D(nn.Module):
         kernel_size: 卷积核大小
     """
     
-    # 预设的步长策略
+    # NOTE: 预设的步长策略
     STRIDE_PRESETS = {
         "xy_only": (1, 2, 2),      # 只对XY下采样，保留Z
         "z_half": (1, 2, 2),       # Z轴步长为1（后续可改为2）
@@ -64,10 +64,10 @@ class AsymmetricDownsample3D(nn.Module):
         self.use_conv = use_conv
         self.min_z_size = min_z_size
         
-        # 解析步长
+        # NOTE: 解析步长
         if isinstance(stride, str):
             if stride == "adaptive" and current_z_size is not None:
-                # 自适应策略：如果Z轴太小就不下采样
+                # NOTE: 自适应策略：如果Z轴太小就不下采样
                 self.stride = (1 if current_z_size <= min_z_size else 2, 2, 2)
             elif stride in self.STRIDE_PRESETS:
                 self.stride = self.STRIDE_PRESETS[stride]
@@ -80,15 +80,15 @@ class AsymmetricDownsample3D(nn.Module):
         else:
             self.stride = tuple(stride)
             
-        # 解析核大小
+        # NOTE: 解析核大小
         if isinstance(kernel_size, int):
             self.kernel_size = (kernel_size, kernel_size, kernel_size)
         else:
             self.kernel_size = tuple(kernel_size)
         
-        # 创建下采样操作
+        # NOTE: 创建下采样操作
         if use_conv:
-            # 计算padding以保持输出大小 = input_size / stride
+            # NOTE: 计算padding以保持输出大小 = input_size / stride
             padding = tuple((k - 1) // 2 for k in self.kernel_size)
             self.op = nn.Conv3d(
                 channels, 
@@ -154,7 +154,7 @@ class AsymmetricUpsample3D(nn.Module):
         self.out_channels = out_channels or channels
         self.use_conv = use_conv
         
-        # 解析上采样因子
+        # NOTE: 解析上采样因子
         if isinstance(scale_factor, str):
             self.scale_factor = self.SCALE_PRESETS.get(scale_factor, (1, 2, 2))
         elif isinstance(scale_factor, int):
@@ -176,7 +176,7 @@ class AsymmetricUpsample3D(nn.Module):
         """
         assert x.shape[1] == self.channels
         
-        # 三线性插值上采样
+        # NOTE: 三线性插值上采样
         x = F.interpolate(
             x,
             scale_factor=self.scale_factor,
@@ -220,7 +220,7 @@ class AdaptiveDownsampleScheduler:
         self.min_z = min_z
         self.z_threshold = z_downsample_threshold
         
-        # 预计算每层的stride
+        # NOTE: 预计算每层的stride
         self.strides = self._compute_strides()
         
     def _compute_strides(self) -> list:
@@ -231,7 +231,7 @@ class AdaptiveDownsampleScheduler:
         for level in range(self.num_levels):
             d, h, w = current_size
             
-            # 决定Z轴是否下采样
+            # NOTE: 决定Z轴是否下采样
             if d > self.z_threshold and d // 2 >= self.min_z:
                 stride = (2, 2, 2)  # 完整下采样
             else:
@@ -239,7 +239,7 @@ class AdaptiveDownsampleScheduler:
             
             strides.append(stride)
             
-            # 更新当前大小
+            # NOTE: 更新当前大小
             current_size = [
                 s // stride[i] for i, s in enumerate(current_size)
             ]
@@ -289,7 +289,7 @@ class DepthWiseDownsample3D(nn.Module):
         self.out_channels = out_channels or channels
         self.stride = stride
         
-        # 深度卷积（逐通道）
+        # NOTE: 深度卷积（逐通道）
         self.depthwise = nn.Conv3d(
             channels, channels,
             kernel_size=3,
@@ -298,7 +298,7 @@ class DepthWiseDownsample3D(nn.Module):
             groups=channels  # 深度可分离
         )
         
-        # 逐点卷积（通道混合）
+        # NOTE: 逐点卷积（通道混合）
         self.pointwise = nn.Conv3d(
             channels, self.out_channels,
             kernel_size=1
@@ -337,24 +337,24 @@ class MultiScaleDownsample3D(nn.Module):
         self.channels = channels
         self.out_channels = out_channels or channels
         
-        # 分支通道数
+        # NOTE: 分支通道数
         branch_ch = self.out_channels // 3
         remainder = self.out_channels - branch_ch * 2
         
-        # 分支1: 1x1 conv -> stride conv
+        # NOTE: 分支1: 1x1 conv -> stride conv
         self.branch1 = nn.Sequential(
             nn.Conv3d(channels, branch_ch, 1),
             nn.Conv3d(branch_ch, branch_ch, 3, stride=stride, padding=1),
         )
         
-        # 分支2: 1x1 conv -> 3x3 conv -> stride conv
+        # NOTE: 分支2: 1x1 conv -> 3x3 conv -> stride conv
         self.branch2 = nn.Sequential(
             nn.Conv3d(channels, branch_ch, 1),
             nn.Conv3d(branch_ch, branch_ch, 3, padding=1),
             nn.Conv3d(branch_ch, branch_ch, 3, stride=stride, padding=1),
         )
         
-        # 分支3: 池化 -> 1x1 conv
+        # NOTE: 分支3: 池化 -> 1x1 conv
         self.branch3 = nn.Sequential(
             nn.AvgPool3d(kernel_size=stride, stride=stride),
             nn.Conv3d(channels, remainder, 1),
@@ -374,9 +374,9 @@ class MultiScaleDownsample3D(nn.Module):
         return out
 
 
-# ==============================================================================
-# 下采样工厂函数
-# ==============================================================================
+# NOTE: ==============================================================================
+# NOTE: 下采样工厂函数
+# NOTE: ==============================================================================
 
 def create_downsample_block(
     channels: int,
@@ -407,13 +407,13 @@ def create_downsample_block(
     out_channels = out_channels or channels
     
     if dims == 2:
-        # 2D 情况，使用标准下采样
+        # NOTE: 2D 情况，使用标准下采样
         if use_conv:
             return nn.Conv2d(channels, out_channels, 3, stride=2, padding=1)
         else:
             return nn.AvgPool2d(2, 2)
     
-    # 3D 情况
+    # NOTE: 3D 情况
     if downsample_type == "asymmetric":
         return AsymmetricDownsample3D(
             channels=channels,
@@ -439,7 +439,7 @@ def create_downsample_block(
             stride=parsed_stride,
         )
     else:
-        # 标准下采样（原始行为）
+        # NOTE: 标准下采样（原始行为）
         standard_stride = (1, 2, 2) if dims == 3 else 2
         if use_conv:
             return nn.Conv3d(
@@ -464,13 +464,13 @@ def create_upsample_block(
     out_channels = out_channels or channels
     
     if dims == 2:
-        # 2D 情况
+        # NOTE: 2D 情况
         layers = [nn.Upsample(scale_factor=2, mode='nearest')]
         if use_conv:
             layers.append(nn.Conv2d(channels, out_channels, 3, padding=1))
         return nn.Sequential(*layers)
     
-    # 3D 情况
+    # NOTE: 3D 情况
     if upsample_type == "asymmetric":
         return AsymmetricUpsample3D(
             channels=channels,
@@ -479,7 +479,7 @@ def create_upsample_block(
             scale_factor=scale_factor,
         )
     else:
-        # 标准上采样
+        # NOTE: 标准上采样
         parsed_scale = AsymmetricUpsample3D.SCALE_PRESETS.get(scale_factor, (1, 2, 2)) \
             if isinstance(scale_factor, str) else scale_factor
         layers = [nn.Upsample(scale_factor=parsed_scale, mode='trilinear', align_corners=False)]

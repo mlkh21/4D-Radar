@@ -8,11 +8,11 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
-VAE_CKPT="${PROJECT_DIR}/train_results/vae/vae_best.pt"
-CD_CKPT="${PROJECT_DIR}/train_results/cd/cd_best.pt"
+VAE_CKPT="${ROOT_DIR}/Result/train_results/vae/vae_best.pt"
+CD_CKPT="${ROOT_DIR}/Result/train_results/cd/cd_best.pt"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
-PREPROCESSED_ROOT="${ROOT_DIR}/NTU4DRadLM_pre_processing/NTU4DRadLM_Pre"
-RAW_ROOT="${ROOT_DIR}/NTU4DRadLM_pre_processing/NTU4DRadLM_Raw"
+PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
+RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
 
 if [ ! -f "${VAE_CKPT}" ]; then
   echo "错误: VAE 模型不存在: ${VAE_CKPT}"
@@ -56,7 +56,7 @@ for SCENE in "${TEST_SCENES[@]}"; do
   RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
   RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
   LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-  OUTPUT_DIR="${PROJECT_DIR}/inference_results/${SCENE}_cd_eval"
+  OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_eval"
 
   if [ ! -d "${RADAR_VOXEL_DIR}" ]; then
     echo "错误: radar_voxel 目录不存在: ${RADAR_VOXEL_DIR}"

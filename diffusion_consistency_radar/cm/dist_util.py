@@ -11,8 +11,8 @@ from mpi4py import MPI
 import torch as th
 import torch.distributed as dist
 
-# Change this to reflect your cluster layout.
-# The GPU for a given rank is (rank % GPUS_PER_NODE).
+# NOTE: 按集群拓扑调整该配置常量。
+# NOTE: 默认按 rank % GPUS_PER_NODE 映射到本地 GPU。
 GPUS_PER_NODE = 8
 
 SETUP_RETRY_COUNT = 3
@@ -36,8 +36,8 @@ def setup_dist():
     if dist.is_initialized():
         return
 
-    # os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
-    # os.environ["CUDA_VISIBLE_DEVICES"] = f"1, 3, 5"
+    # NOTE: 示例：按 rank 自动映射 CUDA_VISIBLE_DEVICES
+    # NOTE: 示例：手动指定可见 GPU 列表
     comm = MPI.COMM_WORLD
     backend = "gloo" if not th.cuda.is_available() else "nccl"
     if backend == "gloo":
