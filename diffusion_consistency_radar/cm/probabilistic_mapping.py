@@ -37,6 +37,7 @@ class GridMapConfig:
     prior_reliability: float = 0.90
     radar_reliability: float = 0.75
     infrared_reliability: float = 0.65
+    # TODO: 增加速度分档参数(35/50/70mps)以驱动 window_size 与 decay_rate 的自适应调度。
 
     @property
     def shape_xy(self) -> Tuple[int, int]:
@@ -100,6 +101,7 @@ class SlidingProbabilisticGridMap:
         dt = max(0.0, float(timestamp) - float(self.last_timestamp))
         if dt <= 0.0:
             return
+        # TODO: 将固定时间衰减改为速度自适应衰减，并联动里程计协方差进行保守化处理。
         decay = float(np.exp(-self.cfg.decay_rate * dt))
         self.occ_prob = 0.5 + decay * (self.occ_prob - 0.5)
 
@@ -107,6 +109,7 @@ class SlidingProbabilisticGridMap:
     def _odom_confidence(odom_cov: Optional[np.ndarray]) -> float:
         if odom_cov is None:
             return 1.0
+        # TODO: 引入显式状态协方差传播(P_k = F P_{k-1} F^T + Q)，替代当前trace经验映射。
         cov = np.asarray(odom_cov, dtype=np.float32)
         trace = float(np.trace(cov)) if cov.ndim == 2 else float(np.sum(cov))
         return float(np.exp(-0.35 * max(0.0, trace)))
@@ -132,6 +135,7 @@ class SlidingProbabilisticGridMap:
         occ3d = np.clip(voxel_xyzc[..., 0], 0.0, 1.0)
         z_bins = occ3d.shape[2]
         z_values = self.cfg.z_min + (np.arange(z_bins, dtype=np.float32) + 0.5) * self.cfg.z_resolution
+        # TODO: 把多普勒方差(ch3)注入DEM不确定性更新，统一输出高程均值+方差+冲突度。
 
         occ_sum = occ3d.sum(axis=2)
         valid = occ_sum > 0.1
@@ -179,6 +183,7 @@ class SlidingProbabilisticGridMap:
     def update_from_ir_bev(self, bev_xy: np.ndarray, timestamp: float) -> None:
         """Update occupancy map from infrared BEV with shape (X, Y) or (X, Y, C)."""
         self._time_decay(timestamp)
+        # TODO: 接入红外与雷达外参/时间同步补偿，避免高速机动时的BEV投影失配。
         bev = np.asarray(bev_xy, dtype=np.float32)
         if bev.ndim == 3:
             bev = bev[..., 0]
@@ -193,6 +198,7 @@ class SlidingProbabilisticGridMap:
     def fuse_with_prior_dem(self, prior_dem: np.ndarray, prior_confidence: float = 0.6) -> None:
         """Fuse a prior DEM with the online DEM estimate."""
         dem = np.asarray(prior_dem, dtype=np.float32)
+        # TODO: 增加D-S冲突度驱动的动态先验权重，而不是固定prior_confidence。
         if dem.shape != self.dem_mean.shape:
             raise ValueError(f"prior DEM shape {dem.shape} != map shape {self.dem_mean.shape}")
 
@@ -255,6 +261,7 @@ class LazyLocalMapQuery:
         px = int(np.clip((self._occupied_xy_m[min_idx, 0] - self.cfg.x_min) / self.cfg.x_resolution, 0, self._belief_map.shape[0] - 1))
         py = int(np.clip((self._occupied_xy_m[min_idx, 1] - self.cfg.y_min) / self.cfg.y_resolution, 0, self._belief_map.shape[1] - 1))
         uncertainty = float(np.clip(1.0 - self._belief_map[px, py], 0.0, 1.0))
+        # TODO: 将固定风险阈值替换为与飞行速度和反应时长相关的动态安全距离模型。
 
         return {
             "distance": min_dist,

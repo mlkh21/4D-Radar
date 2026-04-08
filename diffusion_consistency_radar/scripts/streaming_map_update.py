@@ -35,6 +35,7 @@ def load_voxel(path: str) -> np.ndarray:
 
     # NOTE: 部分推理输出带批次维度：(N, C, Z, X, Y)。
     # NOTE: 流式冒烟测试仅取批次中的第一个样本。
+    # TODO: 支持批量样本并行更新与异步队列，面向Orin级实时部署。
     if arr.ndim == 5:
         arr = arr[0]
 
@@ -53,6 +54,7 @@ def to_xyzc(arr: np.ndarray) -> np.ndarray:
 
 def load_ir_bev(bev_path: str, target_shape_xy) -> np.ndarray:
     bev = np.load(bev_path).astype(np.float32)
+    # TODO: 增加红外质量门控(噪声/模糊/失焦检测)并输出融合置信度。
     if bev.ndim == 3:
         bev = bev[..., 0]
     if bev.shape != target_shape_xy:
@@ -68,6 +70,7 @@ def build_config(args, first_voxel_xyzc: np.ndarray) -> GridMapConfig:
     x_res = (x_max - x_min) / max(nx, 1)
     y_res = (y_max - y_min) / max(ny, 1)
     z_res = (z_max - z_min) / max(nz, 1)
+    # TODO: 从统一yaml读取速度分档配置，避免在线参数与训练/评估参数漂移。
     return GridMapConfig(
         x_min=x_min,
         y_min=y_min,
@@ -123,6 +126,7 @@ def main() -> None:
 
     prior_dem = None
     if args.prior_dem:
+        # TODO: 支持先验DEM多来源输入及置信度地图，而非单一栅格文件。
         prior_dem = np.load(args.prior_dem).astype(np.float32)
 
     metric_path = os.path.join(args.output_dir, "streaming_metrics.csv")
@@ -136,6 +140,7 @@ def main() -> None:
 
             voxel = load_voxel(os.path.join(args.radar_voxel_dir, file_name))
             grid_map.update_from_voxel(voxel_xyzc=voxel, timestamp=timestamp, sensor="radar")
+            # TODO: 接入里程计协方差与机体速度输入，完善高速场景下不确定性传播。
 
             if args.infrared_bev_dir:
                 ir_path = os.path.join(args.infrared_bev_dir, file_name.replace("_voxel", "_bev"))
@@ -151,6 +156,7 @@ def main() -> None:
             prox = query.query_proximity(x_m=25.0, y_m=0.0, search_radius=30.0)
 
             frame_ms = (time.perf_counter() - frame_start) * 1000.0
+            # TODO: 增加端到端时延分解统计(读取/融合/查询/写盘)与资源监控(CPU/GPU/内存)。
             writer.writerow([
                 i,
                 f"{timestamp:.3f}",
@@ -182,6 +188,7 @@ def main() -> None:
     )
     print(f"Saved final map to: {os.path.join(args.output_dir, 'map_final.npz')}")
     print(f"Saved metrics to: {metric_path}")
+    # TODO: 新增ROS1发布模式，将map_final/streaming指标同步为service/action可消费接口。
 
 
 if __name__ == "__main__":
