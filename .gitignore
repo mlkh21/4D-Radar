@@ -2,6 +2,7 @@
 .vscode/
 switch-cuda.sh
 sync_data.sh
+pull_from_server.sh
 
 # Python
 *.pyc

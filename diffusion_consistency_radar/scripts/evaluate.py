@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
-# NOTE: 该脚本用于评估雷达点云预测结果，支持以下指标：
-# NOTE: 1) Chamfer 距离
-# NOTE: 2) Hausdorff 距离
-# NOTE: 3) Precision / Recall / F-score
-# NOTE: 默认假设 pred_path 与 gt_path 均为 .npy 点云目录，按同名文件进行配对。
+# NOTE: Evaluate predicted point clouds against ground truth.
+# NOTE: Metrics: Chamfer distance, Hausdorff distance, Precision/Recall/F-score.
+# NOTE: pred_path and gt_path should contain matched .npy files by basename.
 
 import argparse
 import json
@@ -17,12 +15,17 @@ from tqdm import tqdm
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate radar point cloud predictions")
-    parser.add_argument("--pred_path", type=str, required=True, help="预测点云目录")
-    parser.add_argument("--gt_path", type=str, required=True, help="真实点云目录")
-    parser.add_argument("--output_path", type=str, default="./eval_results.json", help="输出json路径")
-    parser.add_argument("--distance_threshold", type=float, default=0.5, help="F-score匹配阈值(米)")
-    # TODO: 增加Hausdorff分位数配置（例如95% Hausdorff），降低离群点对指标的极端影响。
-    # TODO: 增加DEM相关指标（DEM RMSE、冲突度统计）并与点云指标统一汇总。
+    parser.add_argument("--pred_path", type=str, required=True, help="Predicted point cloud folder")
+    parser.add_argument("--gt_path", type=str, required=True, help="Ground truth point cloud folder")
+    parser.add_argument("--output_path", type=str, default="./eval_results.json", help="Output json path")
+    parser.add_argument(
+        "--distance_threshold",
+        type=float,
+        default=0.5,
+        help="Distance threshold (meters) for F-score",
+    )
+    # TODO: Add Hausdorff percentile (e.g. 95%) to reduce outlier sensitivity.
+    # TODO: Add DEM metrics (RMSE, etc.) and aggregate with point metrics.
     return parser.parse_args()
 
 
@@ -40,7 +43,7 @@ def _list_npy_files(folder: str) -> Dict[str, str]:
 
 
 def _to_points_xyz(arr: np.ndarray) -> np.ndarray:
-    """将输入数组转换为 (N, 3) 点云坐标。"""
+    """Convert array into (N, 3) xyz point cloud."""
     pts = np.asarray(arr, dtype=np.float32)
 
     if pts.ndim == 1:
@@ -52,7 +55,7 @@ def _to_points_xyz(arr: np.ndarray) -> np.ndarray:
             raise ValueError(f"2D array must have at least 3 columns: shape={pts.shape}")
         pts = pts[:, :3]
     else:
-        # TODO: 如后续输入为体素或多维张量，增加专门的体素->点云转换入口。
+    # TODO: Support voxel or multi-channel tensors with a dedicated converter.
         if pts.shape[-1] < 3:
             raise ValueError(f"Array last dimension must be >=3 for xyz: shape={pts.shape}")
         pts = pts.reshape(-1, pts.shape[-1])[:, :3]
@@ -61,7 +64,7 @@ def _to_points_xyz(arr: np.ndarray) -> np.ndarray:
 
 
 def compute_chamfer_distance(gt: np.ndarray, pred: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
-    """计算 Chamfer 距离，并返回双向最近邻距离数组。"""
+    """Compute Chamfer distance and return both nearest-neighbor distance arrays."""
     kdtree_gt = cKDTree(gt)
     kdtree_pred = cKDTree(pred)
 
@@ -73,11 +76,11 @@ def compute_chamfer_distance(gt: np.ndarray, pred: np.ndarray) -> Tuple[float, n
 
 
 def evaluate_matches(distance_a_to_b: np.ndarray, distance_b_to_a: np.ndarray, threshold: float):
-    """基于距离阈值统计 TP/FN/FP/TN 及 precision/recall。"""
+    """Compute TP/FN/FP/TN and precision/recall from distance threshold."""
     tp = int(np.sum(distance_b_to_a <= threshold))
     fp = int(np.sum(distance_b_to_a > threshold))
     fn = int(np.sum(distance_a_to_b > threshold))
-    tn = 0  # NOTE: 点云匹配任务通常不存在严格定义的 TN。
+    tn = 0  # NOTE: Point cloud matching does not define a strict TN.
 
     precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
     recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
@@ -85,7 +88,7 @@ def evaluate_matches(distance_a_to_b: np.ndarray, distance_b_to_a: np.ndarray, t
 
 
 def read_inference_data(pred_root: str, gt_root: str) -> List[Tuple[str, str, str]]:
-    """按文件名（去扩展名）配对预测与真值，返回 (sample_id, pred_file, gt_file) 列表。"""
+    """Match pred/gt by filename stem and return (sample_id, pred_file, gt_file)."""
     pred_map = _list_npy_files(pred_root)
     gt_map = _list_npy_files(gt_root)
 
@@ -95,7 +98,7 @@ def read_inference_data(pred_root: str, gt_root: str) -> List[Tuple[str, str, st
             f"No matched .npy files between pred_path={pred_root} and gt_path={gt_root}."
         )
 
-    # TODO: 后续可扩展跨场景索引文件驱动配对，避免仅依赖文件名一致。
+    # TODO: Support index files to pair samples beyond filename matching.
     pairs = [(k, pred_map[k], gt_map[k]) for k in shared_keys]
     return pairs
 
@@ -103,7 +106,7 @@ def read_inference_data(pred_root: str, gt_root: str) -> List[Tuple[str, str, st
 def main():
     args = parse_args()
 
-    print(f"评估开始，预测目录: {args.pred_path}，真值目录: {args.gt_path}")
+    print(f"Evaluation start: pred_path={args.pred_path}, gt_path={args.gt_path}")
     pairs = read_inference_data(args.pred_path, args.gt_path)
 
     metrics = {
@@ -179,10 +182,10 @@ def main():
     with open(args.output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"Chamfer 平均距离: {summary['mean_chamfer_distance']:.6f}")
-    print(f"Hausdorff 平均距离: {summary['mean_hausdorff_distance']:.6f}")
-    print(f"F-score 平均值: {summary['mean_fscore']:.6f}")
-    print(f"评估结果已保存到: {args.output_path}")
+    print(f"Mean Chamfer distance: {summary['mean_chamfer_distance']:.6f}")
+    print(f"Mean Hausdorff distance: {summary['mean_hausdorff_distance']:.6f}")
+    print(f"Mean F-score: {summary['mean_fscore']:.6f}")
+    print(f"Results saved to: {args.output_path}")
 
 
 if __name__ == "__main__":

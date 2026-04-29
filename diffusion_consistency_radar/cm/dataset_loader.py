@@ -63,8 +63,10 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             and VoxelAugmentation is not None
         ):
             default_config: dict = {
-                'flip_prob': 0.5,
-                'rotate_prob': 0.3,
+                'enable_flip': False,
+                'enable_rotate': False,
+                'flip_prob': 0.0,
+                'rotate_prob': 0.0,
                 'noise_prob': 0.2,
                 'noise_std': 0.02,
                 'dropout_prob': 0.1,

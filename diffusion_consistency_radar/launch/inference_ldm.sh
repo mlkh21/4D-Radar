@@ -13,6 +13,7 @@ LDM_CKPT="${ROOT_DIR}/Result/train_results/ldm/ldm_best.pt"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
 RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
+TRAIN_DURATION_SECONDS="${TRAIN_DURATION_SECONDS:--1}"
 
 if [ ! -f "${VAE_CKPT}" ]; then
     echo "错误: VAE 模型不存在: ${VAE_CKPT}"
@@ -80,6 +81,7 @@ for SCENE in "${TEST_SCENES[@]}"; do
         --model_type ldm \
         --steps 40 \
         --sampler heun \
+        --train_duration_seconds "${TRAIN_DURATION_SECONDS}" \
         --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
         --save_pointcloud \
         --compare_with_lidar \

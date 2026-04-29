@@ -1,0 +1,70 @@
+data:
+  dataset_dir: /home/ps/zxj_workspace/src/4D-Radar/diffusion_consistency_radar/.tmp_mini_train_dataset
+  batch_size: 1
+  num_workers: 2
+  train_split: 0.8
+  alignment_size: 32
+  use_augmentation: false
+  augmentation:
+    flip_prob: 0.5
+    rotate_prob: 0.3
+    noise_prob: 0.2
+    noise_std: 0.02
+vae:
+  config_type: ultra_lightweight
+  in_channels: 4
+  out_channels: 4
+  latent_dim: 4
+  kl_weight: 1.0e-06
+  epochs: 3
+  lr: 0.0001
+  save_every: 1
+  save_dir: /home/ps/zxj_workspace/src/4D-Radar/Result/train_results_mini/vae
+ldm:
+  model_channels: 32
+  channel_mult:
+  - 1
+  - 2
+  - 3
+  num_res_blocks: 1
+  attention_resolutions: []
+  sigma_data: 0.5
+  sigma_max: 80.0
+  sigma_min: 0.002
+  rho: 7.0
+  epochs: 2
+  lr: 0.0001
+  save_every: 1
+  save_dir: /home/ps/zxj_workspace/src/4D-Radar/Result/train_results_mini/ldm
+cd:
+  teacher_model_path: ''
+  training_mode: consistency_distillation
+  target_ema_mode: fixed
+  start_ema: 0.95
+  scale_mode: fixed
+  start_scales: 40
+  end_scales: 40
+  epochs: 200
+  distill_steps_per_iter: 50000
+  loss_norm: l2
+  lr: 5.0e-05
+  save_every: 10
+  save_dir: ./Result/train_results/cd
+optimization:
+  use_amp: false
+  gradient_accumulation_steps: 1
+  use_checkpoint: true
+  use_fp16: false
+  max_grad_norm: 1.0
+hardware:
+  device: cuda
+  num_gpus: 2
+logging:
+  log_interval: 100
+  save_samples: true
+  sample_interval: 1000
+  tensorboard: true
+  wandb: false
+inference:
+  max_infer_files: 100
+  empty_fallback_topk: 0

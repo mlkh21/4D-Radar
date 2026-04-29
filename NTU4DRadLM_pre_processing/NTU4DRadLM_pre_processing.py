@@ -14,7 +14,7 @@ import pypatchworkpp
 RAW_DATA_PATH = "./Data/NTU4DRadLM_Raw" # 原始数据存放路径
 INDEX_PATH = "./Data/NTU4DRadLM_Raw" # 时间戳索引文件存放路径
 OUTPUT_PATH = "./Data/NTU4DRadLM_Pre" # 预处理后数据存放路径
-CALIB_PATH = "./NTU4DRadLM_pre_processing/config/calib_radar_to_livox.txt" # 标定文件路径
+CALIB_PATH = "./Data/config/calib_radar_to_livox.txt" # 标定文件路径
 
 # NOTE: 体素化与投影参数。
 VOXEL_SIZE = [0.2, 0.2, 0.2] # 体素像素 [x, y, z] 单位：米
@@ -53,8 +53,13 @@ def load_calib(calib_file):
     T = np.zeros(3)
     
     if not os.path.exists(calib_file):
-        print(f"Warning: Calib file {calib_file} not found. Using identity transform.")
-        return R, T
+        if os.environ.get("ALLOW_IDENTITY_CALIB", "0") == "1":
+            print(f"Warning: Calib file {calib_file} not found. Using identity transform.")
+            return R, T
+        raise FileNotFoundError(
+            f"Calibration file not found: {calib_file}. "
+            "Set ALLOW_IDENTITY_CALIB=1 only for debugging."
+        )
 
     with open(calib_file, 'r') as f:
         lines = f.readlines()

@@ -12,10 +12,15 @@ data:
   alignment_size: 32
   use_augmentation: true
   augmentation:
-    flip_prob: 0.5
-    rotate_prob: 0.3
+    # Keep viewpoint geometry fixed for forward-looking radar densification.
+    enable_flip: false
+    enable_rotate: false
+    flip_prob: 0.0
+    rotate_prob: 0.0
     noise_prob: 0.2
     noise_std: 0.02
+    dropout_prob: 0.1
+    point_dropout_rate: 0.05
 
 # --- VAE Configuration ---
 vae:
@@ -25,6 +30,10 @@ vae:
   out_channels: 4
   latent_dim: 4
   kl_weight: 1.0e-6
+  # Sparse occupancy needs stronger positive-voxel supervision than plain MSE.
+  occupied_weight: 8.0
+  empty_weight: 1.0
+  channel_weights: [4.0, 0.2, 0.5, 0.2]
   # Training parameters
   epochs: 100
   lr: 1.0e-4
@@ -43,6 +52,7 @@ ldm:
   sigma_max: 80.0
   sigma_min: 0.002
   rho: 7.0
+  decoded_loss_weight: 0.05
   # Training parameters
   epochs: 200  # Number of training epochs
   lr: 1.0e-4

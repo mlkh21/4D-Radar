@@ -56,6 +56,19 @@ def safe_torch_load(path, map_location):
         raise
 
 
+def apply_vae_config_overrides(vae_config: Dict[str, Any], config: "ConfigManager") -> Dict[str, Any]:
+    """Merge YAML VAE loss overrides into a preset VAE architecture config."""
+    merged = dict(vae_config)
+    yaml_vae = config.get('vae', {}) or {}
+    for key in ("kl_weight", "occupied_weight", "empty_weight", "channel_weights"):
+        if key in yaml_vae:
+            value = yaml_vae[key]
+            if key == "channel_weights" and value is not None:
+                value = tuple(float(v) for v in value)
+            merged[key] = value
+    return merged
+
+
 class ConfigManager:
     """配置管理器 - 统一加载和管理配置"""
     
@@ -430,6 +443,7 @@ class OptimizedLDMTrainer:
             sigma_min=ldm_config.get('sigma_min', 0.002),
             loss_norm='l2',
         )
+        self.decoded_loss_weight = float(ldm_config.get('decoded_loss_weight', 0.0))
         
         # 初始化训练状态
         self.start_epoch = 1
@@ -525,11 +539,12 @@ class OptimizedLDMTrainer:
             
             # NOTE: 按 Karras 噪声范围采样 sigma，覆盖高噪和低噪训练区间。
             batch_size = z_target.shape[0]
-            sigmas = (
-                self.denoiser.sigma_max ** torch.rand(batch_size, device=self.device)
-            ) * (
-                self.denoiser.sigma_min ** (1 - torch.rand(batch_size, device=self.device))
-            )
+            # NOTE: EDM/Karras 训练常用 log-uniform sigma 采样；同一个随机数决定
+            # NOTE: sigma_min 到 sigma_max 的插值位置，避免噪声分布被独立随机数扭曲。
+            u = torch.rand(batch_size, device=self.device)
+            sigmas = self.denoiser.sigma_max * (
+                self.denoiser.sigma_min / self.denoiser.sigma_max
+            ) ** u
             
             # 生成噪声并加噪
             noise = torch.randn_like(z_target)
@@ -541,7 +556,13 @@ class OptimizedLDMTrainer:
             # 前向传播
             with autocast('cuda', enabled=self.memory_opt.use_amp):
                 denoised = self.model(model_input, sigmas)
-                loss = torch.nn.functional.mse_loss(denoised, z_target)
+                latent_loss = torch.nn.functional.mse_loss(denoised, z_target)
+                loss = latent_loss
+                if self.decoded_loss_weight > 0.0:
+                    decoded = self.vae.decode(denoised)
+                    occ_mask = (target[:, 0:1] > 0).float()
+                    decoded_occ_loss = ((decoded[:, 0:1] - target[:, 0:1]) ** 2 * (1.0 + 7.0 * occ_mask)).mean()
+                    loss = loss + self.decoded_loss_weight * decoded_occ_loss
                 loss = loss / self.memory_opt.grad_accum_steps
             
             # 反向传播
@@ -696,6 +717,7 @@ def main():
             vae_config = create_lightweight_vae_config()
         else:
             vae_config = create_standard_vae_config()
+        vae_config = apply_vae_config_overrides(vae_config, config)
         
         vae = VAE3D(**vae_config)
         trainer = OptimizedVAETrainer(vae, config, memory_opt, resume_path=args.resume)
@@ -713,6 +735,7 @@ def main():
             vae_config = create_lightweight_vae_config()
         else:
             vae_config = create_standard_vae_config()
+        vae_config = apply_vae_config_overrides(vae_config, config)
         
         vae = VAE3D(**vae_config)
         ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')

@@ -379,6 +379,9 @@ class VAE3D(nn.Module):
         num_res_blocks: int = 2,
         use_attention: bool = True,
         kl_weight: float = 1e-6,
+        occupied_weight: float = 8.0,
+        empty_weight: float = 1.0,
+        channel_weights: Optional[Tuple[float, ...]] = (4.0, 0.2, 0.5, 0.2),
         dropout: float = 0.0,
         use_checkpoint: bool = True,  # 默认启用梯度检查点
     ):
@@ -386,6 +389,13 @@ class VAE3D(nn.Module):
         self.kl_weight = kl_weight
         self.latent_dim = latent_dim
         self.use_checkpoint = use_checkpoint
+        self.occupied_weight = float(occupied_weight)
+        self.empty_weight = float(empty_weight)
+        if channel_weights is not None:
+            cw = torch.as_tensor(channel_weights, dtype=torch.float32).view(1, -1, 1, 1, 1)
+            self.register_buffer("channel_weights", cw, persistent=False)
+        else:
+            self.channel_weights = None
         
         self.encoder = VAE3DEncoder(
             in_channels=in_channels,
@@ -489,8 +499,23 @@ class VAE3D(nn.Module):
         """
         mean, logvar = posterior
         
-        # NOTE: 重建损失 (L1 或 L2)
-        recon_loss = F.mse_loss(x_recon, x, reduction=reduction)
+        # NOTE: 稀疏体素重建不能用纯 MSE 平均所有空体素，否则模型容易学成近距离/空背景均值。
+        diff = (x_recon - x) ** 2
+        occ_mask = (x[:, 0:1] > 0).float()
+        spatial_weight = self.empty_weight + occ_mask * (self.occupied_weight - self.empty_weight)
+        diff = diff * spatial_weight
+        if self.channel_weights is not None and self.channel_weights.shape[1] == diff.shape[1]:
+            diff = diff * self.channel_weights.to(device=diff.device, dtype=diff.dtype)
+
+        if reduction == "mean":
+            denom = spatial_weight.mean().clamp_min(1e-6)
+            if self.channel_weights is not None and self.channel_weights.shape[1] == diff.shape[1]:
+                denom = denom * self.channel_weights.mean().to(device=diff.device, dtype=diff.dtype).clamp_min(1e-6)
+            recon_loss = diff.mean() / denom
+        elif reduction == "sum":
+            recon_loss = diff.sum()
+        else:
+            recon_loss = diff
         
         # NOTE: 相对熵（KL）散度损失
         kl_loss = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
@@ -675,6 +700,9 @@ def create_ultra_lightweight_vae_config():
         "num_res_blocks": 1,
         "use_attention": False,
         "kl_weight": 1e-6,
+        "occupied_weight": 8.0,
+        "empty_weight": 1.0,
+        "channel_weights": (4.0, 0.2, 0.5, 0.2),
         "use_checkpoint": True,
     }
 
@@ -691,6 +719,9 @@ def create_lightweight_vae_config():
         "num_res_blocks": 1,
         "use_attention": False,
         "kl_weight": 1e-6,
+        "occupied_weight": 8.0,
+        "empty_weight": 1.0,
+        "channel_weights": (4.0, 0.2, 0.5, 0.2),
         "use_checkpoint": True,
     }
 
@@ -707,5 +738,8 @@ def create_standard_vae_config():
         "num_res_blocks": 2,
         "use_attention": True,
         "kl_weight": 1e-6,
+        "occupied_weight": 8.0,
+        "empty_weight": 1.0,
+        "channel_weights": (4.0, 0.2, 0.5, 0.2),
         "use_checkpoint": True,  # 启用梯度检查点
     }

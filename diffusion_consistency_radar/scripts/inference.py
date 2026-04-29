@@ -9,6 +9,7 @@ import csv
 import os
 import sys
 import time
+import random
 from datetime import datetime
 import torch
 import numpy as np
@@ -77,7 +78,7 @@ class RadarGenerator:
         )
         
         print("Models loaded successfully!")
-    
+
     def _load_vae(self, ckpt_path):
         """加载 VAE 模型"""
         # TODO: 目前默认使用 ultra lightweight 配置，后续可从 checkpoint 元信息自动恢复。
@@ -217,6 +218,15 @@ class RadarGenerator:
         return sigmas
 
 
+def set_random_seed(seed: int):
+    """设置随机种子以保证推理可复现。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def load_sparse_voxel(filename):
     # NOTE: 历史数据可能以稀疏格式保存，这里恢复为稠密体素以复用统一推理流程。
     data = np.load(filename)
@@ -245,10 +255,74 @@ def load_radar_voxel_as_tensor(path, device):
     return radar_tensor.to(device)
 
 
-def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.5, empty_fallback_topk=0):
+def count_radar_points(path):
+    """统计原始 radar_voxel 中的占据点数量（基于 Occ 通道 > 0）。"""
+    if path.endswith('.npz'):
+        radar_voxel = load_sparse_voxel(path)
+    else:
+        radar_voxel = np.load(path).astype(np.float32)
+
+    if radar_voxel.ndim != 4 or radar_voxel.shape[-1] < 1:
+        return 0
+
+    return int(np.count_nonzero(radar_voxel[..., 0] > 0))
+
+
+def count_raw_radar_pcl_points(path):
+    """统计原始 radar_pcl 点数（第一维长度）。"""
+    pts = np.load(path)
+    if pts.ndim == 0:
+        return 0
+    return int(pts.shape[0])
+
+
+def load_target_occ_resized(path, device):
+    """加载 target_voxel 并重采样到 (32, 128, 128)，返回 Occ 通道。"""
+    if path.endswith('.npz'):
+        target_voxel = load_sparse_voxel(path)
+    else:
+        target_voxel = np.load(path).astype(np.float32)
+
+    target_tensor = torch.from_numpy(target_voxel).permute(3, 2, 0, 1)
+    target_tensor = F.interpolate(
+        target_tensor.unsqueeze(0),
+        size=(32, 128, 128),
+        mode='trilinear',
+        align_corners=False
+    ).squeeze(0)
+    return target_tensor[0].to(device).cpu().numpy()
+
+
+def find_adaptive_occ_threshold(pred_occ: np.ndarray, target_count: int) -> float:
+    """按目标占据体素数量反推预测 occ 的阈值。"""
+    flat = pred_occ.reshape(-1)
+    n = int(flat.shape[0])
+    k = int(min(max(target_count, 1), n))
+
+    if k >= n:
+        return float(np.nextafter(flat.min(), -np.inf))
+
+    topk_idx = np.argpartition(flat, -k)[-k:]
+    kth_value = float(flat[topk_idx].min())
+    # NOTE: 由于后续是严格大于 '>', 取略小于 kth 的阈值，尽量包含第 k 个点。
+    return float(np.nextafter(kth_value, -np.inf))
+
+
+def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.1, empty_fallback_topk=0):
+    # TODO:  occ_threshold 的默认值需要根据训练时的体素化参数进行调整，过高可能导致生成点云过于稀疏，过低则可能引入大量噪声点。
     # NOTE: 输入 voxel 形状为 (C, Z, H, W)。
     occ = voxel[0]
     intensity = voxel[1]
+
+    # NOTE: 若未显式指定体素尺寸，则按当前输出网格分辨率与 pc_range 自动反推。
+    # NOTE: 这样可避免“训练/推理重采样后仍使用原始 0.2m”导致的坐标尺度失真。
+    if voxel_size is None:
+        voxel_size = [
+            (pc_range[3] - pc_range[0]) / max(occ.shape[1], 1),
+            (pc_range[4] - pc_range[1]) / max(occ.shape[2], 1),
+            (pc_range[5] - pc_range[2]) / max(occ.shape[0], 1),
+        ]
+
     occ_mask = occ > occ_threshold
     used_topk_fallback = False
     if not np.any(occ_mask):
@@ -306,6 +380,10 @@ def main():
                         help="Raw livox_lidar directory for comparison")
     parser.add_argument("--lidar_index_file", type=str, default="",
                         help="lidar_index_sequence.txt for mapping preprocessed index to raw LiDAR")
+    parser.add_argument("--raw_radar_dir", type=str, default="",
+                        help="Raw radar_pcl directory for mapping preprocessed index to raw Radar")
+    parser.add_argument("--radar_index_file", type=str, default="",
+                        help="radar_index_sequence.txt for mapping preprocessed index to raw Radar")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate")
     parser.add_argument("--steps", type=int, default=40, help="Sampling steps (LDM: 40, CD: 1-4)")
     parser.add_argument("--sampler", type=str, default="heun", choices=["heun", "euler"], help="Sampler type")
@@ -318,12 +396,25 @@ def main():
     parser.add_argument("--occ_threshold", type=float, default=0.5, help="Occupancy threshold for point cloud")
     parser.add_argument("--empty_fallback_topk", type=int, default=0,
                         help="If threshold yields empty point cloud, fallback to top-k occupancy voxels (0 disables)")
-    parser.add_argument("--voxel_size", type=float, nargs=3, default=[0.2, 0.2, 0.2],
-                        help="Voxel size used in preprocessing")
+    parser.add_argument("--voxel_size", type=float, nargs=3, default=None,
+                        help="Voxel size [x,y,z] for point cloud conversion; default is auto-derived from output grid and pc_range")
     parser.add_argument("--pc_range", type=float, nargs=6, default=[0, -20, -6, 120, 20, 10],
                         help="Point cloud range used in preprocessing")
-    
+    parser.add_argument("--train_duration_seconds", type=float, default=-1.0,
+                        help="Optional training duration in seconds for experiment tracking (negative means unknown)")
+    parser.add_argument("--seed", type=int, default=-1,
+                        help="Random seed for reproducible inference (negative disables fixed seed)")
+    parser.add_argument("--adaptive_occ_from_target", action="store_true",
+                        help="Adapt per-frame occ threshold to match target_voxel occupancy count")
+    parser.add_argument("--target_voxel_dir", type=str, default="",
+                        help="Directory containing target_voxel files for adaptive occupancy threshold")
+    parser.add_argument("--adaptive_target_threshold", type=float, default=-1.0,
+                        help="Threshold used to count target occupancy in adaptive mode (negative uses --occ_threshold)")
+
     args = parser.parse_args()
+
+    if args.seed >= 0:
+        set_random_seed(args.seed)
     
     # NOTE: 初始化模型与采样器。
     generator = RadarGenerator(
@@ -347,9 +438,22 @@ def main():
 
         if not radar_files:
             raise RuntimeError(f"No radar voxel files found in {args.radar_voxel_dir}")
+        if args.adaptive_occ_from_target and (not args.target_voxel_dir or not os.path.isdir(args.target_voxel_dir)):
+            raise RuntimeError(
+                "--adaptive_occ_from_target requires a valid --target_voxel_dir"
+            )
 
         lidar_files = []
         lidar_indices = []
+        raw_radar_files = []
+        radar_indices = []
+        if args.raw_radar_dir:
+            raw_radar_files = sorted([
+                f for f in os.listdir(args.raw_radar_dir) if f.endswith('.npy')
+            ])
+            if args.radar_index_file:
+                with open(args.radar_index_file, 'r', encoding='utf-8') as f:
+                    radar_indices = [int(line.strip()) for line in f.readlines()]
         if args.compare_with_lidar:
             # NOTE: 当开启对比评估时，按索引映射原始 LiDAR 帧并导出 CSV 指标。
             if not args.raw_livox_dir:
@@ -361,18 +465,29 @@ def main():
                 with open(args.lidar_index_file, 'r', encoding='utf-8') as f:
                     lidar_indices = [int(line.strip()) for line in f.readlines()]
 
-        csv_path = os.path.join(args.output_dir, "comparison_metrics.csv")
-        csv_file = None
-        csv_writer = None
-        if args.compare_with_lidar:
-            csv_file = open(csv_path, 'w', newline='')
-            csv_writer = csv.writer(csv_file)
-            csv_writer.writerow(["index", "radar_file", "lidar_file", "chamfer"])
-
-        timing_csv_path = os.path.join(args.output_dir, "inference_timing.csv")
-        timing_file = open(timing_csv_path, 'w', newline='')
-        timing_writer = csv.writer(timing_file)
-        timing_writer.writerow(["index", "radar_file", "inference_seconds"])
+        merged_csv_path = os.path.join(args.output_dir, "inference_metrics.csv")
+        merged_csv_file = open(merged_csv_path, 'w', newline='')
+        merged_writer = csv.writer(merged_csv_file)
+        merged_writer.writerow([
+            "index",
+            "radar_file",
+            "radar_point_count",
+            "effective_occ_threshold",
+            "target_occ_count",
+            "lidar_file",
+            "inference_seconds",
+            "pred_point_count",
+            "lidar_point_count",
+            "chamfer",
+            "is_empty_frame",
+            "used_topk_fallback",
+            "train_duration_seconds",
+            "total_infer_seconds",
+            "avg_infer_seconds",
+            "avg_pred_point_count",
+            "empty_frame_rate",
+            "mean_chamfer",
+        ])
 
         log_path = os.path.join(args.output_dir, "inference_runtime.log")
         log_file = open(log_path, 'w', encoding='utf-8')
@@ -384,13 +499,22 @@ def main():
         log_file.write(f"device: {args.device}\n")
         log_file.write(f"steps: {args.steps}\n")
         log_file.write(f"sampler: {args.sampler}\n")
+        log_file.write(f"seed: {args.seed}\n")
         log_file.write(f"max_files: {args.max_files}\n")
+        log_file.write(f"occ_threshold: {args.occ_threshold}\n")
+        log_file.write(f"adaptive_occ_from_target: {int(args.adaptive_occ_from_target)}\n")
+        log_file.write(f"target_voxel_dir: {args.target_voxel_dir}\n")
+        log_file.write(f"adaptive_target_threshold: {args.adaptive_target_threshold}\n")
         log_file.write(f"empty_fallback_topk: {args.empty_fallback_topk}\n")
+        log_file.write(f"train_duration_seconds: {args.train_duration_seconds:.3f}\n")
         log_file.write(f"num_files: {len(radar_files)}\n")
         log_file.write("\n")
 
         total_infer_sec = 0.0
         fallback_count = 0
+        empty_frame_count = 0
+        total_pred_points = 0
+        chamfer_values = []
 
         file_pbar = tqdm(
             enumerate(radar_files),
@@ -401,6 +525,23 @@ def main():
 
         for i, fname in file_pbar:
             radar_path = os.path.join(args.radar_voxel_dir, fname)
+            radar_point_count = ""
+            if raw_radar_files:
+                radar_raw_file = None
+                if radar_indices:
+                    if i < len(radar_indices):
+                        idx = radar_indices[i]
+                        if idx < len(raw_radar_files):
+                            radar_raw_file = raw_radar_files[idx]
+                elif i < len(raw_radar_files):
+                    radar_raw_file = raw_radar_files[i]
+
+                if radar_raw_file:
+                    radar_raw_path = os.path.join(args.raw_radar_dir, radar_raw_file)
+                    radar_point_count = count_raw_radar_pcl_points(radar_raw_path)
+            else:
+                # NOTE: 未提供 raw radar_pcl 时，回退为 radar_voxel 占据点计数。
+                radar_point_count = count_radar_points(radar_path)
             condition_data = load_radar_voxel_as_tensor(radar_path, generator.device)
             condition_data = condition_data.unsqueeze(0)
 
@@ -416,23 +557,38 @@ def main():
 
             file_infer_sec = time.perf_counter() - file_start
             total_infer_sec += file_infer_sec
-            timing_writer.writerow([i, fname, f"{file_infer_sec:.6f}"])
             log_file.write(f"file[{i + 1}/{len(radar_files)}] {fname} infer_sec={file_infer_sec:.6f}\n")
             file_pbar.set_postfix_str(f"{i + 1}/{len(radar_files)} | {file_infer_sec:.3f}s")
 
             sample = generated[0].detach().cpu().numpy()
             pcl = np.zeros((0, 4), dtype=np.float32)
+            used_topk_fallback = False
+            effective_occ_threshold = float(args.occ_threshold)
+            target_occ_count = ""
 
             if args.save_voxel:
                 out_voxel = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_voxel.npy")
                 np.save(out_voxel, sample)
 
             if args.save_pointcloud or args.compare_with_lidar:
+                if args.adaptive_occ_from_target:
+                    frame_id = os.path.splitext(fname)[0]
+                    target_path = os.path.join(args.target_voxel_dir, f"{frame_id}.npz")
+                    if not os.path.exists(target_path):
+                        target_path = os.path.join(args.target_voxel_dir, f"{frame_id}.npy")
+                    if os.path.exists(target_path):
+                        target_occ = load_target_occ_resized(target_path, generator.device)
+                        target_th = args.occ_threshold if args.adaptive_target_threshold < 0 else args.adaptive_target_threshold
+                        target_occ_count = int(np.count_nonzero(target_occ > target_th))
+                        effective_occ_threshold = find_adaptive_occ_threshold(sample[0], target_occ_count)
+                    else:
+                        log_file.write(f"warning: target voxel not found for {fname}, fallback to fixed occ_threshold\n")
+
                 pcl, used_topk_fallback = voxel_to_pointcloud(
                     sample,
                     voxel_size=args.voxel_size,
                     pc_range=args.pc_range,
-                    occ_threshold=args.occ_threshold,
+                    occ_threshold=effective_occ_threshold,
                     empty_fallback_topk=args.empty_fallback_topk,
                 )
                 if used_topk_fallback:
@@ -440,6 +596,15 @@ def main():
                 if args.save_pointcloud:
                     out_pcl = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_pcl.npy")
                     np.save(out_pcl, pcl)
+
+            pred_point_count = int(pcl.shape[0])
+            total_pred_points += pred_point_count
+            is_empty_frame = int(pred_point_count == 0)
+            empty_frame_count += is_empty_frame
+
+            lidar_point_count = ""
+            chamfer = ""
+            lidar_file = ""
 
             if args.compare_with_lidar:
                 lidar_file = None
@@ -454,26 +619,73 @@ def main():
                 if lidar_file:
                     lidar_path = os.path.join(args.raw_livox_dir, lidar_file)
                     lidar_pcl = np.load(lidar_path).astype(np.float32)
-                    chamfer = compute_chamfer(pcl, lidar_pcl)
-                    if csv_writer is not None:
-                        csv_writer.writerow([i, fname, lidar_file, f"{chamfer:.6f}"])
+                    lidar_point_count = int(lidar_pcl.shape[0])
+                    chamfer_val = compute_chamfer(pcl, lidar_pcl)
+                    chamfer = f"{chamfer_val:.6f}"
+                    if np.isfinite(chamfer_val):
+                        chamfer_values.append(chamfer_val)
 
-        timing_file.flush()
+            merged_writer.writerow([
+                i,
+                fname,
+                radar_point_count,
+                f"{effective_occ_threshold:.8f}",
+                target_occ_count,
+                lidar_file,
+                f"{file_infer_sec:.6f}",
+                pred_point_count,
+                lidar_point_count,
+                chamfer,
+                is_empty_frame,
+                int(used_topk_fallback if (args.save_pointcloud or args.compare_with_lidar) else 0),
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ])
+
+        merged_csv_file.flush()
         avg_infer_sec = total_infer_sec / max(len(radar_files), 1)
+        avg_pred_point_count = total_pred_points / max(len(radar_files), 1)
+        empty_frame_rate = empty_frame_count / max(len(radar_files), 1)
+        mean_chamfer = float(np.mean(chamfer_values)) if len(chamfer_values) > 0 else float('nan')
+
+        merged_writer.writerow([
+            "__summary__",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            f"{args.train_duration_seconds:.3f}",
+            f"{total_infer_sec:.6f}",
+            f"{avg_infer_sec:.6f}",
+            f"{avg_pred_point_count:.3f}",
+            f"{empty_frame_rate:.6f}",
+            f"{mean_chamfer:.6f}" if np.isfinite(mean_chamfer) else "",
+        ])
+
         log_file.write("\n")
         log_file.write(f"total_infer_sec: {total_infer_sec:.6f}\n")
         log_file.write(f"avg_infer_sec_per_file: {avg_infer_sec:.6f}\n")
+        log_file.write(f"avg_pred_point_count: {avg_pred_point_count:.3f}\n")
+        log_file.write(f"empty_frame_rate: {empty_frame_rate:.6f}\n")
+        log_file.write(f"mean_chamfer: {mean_chamfer:.6f}\n" if np.isfinite(mean_chamfer) else "mean_chamfer: \n")
         log_file.write(f"topk_fallback_frames: {fallback_count}\n")
         log_file.flush()
         file_pbar.close()
 
-        if csv_file:
-            csv_file.close()
-            print(f"Saved metrics to {csv_path}")
-
-        timing_file.close()
+        merged_csv_file.close()
         log_file.close()
-        print(f"Saved timing csv to {timing_csv_path}")
+        print(f"Saved merged metrics csv to {merged_csv_path}")
         print(f"Saved runtime log to {log_path}")
 
     else:

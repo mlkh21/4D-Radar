@@ -282,7 +282,7 @@ def process_ntu_dataset(input_root, output_root):
 
         bag.close()
 
-        # C. 保存 CSV 数据
+        # NOTE: C. 保存 CSV 数据
         # 为了防止不同分卷覆盖同名 csv，在 csv 文件名中加上分卷标识
         # 例如: vectornav_imu/data_loop1_2022-06-03_0.csv
         bag_base_name = os.path.splitext(bag_filename)[0]
