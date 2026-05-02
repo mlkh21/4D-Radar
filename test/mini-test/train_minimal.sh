@@ -1,24 +1,23 @@
 #!/bin/bash
-# Fast minimal training for quick validation.
+# Fast minimal training for quick validation inside test/mini-test.
 # Usage:
-#   bash diffusion_consistency_radar/launch/train_minimal.sh vae
-#   bash diffusion_consistency_radar/launch/train_minimal.sh ldm
-#   bash diffusion_consistency_radar/launch/train_minimal.sh all
+#   bash test/mini-test/train_minimal.sh vae
+#   bash test/mini-test/train_minimal.sh ldm
+#   bash test/mini-test/train_minimal.sh all
 
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SELF_DIR}/.." && pwd)"
-ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "${SELF_DIR}/../.." && pwd)"
+PROJECT_DIR="${ROOT_DIR}/diffusion_consistency_radar"
 SCRIPT_DIR="${PROJECT_DIR}/scripts"
 DEFAULT_CONFIG_PATH="${PROJECT_DIR}/config/default_config.yaml"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 
 PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
-MINI_DATASET_DIR="${PROJECT_DIR}/.tmp_mini_train_dataset"
-MINI_CONFIG_PATH="${PROJECT_DIR}/config/.default_config.mini_override.yaml"
-
-MINI_RESULTS_DIR="${ROOT_DIR}/Result/train_results_mini"
+MINI_DATASET_DIR="${MINI_DATASET_DIR:-${SELF_DIR}/.tmp_mini_train_dataset}"
+MINI_CONFIG_PATH="${MINI_CONFIG_PATH:-${SELF_DIR}/.default_config.mini_override.yaml}"
+MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SELF_DIR}/train_results_mini}"
 
 MODE="${1:-all}"
 CUDA_DEVICES="${CUDA_DEVICES:-0}"
@@ -32,12 +31,22 @@ MINI_USE_AUG="${MINI_USE_AUG:-false}"
 MINI_VAE_EPOCHS="${MINI_VAE_EPOCHS:-3}"
 MINI_LDM_EPOCHS="${MINI_LDM_EPOCHS:-2}"
 
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+	PYTHON_CMD=("${PYTHON_BIN}")
+elif python -c "import torch" >/dev/null 2>&1; then
+	PYTHON_CMD=(python)
+elif command -v conda >/dev/null 2>&1; then
+	PYTHON_CMD=(conda run -n Radar-Diffusion python)
+else
+	PYTHON_CMD=(python)
+fi
+
 if [[ ! -f "${DATA_LOADING_CONFIG}" ]]; then
 	echo "Error: data loading config not found: ${DATA_LOADING_CONFIG}"
 	exit 1
 fi
 
-mapfile -t TRAIN_SCENES < <(python - "${DATA_LOADING_CONFIG}" <<'PY'
+mapfile -t TRAIN_SCENES < <("${PYTHON_CMD[@]}" - "${DATA_LOADING_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -65,7 +74,9 @@ echo "Minimal training setup"
 echo "mode: ${MODE}"
 echo "train scenes: ${TRAIN_SCENES[*]}"
 echo "samples per scene: ${SAMPLES_PER_SCENE}"
+echo "project dir: ${PROJECT_DIR}"
 echo "results dir: ${MINI_RESULTS_DIR}"
+echo "mini dataset dir: ${MINI_DATASET_DIR}"
 echo "=========================================="
 
 rm -rf "${MINI_DATASET_DIR}"
@@ -112,7 +123,7 @@ done
 
 mkdir -p "${MINI_RESULTS_DIR}/vae" "${MINI_RESULTS_DIR}/ldm"
 
-python - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" <<'PY'
+"${PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" <<'PY'
 import sys
 import yaml
 
@@ -159,7 +170,7 @@ echo "Mini config: ${MINI_CONFIG_PATH}"
 echo "Mini dataset: ${MINI_DATASET_DIR}"
 
 run_vae() {
-	CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python "${SCRIPT_DIR}/unified_train.py" \
+	CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_CMD[@]}" "${SCRIPT_DIR}/unified_train.py" \
 		--mode vae \
 		--config "${MINI_CONFIG_PATH}"
 }
@@ -172,7 +183,7 @@ run_ldm() {
 		exit 1
 	fi
 
-	CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" python "${SCRIPT_DIR}/unified_train.py" \
+	CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_CMD[@]}" "${SCRIPT_DIR}/unified_train.py" \
 		--mode ldm \
 		--config "${MINI_CONFIG_PATH}" \
 		--vae_ckpt "${vae_ckpt}"

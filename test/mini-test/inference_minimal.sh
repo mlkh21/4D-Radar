@@ -1,14 +1,14 @@
 #!/bin/bash
-# Fast minimal inference with unified metrics output.
+# Fast minimal inference with outputs isolated under test/mini-test.
 # Usage:
-#   bash diffusion_consistency_radar/launch/inference_minimal.sh ldm
-#   bash diffusion_consistency_radar/launch/inference_minimal.sh cd
+#   bash test/mini-test/inference_minimal.sh ldm
+#   bash test/mini-test/inference_minimal.sh cd
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_DIR="${ROOT_DIR}/diffusion_consistency_radar"
 
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
@@ -23,12 +23,22 @@ ADAPTIVE_OCC_FROM_TARGET="${ADAPTIVE_OCC_FROM_TARGET:-0}"
 ADAPTIVE_TARGET_THRESHOLD="${ADAPTIVE_TARGET_THRESHOLD:--1}"
 TRAIN_DURATION_SECONDS="${TRAIN_DURATION_SECONDS:--1}"
 DEVICE="${DEVICE:-cuda}"
-USE_MINI_CHECKPOINTS="${USE_MINI_CHECKPOINTS:-0}"
+USE_MINI_CHECKPOINTS="${USE_MINI_CHECKPOINTS:-1}"
 USER_OUTPUT_DIR="${OUTPUT_DIR:-}"
 
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  PYTHON_CMD=("${PYTHON_BIN}")
+elif python -c "import torch" >/dev/null 2>&1; then
+  PYTHON_CMD=(python)
+elif command -v conda >/dev/null 2>&1; then
+  PYTHON_CMD=(conda run -n Radar-Diffusion python)
+else
+  PYTHON_CMD=(python)
+fi
+
 if [[ "${USE_MINI_CHECKPOINTS}" == "1" ]]; then
-  DEFAULT_RESULT_DIR="${ROOT_DIR}/Result/train_results_mini"
-  DEFAULT_OUTPUT_ROOT="${ROOT_DIR}/Result/inference_results_mini"
+  DEFAULT_RESULT_DIR="${SCRIPT_DIR}/train_results_mini"
+  DEFAULT_OUTPUT_ROOT="${SCRIPT_DIR}/inference_results_mini"
 else
   DEFAULT_RESULT_DIR="${ROOT_DIR}/Result/train_results"
   DEFAULT_OUTPUT_ROOT="${ROOT_DIR}/Result/inference_results"
@@ -60,7 +70,10 @@ if [[ ! -f "${DATA_LOADING_CONFIG}" ]]; then
   exit 1
 fi
 
-mapfile -t TEST_SCENES < <(python - "${DATA_LOADING_CONFIG}" <<'PY'
+if [[ -n "${SCENE:-}" ]]; then
+  TEST_SCENES=("${SCENE}")
+else
+mapfile -t TEST_SCENES < <("${PYTHON_CMD[@]}" - "${DATA_LOADING_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -77,6 +90,7 @@ for scene in scenes:
         print(s)
 PY
 )
+fi
 
 if [[ ${#TEST_SCENES[@]} -eq 0 ]]; then
   echo "Error: data.test is empty in ${DATA_LOADING_CONFIG}"
@@ -87,6 +101,7 @@ echo "=========================================="
 echo "Minimal inference setup"
 echo "model_type: ${MODEL_TYPE}"
 echo "use_mini_checkpoints: ${USE_MINI_CHECKPOINTS}"
+echo "project dir: ${PROJECT_DIR}"
 echo "model_ckpt: ${MODEL_CKPT}"
 echo "vae_ckpt: ${VAE_CKPT}"
 echo "steps/sampler: ${STEPS}/${SAMPLER}"
@@ -133,7 +148,7 @@ for SCENE in "${TEST_SCENES[@]}"; do
   fi
 
   echo "Running minimal inference for scene: ${SCENE}"
-  python "${INFER_SCRIPT}" \
+  "${PYTHON_CMD[@]}" "${INFER_SCRIPT}" \
     --vae_ckpt "${VAE_CKPT}" \
     --model_ckpt "${MODEL_CKPT}" \
     --model_type "${MODEL_TYPE}" \

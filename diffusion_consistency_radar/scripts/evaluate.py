@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-# NOTE: Evaluate predicted point clouds against ground truth.
-# NOTE: Metrics: Chamfer distance, Hausdorff distance, Precision/Recall/F-score.
-# NOTE: pred_path and gt_path should contain matched .npy files by basename.
+# NOTE: 该脚本用于评估雷达点云预测结果，支持以下指标：
+# NOTE: 1) Chamfer 距离
+# NOTE: 2) Hausdorff 距离
+# NOTE: 3) Precision / Recall / F-score
+# NOTE: 默认假设 pred_path 与 gt_path 均为 .npy 点云目录，按同名文件进行配对。
 
 import argparse
 import json

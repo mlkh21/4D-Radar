@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 import logging
+from typing import Optional
 
 # NOTE: 可选数据增强模块；当依赖缺失时退化为不增强模式。
 try:
@@ -14,6 +15,7 @@ except ImportError:
     MixupAugmentation = None
 
 logger = logging.getLogger(__name__)
+EPS = 1e-6
 
 
 def load_sparse_voxel(filename):
@@ -24,6 +26,36 @@ def load_sparse_voxel(filename):
     if coords.shape[0] > 0:
         voxel_grid[coords[:, 0], coords[:, 1], coords[:, 2]] = data['features']
     return voxel_grid
+
+
+def resize_voxel_channels(voxel_tensor: torch.Tensor, target_size, mask_channel: Optional[int] = None) -> torch.Tensor:
+    """
+    Resize sparse voxel channels with channel-aware rules.
+
+    Occupancy and mask-like channels use max pooling semantics to preserve sparse positives.
+    Feature channels use occupancy-weighted interpolation so zeros outside occupied cells do not dominate.
+    """
+    if voxel_tensor.ndim != 4:
+        raise ValueError(f"Expected (C, Z, H, W), got {tuple(voxel_tensor.shape)}")
+
+    x = voxel_tensor.unsqueeze(0).float()
+    occ = x[:, 0:1]
+
+    resized_occ = F.adaptive_max_pool3d(occ, target_size)
+    outputs = [resized_occ]
+
+    occ_density = F.interpolate(occ, size=target_size, mode='trilinear', align_corners=False)
+
+    for ch in range(1, x.shape[1]):
+        channel = x[:, ch : ch + 1]
+        if mask_channel is not None and ch == mask_channel:
+            outputs.append(F.adaptive_max_pool3d(channel, target_size))
+            continue
+
+        weighted = F.interpolate(channel * occ, size=target_size, mode='trilinear', align_corners=False)
+        outputs.append(weighted / occ_density.clamp_min(EPS))
+
+    return torch.cat(outputs, dim=1).squeeze(0)
 
 class NTU4DRadLM_VoxelDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None, return_path=False, alignment_size=32,
@@ -196,19 +228,8 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         # NOTE: 统一重采样到固定空间尺寸，避免不同场景分辨率导致 batch 拼接失败。
         target_size = (32, 128, 128)  # (Z, H, W)
         
-        radar_tensor = F.interpolate(
-            radar_tensor.unsqueeze(0),  # NOTE: 临时增加 batch 维度进行 3D 插值。
-            size=target_size,
-            mode='trilinear',
-            align_corners=False
-        ).squeeze(0)  # NOTE: 还原为 (C, Z, H, W)。
-        
-        target_tensor = F.interpolate(
-            target_tensor.unsqueeze(0),
-            size=target_size,
-            mode='trilinear',
-            align_corners=False
-        ).squeeze(0)
+        radar_tensor = resize_voxel_channels(radar_tensor, target_size)
+        target_tensor = resize_voxel_channels(target_tensor, target_size, mask_channel=3)
 
         if self.transform:
             # TODO: 预留 transform 钩子；当前分支尚未接入具体变换实现。

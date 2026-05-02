@@ -513,22 +513,34 @@ def generate_target_voxel(lidar_voxel, radar_voxel):
     target[..., 0] = lidar_voxel[..., 0] # Occupancy
     target[..., 1] = lidar_voxel[..., 1] # Intensity
     
-    # NOTE: 2) Doppler 仅在 LiDAR 与 Radar 共同占用区域生效。
-    # 只有当 LiDAR 认为该处有物体 (Occ > 0) 且 Radar 也有读数 (Occ > 0) 时，才信任 Radar 的速度
-    # 或者：只要 LiDAR 有物体，就尝试去取 Radar 的速度（如果 Radar 在该体素有值）
-    
+    # NOTE: 2) Doppler 监督不再要求“同一细体素严格重叠”。
+    # NOTE: 对每个 LiDAR 占据体素，在局部 3x3x3 Radar 邻域内聚合 Doppler，
+    # NOTE: 这样能保留雷达运动信息，同时避免模态细粒度不重叠导致监督几乎全空。
     lidar_occ = lidar_voxel[..., 0] > 0
     radar_occ = radar_voxel[..., 0] > 0
-    
-    # Mask: LiDAR 有物体 AND Radar 也有物体
-    valid_doppler_mask = lidar_occ & radar_occ
-    
-    # 填入 Doppler
-    target[..., 2][valid_doppler_mask] = radar_voxel[..., 2][valid_doppler_mask]
-    
-    # 填入 Mask (作为第4通道，供 Loss 使用)
-    target[..., 3] = valid_doppler_mask.astype(np.float32)
-    
+    radar_doppler = radar_voxel[..., 2]
+
+    doppler_target = np.zeros_like(target[..., 2], dtype=np.float32)
+    doppler_mask = np.zeros_like(target[..., 3], dtype=np.float32)
+
+    lidar_coords = np.argwhere(lidar_occ)
+    nx, ny, nz = lidar_occ.shape
+    for x, y, z in lidar_coords:
+        x0, x1 = max(0, x - 1), min(nx, x + 2)
+        y0, y1 = max(0, y - 1), min(ny, y + 2)
+        z0, z1 = max(0, z - 1), min(nz, z + 2)
+
+        local_mask = radar_occ[x0:x1, y0:y1, z0:z1]
+        if not np.any(local_mask):
+            continue
+
+        local_doppler = radar_doppler[x0:x1, y0:y1, z0:z1][local_mask]
+        doppler_target[x, y, z] = float(np.mean(local_doppler))
+        doppler_mask[x, y, z] = 1.0
+
+    target[..., 2] = doppler_target
+    target[..., 3] = doppler_mask
+
     return target
 
 def process_scene_task(scene_name):

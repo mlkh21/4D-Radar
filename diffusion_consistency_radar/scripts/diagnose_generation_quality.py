@@ -6,13 +6,20 @@ import argparse
 import csv
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+import sys
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import torch
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# Allow direct `python diffusion_consistency_radar/scripts/*.py` execution.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from cm.dataset_loader import resize_voxel_channels
 
 try:
     from scipy.spatial import cKDTree
@@ -62,6 +69,12 @@ def load_array(path: str) -> np.ndarray:
     if path.endswith(".npz"):
         return load_sparse_npz(path)
     return np.load(path).astype(np.float32)
+
+
+def resized_occ_from_voxel_xyzc(voxel: np.ndarray, target_size=(32, 128, 128), mask_channel: Optional[int] = None) -> np.ndarray:
+    tensor = torch.from_numpy(voxel).permute(3, 2, 0, 1)
+    resized = resize_voxel_channels(tensor, target_size, mask_channel=mask_channel)
+    return resized[0].cpu().numpy()
 
 
 def voxel_xyzc_to_points(
@@ -270,13 +283,13 @@ def write_frame_figure(
     plt.close(fig)
 
 
-def build_row(frame_id: str, radar: np.ndarray, target: np.ndarray, pred: np.ndarray, pred_file: str) -> Dict[str, float]:
+def build_row(
+    frame_id: str, radar: np.ndarray, target: np.ndarray, pred: np.ndarray, pred_file: str
+) -> Tuple[Dict[str, Union[str, float]], Dict[str, float]]:
     radar_s = point_stats(radar)
     target_s = point_stats(target)
     pred_s = point_stats(pred)
-    row: Dict[str, float] = {
-        "frame_id": frame_id,
-        "pred_file": pred_file,
+    metrics: Dict[str, float] = {
         "radar_count": radar_s["count"],
         "target_count": target_s["count"],
         "pred_count": pred_s["count"],
@@ -296,8 +309,9 @@ def build_row(frame_id: str, radar: np.ndarray, target: np.ndarray, pred: np.nda
     }
     for prefix, stats in (("radar", radar_s), ("target", target_s), ("pred", pred_s)):
         for key in ("cx", "cy", "cz", "x_min", "x_max", "y_min", "y_max", "z_min", "z_max"):
-            row[f"{prefix}_{key}"] = stats[key]
-    return row
+            metrics[f"{prefix}_{key}"] = stats[key]
+    meta = {"frame_id": frame_id, "pred_file": pred_file}
+    return {**meta, **metrics}, metrics
 
 
 def safe_nanmean(values: List[float]) -> float:
@@ -367,7 +381,8 @@ def main() -> None:
     if not frame_ids:
         raise RuntimeError("No shared frame ids found across radar, target, and prediction dirs")
 
-    rows = []
+    rows: List[Dict[str, Union[str, float]]] = []
+    metrics_rows: List[Dict[str, float]] = []
     image_dir = os.path.join(args.output_dir, "frames")
     os.makedirs(image_dir, exist_ok=True)
 
@@ -387,15 +402,16 @@ def main() -> None:
         target = filter_points(target, args.x_range, args.y_range, args.z_range)
         pred = filter_points(pred, args.x_range, args.y_range, args.z_range)
 
-        row = build_row(frame_id, radar, target, pred, pred_file)
+        row, metrics = build_row(frame_id, radar, target, pred, pred_file)
         rows.append(row)
+        metrics_rows.append(metrics)
         write_frame_figure(
             os.path.join(image_dir, f"{frame_id}_diagnosis.png"),
             frame_id,
             radar,
             target,
             pred,
-            row,
+            metrics,
             args,
             rng,
         )
@@ -406,7 +422,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    write_report(args.output_dir, rows)
+    write_report(args.output_dir, metrics_rows)
     print(f"Saved diagnosis images to: {image_dir}")
     print(f"Saved metrics to: {csv_path}")
     print(f"Saved report to: {os.path.join(args.output_dir, 'diagnosis_report.md')}")

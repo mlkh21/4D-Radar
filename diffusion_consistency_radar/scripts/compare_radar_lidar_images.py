@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""Generate side-by-side BEV or 3D comparison images for predicted radar point clouds and raw LiDAR point clouds."""
+"""
+生成雷达与 LiDAR 的对比图像。 
+读取模型预测的雷达点云和原始 LiDAR 点云，将其转换为鸟瞰图 (BEV) 或 3D 散点图并排拼接
+方便直观地评估雷达生成点云的空间分布是否符合真实的 LiDAR 场景。
+"""
 
 import argparse
 import csv

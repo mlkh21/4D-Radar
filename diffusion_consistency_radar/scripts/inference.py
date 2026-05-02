@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cm.vae_3d import VAE3D, create_ultra_lightweight_vae_config, create_lightweight_vae_config, create_standard_vae_config
 from cm.unet_optimized import OptimizedUNetModel
 from cm.karras_diffusion import KarrasDenoiser
-from cm.dataset_loader import NTU4DRadLM_VoxelDataset
+from cm.dataset_loader import NTU4DRadLM_VoxelDataset, resize_voxel_channels
 from torch.utils.data import DataLoader
 
 try:
@@ -245,12 +245,7 @@ def load_radar_voxel_as_tensor(path, device):
 
     radar_tensor = torch.from_numpy(radar_voxel).permute(3, 2, 0, 1)
     target_size = (32, 128, 128)
-    radar_tensor = F.interpolate(
-        radar_tensor.unsqueeze(0),
-        size=target_size,
-        mode='trilinear',
-        align_corners=False
-    ).squeeze(0)
+    radar_tensor = resize_voxel_channels(radar_tensor, target_size)
 
     return radar_tensor.to(device)
 
@@ -284,12 +279,7 @@ def load_target_occ_resized(path, device):
         target_voxel = np.load(path).astype(np.float32)
 
     target_tensor = torch.from_numpy(target_voxel).permute(3, 2, 0, 1)
-    target_tensor = F.interpolate(
-        target_tensor.unsqueeze(0),
-        size=(32, 128, 128),
-        mode='trilinear',
-        align_corners=False
-    ).squeeze(0)
+    target_tensor = resize_voxel_channels(target_tensor, (32, 128, 128), mask_channel=3)
     return target_tensor[0].to(device).cpu().numpy()
 
 
@@ -393,7 +383,7 @@ def main():
     parser.add_argument("--save_pointcloud", action="store_true", help="Save point cloud .npy per sample")
     parser.add_argument("--save_voxel", action="store_true", help="Save voxel .npy per sample")
     parser.add_argument("--compare_with_lidar", action="store_true", help="Compare with raw livox point clouds")
-    parser.add_argument("--occ_threshold", type=float, default=0.5, help="Occupancy threshold for point cloud")
+    parser.add_argument("--occ_threshold", type=float, default=0.1, help="Occupancy threshold for point cloud")
     parser.add_argument("--empty_fallback_topk", type=int, default=0,
                         help="If threshold yields empty point cloud, fallback to top-k occupancy voxels (0 disables)")
     parser.add_argument("--voxel_size", type=float, nargs=3, default=None,

@@ -1,21 +1,21 @@
 #!/bin/bash
 # ==============================================================================
-# Õ≥“ª—µ¡∑Ω≈±æ - VAE / LDM / CD “ª’æ Ω—µ¡∑
+# Áªü‰∏ÄËÆ≠ÁªÉËÑöÊú¨ - VAE / LDM / CD ‰∏ÄÁ´ôÂºèËÆ≠ÁªÉ
 # ==============================================================================
 #
-#  π”√∑Ω∑®:
-#   sh diffusion_consistency_radar/launch/train_unified.sh vae      # —µ¡∑ VAE
-#   sh diffusion_consistency_radar/launch/train_unified.sh ldm      # —µ¡∑ LDM
-#   sh diffusion_consistency_radar/launch/train_unified.sh cd       # ’Ù¡Û CD
-#   sh diffusion_consistency_radar/launch/train_unified.sh all      # ÕÍ’˚¡˜≥Ã
+# ‰ΩøÁî®ÊñπÊ≥ï:
+#   sh diffusion_consistency_radar/launch/train_unified.sh vae      # ËÆ≠ÁªÉ VAE
+#   sh diffusion_consistency_radar/launch/train_unified.sh ldm      # ËÆ≠ÁªÉ LDM
+#   sh diffusion_consistency_radar/launch/train_unified.sh cd       # Ëí∏È¶è CD
+#   sh diffusion_consistency_radar/launch/train_unified.sh all      # ÂÆåÊï¥ÊµÅÁ®ã
 #
-# ≈‰÷√Œƒº˛: config/default_config.yaml
+# ÈÖçÁΩÆÊñá‰ª∂: config/default_config.yaml
 #
 # ==============================================================================
 
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-# ƒ¨»œ¬∑æ∂
+# ÈªòËÆ§Ë∑ØÂæÑ
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SELF_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
@@ -94,9 +94,19 @@ case "$MODE" in
         echo "Stage 1: Training VAE"
         echo "=========================================="
         
-        CUDA_VISIBLE_DEVICES=0,1 python ${SCRIPT_DIR}/unified_train.py \
-            --mode vae \
-            --config ${CONFIG_PATH}
+        VAE_RESUME="${RESULTS_DIR}/vae/vae_best.pt"
+        if [ -f "$VAE_RESUME" ]; then
+            echo "Found existing VAE checkpoint, resuming from: $VAE_RESUME"
+            CUDA_VISIBLE_DEVICES=0,1 python ${SCRIPT_DIR}/unified_train.py \
+                --mode vae \
+                --config ${CONFIG_PATH} \
+                --resume ${VAE_RESUME}
+        else
+            echo "Starting VAE training from scratch"
+            CUDA_VISIBLE_DEVICES=0,1 python ${SCRIPT_DIR}/unified_train.py \
+                --mode vae \
+                --config ${CONFIG_PATH}
+        fi
         ;;
         
     ldm)
@@ -111,7 +121,7 @@ case "$MODE" in
             exit 1
         fi
         
-        # ºÏ≤È «∑Ò¥Ê‘⁄ LDM ºÏ≤Èµ„“‘±„∂œµ„–¯—µ
+        # Ê£ÄÊü•ÊòØÂê¶Â≠òÂú® LDM Ê£ÄÊü•ÁÇπ‰ª•‰æøÊñ≠ÁÇπÁª≠ËÆ≠
         LDM_RESUME="${RESULTS_DIR}/ldm/ldm_best.pt"
         if [ -f "$LDM_RESUME" ]; then
             echo "Found existing LDM checkpoint, resuming from: $LDM_RESUME"
@@ -159,15 +169,15 @@ case "$MODE" in
         echo "=========================================="
         
         # Stage 1: VAE
-        sh $0 vae
+        bash "$0" vae
         if [ $? -ne 0 ]; then exit 1; fi
         
         # Stage 2: LDM
-        sh $0 ldm
+        bash "$0" ldm
         if [ $? -ne 0 ]; then exit 1; fi
         
         # Stage 3: CD
-        sh $0 cd
+        bash "$0" cd
         ;;
         
     *)

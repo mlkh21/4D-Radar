@@ -1,7 +1,7 @@
 #!/bin/bash
-# One-command minimal experiment: train then infer.
+# One-command minimal experiment: train then infer under test/mini-test.
 # Usage:
-#   bash diffusion_consistency_radar/launch/run_minimal_experiment.sh
+#   bash test/mini-test/run_minimal_experiment.sh
 
 set -euo pipefail
 
