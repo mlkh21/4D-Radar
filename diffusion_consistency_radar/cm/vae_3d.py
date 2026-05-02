@@ -382,6 +382,8 @@ class VAE3D(nn.Module):
         occupied_weight: float = 8.0,
         empty_weight: float = 1.0,
         channel_weights: Optional[Tuple[float, ...]] = (4.0, 0.2, 0.5, 0.2),
+        false_positive_weight: float = 0.0,
+        occupancy_mass_weight: float = 0.0,
         dropout: float = 0.0,
         use_checkpoint: bool = True,  # 默认启用梯度检查点
     ):
@@ -391,6 +393,8 @@ class VAE3D(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.occupied_weight = float(occupied_weight)
         self.empty_weight = float(empty_weight)
+        self.false_positive_weight = float(false_positive_weight)
+        self.occupancy_mass_weight = float(occupancy_mass_weight)
         if channel_weights is not None:
             cw = torch.as_tensor(channel_weights, dtype=torch.float32).view(1, -1, 1, 1, 1)
             self.register_buffer("channel_weights", cw, persistent=False)
@@ -516,6 +520,27 @@ class VAE3D(nn.Module):
             recon_loss = diff.sum()
         else:
             recon_loss = diff
+
+        if reduction == "mean":
+            occ_target = x[:, 0:1]
+            occ_pred = x_recon[:, 0:1]
+            empty_mask = (occ_target <= 0).float()
+
+            fp_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+            if self.false_positive_weight > 0.0:
+                fp_loss = (torch.relu(occ_pred - occ_target) ** 2 * empty_mask).mean()
+
+            mass_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+            if self.occupancy_mass_weight > 0.0:
+                pred_mass = torch.relu(occ_pred).mean()
+                target_mass = torch.relu(occ_target).mean()
+                mass_loss = torch.abs(pred_mass - target_mass)
+
+            recon_loss = (
+                recon_loss
+                + self.false_positive_weight * fp_loss
+                + self.occupancy_mass_weight * mass_loss
+            )
         
         # NOTE: 相对熵（KL）散度损失
         kl_loss = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
@@ -703,6 +728,8 @@ def create_ultra_lightweight_vae_config():
         "occupied_weight": 8.0,
         "empty_weight": 1.0,
         "channel_weights": (4.0, 0.2, 0.5, 0.2),
+        "false_positive_weight": 4.0,
+        "occupancy_mass_weight": 1.0,
         "use_checkpoint": True,
     }
 
@@ -722,6 +749,8 @@ def create_lightweight_vae_config():
         "occupied_weight": 8.0,
         "empty_weight": 1.0,
         "channel_weights": (4.0, 0.2, 0.5, 0.2),
+        "false_positive_weight": 4.0,
+        "occupancy_mass_weight": 1.0,
         "use_checkpoint": True,
     }
 
@@ -741,5 +770,7 @@ def create_standard_vae_config():
         "occupied_weight": 8.0,
         "empty_weight": 1.0,
         "channel_weights": (4.0, 0.2, 0.5, 0.2),
+        "false_positive_weight": 4.0,
+        "occupancy_mass_weight": 1.0,
         "use_checkpoint": True,  # 启用梯度检查点
     }

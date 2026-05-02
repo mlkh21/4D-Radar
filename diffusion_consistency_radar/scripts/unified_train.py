@@ -60,7 +60,14 @@ def apply_vae_config_overrides(vae_config: Dict[str, Any], config: "ConfigManage
     """Merge YAML VAE loss overrides into a preset VAE architecture config."""
     merged = dict(vae_config)
     yaml_vae = config.get('vae', {}) or {}
-    for key in ("kl_weight", "occupied_weight", "empty_weight", "channel_weights"):
+    for key in (
+        "kl_weight",
+        "occupied_weight",
+        "empty_weight",
+        "channel_weights",
+        "false_positive_weight",
+        "occupancy_mass_weight",
+    ):
         if key in yaml_vae:
             value = yaml_vae[key]
             if key == "channel_weights" and value is not None:
@@ -444,6 +451,8 @@ class OptimizedLDMTrainer:
             loss_norm='l2',
         )
         self.decoded_loss_weight = float(ldm_config.get('decoded_loss_weight', 0.0))
+        self.decoded_false_positive_weight = float(ldm_config.get('decoded_false_positive_weight', 0.0))
+        self.decoded_mass_weight = float(ldm_config.get('decoded_mass_weight', 0.0))
         
         # 初始化训练状态
         self.start_epoch = 1
@@ -563,6 +572,17 @@ class OptimizedLDMTrainer:
                     occ_mask = (target[:, 0:1] > 0).float()
                     decoded_occ_loss = ((decoded[:, 0:1] - target[:, 0:1]) ** 2 * (1.0 + 7.0 * occ_mask)).mean()
                     loss = loss + self.decoded_loss_weight * decoded_occ_loss
+                    if self.decoded_false_positive_weight > 0.0:
+                        empty_mask = 1.0 - occ_mask
+                        decoded_fp_loss = (
+                            torch.relu(decoded[:, 0:1] - target[:, 0:1]) ** 2 * empty_mask
+                        ).mean()
+                        loss = loss + self.decoded_false_positive_weight * decoded_fp_loss
+                    if self.decoded_mass_weight > 0.0:
+                        decoded_mass_loss = torch.abs(
+                            torch.relu(decoded[:, 0:1]).mean() - torch.relu(target[:, 0:1]).mean()
+                        )
+                        loss = loss + self.decoded_mass_weight * decoded_mass_loss
                 loss = loss / self.memory_opt.grad_accum_steps
             
             # 反向传播

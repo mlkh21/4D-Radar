@@ -46,6 +46,11 @@ if [[ ! -f "${DATA_LOADING_CONFIG}" ]]; then
 	exit 1
 fi
 
+if [[ -n "${TRAIN_SCENES_OVERRIDE:-}" ]]; then
+	IFS=',' read -r -a TRAIN_SCENES <<< "${TRAIN_SCENES_OVERRIDE}"
+elif [[ -n "${SCENE:-}" ]]; then
+	TRAIN_SCENES=("${SCENE}")
+else
 mapfile -t TRAIN_SCENES < <("${PYTHON_CMD[@]}" - "${DATA_LOADING_CONFIG}" <<'PY'
 import sys
 import yaml
@@ -63,6 +68,7 @@ for scene in scenes:
 				print(s)
 PY
 )
+fi
 
 if [[ ${#TRAIN_SCENES[@]} -eq 0 ]]; then
 	echo "Error: data.train is empty in ${DATA_LOADING_CONFIG}"

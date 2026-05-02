@@ -34,6 +34,8 @@ vae:
   occupied_weight: 8.0
   empty_weight: 1.0
   channel_weights: [4.0, 0.2, 0.5, 0.2]
+  false_positive_weight: 4.0
+  occupancy_mass_weight: 1.0
   # Training parameters
   epochs: 100
   lr: 1.0e-4
@@ -53,6 +55,8 @@ ldm:
   sigma_min: 0.002
   rho: 7.0
   decoded_loss_weight: 0.05
+  decoded_false_positive_weight: 0.10
+  decoded_mass_weight: 0.05
   # Training parameters
   epochs: 200  # Number of training epochs
   lr: 1.0e-4
