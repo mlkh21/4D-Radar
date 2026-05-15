@@ -55,12 +55,18 @@ fi
 
 for SCENE in "${TEST_SCENES[@]}"; do
   RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
+  TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
   RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
   LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
   OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_eval"
 
   if [ ! -d "${RADAR_VOXEL_DIR}" ]; then
     echo "´íÎó: radar_voxel Ä¿Â¼²»´æÔÚ: ${RADAR_VOXEL_DIR}"
+    exit 1
+  fi
+
+  if [ ! -d "${TARGET_VOXEL_DIR}" ]; then
+    echo "Error: target_voxel directory not found: ${TARGET_VOXEL_DIR}"
     exit 1
   fi
 
@@ -83,6 +89,9 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --sampler euler \
     --train_duration_seconds "${TRAIN_DURATION_SECONDS}" \
     --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
+    --target_voxel_dir "${TARGET_VOXEL_DIR}" \
+    --compare_with_target \
+    --save_voxel \
     --save_pointcloud \
     --compare_with_lidar \
     --raw_livox_dir "${RAW_LIVOX_DIR}" \

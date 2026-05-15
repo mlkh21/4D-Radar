@@ -114,6 +114,7 @@ if [ "$RUN_LDM" = true ]; then
     
     for SCENE in "${TEST_SCENES[@]}"; do
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
+        TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
         RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
         LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
         LDM_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_ldm_eval"
@@ -128,6 +129,9 @@ if [ "$RUN_LDM" = true ]; then
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
+            --target_voxel_dir "${TARGET_VOXEL_DIR}" \
+            --compare_with_target \
+            --save_voxel \
             --save_pointcloud \
             --compare_with_lidar \
             --raw_livox_dir "${RAW_LIVOX_DIR}" \
@@ -143,14 +147,15 @@ fi
 if [ "$RUN_CD" = true ]; then
     echo ""
     echo "=========================================="
-    echo "2. CD 推理 (2步快速生成)"
+    echo "2. CD 推理 (1步快速生成)"
     echo "=========================================="
     
     for SCENE in "${TEST_SCENES[@]}"; do
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
+        TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
         RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
         LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-        CD_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_2step_eval"
+        CD_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_1step_eval"
 
         echo "  - 场景: ${SCENE}"
         python "${INFER_SCRIPT}" \
@@ -162,6 +167,9 @@ if [ "$RUN_CD" = true ]; then
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
+            --target_voxel_dir "${TARGET_VOXEL_DIR}" \
+            --compare_with_target \
+            --save_voxel \
             --save_pointcloud \
             --compare_with_lidar \
             --raw_livox_dir "${RAW_LIVOX_DIR}" \
@@ -170,7 +178,7 @@ if [ "$RUN_CD" = true ]; then
             --device cuda
     done
     
-    echo "✓ CD 2步推理完成"
+    echo "✓ CD 1步推理完成"
     
     # CD 4步推理（提升质量）
     echo ""
@@ -180,6 +188,7 @@ if [ "$RUN_CD" = true ]; then
     
     for SCENE in "${TEST_SCENES[@]}"; do
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
+        TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
         RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
         LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
         CD4_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_4step_eval"
@@ -194,6 +203,9 @@ if [ "$RUN_CD" = true ]; then
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
+            --target_voxel_dir "${TARGET_VOXEL_DIR}" \
+            --compare_with_target \
+            --save_voxel \
             --save_pointcloud \
             --compare_with_lidar \
             --raw_livox_dir "${RAW_LIVOX_DIR}" \
@@ -212,5 +224,5 @@ echo "=========================================="
 echo "test 场景列表: ${TEST_SCENES[*]}"
 echo "输入根目录: ${PREPROCESSED_ROOT}"
 echo "输出根目录: ${ROOT_DIR}/Result/inference_results"
-echo "每个输出目录包含: *_pcl.npy + comparison_metrics.csv"
+echo "每个输出目录包含: *_pcl.npy + *_voxel.npy + inference_metrics.csv"
 echo ""

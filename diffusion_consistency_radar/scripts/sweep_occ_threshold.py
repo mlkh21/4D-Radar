@@ -8,11 +8,15 @@ using the same resolution (C, Z, H, W) = (4, 32, 128, 128).
 import argparse
 import csv
 import os
+import sys
 from typing import List
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from cm.dataset_loader import resize_voxel_channels
 
 
 def load_sparse_voxel(path: str) -> np.ndarray:
@@ -30,15 +34,11 @@ def load_target_occ_resized(path: str, device: torch.device) -> np.ndarray:
     else:
         target = np.load(path).astype(np.float32)
 
-    # target: (H, W, Z, C) -> (C, Z, H, W), then resize to training/inference size.
-    tensor = torch.from_numpy(target).permute(3, 2, 0, 1).unsqueeze(0).to(device)
-    resized = F.interpolate(
-        tensor,
-        size=(32, 128, 128),
-        mode="trilinear",
-        align_corners=False,
-    ).squeeze(0).cpu().numpy()
-    return resized[0]
+    # target: (H, W, Z, C) -> (C, Z, H, W), then resize with the same sparse-aware
+    # rule used by training and inference.
+    tensor = torch.from_numpy(target).permute(3, 2, 0, 1).to(device)
+    resized = resize_voxel_channels(tensor, (32, 128, 128), mask_channel=3)
+    return resized[0].cpu().numpy()
 
 
 def parse_thresholds(raw: str) -> List[float]:

@@ -135,6 +135,10 @@ for SCENE in "${TEST_SCENES[@]}"; do
     EXTRA_COMPARE_ARGS+=(--raw_livox_dir "${RAW_LIVOX_DIR}")
     EXTRA_COMPARE_ARGS+=(--lidar_index_file "${LIDAR_INDEX_FILE}")
   fi
+  if [[ -d "${TARGET_VOXEL_DIR}" ]]; then
+    EXTRA_COMPARE_ARGS+=(--target_voxel_dir "${TARGET_VOXEL_DIR}")
+    EXTRA_COMPARE_ARGS+=(--compare_with_target)
+  fi
 
   EXTRA_ADAPTIVE_ARGS=()
   if [[ "${ADAPTIVE_OCC_FROM_TARGET}" == "1" ]]; then
@@ -162,6 +166,7 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --max_files "${MAX_INFER_FILES}" \
     --occ_threshold "${OCC_THRESHOLD}" \
     --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
+    --save_voxel \
     --save_pointcloud \
     --output_dir "${OUTPUT_DIR}" \
     "${EXTRA_ADAPTIVE_ARGS[@]}" \

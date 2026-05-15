@@ -312,6 +312,19 @@ class OptimizedVAETrainer:
             # 定期清理显存
             if batch_idx % 50 == 0:
                 self.memory_opt.clear_cache()
+
+        # NOTE: 当 batch 数不能被梯度累积步数整除时，补上最后一次未提交的更新。
+        remainder = len(train_loader) % self.memory_opt.grad_accum_steps
+        if remainder:
+            if self.memory_opt.scaler:
+                self.memory_opt.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.memory_opt.scaler.step(self.optimizer)
+                self.memory_opt.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+            self.optimizer.zero_grad()
         
         self.scheduler.step()
         n = len(train_loader)
@@ -613,6 +626,19 @@ class OptimizedLDMTrainer:
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
             })
         
+        # NOTE: 当 batch 数不能被梯度累积步数整除时，补上最后一次未提交的更新。
+        remainder = len(train_loader) % self.memory_opt.grad_accum_steps
+        if remainder:
+            if self.memory_opt.scaler:
+                self.memory_opt.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.memory_opt.scaler.step(self.optimizer)
+                self.memory_opt.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+            self.optimizer.zero_grad()
+
         return total_loss / len(train_loader)
     
     def train(self, train_loader: DataLoader):
