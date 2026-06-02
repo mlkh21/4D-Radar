@@ -42,6 +42,7 @@ DEFAULT_EMPTY_FALLBACK_TOPK=$(echo "${INFER_DEFAULTS}" | sed -n '2p')
 
 MAX_INFER_FILES="${MAX_INFER_FILES:-${DEFAULT_MAX_INFER_FILES}}"
 EMPTY_FALLBACK_TOPK="${EMPTY_FALLBACK_TOPK:-${DEFAULT_EMPTY_FALLBACK_TOPK}}"
+OCC_THRESHOLD="${OCC_THRESHOLD:-0.05}"
 
 echo "=========================================="
 echo "4D Radar 推理"
@@ -49,6 +50,7 @@ echo "=========================================="
 echo "default config: ${DEFAULT_CONFIG}"
 echo "max files per scene: ${MAX_INFER_FILES} (0 means all)"
 echo "empty fallback top-k: ${EMPTY_FALLBACK_TOPK} (0 means disabled)"
+echo "occ threshold: ${OCC_THRESHOLD}"
 
 # 检查模型是否存在
 VAE_CKPT="${ROOT_DIR}/Result/train_results/vae/vae_best.pt"
@@ -128,6 +130,7 @@ if [ "$RUN_LDM" = true ]; then
             --sampler heun \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
+            --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --target_voxel_dir "${TARGET_VOXEL_DIR}" \
             --compare_with_target \
@@ -166,6 +169,7 @@ if [ "$RUN_CD" = true ]; then
             --sampler euler \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
+            --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --target_voxel_dir "${TARGET_VOXEL_DIR}" \
             --compare_with_target \
@@ -202,6 +206,7 @@ if [ "$RUN_CD" = true ]; then
             --sampler euler \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
+            --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --target_voxel_dir "${TARGET_VOXEL_DIR}" \
             --compare_with_target \

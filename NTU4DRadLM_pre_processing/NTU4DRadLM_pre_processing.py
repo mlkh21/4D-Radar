@@ -27,6 +27,13 @@ AZIMUTH_BINS = 128 # -90 到 90 度
 SAVE_SPARSE = True # 是否使用稀疏格式存储体素 (.npz)
 GENERATE_VISUALIZATION = False # 是否生成可视化文件 (Mesh, Heatmap, BEV, PLY)
 
+
+def invert_r_t(r_mat, t_vec):
+    """将 x' = R x + T 的外参取逆，返回 x = R_inv x' + T_inv。"""
+    r_inv = r_mat.T
+    t_inv = -np.dot(r_inv, t_vec)
+    return r_inv, t_inv
+
 def ensure_dir(path):
     """
     输入: path (str) - 需要创建的目录路径
@@ -393,8 +400,9 @@ def save_voxel_obj(filename, voxel_grid, voxel_size):
         norm_features = np.zeros_like(features)
     
     # 从颜色图中获取 RGB 颜色 (jet)
-    cmap = plt.get_cmap('jet')
-    rgba = cmap(norm_features) # N x 4
+    import matplotlib.cm as cm
+    cmap = cm.get_cmap('jet')
+    rgba = np.asarray(cmap(norm_features)) # N x 4
     rgb = rgba[:, :3] # N x 3
     
     # 体素尺寸
@@ -543,7 +551,13 @@ def generate_target_voxel(lidar_voxel, radar_voxel):
 
     return target
 
-def process_scene_task(scene_name):
+def process_scene_task(
+    scene_name,
+    invert_calib=False,
+    radar_z_shift=0.0,
+    max_frames=0,
+    align_to="lidar",
+):
     
     """
     输入: 
@@ -566,7 +580,15 @@ def process_scene_task(scene_name):
     scene_out_path = os.path.join(OUTPUT_PATH, scene_name)
     
     # NOTE: 每个场景都加载同一套外参用于 Radar->LiDAR 坐标对齐。
-    R, T = load_calib(CALIB_PATH)
+    r_radar_to_lidar, t_radar_to_lidar = load_calib(CALIB_PATH)
+    if invert_calib:
+        r_radar_to_lidar, t_radar_to_lidar = invert_r_t(r_radar_to_lidar, t_radar_to_lidar)
+        print(f"[{scene_name}] Using inverted calibration transform")
+    if abs(radar_z_shift) > 1e-8:
+        t_radar_to_lidar = t_radar_to_lidar.copy()
+        t_radar_to_lidar[2] += float(radar_z_shift)
+        print(f"[{scene_name}] Applying radar z shift: {radar_z_shift:.3f} m")
+    r_lidar_to_radar, t_lidar_to_radar = invert_r_t(r_radar_to_lidar, t_radar_to_lidar)
     print(f"Loaded calibration for {scene_name}")
 
     # NOTE: 地面分割算法（Patchwork++）先滤除地面点，减少体素化噪声。
@@ -605,6 +627,9 @@ def process_scene_task(scene_name):
     lidar_files = sorted([f for f in os.listdir(os.path.join(scene_raw_path, "livox_lidar")) if f.endswith('.npy')])
     
     min_len = min(len(radar_indices), len(lidar_indices))
+    if max_frames > 0:
+        min_len = min(min_len, int(max_frames))
+    print(f"[{scene_name}] processing frames: {min_len}")
     
     for i in range(min_len):
         r_idx = radar_indices[i]
@@ -620,14 +645,20 @@ def process_scene_task(scene_name):
         radar_pcl = np.load(os.path.join(scene_raw_path, "radar_pcl", r_file))
         lidar_pcl = np.load(os.path.join(scene_raw_path, "livox_lidar", l_file))
         
-        # 将Radar原始数据与LiDAR空间对齐
-        radar_pcl = transform_pcl(radar_pcl, R, T)
-        
         # 备份原始LiDAR数据
         lidar_pcl_raw = lidar_pcl.copy()
-        
-        # 移除LiDAR地面点
+        # 移除LiDAR地面点（先在 LiDAR 原始坐标下处理）
         lidar_pcl = lidar_filtering(lidar_pcl, patchwork)
+
+        if align_to == "lidar":
+            # 默认：将 Radar 转到 LiDAR 坐标系
+            radar_pcl = transform_pcl(radar_pcl, r_radar_to_lidar, t_radar_to_lidar)
+        elif align_to == "radar":
+            # 可选：将 LiDAR 转到 Radar 坐标系
+            lidar_pcl = transform_pcl(lidar_pcl, r_lidar_to_radar, t_lidar_to_radar)
+            lidar_pcl_raw = transform_pcl(lidar_pcl_raw, r_lidar_to_radar, t_lidar_to_radar)
+        else:
+            raise ValueError(f"Unsupported align_to mode: {align_to}")
         
         # TODO: 可选 Radar 近邻过滤，当前默认关闭以保留原始雷达回波密度。
         # radar_pcl = radar_filtering_by_lidar(radar_pcl, lidar_pcl_raw, threshold=0.5)
@@ -681,14 +712,46 @@ def process_scene_task(scene_name):
             print(f"Scene {scene_name}: Processed {i}/{min_len} frames")
 
 if __name__ == "__main__":
-    scenes = [d for d in os.listdir(RAW_DATA_PATH) if os.path.isdir(os.path.join(RAW_DATA_PATH, d))]
+    parser = argparse.ArgumentParser(description="NTU4DRadLM preprocessing")
+    parser.add_argument("--raw_data_path", type=str, default=RAW_DATA_PATH, help="Raw scene root")
+    parser.add_argument("--index_path", type=str, default=INDEX_PATH, help="Index root")
+    parser.add_argument("--output_path", type=str, default=OUTPUT_PATH, help="Output root")
+    parser.add_argument("--calib_path", type=str, default=CALIB_PATH, help="Calibration file path")
+    parser.add_argument("--scene", type=str, default="", help="Only process one scene (default: all scenes)")
+    parser.add_argument("--max_frames", type=int, default=0, help="Limit processed frames per scene (0 means all)")
+    parser.add_argument("--invert_calib", action="store_true", help="Use inverse of calib_radar_to_livox transform")
+    parser.add_argument("--radar_z_shift", type=float, default=0.0, help="Extra z shift (meters) added to radar translation")
+    parser.add_argument(
+        "--align_to",
+        type=str,
+        default="lidar",
+        choices=["lidar", "radar"],
+        help="Coordinate frame to align outputs to: lidar(default) or radar",
+    )
+    args = parser.parse_args()
+
+    RAW_DATA_PATH = args.raw_data_path
+    INDEX_PATH = args.index_path
+    OUTPUT_PATH = args.output_path
+    CALIB_PATH = args.calib_path
+
+    if args.scene:
+        scenes = [args.scene]
+    else:
+        scenes = [d for d in os.listdir(RAW_DATA_PATH) if os.path.isdir(os.path.join(RAW_DATA_PATH, d))]
     print(f"Found scenes: {scenes}")
     
     # NOTE: 默认单进程便于调试；并行处理可按机器资源开启。
     # TODO: 后续可增加命令行参数控制并行进程数。
     for scene in scenes:
         try:
-            process_scene_task(scene)
+            process_scene_task(
+                scene_name=scene,
+                invert_calib=args.invert_calib,
+                radar_z_shift=args.radar_z_shift,
+                max_frames=args.max_frames,
+                align_to=args.align_to,
+            )
         except Exception as e:
             print(f"Error processing scene {scene}: {e}")
             import traceback

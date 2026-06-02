@@ -14,6 +14,7 @@ DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
 RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
 TRAIN_DURATION_SECONDS="${TRAIN_DURATION_SECONDS:--1}"
+OCC_THRESHOLD="${OCC_THRESHOLD:-0.05}"
 
 if [ ! -f "${VAE_CKPT}" ]; then
     echo "错误: VAE 模型不存在: ${VAE_CKPT}"
@@ -88,6 +89,7 @@ for SCENE in "${TEST_SCENES[@]}"; do
         --steps 40 \
         --sampler heun \
         --train_duration_seconds "${TRAIN_DURATION_SECONDS}" \
+        --occ_threshold "${OCC_THRESHOLD}" \
         --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
         --target_voxel_dir "${TARGET_VOXEL_DIR}" \
         --compare_with_target \
