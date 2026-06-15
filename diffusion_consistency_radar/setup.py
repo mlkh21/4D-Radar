@@ -20,6 +20,7 @@ setup(
         "flash-attn==0.2.8",
         "pillow",
         "einops",
+        
         "fvcore",
         "matplotlib",
         "easydict",
