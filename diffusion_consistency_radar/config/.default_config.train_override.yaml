@@ -1,21 +1,34 @@
 data:
-  dataset_dir: /home/ps/zxj_workspace/src/4D-Radar/diffusion_consistency_radar/Data/.tmp_train_dataset
+  dataset_dir: /home/zxj/catkin_ws/src/4D-Radar-Diffusion/diffusion_consistency_radar/.tmp_train_dataset
   batch_size: 2
   num_workers: 4
   train_split: 0.8
   alignment_size: 32
   use_augmentation: true
   augmentation:
-    flip_prob: 0.5
-    rotate_prob: 0.3
+    enable_flip: false
+    enable_rotate: false
+    flip_prob: 0.0
+    rotate_prob: 0.0
     noise_prob: 0.2
     noise_std: 0.02
+    dropout_prob: 0.1
+    point_dropout_rate: 0.05
 vae:
   config_type: ultra_lightweight
   in_channels: 4
   out_channels: 4
   latent_dim: 4
   kl_weight: 1.0e-06
+  occupied_weight: 8.0
+  empty_weight: 1.0
+  channel_weights:
+  - 4.0
+  - 0.2
+  - 0.5
+  - 0.2
+  false_positive_weight: 4.0
+  occupancy_mass_weight: 1.0
   epochs: 100
   lr: 0.0001
   save_every: 10
@@ -32,6 +45,9 @@ ldm:
   sigma_max: 80.0
   sigma_min: 0.002
   rho: 7.0
+  decoded_loss_weight: 0.05
+  decoded_false_positive_weight: 0.1
+  decoded_mass_weight: 0.05
   epochs: 200
   lr: 0.0001
   save_every: 10

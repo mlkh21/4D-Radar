@@ -8,7 +8,6 @@ data:
   batch_size: 2
   num_workers: 4
   train_split: 0.8
-  # TODO: 新增跨场景评估切分配置，固定garden/loop3实验协议以便复现。
   alignment_size: 32
   use_augmentation: true
   augmentation:
@@ -41,14 +40,14 @@ vae:
   lr: 1.0e-4
   save_every: 10
   save_dir: "./Result/train_results/vae"
-  
+
 # --- Latent Diffusion Model Configuration ---
 ldm:
   # Model architecture
   model_channels: 32
   channel_mult: [1, 2, 3]
   num_res_blocks: 1
-  attention_resolutions: []  # Disable attention to save memory
+  attention_resolutions: [] # Disable attention to save memory
   # Diffusion parameters (Karras)
   sigma_data: 0.5
   sigma_max: 80.0
@@ -58,15 +57,15 @@ ldm:
   decoded_false_positive_weight: 0.10
   decoded_mass_weight: 0.05
   # Training parameters
-  epochs: 200  # Number of training epochs
+  epochs: 200 # Number of training epochs
   lr: 1.0e-4
-  save_every: 10  # Save checkpoint every N epochs
+  save_every: 10 # Save checkpoint every N epochs
   save_dir: "./Result/train_results/ldm"
 
 # --- Consistency Distillation Configuration ---
 cd:
   # Distillation from LDM to CD model
-  teacher_model_path: ""  # LDM checkpoint path
+  teacher_model_path: "" # LDM checkpoint path
   # Distillation parameters
   training_mode: "consistency_distillation"
   target_ema_mode: "fixed"
@@ -74,20 +73,20 @@ cd:
   scale_mode: "fixed"
   start_scales: 40
   end_scales: 40
-  epochs: 200  # Number of training epochs (100 epochs * 2007 batches ≈ 200k steps)
+  epochs: 200 # Number of training epochs (100 epochs * 2007 batches ≈ 200k steps)
   distill_steps_per_iter: 50000
-  loss_norm: "l2"  # l1 / l2 / lpips
+  loss_norm: "l2" # l1 / l2 / lpips
   # Training parameters
   lr: 5.0e-5
-  save_every: 10  # Save checkpoint every N epochs
+  save_every: 10 # Save checkpoint every N epochs
   save_dir: "./Result/train_results/cd"
 
 # --- Optimization Configuration ---
 optimization:
-  use_amp: false  # Mixed precision training (disabled due to type mismatch in VAE)
+  use_amp: false # Mixed precision training (disabled due to type mismatch in VAE)
   gradient_accumulation_steps: 8
-  use_checkpoint: true  # Gradient checkpointing
-  use_fp16: false  # FP16 model weights
+  use_checkpoint: true # Gradient checkpointing
+  use_fp16: false # FP16 model weights
   max_grad_norm: 1.0
 
 # --- Hardware Configuration ---
