@@ -20,6 +20,12 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cm.dataset_loader import resize_voxel_channels
+from cm.evaluation_metrics import (
+    bev_iou as task_bev_iou,
+    filter_points_by_band,
+    nearest_neighbor_metrics,
+    occupancy_prf,
+)
 
 try:
     from scipy.spatial import cKDTree
@@ -307,6 +313,21 @@ def build_row(
         "pred_z_std": pred_s["z_std"],
         "pred_target_count_ratio": pred_s["count"] / max(target_s["count"], 1),
     }
+    near_pred = filter_points_by_band(pred[:, :3], x_min=0.0, x_max=20.0, z_min=-1.0)
+    near_target = filter_points_by_band(target[:, :3], x_min=0.0, x_max=20.0, z_min=-1.0)
+    task_prf = occupancy_prf(near_pred, near_target, cell_size=0.5)
+    task_iou = task_bev_iou(near_pred, near_target, cell_size=0.5)
+    task_nn = nearest_neighbor_metrics(near_pred, near_target, thresholds=(2.0,))
+    metrics.update(
+        {
+            "task_near_precision": task_prf["precision"],
+            "task_near_recall": task_prf["recall"],
+            "task_near_f1": task_prf["f1"],
+            "task_near_bev_iou": task_iou["bev_iou"],
+            "task_near_nn_mean": task_nn["nn_mean"],
+            "task_near_match_ratio_2": task_nn["match_ratio_2"],
+        }
+    )
     for prefix, stats in (("radar", radar_s), ("target", target_s), ("pred", pred_s)):
         for key in ("cx", "cy", "cz", "x_min", "x_max", "y_min", "y_max", "z_min", "z_max"):
             metrics[f"{prefix}_{key}"] = stats[key]
@@ -330,6 +351,9 @@ def write_report(output_dir: str, rows: List[Dict[str, float]]) -> None:
     mean_count_ratio = safe_nanmean([r["pred_target_count_ratio"] for r in rows])
     mean_pred_z_std = safe_nanmean([r["pred_z_std"] for r in rows])
     mean_target_z_std = safe_nanmean([r["target_z_std"] for r in rows])
+    mean_task_recall = safe_nanmean([r["task_near_recall"] for r in rows])
+    mean_task_precision = safe_nanmean([r["task_near_precision"] for r in rows])
+    mean_task_iou = safe_nanmean([r["task_near_bev_iou"] for r in rows])
 
     flags = []
     if mean_count_ratio < 0.2:
@@ -361,6 +385,10 @@ def write_report(output_dir: str, rows: List[Dict[str, float]]) -> None:
         f.write(f"- Mean |radar-target dz|: {mean_radar_dz:.4f} m\n")
         f.write(f"- Mean pred/target count ratio: {mean_count_ratio:.4f}\n")
         f.write(f"- Mean pred z std / target z std: {mean_pred_z_std:.4f} / {mean_target_z_std:.4f}\n\n")
+        f.write("## Task-Oriented Shared-Visible Metrics\n\n")
+        f.write(f"- Near obstacle precision (x=0-20m, z>=-1m): {mean_task_precision:.4f}\n")
+        f.write(f"- Near obstacle recall (x=0-20m, z>=-1m): {mean_task_recall:.4f}\n")
+        f.write(f"- Near BEV IoU (x=0-20m, z>=-1m): {mean_task_iou:.4f}\n\n")
         f.write("## Diagnostic Flags\n\n")
         for flag in flags:
             f.write(f"- {flag}\n")

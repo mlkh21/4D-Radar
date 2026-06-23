@@ -157,10 +157,11 @@ case "$MODE" in
             exit 1
         fi
         
-        CUDA_VISIBLE_DEVICES=0 python ${SCRIPT_DIR}/cd_train_optimized.py \
-            --ldm_ckpt ${LDM_CKPT} \
+        CUDA_VISIBLE_DEVICES=0 python ${SCRIPT_DIR}/unified_train.py \
+            --mode cd \
+            --config ${CONFIG_PATH} \
             --vae_ckpt ${VAE_CKPT} \
-            --dataset_dir ${TRAIN_DATASET_DIR}
+            --ldm_ckpt ${LDM_CKPT}
         ;;
         
     all)

@@ -23,12 +23,19 @@ import argparse
 import logging
 import csv
 import time
-from typing import Tuple
+from typing import Any, Dict, Optional, Tuple
 from tqdm import tqdm
+import yaml
 
 from cm.unet_optimized import OptimizedUNetModel
+from cm.multimodal_fusion import CompleteDualModalityPerceptionNet
 from cm.karras_diffusion import KarrasDenoiser
-from cm.vae_3d import VAE3D, create_ultra_lightweight_vae_config
+from cm.vae_3d import (
+    VAE3D,
+    create_lightweight_vae_config,
+    create_standard_vae_config,
+    create_ultra_lightweight_vae_config,
+)
 from cm.dataset_loader import NTU4DRadLM_VoxelDataset
 
 
@@ -45,6 +52,152 @@ def safe_torch_load(path, map_location):
         if "Weights only load failed" in msg or "Unsupported global" in msg:
             return torch.load(path, map_location=map_location)
         raise
+
+
+def checkpoint_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
+    """Return the actual model state dict from either raw or wrapped checkpoints."""
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        return ckpt["model_state_dict"]
+    return ckpt
+
+
+def load_yaml_config(path: str) -> Dict[str, Any]:
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def create_vae_from_config(config: Optional[Dict[str, Any]] = None) -> VAE3D:
+    cfg = config or {}
+    vae_cfg = cfg.get("vae", {}) if isinstance(cfg.get("vae", {}), dict) else {}
+    config_type = vae_cfg.get("config_type", "ultra_lightweight")
+    if config_type == "lightweight":
+        model_cfg = create_lightweight_vae_config()
+    elif config_type == "standard":
+        model_cfg = create_standard_vae_config()
+    else:
+        model_cfg = create_ultra_lightweight_vae_config()
+    return VAE3D(**model_cfg)
+
+
+def has_multimodal_state_dict(state_dict: Dict[str, torch.Tensor]) -> bool:
+    """Detect checkpoints saved from CompleteDualModalityPerceptionNet."""
+    keys = tuple(state_dict.keys())
+    prefixes = ("unet_3d.", "ir_extractor.", "projection_layer.", "fusion_conv.")
+    return any(key.startswith(prefixes) for key in keys)
+
+
+def create_legacy_unet(config: Optional[Dict[str, Any]] = None) -> OptimizedUNetModel:
+    """Build the legacy latent denoiser used by historical CD/LDM checkpoints."""
+    cfg = config or {}
+    return OptimizedUNetModel(
+        image_size=32,
+        in_channels=int(cfg.get("legacy_in_channels", 8)),
+        model_channels=int(cfg.get("model_channels", 32)),
+        out_channels=4,
+        num_res_blocks=int(cfg.get("num_res_blocks", 1)),
+        attention_resolutions=tuple(cfg.get("attention_resolutions", [])),
+        channel_mult=tuple(cfg.get("channel_mult", [1, 2, 3])),
+        use_checkpoint=True,
+        attention_type="linear",
+    )
+
+
+def create_multimodal_cd_model(config: Optional[Dict[str, Any]] = None) -> CompleteDualModalityPerceptionNet:
+    """Build the multimodal CD/LDM denoiser with a 16-channel latent backbone."""
+    cfg = config or {}
+    base_unet = OptimizedUNetModel(
+        image_size=32,
+        in_channels=16,
+        model_channels=int(cfg.get("model_channels", 32)),
+        out_channels=4,
+        num_res_blocks=int(cfg.get("num_res_blocks", 1)),
+        attention_resolutions=tuple(cfg.get("attention_resolutions", [])),
+        channel_mult=tuple(cfg.get("channel_mult", [1, 2, 3])),
+        use_checkpoint=True,
+        attention_type="linear",
+    )
+    fusion_voxel_shape = tuple(int(v) for v in cfg.get("fusion_voxel_shape", [32, 128, 128]))
+    fusion_latent_shape = tuple(int(v) for v in cfg.get("fusion_latent_shape", fusion_voxel_shape))
+    fusion_pc_range = tuple(float(v) for v in cfg.get("fusion_pc_range", [0, -20, -6, 120, 20, 10]))
+    return CompleteDualModalityPerceptionNet(
+        base_unet,
+        voxel_shape=fusion_voxel_shape,
+        pc_range=fusion_pc_range,
+        downsample_to_latent=True,
+        latent_shape=fusion_latent_shape,
+    )
+
+
+def create_cd_model(multimodal: bool, config: Optional[Dict[str, Any]] = None) -> nn.Module:
+    return create_multimodal_cd_model(config) if multimodal else create_legacy_unet(config)
+
+
+def has_multimodal_meta(meta: Optional[Dict[str, Any]]) -> bool:
+    required = ("ir_img", "r_mat", "t_vec", "k_mat")
+    return all(torch.is_tensor((meta or {}).get(key)) for key in required)
+
+
+def move_meta_to_device(meta: Optional[Dict[str, Any]], device: torch.device) -> Dict[str, Any]:
+    moved = {}
+    for key, value in (meta or {}).items():
+        moved[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+    return moved
+
+
+def unpack_cd_batch(batch):
+    """Support both legacy (target, radar) and metadata-rich dataset batches."""
+    if len(batch) == 2:
+        target, radar = batch
+        return target, radar, {}
+    if len(batch) == 3:
+        target, radar, meta = batch
+        return target, radar, meta
+    if len(batch) == 4:
+        target, radar, meta, _path = batch
+        return target, radar, meta
+    raise ValueError(f"Unsupported batch format with {len(batch)} elements")
+
+
+def pad_latent_input_to_sixteen_channels(model_input: torch.Tensor) -> torch.Tensor:
+    if model_input.shape[1] == 16:
+        return model_input
+    if model_input.shape[1] > 16:
+        raise ValueError(f"Expected <=16 latent input channels, got {model_input.shape[1]}")
+    pad = torch.zeros(
+        model_input.shape[0],
+        16 - model_input.shape[1],
+        *model_input.shape[2:],
+        device=model_input.device,
+        dtype=model_input.dtype,
+    )
+    return torch.cat([model_input, pad], dim=1)
+
+
+def call_cd_denoiser(
+    model: nn.Module,
+    x_t: torch.Tensor,
+    z_cond: torch.Tensor,
+    timesteps: torch.Tensor,
+    radar_voxel: Optional[torch.Tensor] = None,
+    meta_dict: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
+    """Call legacy or multimodal denoisers through one CD training interface."""
+    if getattr(model, "is_multimodal", False):
+        if has_multimodal_meta(meta_dict) and radar_voxel is not None:
+            return model(
+                radar_voxel,
+                meta_dict["ir_img"],
+                meta_dict["r_mat"],
+                meta_dict["t_vec"],
+                meta_dict["k_mat"],
+                timesteps,
+                noised_latent=x_t,
+            )
+        model_input = pad_latent_input_to_sixteen_channels(torch.cat([x_t, z_cond], dim=1))
+        return model.unet_3d(model_input, timesteps)
+    return model(torch.cat([x_t, z_cond], dim=1), timesteps)
 
 
 class ConsistencyDistillationTrainer:
@@ -75,26 +228,18 @@ class ConsistencyDistillationTrainer:
         self.start_epoch = 1
         self.best_loss = float('inf')
         self.is_resumed = False
+        self.model_config = dict(self.config.get("ldm", {}) or self.config.get("model", {}) or {})
         
         # 加载 LDM 教师模型
         self.ldm_model = self._load_ldm_model(ldm_ckpt_path)
+        self.use_multimodal = bool(getattr(self.ldm_model, "is_multimodal", False))
         self.vae = vae.to(device)
         self.vae.eval()
         for param in self.vae.parameters():
             param.requires_grad = False
         
         # 创建 CD 学生模型（与 LDM 同结构）
-        self.cd_model = OptimizedUNetModel(
-            image_size=32,
-            in_channels=8,
-            model_channels=32,
-            out_channels=4,
-            num_res_blocks=1,
-            attention_resolutions=(),
-            channel_mult=(1, 2, 3),
-            use_checkpoint=True,
-            attention_type="linear",
-        ).to(device)
+        self.cd_model = create_cd_model(self.use_multimodal, self.model_config).to(device)
         
         # 创建 EMA 目标模型
         self.cd_model_ema = self._create_ema_model(self.cd_model)
@@ -147,25 +292,13 @@ class ConsistencyDistillationTrainer:
         old_stdout = sys.stdout
         sys.stdout = StringIO()
         
-        model = OptimizedUNetModel(
-            image_size=32,
-            in_channels=8,
-            model_channels=32,
-            out_channels=4,
-            num_res_blocks=1,
-            attention_resolutions=(),
-            channel_mult=(1, 2, 3),
-            use_checkpoint=True,
-            attention_type="linear",
-        ).to(self.device)
+        ckpt = safe_torch_load(ckpt_path, map_location='cpu')
+        state_dict = checkpoint_state_dict(ckpt)
+        model = create_cd_model(has_multimodal_state_dict(state_dict), self.model_config).to(self.device)
         
         sys.stdout = old_stdout
         
-        ckpt = safe_torch_load(ckpt_path, map_location='cpu')
-        if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
-        else:
-            model.load_state_dict(ckpt)
+        model.load_state_dict(state_dict)
         
         model.eval()
         for param in model.parameters():
@@ -182,16 +315,9 @@ class ConsistencyDistillationTrainer:
         old_stdout = sys.stdout
         sys.stdout = StringIO()
         
-        ema_model = OptimizedUNetModel(
-            image_size=32,
-            in_channels=8,
-            model_channels=32,
-            out_channels=4,
-            num_res_blocks=1,
-            attention_resolutions=(),
-            channel_mult=(1, 2, 3),
-            use_checkpoint=True,
-            attention_type="linear",
+        ema_model = create_cd_model(
+            bool(getattr(model, "is_multimodal", False)),
+            self.model_config,
         ).to(self.device)
         
         sys.stdout = old_stdout
@@ -285,6 +411,8 @@ class ConsistencyDistillationTrainer:
         t: torch.Tensor,
         next_t: torch.Tensor,
         cond: torch.Tensor,
+        radar_voxel: Optional[torch.Tensor] = None,
+        meta_dict: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """
         Euler ODE 求解器
@@ -292,8 +420,14 @@ class ConsistencyDistillationTrainer:
         用于从当前时间步推进到下一时间步
         """
         # 模型输出
-        model_input = torch.cat([x_t, cond], dim=1)
-        denoised = model(model_input, t)
+        denoised = call_cd_denoiser(
+            model,
+            x_t,
+            cond,
+            t,
+            radar_voxel=radar_voxel,
+            meta_dict=meta_dict,
+        )
         
         # NOTE: 这里使用显式 Euler，对应一致性蒸馏中的教师推进步骤。
         # NOTE: 常微分方程（ODE）形式：dx/dt = (x - denoised) / t。
@@ -310,6 +444,8 @@ class ConsistencyDistillationTrainer:
         z_target: torch.Tensor,
         z_cond: torch.Tensor,
         num_scales: int = 40,
+        radar_voxel: Optional[torch.Tensor] = None,
+        meta_dict: Optional[Dict[str, Any]] = None,
     ) -> float:
         """
         单个训练步骤（Consistency Distillation）
@@ -347,19 +483,37 @@ class ConsistencyDistillationTrainer:
         x_t_n = z_target + noise * t_n.view(-1, 1, 1, 1, 1)
         
         # 学生模型：从 x(t_n) 直接预测去噪结果
-        student_input = torch.cat([x_t_n, z_cond], dim=1)
-        student_denoised = self.cd_model(student_input, t_n)
+        student_denoised = call_cd_denoiser(
+            self.cd_model,
+            x_t_n,
+            z_cond,
+            t_n,
+            radar_voxel=radar_voxel,
+            meta_dict=meta_dict,
+        )
         
         # 教师模型（EMA）：从 x(t_n) 推进到 x(t_{n+1})，再预测
         with torch.no_grad():
             # 使用 EMA 教师模型
             x_t_next = self._euler_solver(
-                self.cd_model_ema, x_t_n, t_n, t_next, z_cond
+                self.cd_model_ema,
+                x_t_n,
+                t_n,
+                t_next,
+                z_cond,
+                radar_voxel=radar_voxel,
+                meta_dict=meta_dict,
             )
             
             # 教师在 t_{n+1} 的预测
-            teacher_input = torch.cat([x_t_next, z_cond], dim=1)
-            teacher_denoised = self.cd_model_ema(teacher_input, t_next)
+            teacher_denoised = call_cd_denoiser(
+                self.cd_model_ema,
+                x_t_next,
+                z_cond,
+                t_next,
+                radar_voxel=radar_voxel,
+                meta_dict=meta_dict,
+            )
         
         # NOTE: 一致性目标：学生一步输出逼近教师多步推进后的输出。
         loss = F.mse_loss(student_denoised, teacher_denoised)
@@ -380,9 +534,11 @@ class ConsistencyDistillationTrainer:
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         self.optimizer.zero_grad()
         
-        for batch_idx, (target, cond) in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            target, cond, meta_dict = unpack_cd_batch(batch)
             target = target.to(self.device)
             cond = cond.to(self.device)
+            meta_dict = move_meta_to_device(meta_dict, self.device)
             
             # 编码到潜空间
             with torch.no_grad():
@@ -390,7 +546,13 @@ class ConsistencyDistillationTrainer:
                 z_cond = self.vae.get_latent(cond)
             
             # 计算损失
-            loss = self.train_step(z_target, z_cond, num_scales=num_scales)
+            loss = self.train_step(
+                z_target,
+                z_cond,
+                num_scales=num_scales,
+                radar_voxel=cond,
+                meta_dict=meta_dict,
+            )
             loss = loss / grad_accum_steps
             
             # 反向传播
@@ -407,6 +569,12 @@ class ConsistencyDistillationTrainer:
             
             total_loss += loss.item() * grad_accum_steps
             pbar.set_postfix({'loss': f'{loss.item() * grad_accum_steps:.6f}'})
+
+        if len(train_loader) % grad_accum_steps != 0:
+            torch.nn.utils.clip_grad_norm_(self.cd_model.parameters(), 1.0)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self._update_ema(ema_rate=0.999)
         
         return total_loss / len(train_loader)
     
@@ -415,6 +583,7 @@ class ConsistencyDistillationTrainer:
         train_loader: DataLoader,
         num_epochs: int = 100,
         save_every: int = 10,
+        grad_accum_steps: int = 8,
     ):
         """完整训练流程"""
         estimated_total_steps = num_epochs * len(train_loader)
@@ -426,6 +595,7 @@ class ConsistencyDistillationTrainer:
         msg += f"  Estimated total steps: {estimated_total_steps:,}\n"
         msg += f"  Start epoch: {self.start_epoch}\n"
         msg += f"  Batch size: {train_loader.batch_size}\n"
+        msg += f"  Gradient accumulation: {grad_accum_steps}\n"
         msg += f"  Learning rate: {self.optimizer.param_groups[0]['lr']:.2e}\n"
         msg += f"  Save directory: {self.save_dir}\n"
         msg += f"  Log file: {self.log_file}\n"
@@ -436,7 +606,7 @@ class ConsistencyDistillationTrainer:
 
         for epoch in range(self.start_epoch, num_epochs + 1):
             epoch_start = time.time()
-            loss = self.train_epoch(epoch, train_loader)
+            loss = self.train_epoch(epoch, train_loader, grad_accum_steps=grad_accum_steps)
             epoch_time = time.time() - epoch_start
             
             # 记录日志
@@ -482,17 +652,23 @@ def main():
     parser = argparse.ArgumentParser(description="Consistency Distillation Training")
     parser.add_argument("--ldm_ckpt", type=str, required=True, help="LDM checkpoint path")
     parser.add_argument("--vae_ckpt", type=str, required=True, help="VAE checkpoint path")
+    parser.add_argument("--config", type=str, default="", help="Optional unified YAML config")
     parser.add_argument("--dataset_dir", type=str, default="./Data/NTU4DRadLM_Pre")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--save_dir", type=str, default="./Result/train_results/cd")
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--grad_accum_steps", type=int, default=8)
     
     args = parser.parse_args()
     
+    config = load_yaml_config(args.config)
+    cd_config = dict(config.get("cd", {}) if isinstance(config.get("cd", {}), dict) else {})
+    ldm_config = dict(config.get("ldm", {}) if isinstance(config.get("ldm", {}), dict) else {})
+    opt_config = dict(config.get("optimization", {}) if isinstance(config.get("optimization", {}), dict) else {})
+
     # 加载 VAE
-    vae_config = create_ultra_lightweight_vae_config()
-    vae = VAE3D(**vae_config)
+    vae = create_vae_from_config(config)
     ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
     if 'model_state_dict' in ckpt:
         vae.load_state_dict(ckpt['model_state_dict'])
@@ -513,8 +689,10 @@ def main():
         pin_memory=False,
     )
     
+    cd_save_dir = cd_config.get("save_dir", args.save_dir)
+
     # 检查是否有检查点可以恢复
-    resume_path = os.path.join(args.save_dir, 'cd_best.pt')
+    resume_path = os.path.join(cd_save_dir, 'cd_best.pt')
     if not os.path.exists(resume_path):
         resume_path = None
     
@@ -523,16 +701,18 @@ def main():
         ldm_ckpt_path=args.ldm_ckpt,
         vae=vae,
         config={
-            'lr': args.lr,
-            'save_dir': args.save_dir,
+            'lr': float(cd_config.get("lr", args.lr)),
+            'save_dir': cd_save_dir,
             'resume_path': resume_path,
+            'ldm': ldm_config,
         },
     )
     
     trainer.train(
         train_loader,
-        num_epochs=args.num_epochs,
-        save_every=10,
+        num_epochs=int(cd_config.get("epochs", args.num_epochs)),
+        save_every=int(cd_config.get("save_every", 10)),
+        grad_accum_steps=int(opt_config.get("gradient_accumulation_steps", args.grad_accum_steps)),
     )
     
     print("Training completed!")

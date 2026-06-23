@@ -15,6 +15,7 @@ PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
 RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
 TRAIN_DURATION_SECONDS="${TRAIN_DURATION_SECONDS:--1}"
 OCC_THRESHOLD="${OCC_THRESHOLD:-0.05}"
+USE_MULTIMODAL_META="${USE_MULTIMODAL_META:-0}"
 
 if [ ! -f "${VAE_CKPT}" ]; then
     echo "错误: VAE 模型不存在: ${VAE_CKPT}"
@@ -81,6 +82,11 @@ for SCENE in "${TEST_SCENES[@]}"; do
         exit 1
     fi
 
+    EXTRA_META_ARGS=()
+    if [ "${USE_MULTIMODAL_META}" = "1" ]; then
+        EXTRA_META_ARGS+=(--use_multimodal_meta)
+    fi
+
     echo "开始 LDM 推理场景: ${SCENE}"
     python "${INFER_SCRIPT}" \
         --vae_ckpt "${VAE_CKPT}" \
@@ -93,13 +99,15 @@ for SCENE in "${TEST_SCENES[@]}"; do
         --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
         --target_voxel_dir "${TARGET_VOXEL_DIR}" \
         --compare_with_target \
+        --report_task_metrics \
         --save_voxel \
         --save_pointcloud \
         --compare_with_lidar \
         --raw_livox_dir "${RAW_LIVOX_DIR}" \
         --lidar_index_file "${LIDAR_INDEX_FILE}" \
         --output_dir "${OUTPUT_DIR}" \
-        --device cuda
+        --device cuda \
+        "${EXTRA_META_ARGS[@]}"
 
     echo "完成: ${OUTPUT_DIR}"
 done

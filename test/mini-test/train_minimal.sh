@@ -3,7 +3,9 @@
 # Usage:
 #   bash test/mini-test/train_minimal.sh vae
 #   bash test/mini-test/train_minimal.sh ldm
+#   bash test/mini-test/train_minimal.sh cd
 #   bash test/mini-test/train_minimal.sh all
+#   bash test/mini-test/train_minimal.sh all_with_cd
 
 set -euo pipefail
 
@@ -14,7 +16,8 @@ SCRIPT_DIR="${PROJECT_DIR}/scripts"
 DEFAULT_CONFIG_PATH="${PROJECT_DIR}/config/default_config.yaml"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 
-PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
+PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware}"
+CALIB_CONFIG_DIR="${CALIB_CONFIG_DIR:-${ROOT_DIR}/Data/config}"
 MINI_DATASET_DIR="${MINI_DATASET_DIR:-${SELF_DIR}/.tmp_mini_train_dataset}"
 MINI_CONFIG_PATH="${MINI_CONFIG_PATH:-${SELF_DIR}/.default_config.mini_override.yaml}"
 MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SELF_DIR}/train_results_mini}"
@@ -30,6 +33,7 @@ MINI_USE_AUG="${MINI_USE_AUG:-false}"
 
 MINI_VAE_EPOCHS="${MINI_VAE_EPOCHS:-3}"
 MINI_LDM_EPOCHS="${MINI_LDM_EPOCHS:-2}"
+MINI_CD_EPOCHS="${MINI_CD_EPOCHS:-1}"
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
 	PYTHON_CMD=("${PYTHON_BIN}")
@@ -39,6 +43,14 @@ elif command -v conda >/dev/null 2>&1; then
 	PYTHON_CMD=(conda run -n Radar-Diffusion python)
 else
 	PYTHON_CMD=(python)
+fi
+
+if python3 -c "import yaml" >/dev/null 2>&1; then
+	CONFIG_PYTHON_CMD=(python3)
+elif python -c "import yaml" >/dev/null 2>&1; then
+	CONFIG_PYTHON_CMD=(python)
+else
+	CONFIG_PYTHON_CMD=("${PYTHON_CMD[@]}")
 fi
 
 if [[ ! -f "${DATA_LOADING_CONFIG}" ]]; then
@@ -51,7 +63,7 @@ if [[ -n "${TRAIN_SCENES_OVERRIDE:-}" ]]; then
 elif [[ -n "${SCENE:-}" ]]; then
 	TRAIN_SCENES=("${SCENE}")
 else
-mapfile -t TRAIN_SCENES < <("${PYTHON_CMD[@]}" - "${DATA_LOADING_CONFIG}" <<'PY'
+mapfile -t TRAIN_SCENES < <("${CONFIG_PYTHON_CMD[@]}" - "${DATA_LOADING_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -80,28 +92,40 @@ echo "Minimal training setup"
 echo "mode: ${MODE}"
 echo "train scenes: ${TRAIN_SCENES[*]}"
 echo "samples per scene: ${SAMPLES_PER_SCENE}"
+echo "mini epochs: vae=${MINI_VAE_EPOCHS}, ldm=${MINI_LDM_EPOCHS}, cd=${MINI_CD_EPOCHS}"
 echo "project dir: ${PROJECT_DIR}"
+echo "preprocessed root: ${PREPROCESSED_ROOT}"
 echo "results dir: ${MINI_RESULTS_DIR}"
 echo "mini dataset dir: ${MINI_DATASET_DIR}"
 echo "=========================================="
 
 rm -rf "${MINI_DATASET_DIR}"
 mkdir -p "${MINI_DATASET_DIR}"
+if [[ -d "${CALIB_CONFIG_DIR}" ]]; then
+	ln -s "${CALIB_CONFIG_DIR}" "${MINI_DATASET_DIR}/config"
+else
+	echo "Warning: calibration config directory not found: ${CALIB_CONFIG_DIR}"
+fi
 
 for SCENE in "${TRAIN_SCENES[@]}"; do
 	SRC_SCENE_DIR="${PREPROCESSED_ROOT}/${SCENE}"
 	SRC_RADAR_DIR="${SRC_SCENE_DIR}/radar_voxel"
 	SRC_TARGET_DIR="${SRC_SCENE_DIR}/target_voxel"
+	SRC_IR_DIR="${SRC_SCENE_DIR}/ir_image"
 	DST_SCENE_DIR="${MINI_DATASET_DIR}/${SCENE}"
 	DST_RADAR_DIR="${DST_SCENE_DIR}/radar_voxel"
 	DST_TARGET_DIR="${DST_SCENE_DIR}/target_voxel"
+	DST_IR_DIR="${DST_SCENE_DIR}/ir_image"
 
 	if [[ ! -d "${SRC_RADAR_DIR}" || ! -d "${SRC_TARGET_DIR}" ]]; then
 		echo "Error: missing radar_voxel/target_voxel in ${SRC_SCENE_DIR}"
 		exit 1
 	fi
 
-	mkdir -p "${DST_RADAR_DIR}" "${DST_TARGET_DIR}"
+	mkdir -p "${DST_RADAR_DIR}" "${DST_TARGET_DIR}" "${DST_IR_DIR}"
+	if [[ -f "${SRC_SCENE_DIR}/preprocess_policy.json" ]]; then
+		ln -s "${SRC_SCENE_DIR}/preprocess_policy.json" "${DST_SCENE_DIR}/preprocess_policy.json"
+	fi
 
 	mapfile -t RADAR_FILES < <(ls "${SRC_RADAR_DIR}" | grep -E '\.(npy|npz)$' | sort | head -n "${SAMPLES_PER_SCENE}")
 	if [[ ${#RADAR_FILES[@]} -eq 0 ]]; then
@@ -124,12 +148,18 @@ for SCENE in "${TRAIN_SCENES[@]}"; do
 
 		ln -s "${SRC_RADAR_PATH}" "${DST_RADAR_DIR}/$(basename "${SRC_RADAR_PATH}")"
 		ln -s "${SRC_TARGET_PATH}" "${DST_TARGET_DIR}/$(basename "${SRC_TARGET_PATH}")"
+
+		FRAME_STEM="${FILE_NAME%.*}"
+		SRC_IR_PATH="${SRC_IR_DIR}/${FRAME_STEM}_ir.npy"
+		if [[ -f "${SRC_IR_PATH}" ]]; then
+			ln -s "${SRC_IR_PATH}" "${DST_IR_DIR}/${FRAME_STEM}_ir.npy"
+		fi
 	done
 done
 
-mkdir -p "${MINI_RESULTS_DIR}/vae" "${MINI_RESULTS_DIR}/ldm"
+mkdir -p "${MINI_RESULTS_DIR}/vae" "${MINI_RESULTS_DIR}/ldm" "${MINI_RESULTS_DIR}/cd"
 
-"${PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" <<'PY'
+"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" <<'PY'
 import sys
 import yaml
 
@@ -142,9 +172,10 @@ import yaml
 		use_aug,
 		vae_epochs,
 		ldm_epochs,
+		cd_epochs,
 		grad_accum,
 		results_dir,
-) = sys.argv[1:11]
+) = sys.argv[1:12]
 
 with open(src_cfg, 'r', encoding='utf-8') as f:
 		cfg = yaml.safe_load(f) or {}
@@ -155,15 +186,32 @@ cfg['data']['batch_size'] = int(batch_size)
 cfg['data']['num_workers'] = int(num_workers)
 cfg['data']['use_augmentation'] = str(use_aug).lower() in {'1', 'true', 'yes', 'on'}
 
-cfg.setdefault('vae', {})
+cfg['vae'] = dict(cfg.get('vae') or {})
 cfg['vae']['epochs'] = int(vae_epochs)
 cfg['vae']['save_every'] = 1
 cfg['vae']['save_dir'] = f"{results_dir}/vae"
 
-cfg.setdefault('ldm', {})
+cfg['ldm'] = dict(cfg.get('ldm') or {})
 cfg['ldm']['epochs'] = int(ldm_epochs)
 cfg['ldm']['save_every'] = 1
 cfg['ldm']['save_dir'] = f"{results_dir}/ldm"
+cfg['ldm']['uncertainty_loss_weight'] = float(cfg['ldm'].get('uncertainty_loss_weight', 0.05))
+
+cfg['cd'] = {
+	'teacher_model_path': f"{results_dir}/ldm/ldm_best.pt",
+	'training_mode': 'consistency_distillation',
+	'target_ema_mode': 'fixed',
+	'start_ema': 0.95,
+	'scale_mode': 'fixed',
+	'start_scales': 40,
+	'end_scales': 40,
+	'epochs': int(cd_epochs),
+	'distill_steps_per_iter': 50000,
+	'loss_norm': 'l2',
+	'lr': 5.0e-5,
+	'save_every': 1,
+	'save_dir': f"{results_dir}/cd",
+}
 
 cfg.setdefault('optimization', {})
 cfg['optimization']['gradient_accumulation_steps'] = int(grad_accum)
@@ -195,6 +243,27 @@ run_ldm() {
 		--vae_ckpt "${vae_ckpt}"
 }
 
+run_cd() {
+	local vae_ckpt="${MINI_RESULTS_DIR}/vae/vae_best.pt"
+	local ldm_ckpt="${MINI_RESULTS_DIR}/ldm/ldm_best.pt"
+	if [[ ! -f "${vae_ckpt}" ]]; then
+		echo "Error: minimal VAE checkpoint not found: ${vae_ckpt}"
+		echo "Run VAE first: bash ${SELF_DIR}/train_minimal.sh vae"
+		exit 1
+	fi
+	if [[ ! -f "${ldm_ckpt}" ]]; then
+		echo "Error: minimal LDM checkpoint not found: ${ldm_ckpt}"
+		echo "Run LDM first: bash ${SELF_DIR}/train_minimal.sh ldm"
+		exit 1
+	fi
+
+	CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_CMD[@]}" "${SCRIPT_DIR}/unified_train.py" \
+		--mode cd \
+		--config "${MINI_CONFIG_PATH}" \
+		--vae_ckpt "${vae_ckpt}" \
+		--ldm_ckpt "${ldm_ckpt}"
+}
+
 case "${MODE}" in
 	vae)
 		run_vae
@@ -202,12 +271,20 @@ case "${MODE}" in
 	ldm)
 		run_ldm
 		;;
+	cd)
+		run_cd
+		;;
 	all)
 		run_vae
 		run_ldm
 		;;
+	all_with_cd)
+		run_vae
+		run_ldm
+		run_cd
+		;;
 	*)
-		echo "Usage: $0 [vae|ldm|all]"
+		echo "Usage: $0 [vae|ldm|cd|all|all_with_cd]"
 		exit 1
 		;;
 esac

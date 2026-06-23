@@ -19,10 +19,20 @@ from cm.probabilistic_mapping import (  # noqa: E402
     SlidingProbabilisticGridMap,
     load_sparse_voxel_npz,
 )
+from cm.evaluation_metrics import occupancy_prf, voxel_to_points
 
 
 def list_voxel_files(folder: str) -> List[str]:
-    files = [f for f in os.listdir(folder) if f.endswith(".npy") or f.endswith(".npz")]
+    files = [
+        f for f in os.listdir(folder)
+        if f.endswith(".npz")
+        or (
+            f.endswith(".npy")
+            and not f.endswith("_pcl.npy")
+            and not f.endswith("_uncertainty.npy")
+            and (f.endswith("_voxel.npy") or not f.endswith("_bev.npy"))
+        )
+    ]
     files.sort()
     return files
 
@@ -64,13 +74,50 @@ def load_ir_bev(bev_path: str, target_shape_xy) -> np.ndarray:
     return np.clip(bev, 0.0, 1.0)
 
 
+def find_uncertainty_file(uncertainty_dir: str, voxel_file_name: str) -> str:
+    if not uncertainty_dir:
+        return ""
+    stem = os.path.splitext(voxel_file_name)[0]
+    base = stem[:-6] if stem.endswith("_voxel") else stem
+    candidates = [
+        os.path.join(uncertainty_dir, f"{base}_uncertainty.npy"),
+        os.path.join(uncertainty_dir, f"{stem}_uncertainty.npy"),
+        os.path.join(uncertainty_dir, f"{base}_voxel_uncertainty.npy"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def load_model_uncertainty(path: str) -> np.ndarray:
+    if not path:
+        return None
+    arr = np.load(path).astype(np.float32)
+    arr = np.squeeze(arr)
+    if arr.ndim == 4 and arr.shape[0] <= 4:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[0] < arr.shape[1] and arr.shape[0] < arr.shape[2]:
+        arr = np.transpose(arr, (1, 2, 0))
+    return arr
+
+
+def map_occ_to_points(occ_prob: np.ndarray, cfg: GridMapConfig, threshold: float = 0.55) -> np.ndarray:
+    idx = np.argwhere(occ_prob >= float(threshold))
+    if idx.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    x = cfg.x_min + (idx[:, 0].astype(np.float32) + 0.5) * cfg.x_resolution
+    y = cfg.y_min + (idx[:, 1].astype(np.float32) + 0.5) * cfg.y_resolution
+    z = np.zeros_like(x)
+    return np.stack([x, y, z], axis=1).astype(np.float32)
+
+
 def build_config(args, first_voxel_xyzc: np.ndarray) -> GridMapConfig:
     nx, ny, nz = first_voxel_xyzc.shape[:3]
     x_min, y_min, z_min, x_max, y_max, z_max = args.pc_range
     x_res = (x_max - x_min) / max(nx, 1)
     y_res = (y_max - y_min) / max(ny, 1)
     z_res = (z_max - z_min) / max(nz, 1)
-    # TODO: 从统一yaml读取速度分档配置，避免在线参数与训练/评估参数漂移。
     return GridMapConfig(
         x_min=x_min,
         y_min=y_min,
@@ -86,14 +133,18 @@ def build_config(args, first_voxel_xyzc: np.ndarray) -> GridMapConfig:
         prior_reliability=args.prior_reliability,
         radar_reliability=args.radar_reliability,
         infrared_reliability=args.infrared_reliability,
+        speed_m_s=args.speed_m_s,
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Streaming probabilistic map update")
     parser.add_argument("--radar_voxel_dir", type=str, required=True)
+    parser.add_argument("--uncertainty_dir", type=str, default="",
+                        help="Directory containing *_uncertainty.npy files from multimodal inference")
     parser.add_argument("--infrared_bev_dir", type=str, default="")
     parser.add_argument("--prior_dem", type=str, default="")
+    parser.add_argument("--target_voxel_dir", type=str, default="")
     parser.add_argument("--output_dir", type=str, default="./streaming_results")
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--window_size", type=int, default=12)
@@ -101,6 +152,9 @@ def main() -> None:
     parser.add_argument("--prior_reliability", type=float, default=0.90)
     parser.add_argument("--radar_reliability", type=float, default=0.75)
     parser.add_argument("--infrared_reliability", type=float, default=0.65)
+    parser.add_argument("--speed_m_s", type=float, default=50.0)
+    parser.add_argument("--odom_cov_trace", type=float, default=0.0)
+    parser.add_argument("--calib_confidence", type=float, default=1.0)
     parser.add_argument("--frame_limit", type=int, default=0)
     parser.add_argument("--save_every", type=int, default=50)
     parser.add_argument(
@@ -123,6 +177,9 @@ def main() -> None:
     cfg = build_config(args, first_voxel)
     grid_map = SlidingProbabilisticGridMap(cfg)
     query = LazyLocalMapQuery(cfg)
+    odom_cov = None
+    if args.odom_cov_trace > 0.0:
+        odom_cov = np.eye(3, dtype=np.float32) * (float(args.odom_cov_trace) / 3.0)
 
     prior_dem = None
     if args.prior_dem:
@@ -132,15 +189,36 @@ def main() -> None:
     metric_path = os.path.join(args.output_dir, "streaming_metrics.csv")
     with open(metric_path, "w", newline="") as f_csv:
         writer = csv.writer(f_csv)
-        writer.writerow(["frame", "timestamp", "update_ms", "nearest_dist", "nearest_uncertainty", "is_risky"])
+        writer.writerow([
+            "frame",
+            "timestamp",
+            "update_ms",
+            "nearest_dist",
+            "nearest_uncertainty",
+            "is_risky",
+            "speed_m_s",
+            "odom_cov_trace",
+            "obstacle_precision",
+            "obstacle_recall",
+            "false_positive_rate",
+            "mean_uncertainty",
+        ])
 
         for i, file_name in enumerate(radar_files):
             frame_start = time.perf_counter()
             timestamp = i * args.dt
 
             voxel = load_voxel(os.path.join(args.radar_voxel_dir, file_name))
-            grid_map.update_from_voxel(voxel_xyzc=voxel, timestamp=timestamp, sensor="radar")
-            # TODO: 接入里程计协方差与机体速度输入，完善高速场景下不确定性传播。
+            unc_path = find_uncertainty_file(args.uncertainty_dir, file_name)
+            model_uncertainty = load_model_uncertainty(unc_path) if unc_path else None
+            grid_map.update_from_voxel(
+                voxel_xyzc=voxel,
+                timestamp=timestamp,
+                sensor="radar",
+                odom_cov=odom_cov,
+                model_uncertainty=model_uncertainty,
+                calib_confidence=args.calib_confidence,
+            )
 
             if args.infrared_bev_dir:
                 ir_path = os.path.join(args.infrared_bev_dir, file_name.replace("_voxel", "_bev"))
@@ -154,6 +232,26 @@ def main() -> None:
             snapshot = grid_map.snapshot()
             query.refresh(snapshot)
             prox = query.query_proximity(x_m=25.0, y_m=0.0, search_radius=30.0)
+            obstacle_precision = ""
+            obstacle_recall = ""
+            false_positive_rate = ""
+            if args.target_voxel_dir:
+                stem = file_name.replace("_voxel", "")
+                stem = os.path.splitext(stem)[0]
+                target_path = ""
+                for ext in (".npz", ".npy"):
+                    candidate = os.path.join(args.target_voxel_dir, f"{stem}{ext}")
+                    if os.path.exists(candidate):
+                        target_path = candidate
+                        break
+                if target_path:
+                    target_points = voxel_to_points(load_voxel(target_path), pc_range=args.pc_range, occ_threshold=0.1)
+                    map_points = map_occ_to_points(snapshot["occ_prob"], cfg, threshold=0.55)
+                    prf = occupancy_prf(map_points, target_points, pc_range=args.pc_range, cell_size=max(cfg.x_resolution, cfg.y_resolution))
+                    obstacle_precision = f"{prf['precision']:.6f}"
+                    obstacle_recall = f"{prf['recall']:.6f}"
+                    denom = prf["fp"] + prf["tp"]
+                    false_positive_rate = f"{(prf['fp'] / denom if denom else 0.0):.6f}"
 
             frame_ms = (time.perf_counter() - frame_start) * 1000.0
             # TODO: 增加端到端时延分解统计(读取/融合/查询/写盘)与资源监控(CPU/GPU/内存)。
@@ -164,6 +262,12 @@ def main() -> None:
                 f"{prox['distance']:.3f}",
                 f"{prox['uncertainty']:.3f}",
                 int(prox["is_risky"] > 0.5),
+                f"{args.speed_m_s:.3f}",
+                f"{args.odom_cov_trace:.6f}",
+                obstacle_precision,
+                obstacle_recall,
+                false_positive_rate,
+                f"{float(np.mean(1.0 - snapshot['belief'])):.6f}",
             ])
 
             if i % max(1, args.save_every) == 0:

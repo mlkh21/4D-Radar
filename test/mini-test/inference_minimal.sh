@@ -12,12 +12,16 @@ PROJECT_DIR="${ROOT_DIR}/diffusion_consistency_radar"
 
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
-PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
+PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware}"
 RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
+MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SCRIPT_DIR}/train_results_mini}"
+MINI_INFERENCE_RESULTS_DIR="${MINI_INFERENCE_RESULTS_DIR:-${SCRIPT_DIR}/inference_results_mini}"
 
 MODEL_TYPE="${1:-ldm}"
 MAX_INFER_FILES="${MAX_INFER_FILES:-20}"
-OCC_THRESHOLD="${OCC_THRESHOLD:-0.2}"
+# Sensor-aware mini validation selected 0.5 by voxel F1. Override with
+# OCC_THRESHOLD when calibrating a different checkpoint/protocol.
+OCC_THRESHOLD="${OCC_THRESHOLD:-0.5}"
 EMPTY_FALLBACK_TOPK="${EMPTY_FALLBACK_TOPK:-2000}"
 ADAPTIVE_OCC_FROM_TARGET="${ADAPTIVE_OCC_FROM_TARGET:-0}"
 ADAPTIVE_TARGET_THRESHOLD="${ADAPTIVE_TARGET_THRESHOLD:--1}"
@@ -36,9 +40,17 @@ else
   PYTHON_CMD=(python)
 fi
 
+if python3 -c "import yaml" >/dev/null 2>&1; then
+  CONFIG_PYTHON_CMD=(python3)
+elif python -c "import yaml" >/dev/null 2>&1; then
+  CONFIG_PYTHON_CMD=(python)
+else
+  CONFIG_PYTHON_CMD=("${PYTHON_CMD[@]}")
+fi
+
 if [[ "${USE_MINI_CHECKPOINTS}" == "1" ]]; then
-  DEFAULT_RESULT_DIR="${SCRIPT_DIR}/train_results_mini"
-  DEFAULT_OUTPUT_ROOT="${SCRIPT_DIR}/inference_results_mini"
+  DEFAULT_RESULT_DIR="${MINI_RESULTS_DIR}"
+  DEFAULT_OUTPUT_ROOT="${MINI_INFERENCE_RESULTS_DIR}"
 else
   DEFAULT_RESULT_DIR="${ROOT_DIR}/Result/train_results"
   DEFAULT_OUTPUT_ROOT="${ROOT_DIR}/Result/inference_results"
@@ -46,7 +58,7 @@ fi
 
 VAE_CKPT="${VAE_CKPT:-${DEFAULT_RESULT_DIR}/vae/vae_best.pt}"
 if [[ "${MODEL_TYPE}" == "cd" ]]; then
-  MODEL_CKPT="${MODEL_CKPT:-${ROOT_DIR}/Result/train_results/cd/cd_best.pt}"
+  MODEL_CKPT="${MODEL_CKPT:-${DEFAULT_RESULT_DIR}/cd/cd_best.pt}"
   STEPS="${STEPS:-1}"
   SAMPLER="${SAMPLER:-euler}"
 else
@@ -70,10 +82,27 @@ if [[ ! -f "${DATA_LOADING_CONFIG}" ]]; then
   exit 1
 fi
 
+MULTIMODAL_META_ARGS=()
+if "${PYTHON_CMD[@]}" -c 'import sys, torch
+path = sys.argv[1]
+try:
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+except TypeError:
+    ckpt = torch.load(path, map_location="cpu")
+except Exception:
+    ckpt = torch.load(path, map_location="cpu")
+state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else {}
+keys = tuple(state.keys()) if isinstance(state, dict) else ()
+prefixes = ("unet_3d.", "ir_extractor.", "projection_layer.", "radar_encoder.", "uncertainty_head.", "fusion_conv.")
+raise SystemExit(0 if any(k.startswith(prefixes) for k in keys) else 1)' "${MODEL_CKPT}"
+then
+  MULTIMODAL_META_ARGS+=(--use_multimodal_meta)
+fi
+
 if [[ -n "${SCENE:-}" ]]; then
   TEST_SCENES=("${SCENE}")
 else
-mapfile -t TEST_SCENES < <("${PYTHON_CMD[@]}" - "${DATA_LOADING_CONFIG}" <<'PY'
+mapfile -t TEST_SCENES < <("${CONFIG_PYTHON_CMD[@]}" - "${DATA_LOADING_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -102,6 +131,7 @@ echo "Minimal inference setup"
 echo "model_type: ${MODEL_TYPE}"
 echo "use_mini_checkpoints: ${USE_MINI_CHECKPOINTS}"
 echo "project dir: ${PROJECT_DIR}"
+echo "preprocessed root: ${PREPROCESSED_ROOT}"
 echo "model_ckpt: ${MODEL_CKPT}"
 echo "vae_ckpt: ${VAE_CKPT}"
 echo "steps/sampler: ${STEPS}/${SAMPLER}"
@@ -166,9 +196,12 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --max_files "${MAX_INFER_FILES}" \
     --occ_threshold "${OCC_THRESHOLD}" \
     --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
+    --report_task_metrics \
     --save_voxel \
+    --save_uncertainty \
     --save_pointcloud \
     --output_dir "${OUTPUT_DIR}" \
+    "${MULTIMODAL_META_ARGS[@]}" \
     "${EXTRA_ADAPTIVE_ARGS[@]}" \
     "${EXTRA_COMPARE_ARGS[@]}"
 

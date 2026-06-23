@@ -56,6 +56,7 @@ ldm:
   decoded_loss_weight: 0.05
   decoded_false_positive_weight: 0.10
   decoded_mass_weight: 0.05
+  uncertainty_loss_weight: 0.05
   # Training parameters
   epochs: 200 # Number of training epochs
   lr: 1.0e-4

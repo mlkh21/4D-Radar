@@ -22,12 +22,29 @@
 - [x] Run loop3 metrics on Ubuntu/Radar-Diffusion environment
 - [x] Summarize whether dy is caused by calibration, ground filtering, FOV, or distribution mismatch
 - [x] Phase 2: Define sensor-aware training/evaluation protocol for airborne obstacle mapping
-- [ ] Phase 3: Implement filtered/shared-visible target generation and metrics in the main pipeline
+- [x] Phase 3: Implement filtered/shared-visible target generation and metrics in the main pipeline
   - [x] Add sensor-aware target generation utility
   - [x] Validate generated target dataset with the training dataset loader
-  - [ ] Add the new banded/shared-visible metrics into formal inference reports
+  - [x] Add airborne egomotion-aware voxelization and Doppler variance channel tests
+  - [x] Add offline IR metadata loading path and multimodal fusion entry for LDM training
+  - [x] Add the new banded/shared-visible metrics into formal inference reports
 - [ ] Phase 4: Retrain VAE/LDM/CD with the corrected protocol and compare against the old baseline
+  - [x] Close CD training/inference interface for legacy and multimodal checkpoints
+  - [x] Add `unified_train.py --mode cd` and route formal CD launcher through it
+  - [x] Add mini CD training/inference smoke path
+  - [ ] Run full formal VAE/LDM/CD retraining on the complete sensor-aware dataset
+  - [ ] Produce baseline comparison table for old LDM, new LDM, CD 1-step, and CD 4-step
 - [ ] Phase 5: Connect densified radar outputs to uncertainty-aware sliding occupancy/DEM map update
+  - [x] Add Doppler/range-aware reliability to offline probabilistic map updates
+  - [x] Add speed-band and odometry-covariance controls to offline map updates
+  - [x] Add streaming map smoke metrics for obstacle precision/recall/uncertainty
+  - [ ] Add ROS1 service/action bridge after offline retraining metrics are stable
+- [x] Phase 6: Correct mini-model over-density and calibrate uncertainty before formal retraining
+  - [x] Add task-aware occupancy-threshold sweep and select a deployable global threshold
+  - [x] Fix per-frame task metric columns in `inference_metrics.csv`
+  - [x] Add a learnable model-error uncertainty head while retaining Doppler/range physical confidence
+  - [x] Train uncertainty with latent Gaussian NLL and report calibration metrics
+  - [x] Re-run targeted unit tests and a saved-output threshold calibration smoke
 
 ## Notes
 
@@ -46,3 +63,6 @@
 | Existing planning files absent                    |        1 | Recreated `task_plan.md`, `findings.md`, and `progress.md` from recovered chat context. |
 | Windows environment lacks project Python deps     |        1 | Runtime checks were deferred, then completed in the Ubuntu/Radar-Diffusion environment. |
 | `TODO/task_plan.md` contained invalid UTF-8 bytes |        1 | Rewrote the planning file as valid UTF-8 before recording final results.                |
+| mini train script used `conda run python -` with heredoc | 1 | Switched YAML/config helper snippets to system `python3`; training still uses Radar-Diffusion env. |
+| mini CD smoke initially wrote to formal `Result/train_results/cd` | 1 | Fixed mini config generation and reran CD 1-epoch smoke into `test/mini-test/train_results_mini/cd`. |
+| mini dataset-level `config` directory was treated as a scene | 1 | Scene discovery now requires both `radar_voxel` and `target_voxel`; verified 500 garden samples load. |

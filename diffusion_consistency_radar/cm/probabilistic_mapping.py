@@ -37,7 +37,14 @@ class GridMapConfig:
     prior_reliability: float = 0.90
     radar_reliability: float = 0.75
     infrared_reliability: float = 0.65
-    # TODO: Ôö¼ÓËÙ¶È·Öµµ²ÎÊı(35/50/70mps)ÒÔÇı¶¯ window_size Óë decay_rate µÄ×ÔÊÊÓ¦µ÷¶È¡£
+    speed_m_s: float = 50.0
+
+    def __post_init__(self) -> None:
+        # Faster flight leaves fewer frames inside the same local volume, so the
+        # map should forget stale observations sooner and keep a shorter window.
+        speed_scale = float(np.clip(self.speed_m_s / 50.0, 0.5, 2.0))
+        self.window_size = max(4, int(round(float(self.window_size) / speed_scale)))
+        self.decay_rate = float(self.decay_rate) * speed_scale
 
     @property
     def shape_xy(self) -> Tuple[int, int]:
@@ -50,12 +57,15 @@ class DSEvidenceFusion:
     """Dempster-Shafer fusion for occupancy, free, and unknown masses."""
 
     @staticmethod
-    def prob_to_mass(occ_prob: np.ndarray, reliability: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def prob_to_mass(occ_prob: np.ndarray, reliability) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         p = np.clip(occ_prob, 0.0, 1.0)
-        r = float(np.clip(reliability, 0.0, 1.0))
+        if isinstance(reliability, np.ndarray):
+            r = np.clip(reliability, 0.0, 1.0).astype(np.float32)
+        else:
+            r = float(np.clip(reliability, 0.0, 1.0))
         m_occ = r * p
         m_free = r * (1.0 - p)
-        m_unknown = np.full_like(p, 1.0 - r)
+        m_unknown = np.full_like(p, 1.0 - r) if not isinstance(r, np.ndarray) else (1.0 - r).astype(np.float32)
         return m_occ, m_free, m_unknown
 
     @staticmethod
@@ -101,7 +111,7 @@ class SlidingProbabilisticGridMap:
         dt = max(0.0, float(timestamp) - float(self.last_timestamp))
         if dt <= 0.0:
             return
-        # TODO: ½«¹Ì¶¨Ê±¼äË¥¼õ¸ÄÎªËÙ¶È×ÔÊÊÓ¦Ë¥¼õ£¬²¢Áª¶¯Àï³Ì¼ÆĞ­·½²î½øĞĞ±£ÊØ»¯´¦Àí¡£
+        # TODO: å°†å›ºå®šæ—¶é—´è¡°å‡æ”¹ä¸ºé€Ÿåº¦è‡ªé€‚åº”è¡°å‡ï¼Œå¹¶è”åŠ¨é‡Œç¨‹è®¡åæ–¹å·®è¿›è¡Œä¿å®ˆåŒ–å¤„ç†ã€‚
         decay = float(np.exp(-self.cfg.decay_rate * dt))
         self.occ_prob = 0.5 + decay * (self.occ_prob - 0.5)
 
@@ -109,12 +119,12 @@ class SlidingProbabilisticGridMap:
     def _odom_confidence(odom_cov: Optional[np.ndarray]) -> float:
         if odom_cov is None:
             return 1.0
-        # TODO: ÒıÈëÏÔÊ½×´Ì¬Ğ­·½²î´«²¥(P_k = F P_{k-1} F^T + Q)£¬Ìæ´úµ±Ç°trace¾­ÑéÓ³Éä¡£
+        # TODO: å¼•å…¥æ˜¾å¼çŠ¶æ€åæ–¹å·®ä¼ æ’­(P_k = F P_{k-1} F^T + Q)ï¼Œæ›¿ä»£å½“å‰traceç»éªŒæ˜ å°„ã€‚
         cov = np.asarray(odom_cov, dtype=np.float32)
         trace = float(np.trace(cov)) if cov.ndim == 2 else float(np.sum(cov))
         return float(np.exp(-0.35 * max(0.0, trace)))
 
-    def _fuse_occ(self, obs_occ: np.ndarray, obs_reliability: float) -> None:
+    def _fuse_occ(self, obs_occ: np.ndarray, obs_reliability) -> None:
         prior_mass = self.ds_fuser.prob_to_mass(self.occ_prob, self.cfg.prior_reliability)
         obs_mass = self.ds_fuser.prob_to_mass(obs_occ, obs_reliability)
         m_occ, m_free, _, ignorance = self.ds_fuser.fuse_two(prior_mass, obs_mass)
@@ -131,11 +141,72 @@ class SlidingProbabilisticGridMap:
             }
         )
 
-    def _update_dem_from_voxel(self, voxel_xyzc: np.ndarray) -> None:
+    def _doppler_variance_bev(self, voxel_xyzc: np.ndarray) -> np.ndarray:
+        if voxel_xyzc.ndim != 4 or voxel_xyzc.shape[-1] <= 3:
+            return np.zeros(voxel_xyzc.shape[:2], dtype=np.float32)
+        occ3d = np.clip(voxel_xyzc[..., 0], 0.0, 1.0)
+        var3d = np.clip(voxel_xyzc[..., 3], 0.0, 50.0)
+        occ_sum = occ3d.sum(axis=2)
+        weighted = (occ3d * var3d).sum(axis=2)
+        out = np.zeros_like(weighted, dtype=np.float32)
+        valid = occ_sum > EPS
+        out[valid] = weighted[valid] / np.maximum(occ_sum[valid], EPS)
+        return out
+
+    @staticmethod
+    def _uncertainty_to_bev(model_uncertainty: Optional[np.ndarray], target_shape: Tuple[int, int]) -> np.ndarray:
+        if model_uncertainty is None:
+            return np.zeros(target_shape, dtype=np.float32)
+        unc = np.asarray(model_uncertainty, dtype=np.float32)
+        unc = np.squeeze(unc)
+        if unc.ndim == 3:
+            unc = np.nanmean(unc, axis=2)
+        if unc.ndim != 2:
+            return np.zeros(target_shape, dtype=np.float32)
+        if unc.shape != target_shape:
+            # Lightweight nearest-neighbor resize without adding image deps.
+            x_idx = np.clip(
+                np.round(np.linspace(0, unc.shape[0] - 1, target_shape[0])).astype(np.int64),
+                0,
+                unc.shape[0] - 1,
+            )
+            y_idx = np.clip(
+                np.round(np.linspace(0, unc.shape[1] - 1, target_shape[1])).astype(np.int64),
+                0,
+                unc.shape[1] - 1,
+            )
+            unc = unc[x_idx][:, y_idx]
+        return np.nan_to_num(np.clip(unc, 0.0, 50.0), nan=50.0).astype(np.float32)
+
+    def observation_reliability_map(
+        self,
+        voxel_xyzc: np.ndarray,
+        sensor: str = "radar",
+        odom_cov: Optional[np.ndarray] = None,
+        model_uncertainty: Optional[np.ndarray] = None,
+        calib_confidence: float = 1.0,
+    ) -> np.ndarray:
+        base = self.cfg.infrared_reliability if sensor == "infrared" else self.cfg.radar_reliability
+        nx = voxel_xyzc.shape[0]
+        x_centers = self.cfg.x_min + (np.arange(nx, dtype=np.float32) + 0.5) * self.cfg.x_resolution
+        max_range = max(self.cfg.x_max - self.cfg.x_min, EPS)
+        speed_scale = float(np.clip(self.cfg.speed_m_s / 50.0, 0.7, 1.4))
+        range_conf = np.clip(
+            1.0 - 0.65 * speed_scale * ((x_centers - self.cfg.x_min) / max_range),
+            0.18,
+            1.0,
+        )[:, np.newaxis]
+        variance_conf = 1.0 / (1.0 + self._doppler_variance_bev(voxel_xyzc) / 10.0)
+        model_unc = self._uncertainty_to_bev(model_uncertainty, voxel_xyzc.shape[:2])
+        model_conf = 1.0 / (1.0 + model_unc / 5.0)
+        odom_conf = self._odom_confidence(odom_cov)
+        calib_conf = float(np.clip(calib_confidence, 0.02, 1.0))
+        return np.clip(base * range_conf * variance_conf * model_conf * odom_conf * calib_conf, 0.02, 1.0).astype(np.float32)
+
+    def _update_dem_from_voxel(self, voxel_xyzc: np.ndarray, model_uncertainty: Optional[np.ndarray] = None) -> None:
         occ3d = np.clip(voxel_xyzc[..., 0], 0.0, 1.0)
         z_bins = occ3d.shape[2]
         z_values = self.cfg.z_min + (np.arange(z_bins, dtype=np.float32) + 0.5) * self.cfg.z_resolution
-        # TODO: °Ñ¶àÆÕÀÕ·½²î(ch3)×¢ÈëDEM²»È·¶¨ĞÔ¸üĞÂ£¬Í³Ò»Êä³ö¸ß³Ì¾ùÖµ+·½²î+³åÍ»¶È¡£
 
         occ_sum = occ3d.sum(axis=2)
         valid = occ_sum > 0.1
@@ -145,6 +216,8 @@ class SlidingProbabilisticGridMap:
         z_mean = (occ3d * z_values[np.newaxis, np.newaxis, :]).sum(axis=2) / np.maximum(occ_sum, EPS)
         z_second = (occ3d * (z_values[np.newaxis, np.newaxis, :] ** 2)).sum(axis=2) / np.maximum(occ_sum, EPS)
         z_var = np.maximum(0.0, z_second - z_mean ** 2)
+        z_var = z_var + self._doppler_variance_bev(voxel_xyzc)
+        z_var = z_var + self._uncertainty_to_bev(model_uncertainty, voxel_xyzc.shape[:2])
 
         prev_valid = ~np.isnan(self.dem_mean)
         blend_w = np.clip(self.belief, 0.1, 0.95)
@@ -164,6 +237,8 @@ class SlidingProbabilisticGridMap:
         timestamp: float,
         sensor: str = "radar",
         odom_cov: Optional[np.ndarray] = None,
+        model_uncertainty: Optional[np.ndarray] = None,
+        calib_confidence: float = 1.0,
     ) -> None:
         """Update occupancy map from 3D voxel with shape (X, Y, Z, C)."""
         self._time_decay(timestamp)
@@ -174,16 +249,22 @@ class SlidingProbabilisticGridMap:
         odom_conf = self._odom_confidence(odom_cov)
         obs_occ = 0.5 + odom_conf * (obs_occ - 0.5)
 
-        reliability = self.cfg.infrared_reliability if sensor == "infrared" else self.cfg.radar_reliability
+        reliability = self.observation_reliability_map(
+            voxel_xyzc,
+            sensor=sensor,
+            odom_cov=odom_cov,
+            model_uncertainty=model_uncertainty,
+            calib_confidence=calib_confidence,
+        )
 
         self._fuse_occ(obs_occ=obs_occ, obs_reliability=reliability)
-        self._update_dem_from_voxel(voxel_xyzc)
+        self._update_dem_from_voxel(voxel_xyzc, model_uncertainty=model_uncertainty)
         self.last_timestamp = float(timestamp)
 
     def update_from_ir_bev(self, bev_xy: np.ndarray, timestamp: float) -> None:
         """Update occupancy map from infrared BEV with shape (X, Y) or (X, Y, C)."""
         self._time_decay(timestamp)
-        # TODO: ½ÓÈëºìÍâÓëÀ×´ïÍâ²Î/Ê±¼äÍ¬²½²¹³¥£¬±ÜÃâ¸ßËÙ»ú¶¯Ê±µÄBEVÍ¶Ó°Ê§Åä¡£
+        # TODO: æ¥å…¥çº¢å¤–ä¸é›·è¾¾å¤–å‚/æ—¶é—´åŒæ­¥è¡¥å¿ï¼Œé¿å…é«˜é€ŸæœºåŠ¨æ—¶çš„BEVæŠ•å½±å¤±é…ã€‚
         bev = np.asarray(bev_xy, dtype=np.float32)
         if bev.ndim == 3:
             bev = bev[..., 0]
@@ -198,7 +279,7 @@ class SlidingProbabilisticGridMap:
     def fuse_with_prior_dem(self, prior_dem: np.ndarray, prior_confidence: float = 0.6) -> None:
         """Fuse a prior DEM with the online DEM estimate."""
         dem = np.asarray(prior_dem, dtype=np.float32)
-        # TODO: Ôö¼ÓD-S³åÍ»¶ÈÇı¶¯µÄ¶¯Ì¬ÏÈÑéÈ¨ÖØ£¬¶ø²»ÊÇ¹Ì¶¨prior_confidence¡£
+        # TODO: å¢åŠ D-Så†²çªåº¦é©±åŠ¨çš„åŠ¨æ€å…ˆéªŒæƒé‡ï¼Œè€Œä¸æ˜¯å›ºå®šprior_confidenceã€‚
         if dem.shape != self.dem_mean.shape:
             raise ValueError(f"prior DEM shape {dem.shape} != map shape {self.dem_mean.shape}")
 
@@ -261,7 +342,7 @@ class LazyLocalMapQuery:
         px = int(np.clip((self._occupied_xy_m[min_idx, 0] - self.cfg.x_min) / self.cfg.x_resolution, 0, self._belief_map.shape[0] - 1))
         py = int(np.clip((self._occupied_xy_m[min_idx, 1] - self.cfg.y_min) / self.cfg.y_resolution, 0, self._belief_map.shape[1] - 1))
         uncertainty = float(np.clip(1.0 - self._belief_map[px, py], 0.0, 1.0))
-        # TODO: ½«¹Ì¶¨·çÏÕãĞÖµÌæ»»ÎªÓë·ÉĞĞËÙ¶ÈºÍ·´Ó¦Ê±³¤Ïà¹ØµÄ¶¯Ì¬°²È«¾àÀëÄ£ĞÍ¡£
+        # TODO: å°†å›ºå®šé£é™©é˜ˆå€¼æ›¿æ¢ä¸ºä¸é£è¡Œé€Ÿåº¦å’Œååº”æ—¶é•¿ç›¸å…³çš„åŠ¨æ€å®‰å…¨è·ç¦»æ¨¡å‹ã€‚
 
         return {
             "distance": min_dist,

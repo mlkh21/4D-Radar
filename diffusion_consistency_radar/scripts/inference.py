@@ -18,16 +18,61 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cm.vae_3d import VAE3D, create_ultra_lightweight_vae_config, create_lightweight_vae_config, create_standard_vae_config
-from cm.unet_optimized import OptimizedUNetModel
-from cm.karras_diffusion import KarrasDenoiser
-from cm.dataset_loader import NTU4DRadLM_VoxelDataset, resize_voxel_channels
+try:
+    from diffusion_consistency_radar.cm.vae_3d import VAE3D, create_ultra_lightweight_vae_config, create_lightweight_vae_config, create_standard_vae_config
+    from diffusion_consistency_radar.cm.unet_optimized import OptimizedUNetModel
+    from diffusion_consistency_radar.cm.multimodal_fusion import CompleteDualModalityPerceptionNet
+    from diffusion_consistency_radar.cm.karras_diffusion import KarrasDenoiser
+    from diffusion_consistency_radar.cm.dataset_loader import (
+        CalibrationProvider,
+        NTU4DRadLM_VoxelDataset,
+        _resize_or_pad_ir_tensor,
+        resize_voxel_channels,
+    )
+except Exception:
+    from cm.vae_3d import VAE3D, create_ultra_lightweight_vae_config, create_lightweight_vae_config, create_standard_vae_config
+    from cm.unet_optimized import OptimizedUNetModel
+    from cm.multimodal_fusion import CompleteDualModalityPerceptionNet
+    from cm.karras_diffusion import KarrasDenoiser
+    from cm.dataset_loader import CalibrationProvider, NTU4DRadLM_VoxelDataset, _resize_or_pad_ir_tensor, resize_voxel_channels
+
+try:
+    from diffusion_consistency_radar.cm.evaluation_metrics import (
+        bev_iou as task_bev_iou,
+        filter_points_by_band,
+        nearest_neighbor_metrics,
+        occupancy_prf,
+        parse_range_bins,
+        uncertainty_calibration_metrics,
+    )
+except Exception:
+    from cm.evaluation_metrics import (
+        bev_iou as task_bev_iou,
+        filter_points_by_band,
+        nearest_neighbor_metrics,
+        occupancy_prf,
+        parse_range_bins,
+        uncertainty_calibration_metrics,
+    )
 from torch.utils.data import DataLoader
 
 try:
     from scipy.spatial import cKDTree
 except Exception:
     cKDTree = None
+
+
+TASK_METRIC_FIELDS = [
+    "task_near_recall_mean",
+    "task_near_precision_mean",
+    "task_near_bev_iou_mean",
+    "task_near_nn_mean",
+    "task_near_match_ratio_2_mean",
+    "uncertainty_ece",
+    "uncertainty_brier",
+    "uncertainty_nll",
+    "uncertainty_error_corr",
+]
 
 
 def safe_torch_load(path, map_location):
@@ -43,6 +88,148 @@ def safe_torch_load(path, map_location):
         if "Weights only load failed" in msg or "Unsupported global" in msg:
             return torch.load(path, map_location=map_location)
         raise
+
+
+def is_multimodal_state_dict(state_dict) -> bool:
+    keys = list((state_dict or {}).keys())
+    return any(
+        key.startswith("unet_3d.")
+        or key.startswith("ir_extractor.")
+        or key.startswith("projection_layer.")
+        or key.startswith("radar_encoder.")
+        or key.startswith("uncertainty_head.")
+        or key.startswith("model_uncertainty_head.")
+        or key.startswith("fusion_conv.")
+        for key in keys
+    )
+
+
+def _compatible_state_dict(model, state_dict):
+    model_state = model.state_dict()
+    return {
+        key: value
+        for key, value in (state_dict or {}).items()
+        if key in model_state and tuple(model_state[key].shape) == tuple(value.shape)
+    }
+
+
+def build_inference_model(state_dict, device, strict: bool = True):
+    if is_multimodal_state_dict(state_dict):
+        base_unet = OptimizedUNetModel(
+            image_size=32,
+            in_channels=16,
+            model_channels=32,
+            out_channels=4,
+            num_res_blocks=1,
+            attention_resolutions=(),
+            channel_mult=(1, 2, 3),
+            use_checkpoint=False,
+            attention_type="linear",
+        )
+        model = CompleteDualModalityPerceptionNet(
+            base_unet,
+            voxel_shape=(32, 128, 128),
+            pc_range=(0, -20, -6, 120, 20, 10),
+            downsample_to_latent=True,
+        ).to(device)
+    else:
+        model = OptimizedUNetModel(
+            image_size=32,
+            in_channels=8,
+            model_channels=32,
+            out_channels=4,
+            num_res_blocks=1,
+            attention_resolutions=(),
+            channel_mult=(1, 2, 3),
+            use_checkpoint=False,
+            attention_type="linear",
+        ).to(device)
+    if state_dict:
+        if strict and not getattr(model, "is_multimodal", False):
+            model.load_state_dict(state_dict)
+        else:
+            model.load_state_dict(_compatible_state_dict(model, state_dict), strict=False)
+    return model
+
+
+def append_task_metric_headers(header):
+    for field in TASK_METRIC_FIELDS:
+        if field not in header:
+            header.append(field)
+    return header
+
+
+def build_task_metric_row(row, header, values):
+    while len(row) < len(header):
+        row.append("")
+    for key, value in (values or {}).items():
+        if key in header:
+            row[header.index(key)] = f"{float(value):.6f}" if np.isfinite(float(value)) else ""
+    return row
+
+
+def build_task_metric_summary_row(row, header, summary):
+    return build_task_metric_row(row, header, summary)
+
+
+def _mock_multimodal_meta(batch_size: int, device):
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, 480, device=device),
+        torch.linspace(-1.0, 1.0, 640, device=device),
+        indexing="ij",
+    )
+    thermal = torch.exp(-((xx * 1.8) ** 2 + (yy * 1.2) ** 2))
+    ir_img = torch.stack([thermal, thermal * 0.85, thermal * 0.65], dim=0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+    return {
+        "ir_img": ir_img,
+        "r_mat": torch.eye(3, device=device).unsqueeze(0).repeat(batch_size, 1, 1),
+        "t_vec": torch.zeros(batch_size, 3, device=device),
+        "k_mat": torch.tensor([[457.2, 0.0, 323.1], [0.0, 457.9, 242.5], [0.0, 0.0, 1.0]], device=device).unsqueeze(0).repeat(batch_size, 1, 1),
+        "is_mock_ir": torch.ones(batch_size, device=device),
+        "is_mock_calib": torch.ones(batch_size, device=device),
+        "odom_cov_trace": torch.zeros(batch_size, device=device),
+    }
+
+
+def prepare_multimodal_meta(meta_dict, batch_size: int, device):
+    meta = _mock_multimodal_meta(batch_size, device)
+    for key in ("ir_img", "r_mat", "t_vec", "k_mat", "is_mock_ir", "is_mock_calib", "odom_cov_trace"):
+        value = (meta_dict or {}).get(key) if isinstance(meta_dict, dict) else None
+        if torch.is_tensor(value):
+            value = value.to(device)
+            if value.dim() == meta[key].dim() - 1:
+                value = value.unsqueeze(0)
+            meta[key] = value
+        elif value is not None and key in ("is_mock_ir", "is_mock_calib", "odom_cov_trace"):
+            meta[key] = torch.as_tensor(value, device=device, dtype=torch.float32).reshape(-1)
+            if meta[key].numel() == 1 and batch_size > 1:
+                meta[key] = meta[key].repeat(batch_size)
+    return meta
+
+
+def load_multimodal_meta_for_radar(radar_path: str, device):
+    scene_dir = os.path.dirname(os.path.dirname(radar_path))
+    dataset_root = os.path.dirname(scene_dir)
+    frame_id = os.path.splitext(os.path.basename(radar_path))[0].replace("_voxel", "")
+    ir_path = os.path.join(scene_dir, "ir_image", f"{frame_id}_ir.npy")
+    meta = {}
+    if os.path.exists(ir_path):
+        arr = np.load(ir_path).astype(np.float32)
+        meta["ir_img"] = _resize_or_pad_ir_tensor(torch.from_numpy(arr)).to(device)
+        meta["is_mock_ir"] = torch.zeros(1, device=device)
+    else:
+        meta["is_mock_ir"] = torch.ones(1, device=device)
+    provider = CalibrationProvider(dataset_root)
+    r_mat, t_vec, k_mat, is_mock = provider.load()
+    if is_mock:
+        t_vec = t_vec.clone()
+        t_vec[0] += 0.01
+    meta["r_mat"] = r_mat.to(device)
+    meta["t_vec"] = t_vec.to(device)
+    meta["k_mat"] = k_mat.to(device)
+    meta["is_mock_calib"] = torch.ones(1, device=device) if is_mock else torch.zeros(1, device=device)
+    meta["odom_cov_trace"] = torch.zeros(1, device=device)
+    return meta
 
 
 class RadarGenerator:
@@ -68,6 +255,7 @@ class RadarGenerator:
         print(f"Loading {model_type.upper()} from {model_path}...")
         self.model = self._load_model(model_path)
         self.model.eval()
+        self.last_uncertainty = None
         
         # NOTE: 复用训练时一致的噪声调度参数。
         self.denoiser = KarrasDenoiser(
@@ -95,28 +283,12 @@ class RadarGenerator:
     
     def _load_model(self, ckpt_path):
         """加载 LDM 或 CD 模型"""
-        model = OptimizedUNetModel(
-            image_size=32,
-            in_channels=8,
-            model_channels=32,
-            out_channels=4,
-            num_res_blocks=1,
-            attention_resolutions=(),
-            channel_mult=(1, 2, 3),
-            use_checkpoint=False,
-            attention_type="linear",
-        ).to(self.device)
-        
         ckpt = safe_torch_load(ckpt_path, map_location=self.device)
-        if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
-        else:
-            model.load_state_dict(ckpt)
-        
-        return model
+        state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+        return build_inference_model(state_dict, self.device, strict=True)
     
     @torch.no_grad()
-    def generate(self, condition, num_samples=1, steps=40, sampler='heun', show_sampling_progress=False):
+    def generate(self, condition, num_samples=1, steps=40, sampler='heun', show_sampling_progress=False, meta_dict=None):
         """
         生成雷达数据
         
@@ -131,10 +303,13 @@ class RadarGenerator:
         """
         if show_sampling_progress:
             print(f"\nGenerating {num_samples} samples with {steps} steps ({sampler} sampler)...")
+        self.last_uncertainty = None
         
         # NOTE: 条件分支将雷达观测编码到潜空间，保证与采样噪声同尺度。
+        condition_voxel = None
         if condition is not None:
             condition = condition.to(self.device)
+            condition_voxel = condition
             z_cond = self.vae.get_latent(condition)
             # FIXME: 噪声潜变量与条件潜变量形状必须严格一致，否则拼接后会在 UNet 前向报错。
             z_shape = tuple(z_cond.shape)
@@ -143,29 +318,73 @@ class RadarGenerator:
             # NOTE: 无条件采样时使用固定潜空间尺寸。
             z_shape = (num_samples, 4, 8, 32, 32)
             z_cond = torch.zeros(z_shape, device=self.device)
+            condition_voxel = torch.zeros(num_samples, 4, 32, 128, 128, device=self.device)
         
         # NOTE: 按 sigma_max 初始化起始噪声，匹配 Karras 采样假设。
         z_T = torch.randn(z_shape, device=self.device) * self.denoiser.sigma_max
         
         # NOTE: 一致性蒸馏（CD）模式支持一步采样，潜扩散模型（LDM）走多步求解器。
         if self.model_type == 'cd' and steps == 1:
-            z_0 = self._cd_sample(z_T, z_cond)
+            z_0 = self._cd_sample(z_T, z_cond, condition_voxel, meta_dict)
         else:
-            z_0 = self._ldm_sample(z_T, z_cond, steps, sampler, show_sampling_progress)
+            z_0 = self._ldm_sample(z_T, z_cond, steps, sampler, show_sampling_progress, condition_voxel, meta_dict)
         
         # NOTE: 将潜变量解码回体素空间输出。
         generated = self.vae.decode(z_0)
         
         return generated
     
-    def _cd_sample(self, z_T, z_cond):
+    def _cd_sample(self, z_T, z_cond, condition_voxel=None, meta_dict=None):
         """CD 一步采样"""
+        if getattr(self.model, "is_multimodal", False):
+            meta = prepare_multimodal_meta(meta_dict, z_T.shape[0], self.device)
+            return self._call_multimodal_model(
+                condition_voxel,
+                meta,
+                torch.ones(z_T.shape[0], device=self.device) * self.denoiser.sigma_max,
+                z_T,
+            )
         model_input = torch.cat([z_T, z_cond], dim=1)
         sigma = torch.ones(z_T.shape[0], device=self.device) * self.denoiser.sigma_max
         z_0 = self.model(model_input, sigma)
         return z_0
+
+    def _call_multimodal_model(self, condition_voxel, meta, sigma_batch, noised_latent):
+        kwargs = {
+            "noised_latent": noised_latent,
+            "odom_cov_trace": meta.get("odom_cov_trace"),
+            "is_mock_ir": meta.get("is_mock_ir"),
+            "is_mock_calib": meta.get("is_mock_calib"),
+            "return_uncertainty": True,
+        }
+        try:
+            out = self.model(
+                condition_voxel,
+                meta["ir_img"],
+                meta["r_mat"],
+                meta["t_vec"],
+                meta["k_mat"],
+                sigma_batch,
+                **kwargs,
+            )
+        except TypeError:
+            out = self.model(
+                condition_voxel,
+                meta["ir_img"],
+                meta["r_mat"],
+                meta["t_vec"],
+                meta["k_mat"],
+                sigma_batch,
+                noised_latent=noised_latent,
+            )
+        if isinstance(out, tuple):
+            denoised, uncertainty = out
+            self.last_uncertainty = uncertainty
+            return denoised
+        self.last_uncertainty = None
+        return out
     
-    def _ldm_sample(self, z_T, z_cond, steps, sampler, show_sampling_progress=False):
+    def _ldm_sample(self, z_T, z_cond, steps, sampler, show_sampling_progress=False, condition_voxel=None, meta_dict=None):
         """LDM 多步采样 (Heun/Euler)"""
         # NOTE: 生成单调递减的 sigma 序列，驱动 ODE 采样。
         sigmas = self._get_sigmas(steps)
@@ -180,9 +399,13 @@ class RadarGenerator:
             sigma_next = sigmas[i + 1]
             
             # NOTE: 拼接条件潜变量后预测去噪结果。
-            model_input = torch.cat([z_t, z_cond], dim=1)
             sigma_batch = torch.ones(z_t.shape[0], device=self.device) * sigma_t
-            denoised = self.model(model_input, sigma_batch)
+            if getattr(self.model, "is_multimodal", False):
+                meta = prepare_multimodal_meta(meta_dict, z_t.shape[0], self.device)
+                denoised = self._call_multimodal_model(condition_voxel, meta, sigma_batch, z_t)
+            else:
+                model_input = torch.cat([z_t, z_cond], dim=1)
+                denoised = self.model(model_input, sigma_batch)
             
             # NOTE: 常微分方程（ODE）形式导数 d = (x - denoised) / sigma。
             d = (z_t - denoised) / sigma_t
@@ -192,9 +415,12 @@ class RadarGenerator:
                 z_next = z_t + d * (sigma_next - sigma_t)
                 
                 # NOTE: 在预测点重新估计导数。
-                model_input_2 = torch.cat([z_next, z_cond], dim=1)
                 sigma_batch_2 = torch.ones(z_t.shape[0], device=self.device) * sigma_next
-                denoised_2 = self.model(model_input_2, sigma_batch_2)
+                if getattr(self.model, "is_multimodal", False):
+                    denoised_2 = self._call_multimodal_model(condition_voxel, meta, sigma_batch_2, z_next)
+                else:
+                    model_input_2 = torch.cat([z_next, z_cond], dim=1)
+                    denoised_2 = self.model(model_input_2, sigma_batch_2)
                 d_2 = (z_next - denoised_2) / sigma_next
                 
                 # NOTE: 两次导数求均值完成校正。
@@ -409,6 +635,8 @@ def main():
     parser.add_argument("--use_condition", action="store_true", help="Use condition data from dataset")
     parser.add_argument("--save_pointcloud", action="store_true", help="Save point cloud .npy per sample")
     parser.add_argument("--save_voxel", action="store_true", help="Save voxel .npy per sample")
+    parser.add_argument("--save_uncertainty", action="store_true",
+                        help="Save multimodal uncertainty/confidence .npy per sample when available")
     parser.add_argument("--compare_with_lidar", action="store_true", help="Compare with raw livox point clouds")
     parser.add_argument("--compare_with_target", action="store_true",
                         help="Compare prediction and radar baseline with processed target_voxel")
@@ -429,6 +657,14 @@ def main():
                         help="Directory containing target_voxel files for adaptive occupancy threshold")
     parser.add_argument("--adaptive_target_threshold", type=float, default=-1.0,
                         help="Threshold used to count target occupancy in adaptive mode (negative uses --occ_threshold)")
+    parser.add_argument("--use_multimodal_meta", action="store_true",
+                        help="Use IR/calibration metadata when the checkpoint is multimodal")
+    parser.add_argument("--report_task_metrics", action="store_true",
+                        help="Report shared-visible obstacle metrics in inference_metrics.csv")
+    parser.add_argument("--task_range_bins", type=str, default="0-20,20-40,40-80,80-120",
+                        help="Range bins for task metrics, formatted as start-end,start-end")
+    parser.add_argument("--task_z_mins", type=str, default="-1,0",
+                        help="Comma-separated z_min filters for task metrics")
 
     args = parser.parse_args()
 
@@ -488,7 +724,7 @@ def main():
         merged_csv_path = os.path.join(args.output_dir, "inference_metrics.csv")
         merged_csv_file = open(merged_csv_path, 'w', newline='')
         merged_writer = csv.writer(merged_csv_file)
-        merged_writer.writerow([
+        metric_header = [
             "index",
             "radar_file",
             "radar_point_count",
@@ -520,7 +756,10 @@ def main():
             "mean_pred_target_chamfer",
             "mean_radar_target_chamfer",
             "mean_raw_lidar_chamfer",
-        ])
+        ]
+        if args.report_task_metrics:
+            append_task_metric_headers(metric_header)
+        merged_writer.writerow(metric_header)
 
         log_path = os.path.join(args.output_dir, "inference_runtime.log")
         log_file = open(log_path, 'w', encoding='utf-8')
@@ -551,6 +790,8 @@ def main():
         target_chamfer_values = []
         radar_target_chamfer_values = []
         raw_lidar_chamfer_values = []
+        task_acc = {field: [] for field in TASK_METRIC_FIELDS}
+        task_range_bins = parse_range_bins(args.task_range_bins)
 
         file_pbar = tqdm(
             enumerate(radar_files),
@@ -580,6 +821,7 @@ def main():
                 radar_point_count = count_radar_points(radar_path)
             condition_data = load_radar_voxel_as_tensor(radar_path, generator.device)
             condition_data = condition_data.unsqueeze(0)
+            meta_dict = load_multimodal_meta_for_radar(radar_path, generator.device) if args.use_multimodal_meta else None
 
             file_start = time.perf_counter()
 
@@ -589,6 +831,7 @@ def main():
                 steps=args.steps,
                 sampler=args.sampler,
                 show_sampling_progress=False,
+                meta_dict=meta_dict,
             )
 
             file_infer_sec = time.perf_counter() - file_start
@@ -601,10 +844,20 @@ def main():
             used_topk_fallback = False
             effective_occ_threshold = float(args.occ_threshold)
             target_occ_count = ""
+            task_values = {}
 
             if args.save_voxel:
                 out_voxel = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_voxel.npy")
                 np.save(out_voxel, sample)
+            if (args.save_voxel or args.save_uncertainty) and generator.last_uncertainty is not None:
+                unc = generator.last_uncertainty.get(
+                    "variance",
+                    generator.last_uncertainty.get("log_var", generator.last_uncertainty.get("confidence")),
+                )
+                if torch.is_tensor(unc):
+                    unc_np = unc[0].detach().cpu().numpy()
+                    out_unc = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_uncertainty.npy")
+                    np.save(out_unc, unc_np)
 
             if args.save_pointcloud or args.compare_with_lidar or args.compare_with_target:
                 if args.adaptive_occ_from_target:
@@ -690,6 +943,41 @@ def main():
                     radar_target_dx = f"{rdx:.6f}" if np.isfinite(rdx) else ""
                     radar_target_dy = f"{rdy:.6f}" if np.isfinite(rdy) else ""
                     radar_target_dz = f"{rdz:.6f}" if np.isfinite(rdz) else ""
+                    if args.report_task_metrics:
+                        near_pred = filter_points_by_band(pcl[:, :3], args.pc_range, x_min=0.0, x_max=20.0, z_min=-1.0)
+                        near_target = filter_points_by_band(target_pcl[:, :3], args.pc_range, x_min=0.0, x_max=20.0, z_min=-1.0)
+                        prf = occupancy_prf(near_pred, near_target, args.pc_range, cell_size=0.5)
+                        iou = task_bev_iou(near_pred, near_target, args.pc_range, cell_size=0.5)
+                        nn = nearest_neighbor_metrics(near_pred, near_target, thresholds=(2.0,))
+                        task_values = {
+                            "task_near_recall_mean": prf["recall"],
+                            "task_near_precision_mean": prf["precision"],
+                            "task_near_bev_iou_mean": iou["bev_iou"],
+                            "task_near_nn_mean": nn["nn_mean"],
+                            "task_near_match_ratio_2_mean": nn["match_ratio_2"],
+                        }
+                        for key, value in task_values.items():
+                            if np.isfinite(value):
+                                task_acc[key].append(float(value))
+                        if generator.last_uncertainty is not None:
+                            uncertainty_tensor = generator.last_uncertainty.get("variance")
+                            if torch.is_tensor(uncertainty_tensor):
+                                calibration = uncertainty_calibration_metrics(
+                                    sample[0],
+                                    target_voxel[0],
+                                    uncertainty_tensor[0].detach().cpu().numpy(),
+                                    occ_threshold=effective_occ_threshold,
+                                )
+                                for key in (
+                                    "uncertainty_ece",
+                                    "uncertainty_brier",
+                                    "uncertainty_nll",
+                                    "uncertainty_error_corr",
+                                ):
+                                    value = calibration[key]
+                                    task_values[key] = value
+                                    if np.isfinite(value):
+                                        task_acc[key].append(float(value))
                 else:
                     log_file.write(f"warning: target voxel not found for {fname}, skip processed target metrics\n")
 
@@ -716,7 +1004,7 @@ def main():
                     if np.isfinite(chamfer_val):
                         raw_lidar_chamfer_values.append(chamfer_val)
 
-            merged_writer.writerow([
+            row = [
                 i,
                 fname,
                 radar_point_count,
@@ -748,7 +1036,10 @@ def main():
                 "",
                 "",
                 "",
-            ])
+            ]
+            if args.report_task_metrics:
+                build_task_metric_row(row, metric_header, task_values)
+            merged_writer.writerow(row)
 
         merged_csv_file.flush()
         avg_infer_sec = total_infer_sec / max(len(radar_files), 1)
@@ -758,7 +1049,7 @@ def main():
         mean_radar_target_chamfer = float(np.mean(radar_target_chamfer_values)) if len(radar_target_chamfer_values) > 0 else float('nan')
         mean_raw_lidar_chamfer = float(np.mean(raw_lidar_chamfer_values)) if len(raw_lidar_chamfer_values) > 0 else float('nan')
 
-        summary_row = [""] * 31
+        summary_row = [""] * len(metric_header)
         summary_row[0] = "__summary__"
         summary_row[23] = f"{args.train_duration_seconds:.3f}"
         summary_row[24] = f"{total_infer_sec:.6f}"
@@ -768,6 +1059,12 @@ def main():
         summary_row[28] = f"{mean_pred_target_chamfer:.6f}" if np.isfinite(mean_pred_target_chamfer) else ""
         summary_row[29] = f"{mean_radar_target_chamfer:.6f}" if np.isfinite(mean_radar_target_chamfer) else ""
         summary_row[30] = f"{mean_raw_lidar_chamfer:.6f}" if np.isfinite(mean_raw_lidar_chamfer) else ""
+        if args.report_task_metrics:
+            task_summary = {
+                key: float(np.mean(values)) if values else float("nan")
+                for key, values in task_acc.items()
+            }
+            build_task_metric_summary_row(summary_row, metric_header, task_summary)
         merged_writer.writerow(summary_row)
 
         log_file.write("\n")
@@ -806,9 +1103,12 @@ def main():
             dataset = NTU4DRadLM_VoxelDataset(args.dataset_dir, split='val')
             dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
             # FIXME: 当验证集为空时这里会触发 StopIteration，后续可改为显式空集检查。
-            condition_data = next(iter(dataloader))[1]
+            batch = next(iter(dataloader))
+            condition_data = batch[1]
+            meta_dict = batch[2] if args.use_multimodal_meta and len(batch) > 2 else None
         else:
             condition_data = None
+            meta_dict = None
 
         # NOTE: 运行生成并保存体素结果。
         generated = generator.generate(
@@ -816,6 +1116,7 @@ def main():
             num_samples=args.num_samples,
             steps=args.steps,
             sampler=args.sampler,
+            meta_dict=meta_dict,
         )
 
         output_path = os.path.join(args.output_dir, f"{args.model_type}_samples_{args.steps}steps.npy")

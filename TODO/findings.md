@@ -100,6 +100,42 @@ Result:
 
 This confirms the new target policy strongly suppresses low-z / far / non-radar-visible LiDAR supervision before retraining.
 
+## Airborne Multimodal Refactor Findings
+
+- The requested refactor is feasible, but the full physical grid `(600, 200, 80)` is too large for routine unit tests and likely too expensive for default LDM training. The implementation keeps `DualModalityProjectionLayer` defaulting to that physical shape, while `OptimizedLDMTrainer` uses configurable `ldm.fusion_voxel_shape` with a throughput-oriented default `(32, 128, 128)` that matches the preprocessed training tensor.
+- The current server environment does not provide a usable `torchvision` import, so `IR2DFeatureExtractor` uses ResNet-18 when available and falls back to a small CNN otherwise. This keeps tests and training code runnable without silently removing the IR pathway.
+- VAE latent size can be smaller than the radar voxel size. The fusion network therefore downsamples fused radar+IR features to the passed `noised_latent` spatial size during LDM training, avoiding shape mismatch in the denoiser loss.
+- LDM checkpoints saved before this refactor contain the old bare UNet state dict. They should be treated as architecture-incompatible unless a dedicated migration script strips or remaps wrapper keys.
+
+## Offline Loop Closure Implementation Findings
+
+- `inference.py` now supports both legacy 8-channel UNet checkpoints and new `CompleteDualModalityPerceptionNet` checkpoints by inspecting checkpoint state-dict keys. New multimodal inference can use sidecar `ir_image/*_ir.npy` and calibration metadata, with mock fallback when missing.
+- Formal task metrics were promoted into `diffusion_consistency_radar/cm/evaluation_metrics.py` and connected to inference/diagnosis reporting. The first production summary focuses on near obstacle metrics (`x=0-20m`, `z>=-1m`) because this is the most relevant band for airborne local obstacle-map updates.
+- `dataset_loader.py` now marks `is_mock_ir` and `is_mock_calib`, and scene-level `preprocess_policy.json` is loaded into `meta_dict`. This makes mock/fallback data explicit instead of hidden.
+- `probabilistic_mapping.py` now converts Doppler variance and range into a per-cell observation reliability map. High variance and far-range cells produce lower belief and higher map/DEM uncertainty.
+- `streaming_map_update.py` now ignores `*_pcl.npy` files when looking for voxel inputs; this fixed the smoke-test failure where point clouds were incorrectly parsed as 4D voxels.
+- Mini shell helpers should not use `conda run -n Radar-Diffusion python - <<'PY'` for heredoc snippets. In this environment the stdin script can be swallowed, causing config generation to silently leave old YAML values in place. Use system `python3` for lightweight YAML helpers and reserve `conda run` for actual PyTorch training/inference commands.
+- A bad mini CD smoke run exposed this issue by ignoring `MINI_CD_EPOCHS` and writing to `Result/train_results/cd`; after switching config helpers to `python3`, mini CD correctly uses `test/mini-test/train_results_mini/cd` and `cd.epochs=1`.
+
+## Mini 500-Sample Inference Diagnosis
+
+- Mini training used 500 `garden` samples for VAE/LDM/CD, 10 epochs each, then inferred 500 `loop3` frames. This is a loop-closure smoke test, not a formal quality result, because train and inference scenes differ and the sample count is tiny.
+- Final mini losses:
+  - VAE epoch 10 loss: `0.143191`
+  - LDM best loss: `0.058654`
+  - CD best loss: `0.000551`
+- Inference summary:
+  - LDM: `mean_pred_target_chamfer=7.591485`, `avg_infer_seconds=1.295140`, `avg_pred_point_count=5708`
+  - CD: `mean_pred_target_chamfer=8.399870`, `avg_infer_seconds=0.024213`, `avg_pred_point_count=9889`
+  - Radar baseline target Chamfer in the same CSV: `5.572554`
+- Root-cause evidence from typical frames (`000068`, `000150`, `000253`, `000386`, `000478`, `000488`):
+  - LDM predicts about `1.56x` target point count; CD predicts about `2.70x`, so CD is over-dense after 1-step distillation.
+  - Predicted point clouds are biased toward smaller x. Example frame `000488`: target centroid x `30.7`, LDM x `27.3`, CD x `18.8`.
+  - Predicted point clouds are biased lower in z. Across inspected frames, target z90 often reaches `6.7-8.1m`, while LDM/CD z90 is mostly `3.8-4.8m`.
+  - y distribution also differs: target often has negative y centroid in late loop3 frames, while predictions stay positive.
+- Working hypothesis: current poor mini inference is primarily caused by undertrained/cross-scene mini training and distribution bias learned from limited data, not by a new runtime loading failure. CD trades quality for speed and currently amplifies over-density.
+- Generated interactive 3D visualizations under `Result/visualization/mini_inference_compare/`.
+
 ## Ubuntu Commands To Run
 ```bash
 conda run -n Radar-Diffusion python test/test_shared_visibility_eval.py
@@ -116,3 +152,24 @@ conda run -n Radar-Diffusion python test/shared_visibility_eval.py \
   --output_dir Result/alignment_check/loop3/shared_visibility_radarframe \
   --max_files 120
 ```
+
+## 2026-06-22 Sensor-Aware Mini Fusion Results
+
+- New training used 500 `garden` sensor-aware samples for 10 epochs each and evaluated 500 `loop3` frames.
+- LDM: mean Chamfer `4.086251`, mean latency `1.901586s`, near recall `0.824063`, near precision `0.305613`, BEV IoU `0.281782`.
+- CD 1-step: mean Chamfer `3.794822`, mean latency `0.037270s`, near recall `0.871762`, near precision `0.296941`, BEV IoU `0.280092`.
+- CD is about 51x faster than LDM and beats LDM Chamfer on 71.4% of frames; both models beat the radar baseline on 360/500 frames.
+- Remaining density problem is severe at threshold 0.2: mean pred/target count ratio is `4.12` for LDM and `4.81` for CD. High recall plus low precision indicates over-prediction.
+- Saved uncertainty arrays are nearly zero and identical for LDM/CD because the current uncertainty head is a deterministic transform of radar Doppler variance, not a learned model-error estimate.
+- Before increasing training penalties, calibrate a global occupancy threshold on validation outputs to separate score calibration error from geometry/model error.
+- Broad threshold sweep confirmed score calibration is the dominant density issue:
+  - LDM pred/target count ratio falls from `3.33` at threshold `0.2` to `1.11` at `0.6`.
+  - CD pred/target count ratio falls from `3.94` at threshold `0.2` to `1.04` at `0.7`.
+- A fixed `0.2` threshold is therefore not comparable across legacy and sensor-aware checkpoints. A validation-calibrated global threshold should be saved with each model/evaluation protocol.
+- Task-region exact-voxel F1 calibration selected threshold `0.5` for both models:
+  - LDM: precision `0.173`, recall `0.237`, F1 `0.200`, count ratio `1.37`.
+  - CD: precision `0.182`, recall `0.320`, F1 `0.232`, count ratio `1.76`.
+- Thresholding corrects much of the density calibration but exact voxel overlap remains low, so geometry learning still needs formal retraining/validation.
+- The uncertainty architecture now separates physical variance from learned model-error variance. The learned branch is initialized conservatively and is optimized with detached-residual Gaussian NLL so it cannot reduce denoising loss by merely inflating variance.
+- A one-sample isolated LDM smoke completed in `0.6s` with about `1.5GB` peak reserved GPU memory. The uncertainty head final-layer weight moved from exactly zero to an absolute sum of about `8e-4`, confirming NLL gradients update it.
+- Formal inference now reports uncertainty ECE, Brier score, Bernoulli NLL, and uncertainty-error correlation. These interpret `variance/(1+variance)` as predicted occupancy-error probability.

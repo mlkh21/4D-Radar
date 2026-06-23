@@ -39,6 +39,55 @@ from cm.vae_3d import (
 from cm.unet_optimized import OptimizedUNetModel, create_lightweight_unet_config
 from cm.dataset_loader import NTU4DRadLM_VoxelDataset
 from cm.karras_diffusion import KarrasDenoiser
+from cm.multimodal_fusion import CompleteDualModalityPerceptionNet, heteroscedastic_gaussian_nll
+from scripts.cd_train_optimized import ConsistencyDistillationTrainer
+
+
+def unpack_training_batch(batch):
+    """Support legacy (target, radar) and multimodal (target, radar, meta[, path]) batches."""
+    if len(batch) == 2:
+        target, radar = batch
+        return target, radar, {}
+    if len(batch) == 3:
+        target, radar, meta = batch
+        return target, radar, meta
+    if len(batch) == 4:
+        target, radar, meta, _path = batch
+        return target, radar, meta
+    raise ValueError(f"Unsupported batch format with {len(batch)} elements")
+
+
+def move_meta_to_device(meta: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    moved = {}
+    for key, value in (meta or {}).items():
+        moved[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+    return moved
+
+
+def pad_ldm_input_to_sixteen_channels(model_input: torch.Tensor) -> torch.Tensor:
+    if model_input.shape[1] == 16:
+        return model_input
+    if model_input.shape[1] > 16:
+        raise ValueError(f"LDM model input has {model_input.shape[1]} channels, expected <= 16")
+    pad_channels = 16 - model_input.shape[1]
+    pad = torch.zeros(
+        model_input.shape[0],
+        pad_channels,
+        *model_input.shape[2:],
+        device=model_input.device,
+        dtype=model_input.dtype,
+    )
+    return torch.cat([model_input, pad], dim=1)
+
+
+def has_multimodal_meta(meta: Dict[str, Any]) -> bool:
+    required = ("ir_img", "r_mat", "t_vec", "k_mat")
+    return all(torch.is_tensor((meta or {}).get(key)) for key in required)
+
+
+def resolve_cd_teacher_checkpoint(args_ldm_ckpt: str, config: "ConfigManager") -> str:
+    """Resolve the CD teacher checkpoint from CLI first, then YAML config."""
+    return args_ldm_ckpt or config.get('cd.teacher_model_path', '')
 
 
 def safe_torch_load(path, map_location):
@@ -261,7 +310,8 @@ class OptimizedVAETrainer:
         # 创建进度条
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{self.epochs}")
         
-        for batch_idx, (target, cond) in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            target, cond, meta_dict = unpack_training_batch(batch)
             target = target.to(self.device, non_blocking=True)
             
             if torch.isnan(target).any():
@@ -436,10 +486,10 @@ class OptimizedLDMTrainer:
         self.save_dir = ldm_config.get('save_dir', './Result/train_results/ldm')
         os.makedirs(self.save_dir, exist_ok=True)
         
-        # 创建潜空间模型
-        self.model = OptimizedUNetModel(
+        # 创建潜空间去噪骨干，再挂到雷达-红外多模态入口。
+        base_unet = OptimizedUNetModel(
             image_size=32,  # 潜空间 H/W
-            in_channels=8,  # 2x latent_dim (条件+噪声)
+            in_channels=16,  # noised latent + multimodal latent condition interface
             model_channels=ldm_config.get('model_channels', 32),
             out_channels=4,  # latent_dim
             num_res_blocks=ldm_config.get('num_res_blocks', 1),
@@ -447,6 +497,16 @@ class OptimizedLDMTrainer:
             channel_mult=tuple(ldm_config.get('channel_mult', [1, 2, 3])),
             use_checkpoint=True,
             attention_type="linear",
+        )
+        fusion_voxel_shape = tuple(int(v) for v in ldm_config.get('fusion_voxel_shape', [32, 128, 128]))
+        fusion_latent_shape = tuple(int(v) for v in ldm_config.get('fusion_latent_shape', fusion_voxel_shape))
+        fusion_pc_range = tuple(float(v) for v in ldm_config.get('fusion_pc_range', [0, -20, -6, 120, 20, 10]))
+        self.model = CompleteDualModalityPerceptionNet(
+            base_unet,
+            voxel_shape=fusion_voxel_shape,
+            pc_range=fusion_pc_range,
+            downsample_to_latent=True,
+            latent_shape=fusion_latent_shape,
         ).to(self.device)
         
         # 优化器
@@ -466,6 +526,7 @@ class OptimizedLDMTrainer:
         self.decoded_loss_weight = float(ldm_config.get('decoded_loss_weight', 0.0))
         self.decoded_false_positive_weight = float(ldm_config.get('decoded_false_positive_weight', 0.0))
         self.decoded_mass_weight = float(ldm_config.get('decoded_mass_weight', 0.0))
+        self.uncertainty_loss_weight = float(ldm_config.get('uncertainty_loss_weight', 0.0))
         
         # 初始化训练状态
         self.start_epoch = 1
@@ -550,9 +611,11 @@ class OptimizedLDMTrainer:
         # 创建进度条
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         
-        for batch_idx, (target, cond) in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            target, cond, meta_dict = unpack_training_batch(batch)
             target = target.to(self.device)
             cond = cond.to(self.device)
+            meta_dict = move_meta_to_device(meta_dict, self.device)
             
             # 编码到潜空间
             with torch.no_grad():
@@ -572,14 +635,40 @@ class OptimizedLDMTrainer:
             noise = torch.randn_like(z_target)
             noised_z = z_target + noise * sigmas.view(-1, 1, 1, 1, 1)
             
-            # NOTE: 条件与噪声样本在通道维拼接，输入到潜空间 UNet。
-            model_input = torch.cat([noised_z, z_cond], dim=1)
-            
             # 前向传播
             with autocast('cuda', enabled=self.memory_opt.use_amp):
-                denoised = self.model(model_input, sigmas)
+                if has_multimodal_meta(meta_dict):
+                    model_out = self.model(
+                        cond,
+                        meta_dict["ir_img"],
+                        meta_dict["r_mat"],
+                        meta_dict["t_vec"],
+                        meta_dict["k_mat"],
+                        sigmas,
+                        noised_latent=noised_z,
+                        odom_cov_trace=meta_dict.get("odom_cov_trace"),
+                        is_mock_ir=meta_dict.get("is_mock_ir"),
+                        is_mock_calib=meta_dict.get("is_mock_calib"),
+                        return_uncertainty=self.uncertainty_loss_weight > 0.0,
+                    )
+                    if isinstance(model_out, tuple):
+                        denoised, uncertainty = model_out
+                    else:
+                        denoised, uncertainty = model_out, None
+                else:
+                    # Legacy batches without IR metadata still train the same 16-channel UNet backbone.
+                    model_input = pad_ldm_input_to_sixteen_channels(torch.cat([noised_z, z_cond], dim=1))
+                    denoised = self.model.unet_3d(model_input, sigmas)
                 latent_loss = torch.nn.functional.mse_loss(denoised, z_target)
                 loss = latent_loss
+                if self.uncertainty_loss_weight > 0.0 and uncertainty is not None:
+                    uncertainty_loss = heteroscedastic_gaussian_nll(
+                        denoised,
+                        z_target,
+                        uncertainty["variance"],
+                        detach_residual=True,
+                    )
+                    loss = loss + self.uncertainty_loss_weight * uncertainty_loss
                 if self.decoded_loss_weight > 0.0:
                     decoded = self.vae.decode(denoised)
                     occ_mask = (target[:, 0:1] > 0).float()
@@ -729,7 +818,9 @@ def main():
     parser.add_argument("--config", type=str, default="./diffusion_consistency_radar/config/default_config.yaml",
                         help="Config file path")
     parser.add_argument("--vae_ckpt", type=str, default="",
-                        help="VAE checkpoint path (for LDM training)")
+                        help="VAE checkpoint path (for LDM/CD training)")
+    parser.add_argument("--ldm_ckpt", type=str, default="",
+                        help="LDM checkpoint path (for CD training)")
     parser.add_argument("--resume", type=str, default="",
                         help="Resume training from checkpoint")
     
@@ -792,6 +883,50 @@ def main():
         
         trainer = OptimizedLDMTrainer(vae, config, memory_opt, resume_path=args.resume)
         trainer.train(train_loader)
+
+    # CD 训练
+    elif args.mode == "cd":
+        if not args.vae_ckpt:
+            raise ValueError("Must provide --vae_ckpt for CD training")
+        ldm_ckpt = resolve_cd_teacher_checkpoint(args.ldm_ckpt, config)
+        if not ldm_ckpt:
+            raise ValueError("Must provide --ldm_ckpt or set cd.teacher_model_path for CD training")
+
+        vae_type = config.get('vae.config_type', 'ultra_lightweight')
+        if vae_type == 'ultra_lightweight':
+            vae_config = create_ultra_lightweight_vae_config()
+        elif vae_type == 'lightweight':
+            vae_config = create_lightweight_vae_config()
+        else:
+            vae_config = create_standard_vae_config()
+        vae_config = apply_vae_config_overrides(vae_config, config)
+
+        vae = VAE3D(**vae_config)
+        ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
+        if 'model_state_dict' in ckpt:
+            vae.load_state_dict(ckpt['model_state_dict'])
+        else:
+            vae.load_state_dict(ckpt)
+
+        cd_cfg = config.get('cd', {}) or {}
+        opt_cfg = config.get('optimization', {}) or {}
+        trainer = ConsistencyDistillationTrainer(
+            ldm_ckpt_path=ldm_ckpt,
+            vae=vae,
+            device=memory_opt.device,
+            config={
+                'lr': cd_cfg.get('lr', 5e-5),
+                'save_dir': cd_cfg.get('save_dir', './Result/train_results/cd'),
+                'resume_path': args.resume or None,
+                'ldm': config.get('ldm', {}) or {},
+            },
+        )
+        trainer.train(
+            train_loader,
+            num_epochs=cd_cfg.get('epochs', 100),
+            save_every=cd_cfg.get('save_every', 10),
+            grad_accum_steps=opt_cfg.get('gradient_accumulation_steps', 8),
+        )
     
     print("Training completed!")
 

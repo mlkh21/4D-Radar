@@ -1,5 +1,5 @@
 #!/bin/bash
-# CD ÍÆÀí½Å±¾ - ¹Ì¶¨ÎªÖğÎÄ¼şÍÆÀíÄ£Ê½£¨1 ¸öÊäÈëÎÄ¼ş -> 1 ¸öÉú³ÉµãÔÆÎÄ¼ş£©
+# CD æ¨ç†è„šæœ¬ - å›ºå®šä¸ºé€æ–‡ä»¶æ¨ç†æ¨¡å¼ï¼ˆ1 ä¸ªè¾“å…¥æ–‡ä»¶ -> 1 ä¸ªç”Ÿæˆç‚¹äº‘æ–‡ä»¶ï¼‰
 
 set -euo pipefail
 
@@ -14,19 +14,20 @@ DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
 RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
 TRAIN_DURATION_SECONDS="${TRAIN_DURATION_SECONDS:--1}"
+USE_MULTIMODAL_META="${USE_MULTIMODAL_META:-0}"
 
 if [ ! -f "${VAE_CKPT}" ]; then
-  echo "´íÎó: VAE Ä£ĞÍ²»´æÔÚ: ${VAE_CKPT}"
+  echo "é”™è¯¯: VAE æ¨¡å‹ä¸å­˜åœ¨: ${VAE_CKPT}"
   exit 1
 fi
 
 if [ ! -f "${CD_CKPT}" ]; then
-  echo "´íÎó: CD Ä£ĞÍ²»´æÔÚ: ${CD_CKPT}"
+  echo "é”™è¯¯: CD æ¨¡å‹ä¸å­˜åœ¨: ${CD_CKPT}"
   exit 1
 fi
 
 if [ ! -f "${DATA_LOADING_CONFIG}" ]; then
-  echo "´íÎó: ÅäÖÃÎÄ¼ş²»´æÔÚ: ${DATA_LOADING_CONFIG}"
+  echo "é”™è¯¯: é…ç½®æ–‡ä»¶ä¸å­˜åœ¨: ${DATA_LOADING_CONFIG}"
   exit 1
 fi
 
@@ -49,7 +50,7 @@ PY
 )
 
 if [ ${#TEST_SCENES[@]} -eq 0 ]; then
-  echo "´íÎó: data_loading_config.yml ÖĞ data.test Îª¿Õ"
+  echo "é”™è¯¯: data_loading_config.yml ä¸­ data.test ä¸ºç©º"
   exit 1
 fi
 
@@ -61,7 +62,7 @@ for SCENE in "${TEST_SCENES[@]}"; do
   OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_eval"
 
   if [ ! -d "${RADAR_VOXEL_DIR}" ]; then
-    echo "´íÎó: radar_voxel Ä¿Â¼²»´æÔÚ: ${RADAR_VOXEL_DIR}"
+    echo "é”™è¯¯: radar_voxel ç›®å½•ä¸å­˜åœ¨: ${RADAR_VOXEL_DIR}"
     exit 1
   fi
 
@@ -71,16 +72,21 @@ for SCENE in "${TEST_SCENES[@]}"; do
   fi
 
   if [ ! -d "${RAW_LIVOX_DIR}" ]; then
-    echo "´íÎó: livox_lidar Ä¿Â¼²»´æÔÚ: ${RAW_LIVOX_DIR}"
+    echo "é”™è¯¯: livox_lidar ç›®å½•ä¸å­˜åœ¨: ${RAW_LIVOX_DIR}"
     exit 1
   fi
 
   if [ ! -f "${LIDAR_INDEX_FILE}" ]; then
-    echo "´íÎó: lidar Ë÷ÒıÎÄ¼ş²»´æÔÚ: ${LIDAR_INDEX_FILE}"
+    echo "é”™è¯¯: lidar ç´¢å¼•æ–‡ä»¶ä¸å­˜åœ¨: ${LIDAR_INDEX_FILE}"
     exit 1
   fi
 
-  echo "¿ªÊ¼ CD ÍÆÀí³¡¾°: ${SCENE}"
+  EXTRA_META_ARGS=()
+  if [ "${USE_MULTIMODAL_META}" = "1" ]; then
+    EXTRA_META_ARGS+=(--use_multimodal_meta)
+  fi
+
+  echo "å¼€å§‹ CD æ¨ç†åœºæ™¯: ${SCENE}"
   python "${INFER_SCRIPT}" \
     --vae_ckpt "${VAE_CKPT}" \
     --model_ckpt "${CD_CKPT}" \
@@ -91,13 +97,15 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
     --target_voxel_dir "${TARGET_VOXEL_DIR}" \
     --compare_with_target \
+    --report_task_metrics \
     --save_voxel \
     --save_pointcloud \
     --compare_with_lidar \
     --raw_livox_dir "${RAW_LIVOX_DIR}" \
     --lidar_index_file "${LIDAR_INDEX_FILE}" \
     --output_dir "${OUTPUT_DIR}" \
-    --device cuda
+    --device cuda \
+    "${EXTRA_META_ARGS[@]}"
 
-  echo "Íê³É: ${OUTPUT_DIR}"
+  echo "å®Œæˆ: ${OUTPUT_DIR}"
 done
