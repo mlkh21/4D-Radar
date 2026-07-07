@@ -45,6 +45,48 @@
   - [x] Add a learnable model-error uncertainty head while retaining Doppler/range physical confidence
   - [x] Train uncertainty with latent Gaussian NLL and report calibration metrics
   - [x] Re-run targeted unit tests and a saved-output threshold calibration smoke
+- [x] Phase 7: Restore tree/obstacle structure before formal retraining
+  - [x] Replace hard radar-visible target deletion with structure-preserving LiDAR supervision
+  - [x] Correct radar-to-thermal extrinsic direction and `(Z,X,Y)` voxel-axis projection
+  - [x] Add a configurable near-field high-resolution model grid for `0-40m`
+  - [x] Add a VAE reconstruction upper-bound diagnostic for train/test scenes
+  - [x] Run unit tests and a small VAE overfit smoke before any LDM/CD retraining
+- [ ] Phase 8: Recover the sparse occupancy VAE upper bound (in progress)
+  - [x] Unify occupancy logits/probability semantics across training, diagnosis, and inference
+  - [x] Replace occupancy MSE with BCE+Dice while masking continuous-channel supervision
+  - [x] Select VAE checkpoints by validation occupancy IoU and persist the exact VAE config
+  - [x] Pass the 32-frame reconstruction overfit gate before any longer experiment
+  - [ ] Compare ultra-lightweight z4, lightweight z8, and lightweight z16 one variable at a time
+  - [x] Reach validation IoU >= 0.50 and recall >= 0.65 on the 500-frame near-field experiment
+  - [x] Resume LDM training only after the VAE upper-bound gate passes
+  - [ ] Resume CD training only after the corrected LDM threshold/evaluation gate passes
+  - [x] Task 3 review: unify standalone CD VAE loading and checkpoint grid metadata
+  - [x] Task 3 review: require explicit fallback for metadata-free diagnostic/inference checkpoints
+  - [x] Task 3 final review: synchronize same-epoch best-loss/best-IoU checkpoint payloads
+  - [x] Task 3 final review: derive conditional/unconditional latent shapes from the loaded VAE
+  - [x] Task 3 quality review: propagate non-4 latent dimensions through LDM/CD/inference
+  - [x] Task 3 quality review: resume VAE scheduler and atomically save checkpoints
+  - [x] Final review: align LDM decoded occupancy auxiliaries with VAE activation semantics
+  - [x] Final review: restore metadata-free fallback checkpoints with legacy raw/MSE semantics
+  - [x] Final review: reject sparse compatible-subset multimodal loads in strict inference
+  - [x] Final review blocker: reject empty or critical-key-incomplete strict inference states
+- [x] Phase 9: Correct the LDM occupancy-threshold evaluation protocol (CD held by visual gate)
+  - [x] Crop source target voxels from `0-120m` to the model `0-40m` range before resize
+  - [x] Select the threshold on the deterministic validation split using near-field BEV task metrics
+  - [x] Re-scan the existing 500 saved LDM outputs without rerunning inference
+  - [x] Re-evaluate 500 frames once with the fixed threshold and inspect 10 raw-LiDAR overlays
+  - [x] Evaluate CD gate: HOLD because tree-structure visual criterion failed
+- [ ] Phase 10: Quantify and recover vertical tree structure
+  - [x] Implement height coverage, top-height, vertical-connectivity, and trunk-region recall metrics
+  - [x] Evaluate the VAE reconstruction upper bound with the new structure metrics
+  - [x] Select the recovery branch: VAE passes, so keep the current VAE/grid protocol
+  - [ ] Add vertical-structure/height-distribution supervision to LDM and retrain it
+    - [x] Implement differentiable height-distribution and vertical-continuity losses
+    - [x] Integrate independent weights, once-per-batch decoding, and component logging
+    - [x] Add mini-script controls and run one short finite-gradient smoke
+    - [x] Leave formal multi-epoch LDM retraining for an explicit experiment run
+  - [ ] Re-evaluate all gate metrics on one independent validation/test set
+  - [ ] Start CD distillation only if a future LDM task/visual quality gate passes
 
 ## Notes
 
@@ -55,6 +97,7 @@
 - The next engineering direction is not "fix calibration until global Chamfer is small"; it is to build a sensor-aware supervision/evaluation protocol that matches the final mapping task.
 - For the final airborne mapping objective, the model should prioritize obstacle occupancy useful for local map update, not LiDAR-style dense reconstruction everywhere.
 - Current sensor-aware target defaults for smoke testing: `z_min=-1.0`, `x_max=80.0`, `require_radar_visibility=True`, `radar_visibility_radius=2`.
+- Phase 7 supersedes the hard visibility default for structure reconstruction: radar visibility must be a confidence/evaluation signal, not a destructive occupancy mask.
 
 ## Errors / Attempts
 
@@ -66,3 +109,12 @@
 | mini train script used `conda run python -` with heredoc | 1 | Switched YAML/config helper snippets to system `python3`; training still uses Radar-Diffusion env. |
 | mini CD smoke initially wrote to formal `Result/train_results/cd` | 1 | Fixed mini config generation and reran CD 1-epoch smoke into `test/mini-test/train_results_mini/cd`. |
 | mini dataset-level `config` directory was treated as a scene | 1 | Scene discovery now requires both `radar_voxel` and `target_voxel`; verified 500 garden samples load. |
+| Tree structure absent despite improved task metrics | 1 | Root cause isolated to destructive target masking, coarse model grid, IR projection geometry errors, VAE underfit, and cross-scene mini evaluation; Phase 7 addresses these before formal retraining. |
+| Standalone `sensor_aware_target.py` disappeared during Phase 7 | 1 | Confirmed its vectorized functionality now lives in the integrated preprocessing script; continue against the integrated entry and remove stale test/pyc dependence rather than restoring the deleted file. |
+| `python -m unittest test...` could not import `test/` modules | 1 | Directly executed test files because `test/` is not a package in this repository. |
+| 1-sample VAE smoke failed in sandbox with OpenMPI socket errors | 1 | Reran the same short smoke outside the sandbox; it passed in 0.7s training time. |
+| 32-frame lightweight VAE failed before epoch 1 because GroupNorm used 32 groups for 24/72 channels | 1 | Made normalization select the largest valid divisor without changing channel/checkpoint shapes; 10 focused tests and two-stage review passed. |
+| GroupNorm quality re-review agent hit its usage limit | 1 | Dispatched a fresh independent reviewer and completed the review without changing implementation scope. |
+| Final regression referenced missing `test_unified_cd_entrypoint.py` | 1 | Located and ran the real `test/test_cd_training_entrypoints.py`; it passed. |
+| Phase 10 combined regression hit OpenMPI socket denial in sandbox | 1 | Re-run the same short verification outside the socket-restricted sandbox. |
+| LDM structure-loss test hit the same OpenMPI sandbox socket denial | 1 | Run the focused test outside the sandbox before Task 1 review. |

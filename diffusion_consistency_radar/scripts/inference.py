@@ -19,7 +19,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from diffusion_consistency_radar.cm.vae_3d import VAE3D, create_ultra_lightweight_vae_config, create_lightweight_vae_config, create_standard_vae_config
+    from diffusion_consistency_radar.cm.vae_3d import VAE3D, build_vae_from_checkpoint, resolve_checkpoint_grid_config
     from diffusion_consistency_radar.cm.unet_optimized import OptimizedUNetModel
     from diffusion_consistency_radar.cm.multimodal_fusion import CompleteDualModalityPerceptionNet
     from diffusion_consistency_radar.cm.karras_diffusion import KarrasDenoiser
@@ -27,14 +27,21 @@ try:
         CalibrationProvider,
         NTU4DRadLM_VoxelDataset,
         _resize_or_pad_ir_tensor,
+        crop_voxel_channels_to_pc_range,
         resize_voxel_channels,
     )
 except Exception:
-    from cm.vae_3d import VAE3D, create_ultra_lightweight_vae_config, create_lightweight_vae_config, create_standard_vae_config
+    from cm.vae_3d import VAE3D, build_vae_from_checkpoint, resolve_checkpoint_grid_config
     from cm.unet_optimized import OptimizedUNetModel
     from cm.multimodal_fusion import CompleteDualModalityPerceptionNet
     from cm.karras_diffusion import KarrasDenoiser
-    from cm.dataset_loader import CalibrationProvider, NTU4DRadLM_VoxelDataset, _resize_or_pad_ir_tensor, resize_voxel_channels
+    from cm.dataset_loader import (
+        CalibrationProvider,
+        NTU4DRadLM_VoxelDataset,
+        _resize_or_pad_ir_tensor,
+        crop_voxel_channels_to_pc_range,
+        resize_voxel_channels,
+    )
 
 try:
     from diffusion_consistency_radar.cm.evaluation_metrics import (
@@ -113,40 +120,110 @@ def _compatible_state_dict(model, state_dict):
     }
 
 
-def build_inference_model(state_dict, device, strict: bool = True):
+def resolve_generation_model_config(checkpoint, fallback_latent_dim=None):
+    """优先读取生成模型元数据，旧 checkpoint 从首尾卷积 shape 推导。"""
+    checkpoint_dict = checkpoint if isinstance(checkpoint, dict) else {}
+    state_dict = checkpoint_dict.get("model_state_dict", checkpoint)
+    metadata_config = checkpoint_dict.get("model_config") or {}
+    latent_dim = checkpoint_dict.get("latent_dim", metadata_config.get("latent_dim"))
+    in_channels = metadata_config.get("in_channels")
+    prefixes = ("", "unet_3d.")
+    if isinstance(state_dict, dict):
+        for prefix in prefixes:
+            input_weight = state_dict.get(f"{prefix}input_blocks.0.0.weight")
+            output_weight = state_dict.get(f"{prefix}out.2.weight")
+            if in_channels is None and torch.is_tensor(input_weight) and input_weight.ndim >= 2:
+                in_channels = int(input_weight.shape[1])
+            if latent_dim is None and torch.is_tensor(output_weight) and output_weight.ndim >= 1:
+                latent_dim = int(output_weight.shape[0])
+    if latent_dim is None:
+        if fallback_latent_dim is None:
+            raise ValueError(
+                "生成模型 checkpoint 缺少 latent_dim 且无法从 state_dict 推导；"
+                "请显式提供 fallback"
+            )
+        latent_dim = int(fallback_latent_dim)
+    resolved = dict(metadata_config)
+    resolved["latent_dim"] = int(latent_dim)
+    resolved["in_channels"] = int(in_channels or 2 * int(latent_dim))
+    resolved.setdefault("out_channels", int(latent_dim))
+    return resolved
+
+
+def build_inference_model(
+    state_dict,
+    device,
+    strict: bool = True,
+    fusion_voxel_shape=(32, 128, 128),
+    fusion_pc_range=(0, -20, -6, 120, 20, 10),
+    latent_dim: int = 4,
+    model_config=None,
+):
+    if strict and not state_dict:
+        raise ValueError(
+            "build_inference_model strict=True 时 state_dict 不能为空，"
+            "拒绝返回随机初始化模型"
+        )
+    cfg = dict(model_config or {})
+    latent_dim = int(cfg.get("latent_dim", latent_dim))
+    model_channels = int(cfg.get("model_channels", 32))
+    num_res_blocks = int(cfg.get("num_res_blocks", 1))
+    channel_mult = tuple(cfg.get("channel_mult", [1, 2, 3]))
+    attention_resolutions = tuple(cfg.get("attention_resolutions", []))
     if is_multimodal_state_dict(state_dict):
+        backbone_in_channels = int(cfg.get("in_channels", max(16, 2 * latent_dim)))
         base_unet = OptimizedUNetModel(
             image_size=32,
-            in_channels=16,
-            model_channels=32,
-            out_channels=4,
-            num_res_blocks=1,
-            attention_resolutions=(),
-            channel_mult=(1, 2, 3),
+            in_channels=backbone_in_channels,
+            model_channels=model_channels,
+            out_channels=latent_dim,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions,
+            channel_mult=channel_mult,
             use_checkpoint=False,
             attention_type="linear",
         )
         model = CompleteDualModalityPerceptionNet(
             base_unet,
-            voxel_shape=(32, 128, 128),
-            pc_range=(0, -20, -6, 120, 20, 10),
+            voxel_shape=tuple(int(v) for v in fusion_voxel_shape),
+            pc_range=tuple(float(v) for v in fusion_pc_range),
+            fused_channels=backbone_in_channels,
             downsample_to_latent=True,
         ).to(device)
     else:
+        backbone_in_channels = int(cfg.get("in_channels", 2 * latent_dim))
         model = OptimizedUNetModel(
             image_size=32,
-            in_channels=8,
-            model_channels=32,
-            out_channels=4,
-            num_res_blocks=1,
-            attention_resolutions=(),
-            channel_mult=(1, 2, 3),
+            in_channels=backbone_in_channels,
+            model_channels=model_channels,
+            out_channels=latent_dim,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions,
+            channel_mult=channel_mult,
             use_checkpoint=False,
             attention_type="linear",
         ).to(device)
     if state_dict:
-        if strict and not getattr(model, "is_multimodal", False):
-            model.load_state_dict(state_dict)
+        if strict:
+            prefix = "unet_3d." if getattr(model, "is_multimodal", False) else ""
+            critical_keys = (
+                f"{prefix}input_blocks.0.0.weight",
+                f"{prefix}out.2.weight",
+            )
+            missing_critical = [key for key in critical_keys if key not in state_dict]
+            if missing_critical:
+                model_kind = "多模态" if prefix else "单模态"
+                raise RuntimeError(
+                    f"{model_kind}生成模型 checkpoint 缺少关键权重: "
+                    + ", ".join(missing_critical)
+                )
+            try:
+                model.load_state_dict(state_dict, strict=True)
+            except RuntimeError as exc:
+                model_kind = "多模态" if getattr(model, "is_multimodal", False) else "单模态"
+                raise RuntimeError(
+                    f"{model_kind}生成模型 checkpoint 与当前结构不兼容: {exc}"
+                ) from exc
         else:
             model.load_state_dict(_compatible_state_dict(model, state_dict), strict=False)
     return model
@@ -232,10 +309,35 @@ def load_multimodal_meta_for_radar(radar_path: str, device):
     return meta
 
 
+def resolve_inference_grid_config(
+    checkpoint_metadata,
+    target_size,
+    source_pc_range,
+    model_pc_range,
+):
+    """解析推理全流程使用的有效网格。"""
+    return resolve_checkpoint_grid_config(
+        checkpoint_metadata,
+        target_size=target_size,
+        source_pc_range=source_pc_range,
+        model_pc_range=model_pc_range,
+    )
+
+
 class RadarGenerator:
     """雷达数据生成器"""
     
-    def __init__(self, vae_path, model_path, model_type='ldm', device='cuda'):
+    def __init__(
+        self,
+        vae_path,
+        model_path,
+        model_type='ldm',
+        device='cuda',
+        target_size=None,
+        pc_range=None,
+        source_pc_range=None,
+        vae_fallback_config_type=None,
+    ):
         """
         Args:
             vae_path: VAE 模型路径
@@ -245,11 +347,22 @@ class RadarGenerator:
         """
         self.device = torch.device(device)
         self.model_type = model_type
+        self.vae_fallback_config_type = vae_fallback_config_type
         
         # NOTE: 变分自编码器（VAE）负责体素空间与潜空间之间的编码/解码。
         print(f"Loading VAE from {vae_path}...")
         self.vae = self._load_vae(vae_path)
         self.vae.eval()
+        (
+            self.target_size,
+            self.source_pc_range,
+            self.pc_range,
+        ) = resolve_inference_grid_config(
+            self.vae_checkpoint_metadata,
+            target_size,
+            source_pc_range,
+            pc_range,
+        )
         
         # NOTE: 生成模型在潜空间进行去噪采样。
         print(f"Loading {model_type.upper()} from {model_path}...")
@@ -269,23 +382,40 @@ class RadarGenerator:
 
     def _load_vae(self, ckpt_path):
         """加载 VAE 模型"""
-        # TODO: 目前默认使用 ultra lightweight 配置，后续可从 checkpoint 元信息自动恢复。
-        vae_config = create_ultra_lightweight_vae_config()
-        vae = VAE3D(**vae_config).to(self.device)
-        
         ckpt = safe_torch_load(ckpt_path, map_location=self.device)
-        if 'model_state_dict' in ckpt:
-            vae.load_state_dict(ckpt['model_state_dict'])
-        else:
-            vae.load_state_dict(ckpt)
-        
-        return vae
+        vae, metadata = build_vae_from_checkpoint(
+            ckpt,
+            fallback_config_type=self.vae_fallback_config_type,
+        )
+        self.vae_checkpoint_metadata = metadata
+        return vae.to(self.device)
     
     def _load_model(self, ckpt_path):
         """加载 LDM 或 CD 模型"""
         ckpt = safe_torch_load(ckpt_path, map_location=self.device)
         state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
-        return build_inference_model(state_dict, self.device, strict=True)
+        model_config = resolve_generation_model_config(
+            ckpt,
+            fallback_latent_dim=self.vae.latent_dim,
+        )
+        return build_inference_model(
+            state_dict,
+            self.device,
+            strict=True,
+            fusion_voxel_shape=self.target_size,
+            fusion_pc_range=self.pc_range,
+            latent_dim=model_config["latent_dim"],
+            model_config=model_config,
+        )
+
+    def _apply_vae_occupancy_activation(self, decoded):
+        """按 checkpoint 协议转换 occupancy，连续通道保持原值。"""
+        metadata = getattr(self, "vae_checkpoint_metadata", {}) or {}
+        if metadata.get("occupancy_activation", "raw") != "sigmoid":
+            return decoded
+        activated = decoded.clone()
+        activated[:, 0:1] = VAE3D.occupancy_probability(decoded[:, 0:1])
+        return activated
     
     @torch.no_grad()
     def generate(self, condition, num_samples=1, steps=40, sampler='heun', show_sampling_progress=False, meta_dict=None):
@@ -315,10 +445,20 @@ class RadarGenerator:
             z_shape = tuple(z_cond.shape)
             num_samples = z_shape[0]
         else:
-            # NOTE: 无条件采样时使用固定潜空间尺寸。
-            z_shape = (num_samples, 4, 8, 32, 32)
+            # NOTE: 无条件采样按已加载 VAE 架构推导潜空间，避免固定 z4/default grid。
+            latent_spatial = self.vae.latent_spatial_shape(self.target_size)
+            z_shape = (num_samples, int(self.vae.latent_dim), *latent_spatial)
             z_cond = torch.zeros(z_shape, device=self.device)
-            condition_voxel = torch.zeros(num_samples, 4, 32, 128, 128, device=self.device)
+            vae_config = (
+                getattr(self, "vae_checkpoint_metadata", {}) or {}
+            ).get("vae_config", {})
+            input_channels = int(vae_config.get("in_channels", 4))
+            condition_voxel = torch.zeros(
+                num_samples,
+                input_channels,
+                *self.target_size,
+                device=self.device,
+            )
         
         # NOTE: 按 sigma_max 初始化起始噪声，匹配 Karras 采样假设。
         z_T = torch.randn(z_shape, device=self.device) * self.denoiser.sigma_max
@@ -330,7 +470,7 @@ class RadarGenerator:
             z_0 = self._ldm_sample(z_T, z_cond, steps, sampler, show_sampling_progress, condition_voxel, meta_dict)
         
         # NOTE: 将潜变量解码回体素空间输出。
-        generated = self.vae.decode(z_0)
+        generated = self._apply_vae_occupancy_activation(self.vae.decode(z_0))
         
         return generated
     
@@ -463,14 +603,22 @@ def load_sparse_voxel(filename):
     return voxel_grid
 
 
-def load_radar_voxel_as_tensor(path, device):
+def load_radar_voxel_as_tensor(
+    path,
+    device,
+    target_size=(32, 128, 128),
+    source_pc_range=(0, -20, -6, 120, 20, 10),
+    model_pc_range=None,
+):
     if path.endswith('.npz'):
         radar_voxel = load_sparse_voxel(path)
     else:
         radar_voxel = np.load(path).astype(np.float32)
 
     radar_tensor = torch.from_numpy(radar_voxel).permute(3, 2, 0, 1)
-    target_size = (32, 128, 128)
+    if model_pc_range is None:
+        model_pc_range = source_pc_range
+    radar_tensor = crop_voxel_channels_to_pc_range(radar_tensor, source_pc_range, model_pc_range)
     radar_tensor = resize_voxel_channels(radar_tensor, target_size)
 
     return radar_tensor.to(device)
@@ -497,13 +645,33 @@ def count_raw_radar_pcl_points(path):
     return int(pts.shape[0])
 
 
-def load_target_occ_resized(path, device):
-    """加载 target_voxel 并重采样到 (32, 128, 128)，返回 Occ 通道。"""
-    target_tensor = load_voxel_as_czxy(path, device, mask_channel=3)
+def load_target_occ_resized(
+    path,
+    device,
+    target_size=(32, 128, 128),
+    source_pc_range=(0, -20, -6, 120, 20, 10),
+    model_pc_range=None,
+):
+    """加载 target_voxel 并按模型网格重采样，返回 Occ 通道。"""
+    target_tensor = load_voxel_as_czxy(
+        path,
+        device,
+        mask_channel=3,
+        target_size=target_size,
+        source_pc_range=source_pc_range,
+        model_pc_range=model_pc_range,
+    )
     return target_tensor[0]
 
 
-def load_voxel_as_czxy(path, device, mask_channel=None):
+def load_voxel_as_czxy(
+    path,
+    device,
+    mask_channel=None,
+    target_size=(32, 128, 128),
+    source_pc_range=(0, -20, -6, 120, 20, 10),
+    model_pc_range=None,
+):
     """加载 XY-Z-C 体素并按训练/推理规则重采样为 (C, Z, X, Y)。"""
     if path.endswith('.npz'):
         voxel = load_sparse_voxel(path)
@@ -511,7 +679,10 @@ def load_voxel_as_czxy(path, device, mask_channel=None):
         voxel = np.load(path).astype(np.float32)
 
     tensor = torch.from_numpy(voxel).permute(3, 2, 0, 1)
-    tensor = resize_voxel_channels(tensor, (32, 128, 128), mask_channel=mask_channel)
+    if model_pc_range is None:
+        model_pc_range = source_pc_range
+    tensor = crop_voxel_channels_to_pc_range(tensor, source_pc_range, model_pc_range)
+    tensor = resize_voxel_channels(tensor, target_size, mask_channel=mask_channel)
     return tensor.to(device).cpu().numpy()
 
 
@@ -632,6 +803,12 @@ def main():
     parser.add_argument("--sampler", type=str, default="heun", choices=["heun", "euler"], help="Sampler type")
     parser.add_argument("--output_dir", type=str, default="./Result/inference_results", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
+    parser.add_argument(
+        "--vae_config_type",
+        choices=["ultra_lightweight", "lightweight", "standard"],
+        default=None,
+        help="仅用于缺少 vae_config 的历史 VAE checkpoint",
+    )
     parser.add_argument("--use_condition", action="store_true", help="Use condition data from dataset")
     parser.add_argument("--save_pointcloud", action="store_true", help="Save point cloud .npy per sample")
     parser.add_argument("--save_voxel", action="store_true", help="Save voxel .npy per sample")
@@ -645,8 +822,12 @@ def main():
                         help="If threshold yields empty point cloud, fallback to top-k occupancy voxels (0 disables)")
     parser.add_argument("--voxel_size", type=float, nargs=3, default=None,
                         help="Voxel size [x,y,z] for point cloud conversion; default is auto-derived from output grid and pc_range")
-    parser.add_argument("--pc_range", type=float, nargs=6, default=[0, -20, -6, 120, 20, 10],
-                        help="Point cloud range used in preprocessing")
+    parser.add_argument("--pc_range", type=float, nargs=6, default=None,
+                        help="Model/output point cloud range used for voxel-to-point conversion")
+    parser.add_argument("--source_pc_range", type=float, nargs=6, default=None,
+                        help="Original preprocessing range before optional physical crop; defaults to --pc_range")
+    parser.add_argument("--target_size", type=int, nargs=3, default=None,
+                        help="Model tensor size as [Z, X, Y] after loading/cropping")
     parser.add_argument("--train_duration_seconds", type=float, default=-1.0,
                         help="Optional training duration in seconds for experiment tracking (negative means unknown)")
     parser.add_argument("--seed", type=int, default=-1,
@@ -667,7 +848,6 @@ def main():
                         help="Comma-separated z_min filters for task metrics")
 
     args = parser.parse_args()
-
     if args.seed >= 0:
         set_random_seed(args.seed)
     
@@ -677,7 +857,14 @@ def main():
         model_path=args.model_ckpt,
         model_type=args.model_type,
         device=args.device,
+        target_size=args.target_size,
+        pc_range=args.pc_range,
+        source_pc_range=args.source_pc_range,
+        vae_fallback_config_type=args.vae_config_type,
     )
+    args.target_size = generator.target_size
+    args.source_pc_range = generator.source_pc_range
+    args.pc_range = generator.pc_range
     
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -774,6 +961,9 @@ def main():
         log_file.write(f"seed: {args.seed}\n")
         log_file.write(f"max_files: {args.max_files}\n")
         log_file.write(f"occ_threshold: {args.occ_threshold}\n")
+        log_file.write(f"target_size: {list(args.target_size)}\n")
+        log_file.write(f"source_pc_range: {args.source_pc_range}\n")
+        log_file.write(f"model_pc_range: {args.pc_range}\n")
         log_file.write(f"adaptive_occ_from_target: {int(args.adaptive_occ_from_target)}\n")
         log_file.write(f"compare_with_target: {int(args.compare_with_target)}\n")
         log_file.write(f"target_voxel_dir: {args.target_voxel_dir}\n")
@@ -819,7 +1009,13 @@ def main():
             else:
                 # NOTE: 未提供 raw radar_pcl 时，回退为 radar_voxel 占据点计数。
                 radar_point_count = count_radar_points(radar_path)
-            condition_data = load_radar_voxel_as_tensor(radar_path, generator.device)
+            condition_data = load_radar_voxel_as_tensor(
+                radar_path,
+                generator.device,
+                target_size=args.target_size,
+                source_pc_range=args.source_pc_range,
+                model_pc_range=args.pc_range,
+            )
             condition_data = condition_data.unsqueeze(0)
             meta_dict = load_multimodal_meta_for_radar(radar_path, generator.device) if args.use_multimodal_meta else None
 
@@ -864,7 +1060,13 @@ def main():
                     frame_id = os.path.splitext(fname)[0]
                     target_path = find_matching_voxel_file(args.target_voxel_dir, frame_id)
                     if os.path.exists(target_path):
-                        target_occ = load_target_occ_resized(target_path, generator.device)
+                        target_occ = load_target_occ_resized(
+                            target_path,
+                            generator.device,
+                            target_size=args.target_size,
+                            source_pc_range=args.source_pc_range,
+                            model_pc_range=args.pc_range,
+                        )
                         target_th = args.occ_threshold if args.adaptive_target_threshold < 0 else args.adaptive_target_threshold
                         target_occ_count = int(np.count_nonzero(target_occ > target_th))
                         effective_occ_threshold = find_adaptive_occ_threshold(sample[0], target_occ_count)
@@ -906,8 +1108,21 @@ def main():
                 target_path = find_matching_voxel_file(args.target_voxel_dir, frame_id)
                 if target_path:
                     target_file = os.path.basename(target_path)
-                    target_voxel = load_voxel_as_czxy(target_path, generator.device, mask_channel=3)
-                    radar_voxel = load_voxel_as_czxy(radar_path, generator.device)
+                    target_voxel = load_voxel_as_czxy(
+                        target_path,
+                        generator.device,
+                        mask_channel=3,
+                        target_size=args.target_size,
+                        source_pc_range=args.source_pc_range,
+                        model_pc_range=args.pc_range,
+                    )
+                    radar_voxel = load_voxel_as_czxy(
+                        radar_path,
+                        generator.device,
+                        target_size=args.target_size,
+                        source_pc_range=args.source_pc_range,
+                        model_pc_range=args.pc_range,
+                    )
                     target_pcl, _ = voxel_to_pointcloud(
                         target_voxel,
                         voxel_size=args.voxel_size,
@@ -1100,7 +1315,13 @@ def main():
         # NOTE: 简单模式下可从验证集抽取一个条件样本。
         if args.use_condition:
             print(f"Loading dataset from {args.dataset_dir}...")
-            dataset = NTU4DRadLM_VoxelDataset(args.dataset_dir, split='val')
+            dataset = NTU4DRadLM_VoxelDataset(
+                args.dataset_dir,
+                split='val',
+                target_size=args.target_size,
+                source_pc_range=args.source_pc_range,
+                model_pc_range=args.pc_range,
+            )
             dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
             # FIXME: 当验证集为空时这里会触发 StopIteration，后续可改为显式空集检查。
             batch = next(iter(dataloader))

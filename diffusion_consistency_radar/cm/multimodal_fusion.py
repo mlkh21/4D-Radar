@@ -131,20 +131,30 @@ class DualModalityProjectionLayer(nn.Module):
 
     def __init__(
         self,
-        voxel_shape: Tuple[int, int, int] = (600, 200, 80),
+        voxel_shape: Tuple[int, int, int] = (80, 600, 200),
         pc_range: Sequence[float] = (0, -20, -6, 120, 20, 10),
+        voxel_layout: str = "ZXY",
     ):
         super().__init__()
         self.voxel_shape = tuple(int(v) for v in voxel_shape)
         self.pc_range = tuple(float(v) for v in pc_range)
-        nx, ny, nz = self.voxel_shape
+        self.voxel_layout = str(voxel_layout).upper()
+        if self.voxel_layout == "ZXY":
+            nz, nx, ny = self.voxel_shape
+        elif self.voxel_layout == "XYZ":
+            nx, ny, nz = self.voxel_shape
+        else:
+            raise ValueError(f"Unsupported voxel_layout: {voxel_layout}")
         x_size = (self.pc_range[3] - self.pc_range[0]) / float(nx)
         y_size = (self.pc_range[4] - self.pc_range[1]) / float(ny)
         z_size = (self.pc_range[5] - self.pc_range[2]) / float(nz)
         xs = self.pc_range[0] + (torch.arange(nx, dtype=torch.float32) + 0.5) * x_size
         ys = self.pc_range[1] + (torch.arange(ny, dtype=torch.float32) + 0.5) * y_size
         zs = self.pc_range[2] + (torch.arange(nz, dtype=torch.float32) + 0.5) * z_size
-        grid_x, grid_y, grid_z = torch.meshgrid(xs, ys, zs, indexing="ij")
+        if self.voxel_layout == "ZXY":
+            grid_z, grid_x, grid_y = torch.meshgrid(zs, xs, ys, indexing="ij")
+        else:
+            grid_x, grid_y, grid_z = torch.meshgrid(xs, ys, zs, indexing="ij")
         coords = torch.stack([grid_x, grid_y, grid_z], dim=-1).reshape(-1, 3)
         self.register_buffer("voxel_coords", coords, persistent=False)
 
@@ -158,15 +168,15 @@ class DualModalityProjectionLayer(nn.Module):
     ) -> torch.Tensor:
         bsz, channels, _, _ = ir_features.shape
         h_img, w_img = img_shape
-        nx, ny, nz = self.voxel_shape
+        dim0, dim1, dim2 = self.voxel_shape
 
         pts_3d = self.voxel_coords.to(ir_features.device, ir_features.dtype).unsqueeze(0).expand(bsz, -1, -1)
         r_mat = r_mat.to(ir_features.device, ir_features.dtype)
         t_vec = t_vec.to(ir_features.device, ir_features.dtype)
         k_mat = k_mat.to(ir_features.device, ir_features.dtype)
 
-        r_inv = r_mat.transpose(-1, -2)
-        pts_cam = torch.bmm(pts_3d - t_vec.unsqueeze(1), r_inv.transpose(-1, -2))
+        # Calibration files define radar-to-camera as p_camera = R * p_radar + T.
+        pts_cam = torch.bmm(pts_3d, r_mat.transpose(-1, -2)) + t_vec.unsqueeze(1)
         depth = pts_cam[..., 2].clamp_min(1e-6)
         pts_pixel = torch.bmm(pts_cam, k_mat.transpose(-1, -2))
         uv = pts_pixel[..., :2] / depth.unsqueeze(-1)
@@ -181,14 +191,14 @@ class DualModalityProjectionLayer(nn.Module):
             padding_mode="zeros",
             align_corners=True,
         ).squeeze(-1)
-        voxel_ir = sampled.view(bsz, channels, nx, ny, nz)
+        voxel_ir = sampled.view(bsz, channels, dim0, dim1, dim2)
         frustum_mask = (
             (pts_cam[..., 2] > 0.1)
             & (u_norm >= -1.0)
             & (u_norm <= 1.0)
             & (v_norm >= -1.0)
             & (v_norm <= 1.0)
-        ).view(bsz, 1, nx, ny, nz)
+        ).view(bsz, 1, dim0, dim1, dim2)
         return voxel_ir * frustum_mask.to(voxel_ir.dtype)
 
 
@@ -198,8 +208,9 @@ class CompleteDualModalityPerceptionNet(nn.Module):
     def __init__(
         self,
         unet_3d_backbone: nn.Module,
-        voxel_shape: Tuple[int, int, int] = (600, 200, 80),
+        voxel_shape: Tuple[int, int, int] = (80, 600, 200),
         pc_range: Sequence[float] = (0, -20, -6, 120, 20, 10),
+        voxel_layout: str = "ZXY",
         ir_channels: int = 32,
         fused_channels: int = 16,
         downsample_to_latent: bool = False,
@@ -209,7 +220,11 @@ class CompleteDualModalityPerceptionNet(nn.Module):
         self.unet_3d = unet_3d_backbone
         self.is_multimodal = True
         self.ir_extractor = IR2DFeatureExtractor(out_channels=ir_channels)
-        self.projection_layer = DualModalityProjectionLayer(voxel_shape=voxel_shape, pc_range=pc_range)
+        self.projection_layer = DualModalityProjectionLayer(
+            voxel_shape=voxel_shape,
+            pc_range=pc_range,
+            voxel_layout=voxel_layout,
+        )
         self.in_channels = fused_channels
         self.radar_encoder = RadarStructureEncoder(in_channels=4, out_channels=fused_channels)
         self.uncertainty_head = UncertaintyHead()

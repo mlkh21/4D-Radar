@@ -38,6 +38,14 @@ def load_pred_points(path: str) -> np.ndarray:
     return pts[:, :4] if pts.shape[1] >= 4 else pts[:, :3]
 
 
+def optional_pred_path(directory: str, frame_id: str) -> str:
+    """返回可选预测点云路径；目录为空或文件缺失时跳过该图层。"""
+    if not directory:
+        return ""
+    path = os.path.join(directory, f"{frame_id}_pcl.npy")
+    return path if os.path.exists(path) else ""
+
+
 def resolve_raw_lidar_path(frame_id: str, raw_lidar_dir: str, lidar_index_file: str) -> str:
     """Resolve a processed frame to its timestamped raw LiDAR file."""
     frame_index = int(frame_id)
@@ -221,30 +229,35 @@ def build_frame(args, frame_id: str, meta: Dict[str, object]) -> str:
     radar_path = os.path.join(args.pre_dir, "radar_voxel", f"{frame_id}.npz")
     raw_lidar_path = resolve_raw_lidar_path(frame_id, args.raw_lidar_dir, args.lidar_index_file)
     ldm_path = os.path.join(args.ldm_dir, f"{frame_id}_pcl.npy")
-    cd_path = os.path.join(args.cd_dir, f"{frame_id}_pcl.npy")
+    cd_path = optional_pred_path(args.cd_dir, frame_id)
 
     radar = sparse_npz_to_points(radar_path, args.pc_range)
     raw_lidar = load_raw_lidar_points(raw_lidar_path)
     ldm = load_pred_points(ldm_path)
-    cd = load_pred_points(cd_path)
+    cd = load_pred_points(cd_path) if cd_path else None
 
     if args.z_min is not None or args.x_max is not None:
         radar = filter_points(radar, args.pc_range, args.z_min, args.x_max)
         raw_lidar = filter_points(raw_lidar, args.pc_range, args.z_min, args.x_max)
         ldm = filter_points(ldm, args.pc_range, args.z_min, args.x_max)
-        cd = filter_points(cd, args.pc_range, args.z_min, args.x_max)
+        if cd is not None:
+            cd = filter_points(cd, args.pc_range, args.z_min, args.x_max)
 
     clouds = [
         {"name": "raw_lidar", "points": downsample(raw_lidar, args.max_lidar_points, 2), "color": "#54a8ff", "size": 1.3, "stats": cloud_stats(raw_lidar)},
         {"name": "radar", "points": downsample(radar, args.max_radar_points, 1), "color": "#ff5d4d", "size": 2.2, "stats": cloud_stats(radar)},
         {"name": "ldm_pred", "points": downsample(ldm, args.max_pred_points, 3), "color": "#ffcf33", "size": 1.7, "stats": cloud_stats(ldm)},
-        {"name": "cd_pred", "points": downsample(cd, args.max_pred_points, 4), "color": "#a678ff", "size": 1.7, "stats": cloud_stats(cd)},
     ]
+    if cd is not None:
+        clouds.append(
+            {"name": "cd_pred", "points": downsample(cd, args.max_pred_points, 4), "color": "#a678ff", "size": 1.7, "stats": cloud_stats(cd)}
+        )
     frame_meta = dict(meta)
     frame_meta.update(
         {
             "frame_id": frame_id,
             "raw_lidar_file": os.path.basename(raw_lidar_path),
+            "cd_layer": bool(cd_path),
             "z_min_filter": args.z_min,
             "x_max_filter": args.x_max,
         }

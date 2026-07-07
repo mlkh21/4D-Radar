@@ -52,7 +52,8 @@ def _voxel_centers(shape: Sequence[int], pc_range: Sequence[float]) -> Tuple[np.
 def build_sensor_aware_target_vectorized(
     lidar_voxel: np.ndarray, radar_voxel: np.ndarray, pc_range: tuple,
     z_min: Optional[float], x_max: Optional[float], require_radar_visibility: bool,
-    radar_visibility_radius: int, doppler_radius: int
+    radar_visibility_radius: int, doppler_radius: int,
+    visibility_mode: str = "preserve",
 ) -> np.ndarray:
     target = np.zeros_like(lidar_voxel, dtype=np.float32)
     lidar_occ = lidar_voxel[..., 0] > 0
@@ -65,7 +66,11 @@ def build_sensor_aware_target_vectorized(
     radar_occ = radar_voxel[..., 0] > 0
     radar_occ_float = radar_occ.astype(np.float32)
 
-    if require_radar_visibility:
+    visibility_mode = str(visibility_mode).strip().lower()
+    if visibility_mode not in {"preserve", "hard"}:
+        raise ValueError(f"Unsupported visibility_mode: {visibility_mode}")
+
+    if visibility_mode == "hard" or require_radar_visibility:
         if radar_visibility_radius > 0:
             k_size = 2 * int(radar_visibility_radius) + 1
             kernel_visible = np.ones((k_size, k_size, k_size), dtype=bool)
@@ -261,7 +266,8 @@ def _parallel_frame_worker(task_args):
         z_min=args_dict["z_min"], x_max=args_dict["x_max"],
         require_radar_visibility=args_dict["require_radar_visibility"],
         radar_visibility_radius=args_dict["radar_visibility_radius"],
-        doppler_radius=args_dict["doppler_radius"]
+        doppler_radius=args_dict["doppler_radius"],
+        visibility_mode=args_dict["visibility_mode"],
     )
 
     if len(thermal_timestamps) > 0:
@@ -330,7 +336,7 @@ def process_scene_task(scene_name, args, v_drone, dt_sync):
 
     num_workers = min(cpu_count(), len(worker_tasks), 16)
 
-    # ──► 核心重构：使用 initializer 绑定进程启动钩子，每个进程终生只打印一次初始化日志！
+    # 使用 initializer 绑定进程启动钩子，每个进程终生只打印一次初始化日志！
     print(f"🔥 正在拉起 {num_workers} 个并行的常驻感知 Worker...")
     written = 0
     with Pool(processes=num_workers, initializer=_init_worker_patchwork) as pool:
@@ -341,6 +347,7 @@ def process_scene_task(scene_name, args, v_drone, dt_sync):
         "source_scene": scene_name, "frames_written": written,
         "policy": {
             "z_min": args.z_min, "x_max": args.x_max,
+            "visibility_mode": args.visibility_mode,
             "require_radar_visibility": args.require_radar_visibility,
             "radar_visibility_radius": args.radar_visibility_radius, "doppler_radius": args.doppler_radius
         }
@@ -359,6 +366,7 @@ def process_scene_task(scene_name, args, v_drone, dt_sync):
         "dt_sync": float(dt_sync),
         "z_min": args.z_min,
         "x_max": args.x_max,
+        "visibility_mode": args.visibility_mode,
         "require_radar_visibility": bool(args.require_radar_visibility),
         "radar_visibility_radius": int(args.radar_visibility_radius),
         "doppler_radius": int(args.doppler_radius),
@@ -391,7 +399,17 @@ if __name__ == "__main__":
     parser.add_argument("--pc_range", type=float, nargs=6, default=(0, -20, -6, 120, 20, 10))
     parser.add_argument("--z_min", type=float, default=-1.0)
     parser.add_argument("--x_max", type=float, default=80.0)
-    parser.add_argument("--require_radar_visibility", action="store_true")
+    parser.add_argument(
+        "--visibility_mode",
+        choices=("preserve", "hard"),
+        default="preserve",
+        help="preserve keeps cropped LiDAR obstacle structure; hard keeps only radar-neighbor cells",
+    )
+    parser.add_argument(
+        "--require_radar_visibility",
+        action="store_true",
+        help="Deprecated compatibility alias for --visibility_mode hard",
+    )
     parser.add_argument("--radar_visibility_radius", type=int, default=2)
     parser.add_argument("--doppler_radius", type=int, default=1)
     args = parser.parse_args()

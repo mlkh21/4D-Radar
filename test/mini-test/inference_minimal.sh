@@ -16,6 +16,9 @@ PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_a
 RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
 MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SCRIPT_DIR}/train_results_mini}"
 MINI_INFERENCE_RESULTS_DIR="${MINI_INFERENCE_RESULTS_DIR:-${SCRIPT_DIR}/inference_results_mini}"
+MINI_TARGET_SIZE="${MINI_TARGET_SIZE:-32,128,128}"
+MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-0,-20,-6,120,20,10}"
+MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-0,-20,-6,40,20,10}"
 
 MODEL_TYPE="${1:-ldm}"
 MAX_INFER_FILES="${MAX_INFER_FILES:-20}"
@@ -139,6 +142,9 @@ echo "max files per scene: ${MAX_INFER_FILES}"
 echo "occ_threshold: ${OCC_THRESHOLD}"
 echo "empty_fallback_topk: ${EMPTY_FALLBACK_TOPK}"
 echo "adaptive_occ_from_target: ${ADAPTIVE_OCC_FROM_TARGET} (adaptive_target_threshold=${ADAPTIVE_TARGET_THRESHOLD})"
+echo "target size [Z,X,Y]: ${MINI_TARGET_SIZE}"
+echo "source pc range: ${MINI_SOURCE_PC_RANGE}"
+echo "model pc range: ${MINI_MODEL_PC_RANGE}"
 echo "=========================================="
 
 for SCENE in "${TEST_SCENES[@]}"; do
@@ -196,6 +202,9 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --max_files "${MAX_INFER_FILES}" \
     --occ_threshold "${OCC_THRESHOLD}" \
     --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
+    --target_size ${MINI_TARGET_SIZE//,/ } \
+    --source_pc_range ${MINI_SOURCE_PC_RANGE//,/ } \
+    --pc_range ${MINI_MODEL_PC_RANGE//,/ } \
     --report_task_metrics \
     --save_voxel \
     --save_uncertainty \

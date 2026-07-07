@@ -375,6 +375,21 @@ def append_zero(x):
     return th.cat([x, x.new_zeros([1])])
 
 
+def _valid_group_count(channels: int, requested_groups: int) -> int:
+    """选择不超过请求值且能整除通道数的最大 GroupNorm 组数。"""
+    if not isinstance(channels, int) or isinstance(channels, bool) or channels <= 0:
+        raise ValueError(f"channels 必须是正整数，实际为 {channels!r}")
+    if not isinstance(requested_groups, int) or isinstance(requested_groups, bool):
+        raise TypeError(f"num_groups 必须是正整数，实际为 {requested_groups!r}")
+    if requested_groups <= 0:
+        raise ValueError(f"num_groups 必须是正整数，实际为 {requested_groups!r}")
+
+    upper_bound = min(requested_groups, channels)
+    for groups in range(upper_bound, 0, -1):
+        if channels % groups == 0:
+            return groups
+
+
 def normalization(channels, norm_type: str = None, num_groups: int = None):
     """
     输入:
@@ -389,10 +404,10 @@ def normalization(channels, norm_type: str = None, num_groups: int = None):
     """
     # NOTE: 使用全局配置或参数覆盖
     _norm_type = norm_type or NORM_TYPE
-    _num_groups = num_groups or NORM_GROUPS
+    _num_groups = NORM_GROUPS if num_groups is None else num_groups
     
-    # NOTE: 确保 num_groups 不超过通道数
-    _num_groups = min(_num_groups, channels)
+    # NOTE: GroupNorm 要求组数不超过通道数且能整除通道数。
+    _num_groups = _valid_group_count(channels, _num_groups)
     
     if _norm_type == "group":
         return GroupNorm32(_num_groups, channels)

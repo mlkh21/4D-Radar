@@ -219,6 +219,38 @@ class MultimodalFusionTest(unittest.TestCase):
         )
         self.assertEqual(tuple(latent_out.shape), (1, 16, 1, 1, 1))
 
+    def test_projection_grid_maps_zxy_tensor_axes_to_xyz_physical_coordinates(self):
+        from diffusion_consistency_radar.cm.multimodal_fusion import DualModalityProjectionLayer
+
+        projection = DualModalityProjectionLayer(
+            voxel_shape=(2, 3, 4),
+            pc_range=(0.0, 0.0, 0.0, 3.0, 4.0, 2.0),
+            voxel_layout="ZXY",
+        )
+
+        coords = projection.voxel_coords.view(2, 3, 4, 3)
+
+        torch.testing.assert_close(coords[0, 0, 0], torch.tensor([0.5, 0.5, 0.5]))
+        torch.testing.assert_close(coords[1, 2, 3], torch.tensor([2.5, 3.5, 1.5]))
+
+    def test_projection_applies_radar_to_camera_extrinsic_in_forward_direction(self):
+        from diffusion_consistency_radar.cm.multimodal_fusion import DualModalityProjectionLayer
+
+        projection = DualModalityProjectionLayer(
+            voxel_shape=(1, 1, 1),
+            pc_range=(-0.5, -0.5, 0.5, 0.5, 0.5, 1.5),
+            voxel_layout="ZXY",
+        )
+        projected = projection(
+            torch.ones(1, 1, 8, 8),
+            torch.eye(3).unsqueeze(0),
+            torch.tensor([[0.0, 0.0, 1.0]]),
+            torch.tensor([[[2.0, 0.0, 3.5], [0.0, 2.0, 3.5], [0.0, 0.0, 1.0]]]),
+            (8, 8),
+        )
+
+        self.assertGreater(float(projected[0, 0, 0, 0, 0]), 0.99)
+
 
 class UnifiedTrainBatchTest(unittest.TestCase):
     def test_unpack_training_batch_supports_meta_dict_and_legacy_batches(self):

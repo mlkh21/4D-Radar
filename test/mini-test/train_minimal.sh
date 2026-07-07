@@ -21,6 +21,16 @@ CALIB_CONFIG_DIR="${CALIB_CONFIG_DIR:-${ROOT_DIR}/Data/config}"
 MINI_DATASET_DIR="${MINI_DATASET_DIR:-${SELF_DIR}/.tmp_mini_train_dataset}"
 MINI_CONFIG_PATH="${MINI_CONFIG_PATH:-${SELF_DIR}/.default_config.mini_override.yaml}"
 MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SELF_DIR}/train_results_mini}"
+MINI_TARGET_SIZE="${MINI_TARGET_SIZE:-32,128,128}"
+MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-0,-20,-6,120,20,10}"
+MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-0,-20,-6,40,20,10}"
+MINI_VAE_CONFIG_TYPE="${MINI_VAE_CONFIG_TYPE:-ultra_lightweight}"
+MINI_VAE_LATENT_DIM="${MINI_VAE_LATENT_DIM:-}"
+MINI_VAE_OCC_LOSS="${MINI_VAE_OCC_LOSS:-bce_dice}"
+MINI_TRAIN_SPLIT="${MINI_TRAIN_SPLIT:-0.8}"
+MINI_SPLIT_SEED="${MINI_SPLIT_SEED:-42}"
+MINI_LDM_HEIGHT_WEIGHT="${MINI_LDM_HEIGHT_WEIGHT:-0.02}"
+MINI_LDM_CONTINUITY_WEIGHT="${MINI_LDM_CONTINUITY_WEIGHT:-0.02}"
 
 MODE="${1:-all}"
 CUDA_DEVICES="${CUDA_DEVICES:-0}"
@@ -97,6 +107,16 @@ echo "project dir: ${PROJECT_DIR}"
 echo "preprocessed root: ${PREPROCESSED_ROOT}"
 echo "results dir: ${MINI_RESULTS_DIR}"
 echo "mini dataset dir: ${MINI_DATASET_DIR}"
+echo "target size [Z,X,Y]: ${MINI_TARGET_SIZE}"
+echo "source pc range: ${MINI_SOURCE_PC_RANGE}"
+echo "model pc range: ${MINI_MODEL_PC_RANGE}"
+echo "vae config type: ${MINI_VAE_CONFIG_TYPE}"
+echo "vae latent dim: ${MINI_VAE_LATENT_DIM:-preset}"
+echo "vae occupancy loss: ${MINI_VAE_OCC_LOSS}"
+echo "train split: ${MINI_TRAIN_SPLIT}"
+echo "split seed: ${MINI_SPLIT_SEED}"
+echo "ldm height distribution weight: ${MINI_LDM_HEIGHT_WEIGHT}"
+echo "ldm vertical continuity weight: ${MINI_LDM_CONTINUITY_WEIGHT}"
 echo "=========================================="
 
 rm -rf "${MINI_DATASET_DIR}"
@@ -159,7 +179,7 @@ done
 
 mkdir -p "${MINI_RESULTS_DIR}/vae" "${MINI_RESULTS_DIR}/ldm" "${MINI_RESULTS_DIR}/cd"
 
-"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" <<'PY'
+"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" "${MINI_TARGET_SIZE}" "${MINI_SOURCE_PC_RANGE}" "${MINI_MODEL_PC_RANGE}" "${MINI_VAE_CONFIG_TYPE}" "${MINI_VAE_LATENT_DIM}" "${MINI_VAE_OCC_LOSS}" "${MINI_TRAIN_SPLIT}" "${MINI_SPLIT_SEED}" "${MINI_LDM_HEIGHT_WEIGHT}" "${MINI_LDM_CONTINUITY_WEIGHT}" <<'PY'
 import sys
 import yaml
 
@@ -175,27 +195,64 @@ import yaml
 		cd_epochs,
 		grad_accum,
 		results_dir,
-) = sys.argv[1:12]
+		target_size_raw,
+		source_pc_range_raw,
+		model_pc_range_raw,
+		vae_config_type,
+		vae_latent_dim,
+		vae_occ_loss,
+		train_split,
+		split_seed,
+		ldm_height_weight,
+		ldm_continuity_weight,
+) = sys.argv[1:22]
+
+
+def parse_numbers(raw, caster):
+		return [caster(v.strip()) for v in str(raw).split(',') if v.strip()]
 
 with open(src_cfg, 'r', encoding='utf-8') as f:
 		cfg = yaml.safe_load(f) or {}
+
+target_size = parse_numbers(target_size_raw, int)
+source_pc_range = parse_numbers(source_pc_range_raw, float)
+model_pc_range = parse_numbers(model_pc_range_raw, float)
+if len(target_size) != 3:
+		raise SystemExit(f"MINI_TARGET_SIZE must contain 3 values, got {target_size_raw}")
+if len(source_pc_range) != 6 or len(model_pc_range) != 6:
+		raise SystemExit("MINI_SOURCE_PC_RANGE and MINI_MODEL_PC_RANGE must contain 6 values")
 
 cfg.setdefault('data', {})
 cfg['data']['dataset_dir'] = dataset_dir
 cfg['data']['batch_size'] = int(batch_size)
 cfg['data']['num_workers'] = int(num_workers)
 cfg['data']['use_augmentation'] = str(use_aug).lower() in {'1', 'true', 'yes', 'on'}
+cfg['data']['target_size'] = target_size
+cfg['data']['source_pc_range'] = source_pc_range
+cfg['data']['model_pc_range'] = model_pc_range
+cfg['data']['train_split'] = float(train_split)
+cfg['data']['split_seed'] = int(split_seed)
 
 cfg['vae'] = dict(cfg.get('vae') or {})
 cfg['vae']['epochs'] = int(vae_epochs)
 cfg['vae']['save_every'] = 1
 cfg['vae']['save_dir'] = f"{results_dir}/vae"
+cfg['vae']['config_type'] = vae_config_type
+if vae_latent_dim:
+		cfg['vae']['latent_dim'] = int(vae_latent_dim)
+else:
+		cfg['vae'].pop('latent_dim', None)
+cfg['vae']['occupancy_loss_type'] = vae_occ_loss
 
 cfg['ldm'] = dict(cfg.get('ldm') or {})
 cfg['ldm']['epochs'] = int(ldm_epochs)
 cfg['ldm']['save_every'] = 1
 cfg['ldm']['save_dir'] = f"{results_dir}/ldm"
 cfg['ldm']['uncertainty_loss_weight'] = float(cfg['ldm'].get('uncertainty_loss_weight', 0.05))
+cfg['ldm']['decoded_height_distribution_weight'] = float(ldm_height_weight)
+cfg['ldm']['decoded_vertical_continuity_weight'] = float(ldm_continuity_weight)
+cfg['ldm']['fusion_voxel_shape'] = target_size
+cfg['ldm']['fusion_pc_range'] = model_pc_range
 
 cfg['cd'] = {
 	'teacher_model_path': f"{results_dir}/ldm/ldm_best.pt",

@@ -12,9 +12,65 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from diffusion_consistency_radar.scripts.cd_train_optimized import (
+    build_cd_vae_from_checkpoint,
     call_cd_denoiser,
     has_multimodal_state_dict,
+    create_cd_model,
 )
+from diffusion_consistency_radar.cm.vae_3d import (
+    VAE3D,
+    create_lightweight_vae_config,
+    create_ultra_lightweight_vae_config,
+)
+
+
+def test_cd_vae_checkpoint_metadata_precedes_fallback_config():
+    config = create_lightweight_vae_config()
+    config["latent_dim"] = 8
+    config["base_channels"] = 32
+    checkpoint = {
+        "model_state_dict": VAE3D(**config).state_dict(),
+        "vae_config": config,
+        "vae_config_type": "lightweight",
+    }
+
+    model, metadata = build_cd_vae_from_checkpoint(
+        checkpoint,
+        fallback_config_type="ultra_lightweight",
+    )
+
+    assert model.latent_dim == 8
+    assert metadata["vae_config_type"] == "lightweight"
+
+
+def test_cd_legacy_vae_requires_explicit_fallback():
+    config = create_ultra_lightweight_vae_config()
+    checkpoint = {"model_state_dict": VAE3D(**config).state_dict()}
+
+    try:
+        build_cd_vae_from_checkpoint(checkpoint, fallback_config_type=None)
+    except ValueError as exc:
+        assert "fallback" in str(exc)
+    else:
+        raise AssertionError("legacy checkpoint without fallback must fail")
+
+
+def test_cd_z8_legacy_model_has_dynamic_input_and_output_channels():
+    model = create_cd_model(
+        False,
+        {
+            "latent_dim": 8,
+            "model_channels": 8,
+            "channel_mult": [1],
+            "use_checkpoint": False,
+        },
+    )
+
+    output = model(torch.randn(1, 16, 2, 4, 4), torch.ones(1))
+
+    assert model.in_channels == 16
+    assert model.out_channels == 8
+    assert output.shape == (1, 8, 2, 4, 4)
 
 
 class LegacyRecorder(nn.Module):
@@ -103,6 +159,9 @@ def test_multimodal_cd_denoiser_passes_radar_ir_and_noised_latent():
 
 
 if __name__ == "__main__":
+    test_cd_vae_checkpoint_metadata_precedes_fallback_config()
+    test_cd_legacy_vae_requires_explicit_fallback()
+    test_cd_z8_legacy_model_has_dynamic_input_and_output_channels()
     test_multimodal_checkpoint_detection()
     test_legacy_cd_denoiser_keeps_eight_channel_path()
     test_multimodal_cd_denoiser_passes_radar_ir_and_noised_latent()

@@ -79,6 +79,115 @@ def uncertainty_calibration_metrics(
     }
 
 
+def _longest_consecutive_run(indices: np.ndarray) -> int:
+    """计算升序索引中的最长连续段长度。"""
+    if indices.size == 0:
+        return 0
+    longest = 1
+    current = 1
+    for delta in np.diff(indices):
+        if int(delta) == 1:
+            current += 1
+        else:
+            longest = max(longest, current)
+            current = 1
+    return int(max(longest, current))
+
+
+def vertical_structure_metrics(
+    pred_occ: np.ndarray,
+    target_occ: np.ndarray,
+    pc_range: Sequence[float] = DEFAULT_PC_RANGE,
+    occ_threshold: float = 0.5,
+    top_height_tolerance_m: float = 0.0,
+    trunk_base_max_z: float = 1.0,
+    trunk_min_height_m: float = 2.0,
+    trunk_height_cap_m: float = 3.0,
+) -> Dict[str, float]:
+    """评估树木/垂直结构的高度覆盖、顶高、连通性与主干区域召回。"""
+    pred = np.asarray(pred_occ, dtype=np.float32).squeeze()
+    target = np.asarray(target_occ, dtype=np.float32).squeeze()
+    if pred.shape != target.shape or pred.ndim != 3:
+        raise ValueError(f"Expected matching 3D occupancy arrays, got {pred.shape} and {target.shape}")
+
+    z_min = float(pc_range[2])
+    z_max = float(pc_range[5])
+    voxel_height = (z_max - z_min) / max(int(pred.shape[0]), 1)
+    if voxel_height <= 0.0:
+        raise ValueError(f"Invalid pc_range z extent for vertical metrics: {pc_range}")
+
+    pred_mask = pred > float(occ_threshold)
+    target_mask = target > float(occ_threshold)
+    top_tolerance_vox = max(0, int(np.floor(float(top_height_tolerance_m) / voxel_height + 1e-6)))
+    trunk_cap_vox = max(0, int(np.ceil(float(trunk_height_cap_m) / voxel_height - 1e-6)))
+
+    height_num = 0.0
+    height_den = 0.0
+    top_num = 0.0
+    top_den = 0.0
+    conn_num = 0.0
+    conn_den = 0.0
+    trunk_num = 0.0
+    trunk_den = 0.0
+
+    target_columns = np.argwhere(np.any(target_mask, axis=0))
+    for x_idx, y_idx in target_columns:
+        target_z = np.flatnonzero(target_mask[:, x_idx, y_idx])
+        pred_z = np.flatnonzero(pred_mask[:, x_idx, y_idx])
+        overlap_mask = pred_mask[:, x_idx, y_idx] & target_mask[:, x_idx, y_idx]
+        overlap_z = np.flatnonzero(overlap_mask)
+
+        target_bottom = int(target_z[0])
+        target_top = int(target_z[-1])
+        target_span = target_top - target_bottom + 1
+        if pred_z.size:
+            pred_top = int(pred_z[-1])
+        else:
+            pred_top = None
+
+        # 高度覆盖显式统计目标列中被预测命中的真实占用体素数量，
+        # 避免包络接近但中间有空洞、或整体错层时出现虚高分数。
+        height_num += float(overlap_z.size)
+        height_den += float(target_z.size)
+
+        top_den += 1.0
+        # 顶高召回采用“不能高估目标顶部”的定义：
+        # 预测顶部必须不高于目标顶部，且只能在容差范围内略低。
+        if pred_top is not None and int(pred_top) <= target_top and int(pred_top) >= (target_top - top_tolerance_vox):
+            top_num += 1.0
+
+        target_run = _longest_consecutive_run(target_z)
+        overlap_run = _longest_consecutive_run(overlap_z)
+        # 连通性分子只统计预测与目标交集中的最长连续段，
+        # 避免错误高度上的连续预测段获得满分。
+        conn_num += float(overlap_run)
+        conn_den += float(target_run)
+
+        target_bottom_z = z_min + float(target_bottom) * voxel_height
+        target_height_m = float(target_span) * voxel_height
+        if target_bottom_z <= float(trunk_base_max_z) and target_height_m >= float(trunk_min_height_m) and trunk_cap_vox > 0:
+            trunk_top = min(target_bottom + trunk_cap_vox, pred.shape[0])
+            target_trunk_region = target_mask[target_bottom:trunk_top, x_idx, y_idx]
+            pred_trunk_region = pred_mask[target_bottom:trunk_top, x_idx, y_idx]
+            trunk_den += float(np.count_nonzero(target_trunk_region))
+            trunk_num += float(np.count_nonzero(target_trunk_region & pred_trunk_region))
+
+    return {
+        "height_coverage_recall": float(height_num / height_den) if height_den else 0.0,
+        "height_coverage_numerator": float(height_num),
+        "height_coverage_denominator": float(height_den),
+        "top_height_recall": float(top_num / top_den) if top_den else 0.0,
+        "top_height_numerator": float(top_num),
+        "top_height_denominator": float(top_den),
+        "vertical_connectivity_recall": float(conn_num / conn_den) if conn_den else 0.0,
+        "vertical_connectivity_numerator": float(conn_num),
+        "vertical_connectivity_denominator": float(conn_den),
+        "trunk_region_recall": float(trunk_num / trunk_den) if trunk_den else 0.0,
+        "trunk_region_numerator": float(trunk_num),
+        "trunk_region_denominator": float(trunk_den),
+    }
+
+
 def threshold_label(value: float) -> str:
     text = f"{float(value):g}".replace("-", "m").replace(".", "p")
     return text

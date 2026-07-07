@@ -32,6 +32,7 @@ from cm.multimodal_fusion import CompleteDualModalityPerceptionNet
 from cm.karras_diffusion import KarrasDenoiser
 from cm.vae_3d import (
     VAE3D,
+    build_vae_from_checkpoint,
     create_lightweight_vae_config,
     create_standard_vae_config,
     create_ultra_lightweight_vae_config,
@@ -68,6 +69,18 @@ def load_yaml_config(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def resolve_data_grid_config(data_config: Dict[str, Any]):
+    """从 data 配置解析原始体素范围、模型裁剪范围和训练张量尺寸。"""
+    source_pc_range = data_config.get("source_pc_range", data_config.get("pc_range", [0, -20, -6, 120, 20, 10]))
+    model_pc_range = data_config.get("model_pc_range", data_config.get("pc_range", source_pc_range))
+    target_size = data_config.get("target_size", data_config.get("voxel_shape", [32, 128, 128]))
+    return (
+        tuple(int(v) for v in target_size),
+        tuple(float(v) for v in source_pc_range),
+        tuple(float(v) for v in model_pc_range),
+    )
+
+
 def create_vae_from_config(config: Optional[Dict[str, Any]] = None) -> VAE3D:
     cfg = config or {}
     vae_cfg = cfg.get("vae", {}) if isinstance(cfg.get("vae", {}), dict) else {}
@@ -81,6 +94,17 @@ def create_vae_from_config(config: Optional[Dict[str, Any]] = None) -> VAE3D:
     return VAE3D(**model_cfg)
 
 
+def build_cd_vae_from_checkpoint(
+    checkpoint: Any,
+    fallback_config_type: Optional[str] = None,
+):
+    """按共享 checkpoint 协议构建 CD 训练使用的 VAE。"""
+    return build_vae_from_checkpoint(
+        checkpoint,
+        fallback_config_type=fallback_config_type,
+    )
+
+
 def has_multimodal_state_dict(state_dict: Dict[str, torch.Tensor]) -> bool:
     """Detect checkpoints saved from CompleteDualModalityPerceptionNet."""
     keys = tuple(state_dict.keys())
@@ -91,15 +115,16 @@ def has_multimodal_state_dict(state_dict: Dict[str, torch.Tensor]) -> bool:
 def create_legacy_unet(config: Optional[Dict[str, Any]] = None) -> OptimizedUNetModel:
     """Build the legacy latent denoiser used by historical CD/LDM checkpoints."""
     cfg = config or {}
+    latent_dim = int(cfg.get("latent_dim", 4))
     return OptimizedUNetModel(
         image_size=32,
-        in_channels=int(cfg.get("legacy_in_channels", 8)),
+        in_channels=int(cfg.get("in_channels", cfg.get("legacy_in_channels", 2 * latent_dim))),
         model_channels=int(cfg.get("model_channels", 32)),
-        out_channels=4,
+        out_channels=latent_dim,
         num_res_blocks=int(cfg.get("num_res_blocks", 1)),
         attention_resolutions=tuple(cfg.get("attention_resolutions", [])),
         channel_mult=tuple(cfg.get("channel_mult", [1, 2, 3])),
-        use_checkpoint=True,
+        use_checkpoint=bool(cfg.get("use_checkpoint", True)),
         attention_type="linear",
     )
 
@@ -107,15 +132,17 @@ def create_legacy_unet(config: Optional[Dict[str, Any]] = None) -> OptimizedUNet
 def create_multimodal_cd_model(config: Optional[Dict[str, Any]] = None) -> CompleteDualModalityPerceptionNet:
     """Build the multimodal CD/LDM denoiser with a 16-channel latent backbone."""
     cfg = config or {}
+    latent_dim = int(cfg.get("latent_dim", 4))
+    backbone_in_channels = int(cfg.get("in_channels", max(16, 2 * latent_dim)))
     base_unet = OptimizedUNetModel(
         image_size=32,
-        in_channels=16,
+        in_channels=backbone_in_channels,
         model_channels=int(cfg.get("model_channels", 32)),
-        out_channels=4,
+        out_channels=latent_dim,
         num_res_blocks=int(cfg.get("num_res_blocks", 1)),
         attention_resolutions=tuple(cfg.get("attention_resolutions", [])),
         channel_mult=tuple(cfg.get("channel_mult", [1, 2, 3])),
-        use_checkpoint=True,
+        use_checkpoint=bool(cfg.get("use_checkpoint", True)),
         attention_type="linear",
     )
     fusion_voxel_shape = tuple(int(v) for v in cfg.get("fusion_voxel_shape", [32, 128, 128]))
@@ -127,11 +154,35 @@ def create_multimodal_cd_model(config: Optional[Dict[str, Any]] = None) -> Compl
         pc_range=fusion_pc_range,
         downsample_to_latent=True,
         latent_shape=fusion_latent_shape,
+        fused_channels=backbone_in_channels,
     )
 
 
 def create_cd_model(multimodal: bool, config: Optional[Dict[str, Any]] = None) -> nn.Module:
     return create_multimodal_cd_model(config) if multimodal else create_legacy_unet(config)
+
+
+def resolve_cd_generation_config(checkpoint, fallback_latent_dim: Optional[int]):
+    """读取教师/CD checkpoint 模型配置，旧权重从卷积 shape 推导。"""
+    checkpoint_dict = checkpoint if isinstance(checkpoint, dict) else {}
+    state_dict = checkpoint_state_dict(checkpoint)
+    config = dict(checkpoint_dict.get("model_config") or {})
+    latent_dim = checkpoint_dict.get("latent_dim", config.get("latent_dim"))
+    for prefix in ("", "unet_3d."):
+        input_weight = state_dict.get(f"{prefix}input_blocks.0.0.weight")
+        output_weight = state_dict.get(f"{prefix}out.2.weight")
+        if "in_channels" not in config and torch.is_tensor(input_weight) and input_weight.ndim >= 2:
+            config["in_channels"] = int(input_weight.shape[1])
+        if latent_dim is None and torch.is_tensor(output_weight) and output_weight.ndim >= 1:
+            latent_dim = int(output_weight.shape[0])
+    if latent_dim is None:
+        if fallback_latent_dim is None:
+            raise ValueError("生成模型 checkpoint 无法推导 latent_dim，请显式提供 fallback")
+        latent_dim = fallback_latent_dim
+    config["latent_dim"] = int(latent_dim)
+    config.setdefault("in_channels", 2 * int(latent_dim))
+    config.setdefault("out_channels", int(latent_dim))
+    return config
 
 
 def has_multimodal_meta(meta: Optional[Dict[str, Any]]) -> bool:
@@ -229,6 +280,7 @@ class ConsistencyDistillationTrainer:
         self.best_loss = float('inf')
         self.is_resumed = False
         self.model_config = dict(self.config.get("ldm", {}) or self.config.get("model", {}) or {})
+        self.model_config.setdefault("latent_dim", int(vae.latent_dim))
         
         # 加载 LDM 教师模型
         self.ldm_model = self._load_ldm_model(ldm_ckpt_path)
@@ -294,6 +346,15 @@ class ConsistencyDistillationTrainer:
         
         ckpt = safe_torch_load(ckpt_path, map_location='cpu')
         state_dict = checkpoint_state_dict(ckpt)
+        resolved_config = resolve_cd_generation_config(
+            ckpt,
+            fallback_latent_dim=self.model_config.get("latent_dim"),
+        )
+        resolved_config.update({
+            key: value for key, value in self.model_config.items()
+            if key not in resolved_config
+        })
+        self.model_config = resolved_config
         model = create_cd_model(has_multimodal_state_dict(state_dict), self.model_config).to(self.device)
         
         sys.stdout = old_stdout
@@ -626,6 +687,8 @@ class ConsistencyDistillationTrainer:
                     'model_state_dict': self.cd_model.state_dict(),
                     'ema_model_state_dict': self.cd_model_ema.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
+                    'latent_dim': int(self.model_config["latent_dim"]),
+                    'model_config': dict(self.model_config),
                 }, best_ckpt)
                 msg = f"  ✓ Saved best model (loss: {loss:.4f})"
                 self.logger.info(msg)
@@ -640,6 +703,8 @@ class ConsistencyDistillationTrainer:
                     'model_state_dict': self.cd_model.state_dict(),
                     'ema_model_state_dict': self.cd_model_ema.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
+                    'latent_dim': int(self.model_config["latent_dim"]),
+                    'model_config': dict(self.model_config),
                 }, ckpt_path)
                 self.logger.info(f"  Saved checkpoint: {ckpt_path}")
         
@@ -666,20 +731,27 @@ def main():
     cd_config = dict(config.get("cd", {}) if isinstance(config.get("cd", {}), dict) else {})
     ldm_config = dict(config.get("ldm", {}) if isinstance(config.get("ldm", {}), dict) else {})
     opt_config = dict(config.get("optimization", {}) if isinstance(config.get("optimization", {}), dict) else {})
+    data_config = dict(config.get("data", {}) if isinstance(config.get("data", {}), dict) else {})
+    target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
+    ldm_config.setdefault("fusion_voxel_shape", list(target_size))
+    ldm_config.setdefault("fusion_pc_range", list(model_pc_range))
 
     # 加载 VAE
-    vae = create_vae_from_config(config)
     ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
-    if 'model_state_dict' in ckpt:
-        vae.load_state_dict(ckpt['model_state_dict'])
-    else:
-        vae.load_state_dict(ckpt)
+    vae_config = config.get("vae", {}) if isinstance(config.get("vae", {}), dict) else {}
+    vae, _vae_metadata = build_cd_vae_from_checkpoint(
+        ckpt,
+        fallback_config_type=vae_config.get("config_type"),
+    )
     
     # 创建数据加载器
     dataset = NTU4DRadLM_VoxelDataset(
         root_dir=args.dataset_dir,
         split='train',
         use_augmentation=False,
+        target_size=target_size,
+        source_pc_range=source_pc_range,
+        model_pc_range=model_pc_range,
     )
     train_loader = DataLoader(
         dataset,

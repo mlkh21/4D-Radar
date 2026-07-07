@@ -12,11 +12,18 @@ DEFAULT_DT=0.002       # 默认红外-雷达硬件触发时钟残差 (秒)，即
 # 解析输入的命令行参数
 VX=${1:-$DEFAULT_VX}
 DT_SYNC=${2:-$DEFAULT_DT}
+VISIBILITY_MODE="${VISIBILITY_MODE:-preserve}"
+
+if [[ "$VISIBILITY_MODE" != "preserve" && "$VISIBILITY_MODE" != "hard" ]]; then
+    echo "Error: VISIBILITY_MODE must be preserve or hard, got: $VISIBILITY_MODE"
+    exit 2
+fi
 
 echo "======================================================================"
 echo "🚀 启动 NTU4DRadLM 高动态机载数据预处理流水线"
 echo "   设定巡航速度  --vx      : ${VX} m/s"
 echo "   设定硬件时滞  --dt_sync : ${DT_SYNC} s"
+echo "   监督可见性模式           : ${VISIBILITY_MODE}"
 echo "======================================================================"
 
 # 获取脚本所在目录的绝对路径，确保在任何路径下执行都能正确定位
@@ -51,7 +58,7 @@ echo -e "\n[STEP 2/2] 正在执行机载高速自身运动多普勒补偿与红�
 
 if [ -f "$SCRIPT_DIR/NTU4DRadLM_pre_processing.py" ]; then
     # 💡 严格核对：确保所有变量与路径的双引号完美闭合，消除所有 Bad Token
-    python3 "$SCRIPT_DIR/NTU4DRadLM_pre_processing.py" --vx "$VX" --dt_sync "$DT_SYNC" --require_radar_visibility
+    python3 "$SCRIPT_DIR/NTU4DRadLM_pre_processing.py" --vx "$VX" --dt_sync "$DT_SYNC" --visibility_mode "$VISIBILITY_MODE"
     
     if [ $? -ne 0 ]; then
         echo "❌ 错误: 预处理核心矩阵解算失败！"

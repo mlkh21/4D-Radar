@@ -14,10 +14,11 @@ Latent Diffusion 的核心思想：
 """
 
 import math
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List
+from typing import Any, Dict, Mapping, Optional, Tuple, List
 from einops import rearrange
 
 from .nn import normalization, conv_nd
@@ -384,6 +385,11 @@ class VAE3D(nn.Module):
         channel_weights: Optional[Tuple[float, ...]] = (4.0, 0.2, 0.5, 0.2),
         false_positive_weight: float = 0.0,
         occupancy_mass_weight: float = 0.0,
+        occupancy_loss_type: str = "bce_dice",
+        occupancy_bce_weight: float = 1.0,
+        occupancy_dice_weight: float = 1.0,
+        occupancy_pos_weight_cap: float = 128.0,
+        continuous_recon_weight: float = 1.0,
         dropout: float = 0.0,
         use_checkpoint: bool = True,  # 默认启用梯度检查点
     ):
@@ -395,6 +401,17 @@ class VAE3D(nn.Module):
         self.empty_weight = float(empty_weight)
         self.false_positive_weight = float(false_positive_weight)
         self.occupancy_mass_weight = float(occupancy_mass_weight)
+        if occupancy_loss_type not in ("bce_dice", "legacy_mse"):
+            raise ValueError(
+                "occupancy_loss_type 必须是 'bce_dice' 或 'legacy_mse'，"
+                f"实际为 {occupancy_loss_type!r}"
+            )
+        self.occupancy_loss_type = occupancy_loss_type
+        self.occupancy_bce_weight = float(occupancy_bce_weight)
+        self.occupancy_dice_weight = float(occupancy_dice_weight)
+        self.occupancy_pos_weight_cap = float(occupancy_pos_weight_cap)
+        self.continuous_recon_weight = float(continuous_recon_weight)
+        self._loss_components = {}
         if channel_weights is not None:
             cw = torch.as_tensor(channel_weights, dtype=torch.float32).view(1, -1, 1, 1, 1)
             self.register_buffer("channel_weights", cw, persistent=False)
@@ -466,6 +483,11 @@ class VAE3D(nn.Module):
         """
         z = self.post_quant_conv(z)
         return self.decoder(z)
+
+    @staticmethod
+    def occupancy_probability(occupancy_logits: torch.Tensor) -> torch.Tensor:
+        """将 occupancy logits 转换为概率，不处理其他连续通道。"""
+        return torch.sigmoid(occupancy_logits)
     
     def forward(self, x, sample_posterior: bool = True):
         """
@@ -486,11 +508,132 @@ class VAE3D(nn.Module):
         """获取潜向量（用于扩散模型训练）"""
         z, _ = self.encode(x, deterministic=deterministic)
         return z
-    
+
+    def latent_spatial_shape(self, input_size):
+        """按 encoder 的真实下采样卷积参数推导潜空间尺寸，不分配输入张量。"""
+        spatial = tuple(int(value) for value in input_size)
+        for block in self.encoder.down_blocks:
+            for layer in block:
+                if not isinstance(layer, Downsample3D):
+                    continue
+                conv = layer.conv
+                spatial = tuple(
+                    math.floor(
+                        (
+                            size
+                            + 2 * padding
+                            - dilation * (kernel - 1)
+                            - 1
+                        )
+                        / stride
+                        + 1
+                    )
+                    for size, padding, dilation, kernel, stride in zip(
+                        spatial,
+                        conv.padding,
+                        conv.dilation,
+                        conv.kernel_size,
+                        conv.stride,
+                    )
+                )
+        return spatial
+
+    @property
+    def loss_components(self):
+        """返回最近一次损失分量的浅拷贝，避免外部替换内部字典。"""
+        return dict(self._loss_components)
+
+    def _compute_legacy_reconstruction_loss(self, x, x_recon, reduction):
+        """保留历史加权 MSE 重建行为，兼容旧配置与旧实验。"""
+        diff = (x_recon - x) ** 2
+        occ_mask = (x[:, 0:1] > 0).float()
+        spatial_weight = self.empty_weight + occ_mask * (self.occupied_weight - self.empty_weight)
+        diff = diff * spatial_weight
+        if self.channel_weights is not None and self.channel_weights.shape[1] == diff.shape[1]:
+            diff = diff * self.channel_weights.to(device=diff.device, dtype=diff.dtype)
+
+        if reduction == "mean":
+            denom = spatial_weight.mean().clamp_min(1e-6)
+            if self.channel_weights is not None and self.channel_weights.shape[1] == diff.shape[1]:
+                channel_denom = self.channel_weights.mean().to(
+                    device=diff.device, dtype=diff.dtype
+                ).clamp_min(1e-6)
+                denom = denom * channel_denom
+            recon_loss = diff.mean() / denom
+        elif reduction == "sum":
+            recon_loss = diff.sum()
+        else:
+            recon_loss = diff
+
+        if reduction == "mean":
+            occ_target = x[:, 0:1]
+            occ_pred = x_recon[:, 0:1]
+            empty_mask = (occ_target <= 0).float()
+            fp_loss = x_recon.new_zeros(())
+            if self.false_positive_weight > 0.0:
+                fp_loss = (torch.relu(occ_pred - occ_target) ** 2 * empty_mask).mean()
+
+            mass_loss = x_recon.new_zeros(())
+            if self.occupancy_mass_weight > 0.0:
+                pred_mass = torch.relu(occ_pred).mean()
+                target_mass = torch.relu(occ_target).mean()
+                mass_loss = torch.abs(pred_mass - target_mass)
+
+            recon_loss = (
+                recon_loss
+                + self.false_positive_weight * fp_loss
+                + self.occupancy_mass_weight * mass_loss
+            )
+        return recon_loss
+
+    def _compute_sparse_reconstruction_loss(self, x, x_recon):
+        """计算稀疏 occupancy 分类损失和有效体素内的连续通道损失。"""
+        # NOTE: 大体素网格在 AMP 下可能超过 FP16 精确计数范围，分类统计统一使用 FP32。
+        occupancy_target = (x[:, 0:1] > 0.5).to(dtype=torch.float32)
+        occupancy_logits = x_recon[:, 0:1].float()
+        positive_count = occupancy_target.sum()
+        total_count = occupancy_target.new_tensor(occupancy_target.numel())
+        negative_count = total_count - positive_count
+        pos_weight = torch.where(
+            positive_count > 0,
+            negative_count / positive_count.clamp_min(1.0),
+            occupancy_logits.new_ones(()),
+        ).clamp(max=self.occupancy_pos_weight_cap)
+        occ_bce_loss = F.binary_cross_entropy_with_logits(
+            occupancy_logits,
+            occupancy_target,
+            pos_weight=pos_weight,
+        )
+
+        occupancy_probability = self.occupancy_probability(occupancy_logits)
+        intersection = (occupancy_probability * occupancy_target).sum()
+        denominator = occupancy_probability.sum() + occupancy_target.sum()
+        occ_dice_loss = 1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
+
+        continuous_loss = x_recon.new_zeros(())
+        if x.shape[1] > 1:
+            valid_mask = occupancy_target.bool()
+            if x.shape[1] > 3:
+                valid_mask = valid_mask | (x[:, 3:4] > 0.5)
+            valid_mask = valid_mask.expand(-1, x.shape[1] - 1, -1, -1, -1)
+            if valid_mask.any():
+                continuous_loss = F.smooth_l1_loss(
+                    x_recon[:, 1:][valid_mask],
+                    x[:, 1:].to(dtype=x_recon.dtype)[valid_mask],
+                    reduction="mean",
+                )
+
+        recon_loss = (
+            self.occupancy_bce_weight * occ_bce_loss
+            + self.occupancy_dice_weight * occ_dice_loss
+            + self.continuous_recon_weight * continuous_loss
+        )
+        return recon_loss, occ_bce_loss, occ_dice_loss, continuous_loss
+
     def compute_loss(self, x, x_recon, posterior, reduction: str = "mean"):
         """
         计算 VAE 损失
-        
+
         Args:
             x: 原始输入
             x_recon: 重建
@@ -502,44 +645,18 @@ class VAE3D(nn.Module):
             kl_loss: KL 散度损失
         """
         mean, logvar = posterior
-        
-        # NOTE: 稀疏体素重建不能用纯 MSE 平均所有空体素，否则模型容易学成近距离/空背景均值。
-        diff = (x_recon - x) ** 2
-        occ_mask = (x[:, 0:1] > 0).float()
-        spatial_weight = self.empty_weight + occ_mask * (self.occupied_weight - self.empty_weight)
-        diff = diff * spatial_weight
-        if self.channel_weights is not None and self.channel_weights.shape[1] == diff.shape[1]:
-            diff = diff * self.channel_weights.to(device=diff.device, dtype=diff.dtype)
 
-        if reduction == "mean":
-            denom = spatial_weight.mean().clamp_min(1e-6)
-            if self.channel_weights is not None and self.channel_weights.shape[1] == diff.shape[1]:
-                denom = denom * self.channel_weights.mean().to(device=diff.device, dtype=diff.dtype).clamp_min(1e-6)
-            recon_loss = diff.mean() / denom
-        elif reduction == "sum":
-            recon_loss = diff.sum()
+        zero = x_recon.new_zeros(())
+        if self.occupancy_loss_type == "legacy_mse":
+            recon_loss = self._compute_legacy_reconstruction_loss(x, x_recon, reduction)
+            occ_bce_loss = zero
+            occ_dice_loss = zero
+            continuous_loss = zero
         else:
-            recon_loss = diff
-
-        if reduction == "mean":
-            occ_target = x[:, 0:1]
-            occ_pred = x_recon[:, 0:1]
-            empty_mask = (occ_target <= 0).float()
-
-            fp_loss = torch.zeros((), device=x.device, dtype=x.dtype)
-            if self.false_positive_weight > 0.0:
-                fp_loss = (torch.relu(occ_pred - occ_target) ** 2 * empty_mask).mean()
-
-            mass_loss = torch.zeros((), device=x.device, dtype=x.dtype)
-            if self.occupancy_mass_weight > 0.0:
-                pred_mass = torch.relu(occ_pred).mean()
-                target_mass = torch.relu(occ_target).mean()
-                mass_loss = torch.abs(pred_mass - target_mass)
-
-            recon_loss = (
-                recon_loss
-                + self.false_positive_weight * fp_loss
-                + self.occupancy_mass_weight * mass_loss
+            if reduction != "mean":
+                raise ValueError("bce_dice occupancy 损失当前仅支持 reduction='mean'")
+            recon_loss, occ_bce_loss, occ_dice_loss, continuous_loss = (
+                self._compute_sparse_reconstruction_loss(x, x_recon)
             )
         
         # NOTE: 相对熵（KL）散度损失
@@ -547,6 +664,12 @@ class VAE3D(nn.Module):
         
         # NOTE: 总损失
         total_loss = recon_loss + self.kl_weight * kl_loss
+
+        self._loss_components = {
+            "occ_bce_loss": occ_bce_loss.detach(),
+            "occ_dice_loss": occ_dice_loss.detach(),
+            "continuous_loss": continuous_loss.detach(),
+        }
         
         return total_loss, recon_loss, kl_loss
     
@@ -730,6 +853,11 @@ def create_ultra_lightweight_vae_config():
         "channel_weights": (4.0, 0.2, 0.5, 0.2),
         "false_positive_weight": 4.0,
         "occupancy_mass_weight": 1.0,
+        "occupancy_loss_type": "bce_dice",
+        "occupancy_bce_weight": 1.0,
+        "occupancy_dice_weight": 1.0,
+        "occupancy_pos_weight_cap": 128.0,
+        "continuous_recon_weight": 1.0,
         "use_checkpoint": True,
     }
 
@@ -740,7 +868,7 @@ def create_lightweight_vae_config():
         "in_channels": 4,
         "out_channels": 4,
         "latent_dim": 4,
-        "base_channels": 24,  # 减小基础通道 (32->24)
+        "base_channels": 24,
         "encoder_channel_mult": (1, 2, 3),  # 减少最后一层 (4->3)
         "decoder_channel_mult": (3, 2, 1),
         "num_res_blocks": 1,
@@ -751,8 +879,146 @@ def create_lightweight_vae_config():
         "channel_weights": (4.0, 0.2, 0.5, 0.2),
         "false_positive_weight": 4.0,
         "occupancy_mass_weight": 1.0,
+        "occupancy_loss_type": "bce_dice",
+        "occupancy_bce_weight": 1.0,
+        "occupancy_dice_weight": 1.0,
+        "occupancy_pos_weight_cap": 128.0,
+        "continuous_recon_weight": 1.0,
         "use_checkpoint": True,
     }
+
+
+def resolve_checkpoint_grid_config(
+    checkpoint_metadata: Optional[Mapping[str, Any]],
+    target_size=None,
+    source_pc_range=None,
+    model_pc_range=None,
+) -> Tuple[Tuple[int, ...], Tuple[float, ...], Tuple[float, ...]]:
+    """解析有效网格，显式参数优先于 checkpoint 元数据和历史默认值。"""
+    metadata = checkpoint_metadata or {}
+    grid = metadata.get("data_grid_config") or {}
+    default_source = (0, -20, -6, 120, 20, 10)
+    effective_target = target_size or grid.get("target_size") or (32, 128, 128)
+    effective_source = (
+        source_pc_range or grid.get("source_pc_range") or default_source
+    )
+    effective_model = (
+        model_pc_range
+        or grid.get("model_pc_range")
+        or effective_source
+    )
+    return (
+        tuple(int(value) for value in effective_target),
+        tuple(float(value) for value in effective_source),
+        tuple(float(value) for value in effective_model),
+    )
+
+
+def create_vae_config(config_type: str) -> Dict[str, Any]:
+    """按显式类型创建完整 VAE 配置。"""
+    factories = {
+        "ultra_lightweight": create_ultra_lightweight_vae_config,
+        "lightweight": create_lightweight_vae_config,
+        "standard": create_standard_vae_config,
+    }
+    if config_type not in factories:
+        raise ValueError(
+            f"未知 VAE config_type={config_type!r}，"
+            f"可选值为 {sorted(factories)}"
+        )
+    return factories[config_type]()
+
+
+def _extract_vae_state_dict(checkpoint: Any) -> Mapping[str, torch.Tensor]:
+    """从新旧 checkpoint 中提取 VAE 参数。"""
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("VAE checkpoint 必须是 state_dict 或包含 state_dict 的字典")
+    for key in ("model_state_dict", "state_dict"):
+        state = checkpoint.get(key)
+        if isinstance(state, Mapping):
+            return state
+    if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
+        return checkpoint
+    raise ValueError("VAE checkpoint 中未找到 model_state_dict/state_dict")
+
+
+def build_vae_from_checkpoint(
+    checkpoint: Any,
+    fallback_config_type: Optional[str] = None,
+    fallback_vae_config: Optional[Mapping[str, Any]] = None,
+) -> Tuple[VAE3D, Dict[str, Any]]:
+    """
+    按 checkpoint 元数据构建并严格加载 VAE。
+
+    新 checkpoint 必须保存可直接传给 ``VAE3D`` 的完整 ``vae_config``。
+    历史 checkpoint 没有元数据时，调用方必须显式提供 fallback 类型。
+    """
+    checkpoint_dict = checkpoint if isinstance(checkpoint, Mapping) else {}
+    stored_config = checkpoint_dict.get("vae_config")
+    stored_type = checkpoint_dict.get("vae_config_type")
+    if stored_config is None:
+        if fallback_config_type is None and fallback_vae_config is None:
+            raise ValueError(
+                "历史 VAE checkpoint 缺少 vae_config；"
+                "请显式提供 fallback_config_type"
+            )
+        if fallback_vae_config is not None:
+            if not isinstance(fallback_vae_config, Mapping):
+                raise TypeError("fallback_vae_config 必须是完整字典")
+            vae_config = dict(fallback_vae_config)
+            config_type = fallback_config_type or "custom"
+        else:
+            vae_config = create_vae_config(fallback_config_type)
+            # 历史无 metadata 权重来自 raw occupancy + MSE 训练协议。
+            vae_config["occupancy_loss_type"] = "legacy_mse"
+            config_type = fallback_config_type
+    else:
+        if not isinstance(stored_config, Mapping):
+            raise TypeError("checkpoint.vae_config 必须是字典")
+        vae_config = dict(stored_config)
+        config_type = stored_type or "custom"
+
+    valid_keys = set(inspect.signature(VAE3D.__init__).parameters) - {"self"}
+    unknown_keys = sorted(set(vae_config) - valid_keys)
+    if unknown_keys:
+        raise ValueError(
+            "checkpoint.vae_config 含有 VAE3D 不支持的字段: "
+            + ", ".join(unknown_keys)
+        )
+
+    try:
+        model = VAE3D(**vae_config)
+    except Exception as exc:
+        raise ValueError(
+            f"无法按 vae_config 构建 VAE（config_type={config_type!r}）: {exc}"
+        ) from exc
+
+    state_dict = _extract_vae_state_dict(checkpoint)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "VAE checkpoint 与声明的 vae_config 结构不匹配；"
+            f"config_type={config_type!r}。原始错误: {exc}"
+        ) from exc
+
+    default_activation = (
+        "sigmoid"
+        if fallback_vae_config is not None
+        and vae_config.get("occupancy_loss_type") == "bce_dice"
+        else "raw"
+    )
+    activation = checkpoint_dict.get("occupancy_activation", default_activation)
+    if activation not in {"raw", "sigmoid"}:
+        raise ValueError(f"不支持 occupancy_activation={activation!r}")
+    model.occupancy_activation = activation
+    metadata = {
+        "vae_config": vae_config,
+        "vae_config_type": config_type,
+        "occupancy_activation": activation,
+        "data_grid_config": checkpoint_dict.get("data_grid_config"),
+    }
+    return model, metadata
 
 
 def create_standard_vae_config():
@@ -772,5 +1038,10 @@ def create_standard_vae_config():
         "channel_weights": (4.0, 0.2, 0.5, 0.2),
         "false_positive_weight": 4.0,
         "occupancy_mass_weight": 1.0,
+        "occupancy_loss_type": "bce_dice",
+        "occupancy_bce_weight": 1.0,
+        "occupancy_dice_weight": 1.0,
+        "occupancy_pos_weight_cap": 128.0,
+        "continuous_recon_weight": 1.0,
         "use_checkpoint": True,  # 启用梯度检查点
     }

@@ -22,6 +22,59 @@ def write_sparse(path, voxel):
 
 
 class DatasetProtocolMetadataTest(unittest.TestCase):
+    def test_dataset_crops_physical_near_field_before_high_resolution_resize(self):
+        from diffusion_consistency_radar.cm.dataset_loader import NTU4DRadLM_VoxelDataset
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scene = os.path.join(tmp, "garden")
+            radar_dir = os.path.join(scene, "radar_voxel")
+            target_dir = os.path.join(scene, "target_voxel")
+            os.makedirs(radar_dir)
+            os.makedirs(target_dir)
+
+            voxel = np.zeros((6, 4, 4, 4), dtype=np.float32)
+            voxel[1, 1, 1, 0] = 1.0
+            voxel[4, 1, 1, 0] = 1.0
+            write_sparse(os.path.join(radar_dir, "000000.npz"), voxel)
+            write_sparse(os.path.join(target_dir, "000000.npz"), voxel)
+
+            ds = NTU4DRadLM_VoxelDataset(
+                tmp,
+                split="train",
+                use_augmentation=False,
+                target_size=(4, 3, 4),
+                source_pc_range=(0.0, -2.0, -2.0, 6.0, 2.0, 2.0),
+                model_pc_range=(0.0, -2.0, -2.0, 3.0, 2.0, 2.0),
+            )
+
+            target, radar, meta = ds[0]
+
+            self.assertEqual(tuple(target.shape), (4, 4, 3, 4))
+            self.assertEqual(tuple(radar.shape), (4, 4, 3, 4))
+            self.assertEqual(int((target[0] > 0).sum()), 1)
+            self.assertEqual(meta["model_pc_range"], [0.0, -2.0, -2.0, 3.0, 2.0, 2.0])
+
+    def test_inference_voxel_loader_uses_same_near_field_crop(self):
+        from diffusion_consistency_radar.scripts.inference import load_voxel_as_czxy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "000000.npz")
+            voxel = np.zeros((6, 4, 4, 4), dtype=np.float32)
+            voxel[1, 1, 1, 0] = 1.0
+            voxel[4, 1, 1, 0] = 1.0
+            write_sparse(path, voxel)
+
+            loaded = load_voxel_as_czxy(
+                path,
+                device="cpu",
+                target_size=(4, 3, 4),
+                source_pc_range=(0.0, -2.0, -2.0, 6.0, 2.0, 2.0),
+                model_pc_range=(0.0, -2.0, -2.0, 3.0, 2.0, 2.0),
+            )
+
+            self.assertEqual(tuple(loaded.shape), (4, 4, 3, 4))
+            self.assertEqual(int((loaded[0] > 0).sum()), 1)
+
     def test_non_scene_config_directory_is_excluded_from_scene_split(self):
         from diffusion_consistency_radar.cm.dataset_loader import NTU4DRadLM_VoxelDataset
 

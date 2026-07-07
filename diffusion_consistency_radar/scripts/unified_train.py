@@ -10,14 +10,16 @@
 """
 
 import argparse
+import math
 import os
+import shutil
 import sys
 import yaml
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Dict, Optional, Any
-from torch.utils.data import DataLoader
+from typing import Dict, Optional, Any, List, Tuple
+from torch.utils.data import DataLoader, Subset
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 from torch.optim.adamw import AdamW
@@ -32,6 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cm.vae_3d import (
     VAE3D, 
+    build_vae_from_checkpoint,
+    create_vae_config,
     create_lightweight_vae_config,
     create_ultra_lightweight_vae_config,
     create_standard_vae_config,
@@ -41,6 +45,28 @@ from cm.dataset_loader import NTU4DRadLM_VoxelDataset
 from cm.karras_diffusion import KarrasDenoiser
 from cm.multimodal_fusion import CompleteDualModalityPerceptionNet, heteroscedastic_gaussian_nll
 from scripts.cd_train_optimized import ConsistencyDistillationTrainer
+
+
+def atomic_torch_save(payload: Any, path: str):
+    """同目录写临时文件后原子替换 checkpoint。"""
+    temp_path = f"{path}.tmp-{os.getpid()}-{time.time_ns()}"
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def atomic_copy_file(source: str, destination: str):
+    """通过独立临时文件原子更新 checkpoint 兼容别名。"""
+    temp_path = f"{destination}.tmp-{os.getpid()}-{time.time_ns()}"
+    try:
+        shutil.copyfile(source, temp_path)
+        os.replace(temp_path, destination)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 def unpack_training_batch(batch):
@@ -106,16 +132,22 @@ def safe_torch_load(path, map_location):
 
 
 def apply_vae_config_overrides(vae_config: Dict[str, Any], config: "ConfigManager") -> Dict[str, Any]:
-    """Merge YAML VAE loss overrides into a preset VAE architecture config."""
+    """将 YAML 中允许的 VAE 架构与损失配置覆盖到 preset。"""
     merged = dict(vae_config)
     yaml_vae = config.get('vae', {}) or {}
     for key in (
+        "latent_dim",
         "kl_weight",
         "occupied_weight",
         "empty_weight",
         "channel_weights",
         "false_positive_weight",
         "occupancy_mass_weight",
+        "occupancy_loss_type",
+        "occupancy_bce_weight",
+        "occupancy_dice_weight",
+        "occupancy_pos_weight_cap",
+        "continuous_recon_weight",
     ):
         if key in yaml_vae:
             value = yaml_vae[key]
@@ -123,6 +155,315 @@ def apply_vae_config_overrides(vae_config: Dict[str, Any], config: "ConfigManage
                 value = tuple(float(v) for v in value)
             merged[key] = value
     return merged
+
+
+def deterministic_split_indices(
+    dataset_size: int,
+    train_split: float = 0.8,
+    split_seed: int = 42,
+) -> Tuple[List[int], List[int]]:
+    """按固定随机种子划分非空训练集和验证集。"""
+    if dataset_size < 2:
+        raise ValueError("训练/验证划分至少需要 2 个样本")
+    if not 0.0 < train_split < 1.0:
+        raise ValueError("data.train_split 必须严格位于 (0, 1)")
+    train_size = int(dataset_size * train_split)
+    if train_size <= 0 or train_size >= dataset_size:
+        raise ValueError(
+            f"train_split={train_split} 导致空划分："
+            f"dataset_size={dataset_size}, train_size={train_size}"
+        )
+    generator = torch.Generator().manual_seed(int(split_seed))
+    indices = torch.randperm(dataset_size, generator=generator).tolist()
+    return indices[:train_size], indices[train_size:]
+
+
+def micro_occupancy_metrics(
+    probability: torch.Tensor,
+    target: torch.Tensor,
+    threshold: float = 0.5,
+) -> Dict[str, int]:
+    """返回可跨 batch 累加的 occupancy 微平均计数。"""
+    prediction = probability >= threshold
+    truth = target >= 0.5
+    return {
+        "intersection": int(torch.logical_and(prediction, truth).sum().item()),
+        "union": int(torch.logical_or(prediction, truth).sum().item()),
+        "target_positive": int(truth.sum().item()),
+        "predicted_positive": int(prediction.sum().item()),
+    }
+
+
+def decoded_occupancy_auxiliary_loss(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    occupancy_activation: str,
+    reconstruction_weight: float = 1.0,
+    false_positive_weight: float = 0.0,
+    mass_weight: float = 0.0,
+) -> torch.Tensor:
+    """按 VAE occupancy 语义计算 LDM 解码辅助损失。"""
+    if occupancy_activation not in {"raw", "sigmoid"}:
+        raise ValueError(f"不支持 occupancy_activation={occupancy_activation!r}")
+    decoded_occ = decoded[:, 0:1]
+    if occupancy_activation == "sigmoid":
+        decoded_occ = torch.sigmoid(decoded_occ)
+    target_occ = target[:, 0:1]
+    occ_mask = (target_occ > 0).float()
+    reconstruction_loss = (
+        (decoded_occ - target_occ) ** 2 * (1.0 + 7.0 * occ_mask)
+    ).mean()
+    loss = reconstruction_weight * reconstruction_loss
+    if false_positive_weight > 0.0:
+        empty_mask = 1.0 - occ_mask
+        false_positive_loss = (
+            torch.relu(decoded_occ - target_occ) ** 2 * empty_mask
+        ).mean()
+        loss = loss + false_positive_weight * false_positive_loss
+    if mass_weight > 0.0:
+        mass_loss = torch.abs(
+            torch.relu(decoded_occ).mean() - torch.relu(target_occ).mean()
+        )
+        loss = loss + mass_weight * mass_loss
+    return loss
+
+
+def decoded_vertical_structure_losses(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    occupancy_activation: str,
+    eps: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """计算仅由目标非空 Z 列监督的可微垂直结构损失。"""
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"eps 必须是有限正数，实际为 {eps!r}")
+    if decoded.ndim != 5 or target.ndim != 5:
+        raise ValueError(
+            "decoded 和 target 必须是 5 维 [B,C,Z,X,Y] 张量，"
+            f"实际分别为 {decoded.ndim} 维和 {target.ndim} 维"
+        )
+    if decoded.shape[1] < 1 or target.shape[1] < 1:
+        raise ValueError("decoded 和 target 必须至少 1 个通道")
+    decoded_grid = tuple(decoded.shape[index] for index in (0, 2, 3, 4))
+    target_grid = tuple(target.shape[index] for index in (0, 2, 3, 4))
+    if decoded_grid != target_grid:
+        raise ValueError(
+            "decoded 与 target 的 B/Z/X/Y 必须一致，"
+            f"实际分别为 {decoded_grid} 和 {target_grid}"
+        )
+    if occupancy_activation not in {"sigmoid", "raw"}:
+        raise ValueError(f"不支持 occupancy_activation={occupancy_activation!r}")
+
+    decoded_occ = decoded[:, 0].float()
+    if occupancy_activation == "sigmoid":
+        decoded_occ = torch.sigmoid(decoded_occ)
+    else:
+        # 兼容历史 raw occupancy/probability 语义，区间外梯度按 clamp 处理。
+        decoded_occ = decoded_occ.clamp(0.0, 1.0)
+    target_occ = target[:, 0].clamp(0.0, 1.0).float()
+    valid_columns = target_occ.sum(dim=1) > 0
+    graph_zero = decoded_occ.sum() * 0.0
+
+    if not valid_columns.any():
+        return {
+            "height_distribution_loss": graph_zero,
+            "vertical_continuity_loss": graph_zero,
+        }
+
+    pred_mass = decoded_occ.sum(dim=1, keepdim=True)
+    pred_denominator = torch.where(
+        pred_mass > eps,
+        pred_mass,
+        torch.ones_like(pred_mass),
+    )
+    pred_distribution = decoded_occ / pred_denominator
+    target_distribution = target_occ / target_occ.sum(
+        dim=1, keepdim=True
+    ).clamp_min(eps)
+    cdf_difference = torch.abs(
+        pred_distribution.cumsum(dim=1) - target_distribution.cumsum(dim=1)
+    )
+    height_distribution_loss = cdf_difference.mean(dim=1)[valid_columns].mean()
+
+    if decoded_occ.shape[1] < 2:
+        vertical_continuity_loss = graph_zero
+    else:
+        pred_transitions = torch.abs(
+            decoded_occ[:, 1:] - decoded_occ[:, :-1]
+        )
+        target_transitions = torch.abs(
+            target_occ[:, 1:] - target_occ[:, :-1]
+        )
+        continuity_difference = torch.abs(pred_transitions - target_transitions)
+        vertical_continuity_loss = continuity_difference.mean(dim=1)[
+            valid_columns
+        ].mean()
+
+    return {
+        "height_distribution_loss": height_distribution_loss,
+        "vertical_continuity_loss": vertical_continuity_loss,
+    }
+
+
+LDM_LOSS_COMPONENT_NAMES = (
+    "latent_loss",
+    "decoded_occupancy_loss",
+    "height_distribution_loss",
+    "vertical_continuity_loss",
+    "uncertainty_loss",
+)
+LDM_METRICS_HEADER = (
+    "epoch",
+    "step",
+    "loss",
+    *LDM_LOSS_COMPONENT_NAMES,
+    "lr",
+    "time_seconds",
+)
+
+
+def archive_legacy_metrics_csv(csv_file: str):
+    """把旧 metrics.csv 归档到同目录不覆盖的 legacy 文件名。"""
+    legacy_path = os.path.join(os.path.dirname(csv_file), "metrics_legacy.csv")
+    suffix = 1
+    while os.path.exists(legacy_path):
+        legacy_path = os.path.join(
+            os.path.dirname(csv_file),
+            f"metrics_legacy_{suffix}.csv",
+        )
+        suffix += 1
+    os.replace(csv_file, legacy_path)
+
+
+def prepare_ldm_metrics_csv(csv_file: str, is_resumed: bool):
+    """初始化 LDM CSV；恢复旧表头时先归档旧文件再写新表头。"""
+    if is_resumed and os.path.exists(csv_file):
+        with open(csv_file, newline="") as f:
+            header = next(csv.reader(f), [])
+        if tuple(header) == LDM_METRICS_HEADER:
+            return
+        archive_legacy_metrics_csv(csv_file)
+
+    if not os.path.exists(csv_file) or not is_resumed:
+        with open(csv_file, "w", newline="") as f:
+            csv.writer(f).writerow(LDM_METRICS_HEADER)
+
+
+def rescale_accumulated_gradients(
+    parameters,
+    grad_accum_steps: int,
+    accumulation_count: int,
+):
+    """尾部累计不足 grad_accum_steps 时恢复为实际 batch 均值梯度。"""
+    if accumulation_count <= 0 or accumulation_count == grad_accum_steps:
+        return
+    scale = float(grad_accum_steps) / float(accumulation_count)
+    for param in parameters:
+        if param.grad is not None:
+            param.grad.mul_(scale)
+
+
+def compute_ldm_loss_components(
+    denoised: torch.Tensor,
+    z_target: torch.Tensor,
+    target: torch.Tensor,
+    vae: nn.Module,
+    occupancy_activation: str,
+    decoded_loss_weight: float,
+    decoded_false_positive_weight: float,
+    decoded_mass_weight: float,
+    decoded_height_distribution_weight: float,
+    decoded_vertical_continuity_weight: float,
+    uncertainty_loss_weight: float,
+    uncertainty: Optional[Dict[str, torch.Tensor]],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """汇总 LDM 主损失和解码辅助监督组件，必要时只解码一次。"""
+    latent_loss = torch.nn.functional.mse_loss(denoised, z_target)
+    graph_zero = denoised.sum() * 0.0
+    components = {
+        "latent_loss": latent_loss,
+        "decoded_occupancy_loss": graph_zero,
+        "height_distribution_loss": graph_zero,
+        "vertical_continuity_loss": graph_zero,
+        "uncertainty_loss": graph_zero,
+    }
+    loss = latent_loss
+
+    if uncertainty_loss_weight > 0.0 and uncertainty is not None:
+        if "variance" not in uncertainty:
+            raise ValueError("uncertainty loss requires uncertainty['variance']")
+        uncertainty_loss = heteroscedastic_gaussian_nll(
+            denoised,
+            z_target,
+            uncertainty["variance"],
+            detach_residual=True,
+        )
+        components["uncertainty_loss"] = uncertainty_loss
+        loss = loss + uncertainty_loss_weight * uncertainty_loss
+
+    needs_decoded = any(
+        weight > 0.0
+        for weight in (
+            decoded_loss_weight,
+            decoded_false_positive_weight,
+            decoded_mass_weight,
+            decoded_height_distribution_weight,
+            decoded_vertical_continuity_weight,
+        )
+    )
+    if needs_decoded:
+        decoded = vae.decode(denoised)
+        if (
+            decoded_loss_weight > 0.0
+            or decoded_false_positive_weight > 0.0
+            or decoded_mass_weight > 0.0
+        ):
+            decoded_occ_loss = decoded_occupancy_auxiliary_loss(
+                decoded,
+                target,
+                occupancy_activation=occupancy_activation,
+                reconstruction_weight=decoded_loss_weight,
+                false_positive_weight=decoded_false_positive_weight,
+                mass_weight=decoded_mass_weight,
+            )
+            components["decoded_occupancy_loss"] = decoded_occ_loss
+            loss = loss + decoded_occ_loss
+        if (
+            decoded_height_distribution_weight > 0.0
+            or decoded_vertical_continuity_weight > 0.0
+        ):
+            structure_losses = decoded_vertical_structure_losses(
+                decoded,
+                target,
+                occupancy_activation=occupancy_activation,
+            )
+            height_loss = structure_losses["height_distribution_loss"]
+            continuity_loss = structure_losses["vertical_continuity_loss"]
+            components["height_distribution_loss"] = height_loss
+            components["vertical_continuity_loss"] = continuity_loss
+            loss = loss + decoded_height_distribution_weight * height_loss
+            loss = loss + decoded_vertical_continuity_weight * continuity_loss
+
+    return loss, components
+
+
+def resolve_data_grid_config(data_config: Dict[str, Any]):
+    """从 data 配置解析原始体素范围、模型裁剪范围和训练张量尺寸。"""
+    source_pc_range = data_config.get("source_pc_range", data_config.get("pc_range", [0, -20, -6, 120, 20, 10]))
+    model_pc_range = data_config.get("model_pc_range", data_config.get("pc_range", source_pc_range))
+    target_size = data_config.get("target_size", data_config.get("voxel_shape", [32, 128, 128]))
+    return (
+        tuple(int(v) for v in target_size),
+        tuple(float(v) for v in source_pc_range),
+        tuple(float(v) for v in model_pc_range),
+    )
+
+
+def align_ldm_grid_config(config: "ConfigManager", target_size, model_pc_range):
+    """保证多模态投影网格与 dataset 输出张量使用同一物理范围。"""
+    ldm_cfg = config.config.setdefault("ldm", {})
+    ldm_cfg.setdefault("fusion_voxel_shape", list(target_size))
+    ldm_cfg.setdefault("fusion_pc_range", list(model_pc_range))
 
 
 class ConfigManager:
@@ -187,6 +528,21 @@ class MemoryOptimizer:
 
 class OptimizedVAETrainer:
     """优化的 VAE 训练器"""
+
+    METRICS_HEADER = [
+        'epoch', 'loss', 'recon_loss', 'kl_loss',
+        'occ_bce_loss', 'occ_dice_loss', 'continuous_loss',
+        'val_iou', 'val_recall', 'val_precision',
+        'lr', 'time_seconds',
+    ]
+    TASK2_METRICS_HEADER = [
+        'epoch', 'loss', 'recon_loss', 'kl_loss',
+        'occ_bce_loss', 'occ_dice_loss', 'continuous_loss',
+        'lr', 'time_seconds',
+    ]
+    LEGACY_METRICS_HEADER = [
+        'epoch', 'loss', 'recon_loss', 'kl_loss', 'lr', 'time_seconds',
+    ]
     
     def __init__(
         self,
@@ -194,6 +550,8 @@ class OptimizedVAETrainer:
         config: ConfigManager,
         memory_opt: MemoryOptimizer,
         resume_path: Optional[str] = None,
+        vae_model_config: Optional[Dict[str, Any]] = None,
+        vae_config_type: Optional[str] = None,
     ):
         self.config = config
         self.memory_opt = memory_opt
@@ -207,6 +565,24 @@ class OptimizedVAETrainer:
         self.lr = self.vae_config.get('lr', 1e-4)
         self.epochs = self.vae_config.get('epochs', 100)
         self.save_dir = self.vae_config.get('save_dir', './Result/train_results/vae')
+        self.vae_model_config = dict(vae_model_config or {})
+        self.enable_validation_metrics = True
+        self.vae_config_type = vae_config_type or self.vae_config.get(
+            "config_type", "custom"
+        )
+        target_size, source_range, model_range = resolve_data_grid_config(
+            config.get("data", {}) or {}
+        )
+        self.data_grid_config = {
+            "target_size": list(target_size),
+            "source_pc_range": list(source_range),
+            "model_pc_range": list(model_range),
+        }
+        self.occupancy_activation = (
+            "sigmoid"
+            if self.vae_model_config.get("occupancy_loss_type") == "bce_dice"
+            else "raw"
+        )
         
         os.makedirs(self.save_dir, exist_ok=True)
         
@@ -219,10 +595,12 @@ class OptimizedVAETrainer:
         # 初始化训练状态
         self.start_epoch = 1
         self.best_loss = float('inf')
+        self.best_iou = float('-inf')
         
         # NOTE: 日志与训练状态在恢复训练时必须共用同一目录。
         self.start_epoch = 1
         self.best_loss = float('inf')
+        self.best_iou = float('-inf')
         self.is_resumed = False
         
         # 检查是否恢复训练
@@ -261,11 +639,34 @@ class OptimizedVAETrainer:
             self.logger.info("RESUMING TRAINING SESSION")
             self.logger.info("="*70)
         
-        # 初始化 CSV 文件
-        if not os.path.exists(self.csv_file) or not self.is_resumed:
-            with open(self.csv_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['epoch', 'loss', 'recon_loss', 'kl_loss', 'lr', 'time_seconds'])
+        self._prepare_metrics_csv()
+
+    def _prepare_metrics_csv(self):
+        """校验恢复训练的 CSV 表头，并无损迁移旧六列指标文件。"""
+        target_header = (
+            self.METRICS_HEADER
+            if getattr(self, "enable_validation_metrics", False)
+            else self.TASK2_METRICS_HEADER
+        )
+        if self.is_resumed and os.path.exists(self.csv_file):
+            with open(self.csv_file, newline='') as f:
+                header = next(csv.reader(f), [])
+            if header == target_header:
+                return
+            if header not in (self.LEGACY_METRICS_HEADER, self.TASK2_METRICS_HEADER):
+                raise RuntimeError(f"无法识别 metrics.csv 表头: {header}")
+
+            legacy_path = os.path.join(self.save_dir, 'metrics_legacy.csv')
+            suffix = 1
+            while os.path.exists(legacy_path):
+                legacy_path = os.path.join(
+                    self.save_dir, f'metrics_legacy_{suffix}.csv'
+                )
+                suffix += 1
+            os.replace(self.csv_file, legacy_path)
+
+        with open(self.csv_file, 'w', newline='') as f:
+            csv.writer(f).writerow(target_header)
     
     def _resume_from_checkpoint(self, ckpt_path: str):
         """从检查点恢复训练"""
@@ -280,15 +681,37 @@ class OptimizedVAETrainer:
         
         # 加载优化器
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ckpt:
+            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        else:
+            completed_epoch = int(ckpt.get('epoch', 0))
+            self.scheduler.last_epoch = completed_epoch
+            self.scheduler._step_count = completed_epoch + 1
+            self.scheduler._last_lr = [
+                group["lr"] for group in self.optimizer.param_groups
+            ]
         
         # 加载训练状态
         self.start_epoch = ckpt.get('epoch', 0) + 1
         self.best_loss = ckpt.get('best_loss', ckpt.get('loss', float('inf')))
+        self.best_iou = ckpt.get('best_iou', float('-inf'))
         
-        print(f"Resumed from epoch {self.start_epoch - 1}, best loss: {self.best_loss:.4f}")
+        print(
+            f"Resumed from epoch {self.start_epoch - 1}, "
+            f"best loss: {self.best_loss:.4f}, best IoU: {self.best_iou:.4f}"
+        )
     
-    def _log_metrics(self, epoch: int, loss: float, recon_loss: float, kl_loss: float, epoch_time: float):
+    def _log_metrics(
+        self,
+        epoch: int,
+        loss: float,
+        recon_loss: float,
+        kl_loss: float,
+        epoch_time: float,
+        val_metrics: Dict[str, float],
+    ):
         """记录指标到 CSV 文件"""
+        components = getattr(self, "last_epoch_loss_components", {})
         with open(self.csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -296,6 +719,12 @@ class OptimizedVAETrainer:
                 f'{loss:.6f}',
                 f'{recon_loss:.6f}',
                 f'{kl_loss:.8f}',
+                f'{components.get("occ_bce_loss", 0.0):.6f}',
+                f'{components.get("occ_dice_loss", 0.0):.6f}',
+                f'{components.get("continuous_loss", 0.0):.6f}',
+                f'{val_metrics["iou"]:.6f}',
+                f'{val_metrics["recall"]:.6f}',
+                f'{val_metrics["precision"]:.6f}',
                 f'{self.optimizer.param_groups[0]["lr"]:.8f}',
                 f'{epoch_time:.2f}'
             ])
@@ -306,6 +735,13 @@ class OptimizedVAETrainer:
         total_loss = 0
         total_recon = 0
         total_kl = 0
+        total_components = {
+            "occ_bce_loss": 0.0,
+            "occ_dice_loss": 0.0,
+            "continuous_loss": 0.0,
+        }
+        valid_batch_count = 0
+        accumulation_count = 0
         
         # 创建进度条
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{self.epochs}")
@@ -314,8 +750,8 @@ class OptimizedVAETrainer:
             target, cond, meta_dict = unpack_training_batch(batch)
             target = target.to(self.device, non_blocking=True)
             
-            if torch.isnan(target).any():
-                print(f"Warning: Batch {batch_idx} contains NaN")
+            if not torch.isfinite(target).all():
+                print(f"Warning: Batch {batch_idx} target contains NaN or Inf")
                 continue
             
             # NOTE: 前向阶段使用 autocast，配合梯度累积降低显存峰值。
@@ -324,16 +760,23 @@ class OptimizedVAETrainer:
                 loss, recon_loss, kl_loss = self.model.compute_loss(
                     target, recon, (mean, logvar)
                 )
-                loss = loss / self.memory_opt.grad_accum_steps
+
+            losses = (loss, recon_loss, kl_loss)
+            if not all(torch.isfinite(value).all() for value in losses):
+                print(f"Warning: Batch {batch_idx} loss contains NaN or Inf")
+                continue
+
+            scaled_loss = loss / self.memory_opt.grad_accum_steps
             
             # 反向传播
             if self.memory_opt.scaler:
-                self.memory_opt.scaler.scale(loss).backward()
+                self.memory_opt.scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
+                scaled_loss.backward()
+            accumulation_count += 1
             
-            # NOTE: 仅在累计到指定步数后才执行一次 optimizer.step()。
-            if (batch_idx + 1) % self.memory_opt.grad_accum_steps == 0:
+            # NOTE: 非有限 batch 不计入累计边界，避免污染或提前提交已有梯度。
+            if accumulation_count == self.memory_opt.grad_accum_steps:
                 if self.memory_opt.scaler:
                     self.memory_opt.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -344,12 +787,18 @@ class OptimizedVAETrainer:
                     self.optimizer.step()
                 
                 self.optimizer.zero_grad()
+                accumulation_count = 0
             
             # 累积损失
-            batch_loss = loss.item() * self.memory_opt.grad_accum_steps
+            batch_loss = loss.item()
             total_loss += batch_loss
             total_recon += recon_loss.item()
             total_kl += kl_loss.item()
+            valid_batch_count += 1
+            component_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            for name, value in component_model.loss_components.items():
+                if name in total_components:
+                    total_components[name] += value.item()
             
             # 更新进度条显示
             pbar.set_postfix({
@@ -363,24 +812,117 @@ class OptimizedVAETrainer:
             if batch_idx % 50 == 0:
                 self.memory_opt.clear_cache()
 
-        # NOTE: 当 batch 数不能被梯度累积步数整除时，补上最后一次未提交的更新。
-        remainder = len(train_loader) % self.memory_opt.grad_accum_steps
-        if remainder:
+        if valid_batch_count == 0:
+            self.optimizer.zero_grad()
+            raise RuntimeError("当前 epoch 没有有限的有效 batch")
+
+        # NOTE: 仅按有效 batch 的实际累计余数提交尾部梯度。
+        if accumulation_count:
+            tail_gradient_scale = (
+                self.memory_opt.grad_accum_steps / accumulation_count
+            )
             if self.memory_opt.scaler:
                 self.memory_opt.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            # NOTE: 每批 loss 按完整累计步数缩放，尾部不足时需恢复为有效 batch 均值梯度。
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(tail_gradient_scale)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+            if self.memory_opt.scaler:
                 self.memory_opt.scaler.step(self.optimizer)
                 self.memory_opt.scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
             self.optimizer.zero_grad()
         
         self.scheduler.step()
-        n = len(train_loader)
-        return total_loss / n, total_recon / n, total_kl / n
+        self.last_epoch_valid_batch_count = valid_batch_count
+        self.last_epoch_loss_components = {
+            name: value / valid_batch_count for name, value in total_components.items()
+        }
+        return (
+            total_loss / valid_batch_count,
+            total_recon / valid_batch_count,
+            total_kl / valid_batch_count,
+        )
+
+    @torch.no_grad()
+    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
+        """使用确定性编码在完整验证集上计算 threshold=0.5 微平均指标。"""
+        self.model.eval()
+        counts = {
+            "intersection": 0,
+            "union": 0,
+            "target_positive": 0,
+            "predicted_positive": 0,
+        }
+        batch_count = 0
+        model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        for batch in val_loader:
+            target, _condition, _meta = unpack_training_batch(batch)
+            target = target.to(self.device, non_blocking=True)
+            latent, _posterior = model.encode(target, deterministic=True)
+            reconstruction = model.decode(latent)
+            probability = (
+                model.occupancy_probability(reconstruction[:, 0:1])
+                if self.occupancy_activation == "sigmoid"
+                else reconstruction[:, 0:1]
+            )
+            batch_counts = micro_occupancy_metrics(
+                probability, target[:, 0:1], threshold=0.5
+            )
+            for key, value in batch_counts.items():
+                counts[key] += value
+            batch_count += 1
+        if batch_count == 0:
+            raise RuntimeError("验证 DataLoader 为空，无法计算 occupancy 指标")
+        return {
+            "iou": counts["intersection"] / max(counts["union"], 1),
+            "recall": counts["intersection"] / max(counts["target_positive"], 1),
+            "precision": counts["intersection"] / max(counts["predicted_positive"], 1),
+        }
+
+    def _checkpoint_payload(
+        self,
+        epoch: int,
+        loss: float,
+        best_loss: float,
+        best_iou: float,
+    ) -> Dict[str, Any]:
+        """构造训练、诊断和推理均可直接消费的自描述 checkpoint。"""
+        if not self.vae_model_config:
+            raise RuntimeError("保存 VAE checkpoint 前必须提供完整 vae_model_config")
+        state_dict = (
+            self.model.module.state_dict()
+            if isinstance(self.model, nn.DataParallel)
+            else self.model.state_dict()
+        )
+        return {
+            "epoch": epoch,
+            "model_state_dict": state_dict,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "loss": loss,
+            "best_loss": best_loss,
+            "best_iou": best_iou,
+            "vae_config": dict(self.vae_model_config),
+            "vae_config_type": self.vae_config_type,
+            "data_grid_config": dict(self.data_grid_config),
+            "occupancy_activation": self.occupancy_activation,
+        }
+
+    def _update_best_metrics(self, loss: float, val_iou: float):
+        """先原子更新本 epoch 的全局最佳状态，再允许构建 checkpoint。"""
+        improved_loss = loss < self.best_loss
+        improved_iou = val_iou > self.best_iou
+        if improved_loss:
+            self.best_loss = loss
+        if improved_iou:
+            self.best_iou = val_iou
+        return improved_loss, improved_iou
     
-    def train(self, train_loader: DataLoader):
+    def train(self, train_loader: DataLoader, val_loader: DataLoader):
         """完整训练流程"""
         estimated_total_steps = self.epochs * len(train_loader)
         
@@ -407,14 +949,20 @@ class OptimizedVAETrainer:
         for epoch in range(self.start_epoch, self.epochs + 1):
             epoch_start = time.time()
             loss, recon_loss, kl_loss = self.train_epoch(epoch, train_loader)
+            val_metrics = self.validate(val_loader)
             epoch_time = time.time() - epoch_start
             
             # 记录到 CSV
-            self._log_metrics(epoch, loss, recon_loss, kl_loss, epoch_time)
+            self._log_metrics(
+                epoch, loss, recon_loss, kl_loss, epoch_time, val_metrics
+            )
             
             # 打印和记录 epoch 总结
             summary = (f"\n[Epoch {epoch}/{self.epochs}] "
                       f"Loss: {loss:.4f} | Recon: {recon_loss:.4f} | KL: {kl_loss:.6f} | "
+                      f"Val IoU: {val_metrics['iou']:.4f} | "
+                      f"Recall: {val_metrics['recall']:.4f} | "
+                      f"Precision: {val_metrics['precision']:.4f} | "
                       f"Time: {epoch_time:.1f}s")
             print(summary)
             self.logger.info(summary)
@@ -422,33 +970,37 @@ class OptimizedVAETrainer:
             # 显存统计
             self.memory_opt.print_stats(prefix="  ")
             
-            # 保存最佳模型
-            if loss < self.best_loss:
-                self.best_loss = loss
-                best_ckpt = os.path.join(self.save_dir, "vae_best.pt")
-                state_dict = self.model.module.state_dict() if isinstance(self.model, nn.DataParallel) else self.model.state_dict()
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': state_dict,
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'loss': loss,
-                    'best_loss': self.best_loss,
-                }, best_ckpt)
+            improved_loss, improved_iou = self._update_best_metrics(
+                loss, val_metrics["iou"]
+            )
+            checkpoint_payload = self._checkpoint_payload(
+                epoch, loss, self.best_loss, self.best_iou
+            )
+
+            # NOTE: 本 epoch 的所有保存路径共享更新完两个 best 后的同一 payload。
+            if improved_loss:
+                best_ckpt = os.path.join(self.save_dir, "vae_best_loss.pt")
+                atomic_torch_save(checkpoint_payload, best_ckpt)
                 msg = f"  ✓ Saved best model (loss: {loss:.4f})"
+                print(msg)
+                self.logger.info(msg)
+
+            if improved_iou:
+                best_iou_path = os.path.join(self.save_dir, "vae_best_iou.pt")
+                atomic_torch_save(checkpoint_payload, best_iou_path)
+                # NOTE: 兼容历史路径，内容始终与 best-IoU checkpoint 一致。
+                atomic_copy_file(
+                    best_iou_path,
+                    os.path.join(self.save_dir, "vae_best.pt"),
+                )
+                msg = f"  ✓ Saved best-IoU model (IoU: {self.best_iou:.4f})"
                 print(msg)
                 self.logger.info(msg)
             
             # 定期保存
             if epoch % self.vae_config.get('save_every', 10) == 0:
                 ckpt_path = os.path.join(self.save_dir, f"vae_epoch{epoch:04d}.pt")
-                state_dict = self.model.module.state_dict() if isinstance(self.model, nn.DataParallel) else self.model.state_dict()
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': state_dict,
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'loss': loss,
-                    'best_loss': self.best_loss,
-                }, ckpt_path)
+                atomic_torch_save(checkpoint_payload, ckpt_path)
                 msg = f"  ✓ Saved checkpoint: {ckpt_path}"
                 print(msg)
                 self.logger.info(msg)
@@ -483,15 +1035,25 @@ class OptimizedLDMTrainer:
         
         ldm_config: Dict[str, Any] = config.get('ldm', {}) or {}
         self.ldm_config = ldm_config
+        self.latent_dim = int(self.vae.latent_dim)
+        self.model_config = {
+            "latent_dim": self.latent_dim,
+            "in_channels": max(16, 2 * self.latent_dim),
+            "out_channels": self.latent_dim,
+            "model_channels": ldm_config.get('model_channels', 32),
+            "num_res_blocks": ldm_config.get('num_res_blocks', 1),
+            "attention_resolutions": list(ldm_config.get('attention_resolutions', [])),
+            "channel_mult": list(ldm_config.get('channel_mult', [1, 2, 3])),
+        }
         self.save_dir = ldm_config.get('save_dir', './Result/train_results/ldm')
         os.makedirs(self.save_dir, exist_ok=True)
         
         # 创建潜空间去噪骨干，再挂到雷达-红外多模态入口。
         base_unet = OptimizedUNetModel(
             image_size=32,  # 潜空间 H/W
-            in_channels=16,  # noised latent + multimodal latent condition interface
+            in_channels=self.model_config["in_channels"],
             model_channels=ldm_config.get('model_channels', 32),
-            out_channels=4,  # latent_dim
+            out_channels=self.latent_dim,
             num_res_blocks=ldm_config.get('num_res_blocks', 1),
             attention_resolutions=tuple(ldm_config.get('attention_resolutions', [])),
             channel_mult=tuple(ldm_config.get('channel_mult', [1, 2, 3])),
@@ -526,6 +1088,17 @@ class OptimizedLDMTrainer:
         self.decoded_loss_weight = float(ldm_config.get('decoded_loss_weight', 0.0))
         self.decoded_false_positive_weight = float(ldm_config.get('decoded_false_positive_weight', 0.0))
         self.decoded_mass_weight = float(ldm_config.get('decoded_mass_weight', 0.0))
+        self.decoded_height_distribution_weight = float(ldm_config.get('decoded_height_distribution_weight', 0.0))
+        self.decoded_vertical_continuity_weight = float(ldm_config.get('decoded_vertical_continuity_weight', 0.0))
+        self.occupancy_activation = getattr(
+            self.vae,
+            "occupancy_activation",
+            (
+                "sigmoid"
+                if getattr(self.vae, "occupancy_loss_type", "legacy_mse") == "bce_dice"
+                else "raw"
+            ),
+        )
         self.uncertainty_loss_weight = float(ldm_config.get('uncertainty_loss_weight', 0.0))
         
         # 初始化训练状态
@@ -546,6 +1119,17 @@ class OptimizedLDMTrainer:
         # 恢复训练
         if self.is_resumed:
             self._resume_from_checkpoint(resume_path)
+
+    def _ldm_loss_config(self) -> Dict[str, float]:
+        """返回当前生效的 LDM 损失权重，便于 checkpoint 自描述。"""
+        return {
+            "decoded_loss_weight": self.decoded_loss_weight,
+            "decoded_false_positive_weight": self.decoded_false_positive_weight,
+            "decoded_mass_weight": self.decoded_mass_weight,
+            "decoded_height_distribution_weight": self.decoded_height_distribution_weight,
+            "decoded_vertical_continuity_weight": self.decoded_vertical_continuity_weight,
+            "uncertainty_loss_weight": self.uncertainty_loss_weight,
+        }
     
     def _setup_logging(self):
         """设置日志系统"""
@@ -570,11 +1154,8 @@ class OptimizedLDMTrainer:
             self.logger.info("RESUMING TRAINING SESSION")
             self.logger.info("="*70)
         
-        # 初始化 CSV 文件
-        if not os.path.exists(self.csv_file) or not self.is_resumed:
-            with open(self.csv_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['epoch', 'step', 'loss', 'lr', 'time_seconds'])
+        # 初始化 CSV 文件；恢复旧 5 列日志时归档，避免追加新行宽。
+        prepare_ldm_metrics_csv(self.csv_file, self.is_resumed)
     
     def _resume_from_checkpoint(self, ckpt_path: str):
         """从检查点恢复训练"""
@@ -593,12 +1174,17 @@ class OptimizedLDMTrainer:
     
     def _log_metrics(self, epoch: int, step: int, loss: float, epoch_time: float):
         """记录指标到 CSV 文件"""
+        components = getattr(self, "last_epoch_loss_components", {})
         with open(self.csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 epoch,
                 step,
                 f'{loss:.6f}',
+                *[
+                    f'{float(components.get(name, 0.0)):.6f}'
+                    for name in LDM_LOSS_COMPONENT_NAMES
+                ],
                 f'{self.optimizer.param_groups[0]["lr"]:.8f}',
                 f'{epoch_time:.2f}'
             ])
@@ -607,6 +1193,8 @@ class OptimizedLDMTrainer:
         """训练一个 epoch"""
         self.model.train()
         total_loss = 0
+        total_components = {name: 0.0 for name in LDM_LOSS_COMPONENT_NAMES}
+        accumulation_count = 0
         
         # 创建进度条
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
@@ -637,6 +1225,7 @@ class OptimizedLDMTrainer:
             
             # 前向传播
             with autocast('cuda', enabled=self.memory_opt.use_amp):
+                uncertainty = None
                 if has_multimodal_meta(meta_dict):
                     model_out = self.model(
                         cond,
@@ -659,42 +1248,31 @@ class OptimizedLDMTrainer:
                     # Legacy batches without IR metadata still train the same 16-channel UNet backbone.
                     model_input = pad_ldm_input_to_sixteen_channels(torch.cat([noised_z, z_cond], dim=1))
                     denoised = self.model.unet_3d(model_input, sigmas)
-                latent_loss = torch.nn.functional.mse_loss(denoised, z_target)
-                loss = latent_loss
-                if self.uncertainty_loss_weight > 0.0 and uncertainty is not None:
-                    uncertainty_loss = heteroscedastic_gaussian_nll(
-                        denoised,
-                        z_target,
-                        uncertainty["variance"],
-                        detach_residual=True,
-                    )
-                    loss = loss + self.uncertainty_loss_weight * uncertainty_loss
-                if self.decoded_loss_weight > 0.0:
-                    decoded = self.vae.decode(denoised)
-                    occ_mask = (target[:, 0:1] > 0).float()
-                    decoded_occ_loss = ((decoded[:, 0:1] - target[:, 0:1]) ** 2 * (1.0 + 7.0 * occ_mask)).mean()
-                    loss = loss + self.decoded_loss_weight * decoded_occ_loss
-                    if self.decoded_false_positive_weight > 0.0:
-                        empty_mask = 1.0 - occ_mask
-                        decoded_fp_loss = (
-                            torch.relu(decoded[:, 0:1] - target[:, 0:1]) ** 2 * empty_mask
-                        ).mean()
-                        loss = loss + self.decoded_false_positive_weight * decoded_fp_loss
-                    if self.decoded_mass_weight > 0.0:
-                        decoded_mass_loss = torch.abs(
-                            torch.relu(decoded[:, 0:1]).mean() - torch.relu(target[:, 0:1]).mean()
-                        )
-                        loss = loss + self.decoded_mass_weight * decoded_mass_loss
-                loss = loss / self.memory_opt.grad_accum_steps
+                loss, loss_components = compute_ldm_loss_components(
+                    denoised,
+                    z_target,
+                    target,
+                    vae=self.vae,
+                    occupancy_activation=self.occupancy_activation,
+                    decoded_loss_weight=self.decoded_loss_weight,
+                    decoded_false_positive_weight=self.decoded_false_positive_weight,
+                    decoded_mass_weight=self.decoded_mass_weight,
+                    decoded_height_distribution_weight=self.decoded_height_distribution_weight,
+                    decoded_vertical_continuity_weight=self.decoded_vertical_continuity_weight,
+                    uncertainty_loss_weight=self.uncertainty_loss_weight,
+                    uncertainty=uncertainty,
+                )
+                scaled_loss = loss / self.memory_opt.grad_accum_steps
             
             # 反向传播
             if self.memory_opt.scaler:
-                self.memory_opt.scaler.scale(loss).backward()
+                self.memory_opt.scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
+                scaled_loss.backward()
+            accumulation_count += 1
             
             # 梯度更新
-            if (batch_idx + 1) % self.memory_opt.grad_accum_steps == 0:
+            if accumulation_count == self.memory_opt.grad_accum_steps:
                 if self.memory_opt.scaler:
                     self.memory_opt.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -705,29 +1283,43 @@ class OptimizedLDMTrainer:
                     self.optimizer.step()
                 
                 self.optimizer.zero_grad()
+                accumulation_count = 0
             
-            batch_loss = loss.item() * self.memory_opt.grad_accum_steps
+            batch_loss = loss.item()
             total_loss += batch_loss
+            for name in LDM_LOSS_COMPONENT_NAMES:
+                total_components[name] += float(loss_components[name].detach().item())
             
             # 更新进度条
             pbar.set_postfix({
                 'loss': f'{batch_loss:.4f}',
+                'latent': f'{loss_components["latent_loss"].detach().item():.4f}',
+                'height': f'{loss_components["height_distribution_loss"].detach().item():.4f}',
+                'cont': f'{loss_components["vertical_continuity_loss"].detach().item():.4f}',
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
             })
         
         # NOTE: 当 batch 数不能被梯度累积步数整除时，补上最后一次未提交的更新。
-        remainder = len(train_loader) % self.memory_opt.grad_accum_steps
-        if remainder:
+        if accumulation_count:
             if self.memory_opt.scaler:
                 self.memory_opt.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            rescale_accumulated_gradients(
+                self.model.parameters(),
+                grad_accum_steps=self.memory_opt.grad_accum_steps,
+                accumulation_count=accumulation_count,
+            )
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            if self.memory_opt.scaler:
                 self.memory_opt.scaler.step(self.optimizer)
                 self.memory_opt.scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
             self.optimizer.zero_grad()
 
+        self.last_epoch_loss_components = {
+            name: total_components[name] / len(train_loader)
+            for name in LDM_LOSS_COMPONENT_NAMES
+        }
         return total_loss / len(train_loader)
     
     def train(self, train_loader: DataLoader):
@@ -781,6 +1373,9 @@ class OptimizedLDMTrainer:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'loss': loss,
                     'best_loss': self.best_loss,
+                    'latent_dim': self.latent_dim,
+                    'model_config': dict(self.model_config),
+                    'ldm_loss_config': self._ldm_loss_config(),
                 }, best_ckpt)
                 msg = f"  ✓ Saved best model (loss: {loss:.4f})"
                 print(msg)
@@ -796,6 +1391,9 @@ class OptimizedLDMTrainer:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'loss': loss,
                     'best_loss': self.best_loss,
+                    'latent_dim': self.latent_dim,
+                    'model_config': dict(self.model_config),
+                    'ldm_loss_config': self._ldm_loss_config(),
                 }, ckpt_path)
                 msg = f"  ✓ Saved checkpoint: {ckpt_path}"
                 print(msg)
@@ -832,15 +1430,44 @@ def main():
     
     # 创建数据加载器
     data_config = config.get('data', {})
-    dataset = NTU4DRadLM_VoxelDataset(
+    target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
+    align_ldm_grid_config(config, target_size, model_pc_range)
+    train_dataset_base = NTU4DRadLM_VoxelDataset(
         root_dir=data_config.get('dataset_dir'),
         split='train',
         use_augmentation=data_config.get('use_augmentation', True),
+        target_size=target_size,
+        source_pc_range=source_pc_range,
+        model_pc_range=model_pc_range,
     )
+    val_dataset_base = NTU4DRadLM_VoxelDataset(
+        root_dir=data_config.get('dataset_dir'),
+        split='train',
+        use_augmentation=False,
+        target_size=target_size,
+        source_pc_range=source_pc_range,
+        model_pc_range=model_pc_range,
+    )
+    if len(train_dataset_base) != len(val_dataset_base):
+        raise RuntimeError("训练/验证 dataset 样本索引不一致，无法安全划分")
+    train_indices, val_indices = deterministic_split_indices(
+        len(train_dataset_base),
+        train_split=float(data_config.get("train_split", 0.8)),
+        split_seed=int(data_config.get("split_seed", 42)),
+    )
+    train_dataset = Subset(train_dataset_base, train_indices)
+    val_dataset = Subset(val_dataset_base, val_indices)
     train_loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=data_config.get('batch_size', 2),
         shuffle=True,
+        num_workers=data_config.get('num_workers', 4),
+        pin_memory=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=data_config.get('batch_size', 2),
+        shuffle=False,
         num_workers=data_config.get('num_workers', 4),
         pin_memory=False,
     )
@@ -848,17 +1475,27 @@ def main():
     # VAE 训练
     if args.mode == "vae":
         vae_type = config.get('vae.config_type', 'ultra_lightweight')
-        if vae_type == 'ultra_lightweight':
-            vae_config = create_ultra_lightweight_vae_config()
-        elif vae_type == 'lightweight':
-            vae_config = create_lightweight_vae_config()
+        if args.resume:
+            resume_checkpoint = safe_torch_load(args.resume, map_location="cpu")
+            vae, resume_metadata = build_vae_from_checkpoint(
+                resume_checkpoint,
+                fallback_config_type=vae_type,
+            )
+            vae_config = resume_metadata["vae_config"]
+            vae_type = resume_metadata["vae_config_type"]
         else:
-            vae_config = create_standard_vae_config()
-        vae_config = apply_vae_config_overrides(vae_config, config)
-        
-        vae = VAE3D(**vae_config)
-        trainer = OptimizedVAETrainer(vae, config, memory_opt, resume_path=args.resume)
-        trainer.train(train_loader)
+            vae_config = create_vae_config(vae_type)
+            vae_config = apply_vae_config_overrides(vae_config, config)
+            vae = VAE3D(**vae_config)
+        trainer = OptimizedVAETrainer(
+            vae,
+            config,
+            memory_opt,
+            resume_path=args.resume,
+            vae_model_config=vae_config,
+            vae_config_type=vae_type,
+        )
+        trainer.train(train_loader, val_loader)
     
     # LDM 训练
     elif args.mode == "ldm":
@@ -866,20 +1503,10 @@ def main():
             raise ValueError("Must provide --vae_ckpt for LDM, resume_path=args.resume training")
         
         vae_type = config.get('vae.config_type', 'ultra_lightweight')
-        if vae_type == 'ultra_lightweight':
-            vae_config = create_ultra_lightweight_vae_config()
-        elif vae_type == 'lightweight':
-            vae_config = create_lightweight_vae_config()
-        else:
-            vae_config = create_standard_vae_config()
-        vae_config = apply_vae_config_overrides(vae_config, config)
-        
-        vae = VAE3D(**vae_config)
         ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
-        if 'model_state_dict' in ckpt:
-            vae.load_state_dict(ckpt['model_state_dict'])
-        else:
-            vae.load_state_dict(ckpt)
+        vae, _vae_metadata = build_vae_from_checkpoint(
+            ckpt, fallback_config_type=vae_type
+        )
         
         trainer = OptimizedLDMTrainer(vae, config, memory_opt, resume_path=args.resume)
         trainer.train(train_loader)
@@ -893,20 +1520,10 @@ def main():
             raise ValueError("Must provide --ldm_ckpt or set cd.teacher_model_path for CD training")
 
         vae_type = config.get('vae.config_type', 'ultra_lightweight')
-        if vae_type == 'ultra_lightweight':
-            vae_config = create_ultra_lightweight_vae_config()
-        elif vae_type == 'lightweight':
-            vae_config = create_lightweight_vae_config()
-        else:
-            vae_config = create_standard_vae_config()
-        vae_config = apply_vae_config_overrides(vae_config, config)
-
-        vae = VAE3D(**vae_config)
         ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
-        if 'model_state_dict' in ckpt:
-            vae.load_state_dict(ckpt['model_state_dict'])
-        else:
-            vae.load_state_dict(ckpt)
+        vae, _vae_metadata = build_vae_from_checkpoint(
+            ckpt, fallback_config_type=vae_type
+        )
 
         cd_cfg = config.get('cd', {}) or {}
         opt_cfg = config.get('optimization', {}) or {}

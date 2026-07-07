@@ -19,6 +19,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 EPS = 1e-6
+DEFAULT_PC_RANGE = (0.0, -20.0, -6.0, 120.0, 20.0, 10.0)
+DEFAULT_TARGET_SIZE = (32, 128, 128)
 
 
 def _read_calibration_txt(path: str) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -107,6 +109,38 @@ def resize_voxel_channels(voxel_tensor: torch.Tensor, target_size, mask_channel:
     return torch.cat(outputs, dim=1).squeeze(0)
 
 
+def crop_voxel_channels_to_pc_range(
+    voxel_tensor: torch.Tensor,
+    source_pc_range,
+    model_pc_range,
+) -> torch.Tensor:
+    """Crop a `(C,Z,X,Y)` tensor using physical XYZ bounds."""
+    if voxel_tensor.ndim != 4:
+        raise ValueError(f"Expected (C,Z,X,Y), got {tuple(voxel_tensor.shape)}")
+    source = tuple(float(v) for v in source_pc_range)
+    model = tuple(float(v) for v in model_pc_range)
+    if len(source) != 6 or len(model) != 6:
+        raise ValueError("source_pc_range and model_pc_range must contain 6 values")
+    for axis in range(3):
+        if model[axis] < source[axis] or model[axis + 3] > source[axis + 3]:
+            raise ValueError(f"model_pc_range must lie inside source_pc_range: {model} vs {source}")
+        if model[axis] >= model[axis + 3]:
+            raise ValueError(f"Invalid model_pc_range: {model}")
+
+    def physical_slice(size: int, low: float, high: float, crop_low: float, crop_high: float):
+        step = (high - low) / float(size)
+        centers = low + (torch.arange(size, device=voxel_tensor.device) + 0.5) * step
+        indices = torch.where((centers >= crop_low) & (centers < crop_high))[0]
+        if indices.numel() == 0:
+            raise ValueError(f"Physical crop [{crop_low}, {crop_high}) contains no voxel centers")
+        return slice(int(indices[0]), int(indices[-1]) + 1)
+
+    z_slice = physical_slice(voxel_tensor.shape[1], source[2], source[5], model[2], model[5])
+    x_slice = physical_slice(voxel_tensor.shape[2], source[0], source[3], model[0], model[3])
+    y_slice = physical_slice(voxel_tensor.shape[3], source[1], source[4], model[1], model[4])
+    return voxel_tensor[:, z_slice, x_slice, y_slice]
+
+
 def _resize_or_pad_ir_tensor(ir_img: torch.Tensor) -> torch.Tensor:
     if ir_img.ndim == 2:
         ir_img = ir_img.unsqueeze(0).repeat(3, 1, 1)
@@ -131,7 +165,9 @@ def _mock_ir_image(height: int = 480, width: int = 640) -> torch.Tensor:
 
 class NTU4DRadLM_VoxelDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None, return_path=False, alignment_size=32,
-                 use_augmentation=True, augmentation_config=None, sequence_length=1):
+                 use_augmentation=True, augmentation_config=None, sequence_length=1,
+                 target_size=DEFAULT_TARGET_SIZE, source_pc_range=DEFAULT_PC_RANGE,
+                 model_pc_range=None):
         """
         工业闭环重构版：完美支持独立场景内部时序滑窗、动态几何参数分发的多模态数据迭代器
         """
@@ -143,6 +179,11 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         self.scene_policies: Dict[str, dict] = {}
         self.split = split
         self.seq_len = max(1, int(sequence_length))
+        self.target_size = tuple(int(v) for v in target_size)
+        self.source_pc_range = tuple(float(v) for v in source_pc_range)
+        self.model_pc_range = tuple(
+            float(v) for v in (model_pc_range if model_pc_range is not None else source_pc_range)
+        )
         self.ir_dir = os.path.join(root_dir, "ir_image")
         self.calibration_provider = CalibrationProvider(root_dir)
 
@@ -258,8 +299,6 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         radar_seq_paths, target_path, ir_path, scene = self.samples[idx]
 
         # 无缝复原原本完全体的张量空间轴向变换流与重采样
-        target_size = (32, 128, 128)  # (Z, H, W)
-
         # 1. 加载并转换主监督真值体素
         if target_path.endswith('.npz'):
             target_voxel = load_sparse_voxel(target_path)
@@ -268,7 +307,10 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 
         # 完美对齐物理原版轴向重塑: (H, W, Z, C) -> (C, Z, H, W)
         target_tensor = torch.from_numpy(target_voxel).permute(3, 2, 0, 1)
-        target_tensor = resize_voxel_channels(target_tensor, target_size, mask_channel=3)
+        target_tensor = crop_voxel_channels_to_pc_range(
+            target_tensor, self.source_pc_range, self.model_pc_range
+        )
+        target_tensor = resize_voxel_channels(target_tensor, self.target_size, mask_channel=3)
 
         # 2. 时序雷达滑窗包流式解析重采样
         radar_seq_tensors = []
@@ -279,7 +321,10 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                 radar_voxel = np.load(path).astype(np.float32)
 
             r_tensor = torch.from_numpy(radar_voxel).permute(3, 2, 0, 1)
-            r_tensor = resize_voxel_channels(r_tensor, target_size)
+            r_tensor = crop_voxel_channels_to_pc_range(
+                r_tensor, self.source_pc_range, self.model_pc_range
+            )
+            r_tensor = resize_voxel_channels(r_tensor, self.target_size)
             radar_seq_tensors.append(r_tensor)
 
         radar_tensor = radar_seq_tensors[-1]
@@ -300,6 +345,8 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             "is_mock_ir": bool(is_mock_ir),
             "is_mock_calib": bool(is_mock_calib),
             "preprocess_policy": self.scene_policies.get(scene, {}),
+            "model_pc_range": list(self.model_pc_range),
+            "target_size": list(self.target_size),
         }
 
         if self.return_path:
