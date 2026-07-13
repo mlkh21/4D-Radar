@@ -7,6 +7,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -363,6 +364,126 @@ def select_recommended_threshold(
     return float(max(metrics, key=task_key))
 
 
+def select_threshold_with_constraints(
+    metrics: Dict[float, Dict[str, object]],
+    selection_metric: str = "task_bev_f1",
+    min_task_bev_recall: Optional[float] = None,
+    near_band_label: Optional[str] = None,
+    min_near_bev_recall: Optional[float] = None,
+    range_bin_labels: Sequence[str] = (),
+) -> Dict[str, object]:
+    """在可选 recall 约束下选择阈值，并返回可直接写入 JSON 的状态。"""
+    labels = tuple(str(label) for label in range_bin_labels)
+
+    def validate_minimum(name: str, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        parsed = float(value)
+        if not np.isfinite(parsed):
+            raise ValueError(f"{name} 必须是有限数")
+        if not 0.0 <= parsed <= 1.0:
+            raise ValueError(f"{name} 必须位于 [0, 1]，当前为 {parsed}")
+        return parsed
+
+    global_minimum = validate_minimum("min_task_bev_recall", min_task_bev_recall)
+    near_minimum = validate_minimum("min_near_bev_recall", min_near_bev_recall)
+    resolved_near_label = str(near_band_label or "")
+    if not resolved_near_label and near_minimum is not None:
+        if not labels:
+            raise ValueError("启用近距离 recall 约束时 range_bins 不能为空")
+        resolved_near_label = labels[0]
+    if resolved_near_label and resolved_near_label not in labels:
+        raise ValueError(
+            f"near_band_label={resolved_near_label} 不存在于 range_bins: {labels}"
+        )
+
+    unconstrained = select_recommended_threshold(metrics, selection_metric)
+    effective_constraints: Dict[str, object] = {}
+    if global_minimum is not None:
+        effective_constraints["min_task_bev_recall"] = global_minimum
+    if near_minimum is not None:
+        effective_constraints.update(
+            {
+                "near_band_label": resolved_near_label,
+                "min_near_bev_recall": near_minimum,
+            }
+        )
+
+    def read_recall(threshold: float, path: Sequence[str]) -> float:
+        current: object = metrics[threshold]
+        metric_path = ".".join(path)
+        for component in path:
+            if not isinstance(current, dict) or component not in current:
+                raise ValueError(
+                    f"threshold={threshold} 缺少约束指标 {metric_path}"
+                )
+            current = current[component]
+        try:
+            recall = float(current)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"threshold={threshold} 的 {metric_path} 必须是有限数"
+            ) from error
+        if not math.isfinite(recall):
+            raise ValueError(
+                f"threshold={threshold} 的 {metric_path} 必须是有限数"
+            )
+        return recall
+
+    def recall_satisfactions(threshold: float) -> List[float]:
+        satisfactions = []
+        if global_minimum is not None:
+            recall = read_recall(threshold, ("task_bev_recall",))
+            satisfactions.append(1.0 if global_minimum == 0.0 else recall / global_minimum)
+        if near_minimum is not None:
+            recall = read_recall(
+                threshold,
+                ("bands", resolved_near_label, "task_bev_recall"),
+            )
+            satisfactions.append(1.0 if near_minimum == 0.0 else recall / near_minimum)
+        return satisfactions
+
+    feasible = [
+        threshold
+        for threshold in metrics
+        if all(value >= 1.0 for value in recall_satisfactions(threshold))
+    ]
+    if feasible:
+        selected = select_recommended_threshold(
+            {threshold: metrics[threshold] for threshold in feasible},
+            selection_metric,
+        )
+        constraint_satisfied = True
+        reason = None
+    else:
+        minimum_satisfaction = {
+            threshold: min(recall_satisfactions(threshold)) for threshold in metrics
+        }
+        best_satisfaction = max(minimum_satisfaction.values())
+        fallback_candidates = {
+            threshold: metrics[threshold]
+            for threshold, satisfaction in minimum_satisfaction.items()
+            if math.isclose(
+                satisfaction,
+                best_satisfaction,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        }
+        selected = select_recommended_threshold(fallback_candidates, selection_metric)
+        constraint_satisfied = False
+        reason = "无阈值满足全部 recall 约束，已选择约束违例最小的阈值"
+
+    return {
+        "unconstrained_recommended_threshold": float(unconstrained),
+        "recommended_threshold": float(selected),
+        "constraint_satisfied": constraint_satisfied,
+        "constraint_reason": reason,
+        "effective_constraints": effective_constraints,
+        "near_band_label": resolved_near_label or None,
+    }
+
+
 def evaluate_thresholds(
     pred_occ: np.ndarray,
     target_occ: np.ndarray,
@@ -466,6 +587,9 @@ def main():
         choices=("task_bev_f1", "voxel_f1"),
         default="task_bev_f1",
     )
+    parser.add_argument("--min_task_bev_recall", type=float, default=None)
+    parser.add_argument("--min_near_bev_recall", type=float, default=None)
+    parser.add_argument("--near_band_label", type=str, default="")
     parser.add_argument(
         "--x_max",
         type=float,
@@ -492,6 +616,7 @@ def main():
     if not range_bins:
         raise ValueError("range_bins 不能为空")
     validate_range_bins(range_bins, args.model_pc_range)
+    resolved_near_band_label = args.near_band_label or range_bins[0][0]
     if args.bev_cell_size <= 0.0:
         raise ValueError("bev_cell_size 必须大于 0")
 
@@ -721,15 +846,26 @@ def main():
                 ),
             ])
 
-    best_threshold = select_recommended_threshold(
+    selection = select_threshold_with_constraints(
         recommendation_metrics,
-        args.selection_metric,
+        selection_metric=args.selection_metric,
+        min_task_bev_recall=args.min_task_bev_recall,
+        near_band_label=resolved_near_band_label,
+        min_near_bev_recall=args.min_near_bev_recall,
+        range_bin_labels=tuple(label for label, _, _ in range_bins),
     )
+    best_threshold = float(selection["recommended_threshold"])
     output_json = args.output_json or os.path.join(args.pred_voxel_dir, "occ_threshold_recommendation.json")
     with open(output_json, "w", encoding="utf-8") as handle:
         json.dump(
             {
+                "unconstrained_recommended_threshold": selection[
+                    "unconstrained_recommended_threshold"
+                ],
                 "recommended_threshold": float(best_threshold),
+                "constraints": selection["effective_constraints"],
+                "constraint_satisfied": selection["constraint_satisfied"],
+                "constraint_reason": selection["constraint_reason"],
                 "selection_metric": args.selection_metric,
                 "target_threshold": float(args.target_threshold),
                 "source_pc_range": [float(v) for v in args.source_pc_range],
@@ -754,6 +890,17 @@ def main():
         )
 
     print(f"Saved threshold sweep metrics to: {output_csv}")
+    print(
+        "Recall constraints: "
+        f"{selection['effective_constraints'] or 'disabled'}; "
+        f"satisfied={selection['constraint_satisfied']}"
+    )
+    if selection["constraint_reason"]:
+        print(f"Constraint fallback: {selection['constraint_reason']}")
+    print(
+        "Unconstrained recommended threshold: "
+        f"{selection['unconstrained_recommended_threshold']:.6f}"
+    )
     print(f"Recommended threshold: {best_threshold:.6f}")
     print(f"Saved threshold recommendation to: {output_json}")
 

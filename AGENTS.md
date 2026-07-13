@@ -1,5 +1,7 @@
 # 项目规则
 
+## 项目概述
+
 本项目是 4D Radar / LiDAR / infrared 多模态 3D Occupancy 生成项目。
 
 - 任务：基于机载传感器融合的障碍物地图构建与场景地图更新
@@ -21,7 +23,7 @@
 - 不要大范围重构，优先小步修改。
 - 不要删除数据集、checkpoint、训练日志或实验结果。
 - 不要自动运行长时间训练命令。
-- 测试代码放入 `test/` 文件夹，测试结果放入 `test/result/` 文件夹。
+- 测试代码放入 `test/` 文件夹，测试结果放入 `test/result/` 文件夹，具体逻辑见各测试文件 `test/AGENTS.md` 。
 - 运行测试前先说明测试范围。
 - 优先写小测试验证修改是否正确，测试结束后清理测试数据，删除不必要的测试文件。
 - 修改数据预处理、target 生成、模型结构或评估指标时，需要说明改动对监督信号、体素数量和指标结果的影响。
@@ -44,5 +46,5 @@ conda run -n Radar-Diffusion python <script>
 例如：
 
 ```bash
-conda run -n Radar-Diffusion python test/test_sensor_aware_target.py
+conda run -n Radar-Diffusion python test/unit/test_sensor_aware_target.py
 ```

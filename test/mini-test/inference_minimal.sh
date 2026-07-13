@@ -55,8 +55,8 @@ if [[ "${USE_MINI_CHECKPOINTS}" == "1" ]]; then
   DEFAULT_RESULT_DIR="${MINI_RESULTS_DIR}"
   DEFAULT_OUTPUT_ROOT="${MINI_INFERENCE_RESULTS_DIR}"
 else
-  DEFAULT_RESULT_DIR="${ROOT_DIR}/Result/train_results"
-  DEFAULT_OUTPUT_ROOT="${ROOT_DIR}/Result/inference_results"
+  DEFAULT_RESULT_DIR="${ROOT_DIR}/test/result"
+  DEFAULT_OUTPUT_ROOT="${ROOT_DIR}/test/result/ldm/visualization/mini_inference_compare"
 fi
 
 VAE_CKPT="${VAE_CKPT:-${DEFAULT_RESULT_DIR}/vae/vae_best.pt}"

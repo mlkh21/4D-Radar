@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,39 @@ try:
     import torchvision.models as tv_models
 except Exception:
     tv_models = None
+
+
+def migrate_ir_gate_state_dict(model: nn.Module, state_dict: dict) -> dict:
+    """兼容旧 checkpoint 的 IR gate 输入通道。
+
+    旧结构 gate 输入为 `[radar_cond, confidence]`，新结构为
+    `[radar_cond, ir_feat_3d, confidence]`。迁移时保留旧的 radar/confidence
+    权重，新增 IR 特征权重置零，使旧模型可加载且行为尽量接近旧版本。
+    """
+    if not isinstance(state_dict, dict):
+        return state_dict
+    model_state = model.state_dict()
+    migrated = dict(state_dict)
+    for key, old_weight in list(state_dict.items()):
+        if not key.endswith("ir_gate.0.weight") or key not in model_state:
+            continue
+        new_weight = model_state[key]
+        if tuple(old_weight.shape) == tuple(new_weight.shape):
+            continue
+        if old_weight.ndim != 5 or new_weight.ndim != 5:
+            continue
+        if old_weight.shape[0] != new_weight.shape[0] or old_weight.shape[2:] != new_weight.shape[2:]:
+            continue
+        if old_weight.shape[1] >= new_weight.shape[1]:
+            continue
+        if old_weight.shape[1] < 2:
+            continue
+        upgraded = new_weight.detach().clone().zero_()
+        radar_channels = old_weight.shape[1] - 1
+        upgraded[:, :radar_channels] = old_weight[:, :radar_channels]
+        upgraded[:, -1:] = old_weight[:, -1:]
+        migrated[key] = upgraded
+    return migrated
 
 
 def heteroscedastic_gaussian_nll(
@@ -165,7 +198,8 @@ class DualModalityProjectionLayer(nn.Module):
         t_vec: torch.Tensor,
         k_mat: torch.Tensor,
         img_shape: Tuple[int, int],
-    ) -> torch.Tensor:
+        return_mask: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         bsz, channels, _, _ = ir_features.shape
         h_img, w_img = img_shape
         dim0, dim1, dim2 = self.voxel_shape
@@ -199,7 +233,10 @@ class DualModalityProjectionLayer(nn.Module):
             & (v_norm >= -1.0)
             & (v_norm <= 1.0)
         ).view(bsz, 1, dim0, dim1, dim2)
-        return voxel_ir * frustum_mask.to(voxel_ir.dtype)
+        masked_ir = voxel_ir * frustum_mask.to(voxel_ir.dtype)
+        if return_mask:
+            return masked_ir, frustum_mask
+        return masked_ir
 
 
 class CompleteDualModalityPerceptionNet(nn.Module):
@@ -229,7 +266,7 @@ class CompleteDualModalityPerceptionNet(nn.Module):
         self.radar_encoder = RadarStructureEncoder(in_channels=4, out_channels=fused_channels)
         self.uncertainty_head = UncertaintyHead()
         self.ir_gate = nn.Sequential(
-            nn.Conv3d(fused_channels + 1, ir_channels, kernel_size=1),
+            nn.Conv3d(fused_channels + ir_channels + 1, ir_channels, kernel_size=1),
             nn.Sigmoid(),
         )
         self.fusion_conv = nn.Sequential(
@@ -246,6 +283,7 @@ class CompleteDualModalityPerceptionNet(nn.Module):
         nn.init.constant_(self.model_uncertainty_head[-1].bias, -3.0)
         self.downsample_to_latent = downsample_to_latent
         self.latent_shape = tuple(int(v) for v in latent_shape)
+        self.last_ir_frustum_mask = None
 
     def forward(
         self,
@@ -262,8 +300,16 @@ class CompleteDualModalityPerceptionNet(nn.Module):
         return_uncertainty: bool = False,
     ) -> torch.Tensor:
         _, _, h_img, w_img = ir_img.shape
+        self.last_ir_frustum_mask = None
         ir_feat_2d = self.ir_extractor(ir_img)
-        ir_feat_3d = self.projection_layer(ir_feat_2d, r_mat, t_vec, k_mat, (h_img, w_img))
+        ir_feat_3d, ir_frustum_mask = self.projection_layer(
+            ir_feat_2d,
+            r_mat,
+            t_vec,
+            k_mat,
+            (h_img, w_img),
+            return_mask=True,
+        )
         if ir_feat_3d.shape[-3:] != radar_voxel.shape[-3:]:
             ir_feat_3d = F.interpolate(
                 ir_feat_3d,
@@ -271,6 +317,12 @@ class CompleteDualModalityPerceptionNet(nn.Module):
                 mode="trilinear",
                 align_corners=False,
             )
+            ir_frustum_mask = F.interpolate(
+                ir_frustum_mask.float(),
+                size=radar_voxel.shape[-3:],
+                mode="nearest",
+            ).bool()
+        self.last_ir_frustum_mask = ir_frustum_mask.detach()
         radar_cond = self.radar_encoder(radar_voxel)
         uncertainty = self.uncertainty_head(
             radar_voxel,
@@ -279,7 +331,7 @@ class CompleteDualModalityPerceptionNet(nn.Module):
             is_mock_ir=is_mock_ir,
             is_mock_calib=is_mock_calib,
         )
-        ir_gate = self.ir_gate(torch.cat([radar_cond, uncertainty["confidence"]], dim=1))
+        ir_gate = self.ir_gate(torch.cat([radar_cond, ir_feat_3d, uncertainty["confidence"]], dim=1))
         ir_feat_3d = ir_feat_3d * ir_gate
         fused = self.fusion_conv(torch.cat([radar_cond, ir_feat_3d, uncertainty["confidence"]], dim=1))
         if noised_latent is not None:

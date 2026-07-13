@@ -14,7 +14,7 @@
 
 **Files:**
 - Modify: `diffusion_consistency_radar/scripts/unified_train.py`
-- Create: `test/test_ldm_vertical_structure_loss.py`
+- Create: `test/unit/test_ldm_vertical_structure_loss.py`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -35,7 +35,7 @@ The tests must prove that aligned columns score lower than shifted-height column
 Run:
 
 ```bash
-conda run -n Radar-Diffusion python test/test_ldm_vertical_structure_loss.py -v
+conda run -n Radar-Diffusion python test/unit/test_ldm_vertical_structure_loss.py -v
 ```
 
 Expected: failure because `decoded_vertical_structure_losses` does not exist.
@@ -73,7 +73,7 @@ Run the Task 1 test and `py_compile`; both must pass.
 - Modify: `diffusion_consistency_radar/config/default_config.yaml`
 - Modify: `diffusion_consistency_radar/config/.default_config.train_override.yaml`
 - Modify: `test/mini-test/train_minimal.sh`
-- Modify: `test/test_ldm_vertical_structure_loss.py`
+- Modify: `test/unit/test_ldm_vertical_structure_loss.py`
 
 - [ ] **Step 1: Write failing trainer/config tests**
 
@@ -117,11 +117,11 @@ in `test/mini-test/train_minimal.sh`.
 Run:
 
 ```bash
-conda run -n Radar-Diffusion python test/test_ldm_vertical_structure_loss.py -v
-conda run -n Radar-Diffusion python test/test_multimodal_inference_interface.py -v
+conda run -n Radar-Diffusion python test/unit/test_ldm_vertical_structure_loss.py -v
+conda run -n Radar-Diffusion python test/unit/test_multimodal_inference_interface.py -v
 conda run -n Radar-Diffusion python -m py_compile \
   diffusion_consistency_radar/scripts/unified_train.py \
-  test/test_ldm_vertical_structure_loss.py
+  test/unit/test_ldm_vertical_structure_loss.py
 git diff --check
 ```
 
@@ -133,7 +133,7 @@ No long training is part of this task.
 - Modify: `TODO/task_plan.md`
 - Modify: `TODO/findings.md`
 - Modify: `TODO/progress.md`
-- Output: `test/result/ldm_vertical_structure_smoke/`
+- Output: `test/result/ldm/vertical_structure/ldm_vertical_structure_smoke/`
 
 - [ ] **Step 1: Run one short LDM smoke**
 

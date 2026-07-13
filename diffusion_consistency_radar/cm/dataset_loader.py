@@ -45,7 +45,7 @@ def _read_calibration_txt(path: str) -> Tuple[Optional[torch.Tensor], Optional[t
 
 
 class CalibrationProvider:
-    """Load available dataset calibration, with explicit fallback metadata."""
+    """加载数据集标定，并显式区分真实 thermal 外参与 fallback。"""
 
     def __init__(self, root_dir: str):
         self.root_dir = root_dir
@@ -61,14 +61,58 @@ class CalibrationProvider:
             if path not in self.config_dirs:
                 self.config_dirs.append(path)
 
-    def load(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-        k_mat = torch.tensor([[457.2, 0.0, 323.1], [0.0, 457.9, 242.5], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    def _try_read_named_calib(self, name: str):
         for config_dir in self.config_dirs:
-            for name in ("calib_radar_to_thermal.txt", "calib_radar_to_livox.txt"):
-                r_mat, t_vec = _read_calibration_txt(os.path.join(config_dir, name))
-                if r_mat is not None and t_vec is not None:
-                    return r_mat, t_vec, k_mat, False
-        return torch.eye(3, dtype=torch.float32), torch.zeros(3, dtype=torch.float32), k_mat, True
+            path = os.path.join(config_dir, name)
+            r_mat, t_vec = _read_calibration_txt(path)
+            if r_mat is not None and t_vec is not None:
+                return r_mat, t_vec, path
+        return None, None, ""
+
+    def load_with_metadata(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
+        """返回 IR 投影可用标定和来源信息。
+
+        只有 radar-to-thermal 外参可以作为真实 IR 标定。radar-to-livox
+        外参只记录存在性，不再冒充 thermal 外参参与红外投影。
+        """
+        k_mat = torch.tensor([[457.2, 0.0, 323.1], [0.0, 457.9, 242.5], [0.0, 0.0, 1.0]], dtype=torch.float32)
+        thermal_r, thermal_t, thermal_path = self._try_read_named_calib("calib_radar_to_thermal.txt")
+        livox_r, livox_t, livox_path = self._try_read_named_calib("calib_radar_to_livox.txt")
+        has_livox = livox_r is not None and livox_t is not None
+        if thermal_r is not None and thermal_t is not None:
+            metadata = {
+                "is_mock_calib": False,
+                "calib_source": "calib_radar_to_thermal.txt",
+                "calib_path": thermal_path,
+                "calib_is_thermal": True,
+                "has_thermal_calib": True,
+                "has_livox_calib": bool(has_livox),
+                "livox_calib_path": livox_path,
+                "calib_fallback_reason": "",
+            }
+            return thermal_r, thermal_t, k_mat, metadata
+
+        fallback_reason = (
+            "thermal_missing_livox_available_not_used_for_ir"
+            if has_livox
+            else "thermal_missing"
+        )
+        metadata = {
+            "is_mock_calib": True,
+            "calib_source": "mock_default",
+            "calib_path": "",
+            "calib_is_thermal": False,
+            "has_thermal_calib": False,
+            "has_livox_calib": bool(has_livox),
+            "livox_calib_path": livox_path,
+            "calib_fallback_reason": fallback_reason,
+        }
+        return torch.eye(3, dtype=torch.float32), torch.zeros(3, dtype=torch.float32), k_mat, metadata
+
+    def load(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        """兼容历史调用：返回 R/T/K/is_mock_calib。"""
+        r_mat, t_vec, k_mat, metadata = self.load_with_metadata()
+        return r_mat, t_vec, k_mat, bool(metadata["is_mock_calib"])
 
 
 def load_sparse_voxel(filename):
@@ -279,15 +323,19 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         self,
         velocity_m_s: float = 50.0,
         dt_mu_s: float = 200.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        r_mat, t_vec, k_mat, is_mock = self.calibration_provider.load()
-        if is_mock:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
+        r_mat, t_vec, k_mat, calib_meta = self.calibration_provider.load_with_metadata()
+        if calib_meta["is_mock_calib"]:
             r_mat = self.R_cam_to_lidar.clone()
             t_vec = self.T_cam_to_lidar.clone()
             k_mat = self.default_K.clone()
         displacement_x = float(velocity_m_s) * (float(dt_mu_s) / 1e6)
         t_vec[0] += displacement_x
-        return r_mat, t_vec, k_mat, is_mock
+        calib_meta = dict(calib_meta)
+        calib_meta["velocity_m_s"] = float(velocity_m_s)
+        calib_meta["dt_sync_us"] = float(dt_mu_s)
+        calib_meta["sync_displacement_x_m"] = float(displacement_x)
+        return r_mat, t_vec, k_mat, calib_meta
 
     def _load_ir_tensor(self, ir_path: str) -> torch.Tensor:
         if os.path.exists(ir_path):
@@ -336,14 +384,24 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         if self.augmentation is not None:
             target_tensor, radar_tensor = self.augmentation(target_tensor, radar_tensor)
 
-        r_mat, t_vec, k_mat, is_mock_calib = self._get_mock_calibration()
+        r_mat, t_vec, k_mat, calib_meta = self._get_mock_calibration()
         meta_dict = {
             "ir_img": ir_img,
             "r_mat": r_mat,
             "t_vec": t_vec,
             "k_mat": k_mat,
             "is_mock_ir": bool(is_mock_ir),
-            "is_mock_calib": bool(is_mock_calib),
+            "is_mock_calib": bool(calib_meta["is_mock_calib"]),
+            "calib_source": calib_meta["calib_source"],
+            "calib_path": calib_meta["calib_path"],
+            "calib_is_thermal": bool(calib_meta["calib_is_thermal"]),
+            "has_thermal_calib": bool(calib_meta["has_thermal_calib"]),
+            "has_livox_calib": bool(calib_meta["has_livox_calib"]),
+            "livox_calib_path": calib_meta["livox_calib_path"],
+            "calib_fallback_reason": calib_meta["calib_fallback_reason"],
+            "velocity_m_s": float(calib_meta["velocity_m_s"]),
+            "dt_sync_us": float(calib_meta["dt_sync_us"]),
+            "sync_displacement_x_m": float(calib_meta["sync_displacement_x_m"]),
             "preprocess_policy": self.scene_policies.get(scene, {}),
             "model_pc_range": list(self.model_pc_range),
             "target_size": list(self.target_size),

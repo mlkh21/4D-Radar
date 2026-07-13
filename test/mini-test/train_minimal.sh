@@ -18,9 +18,17 @@ DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 
 PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware}"
 CALIB_CONFIG_DIR="${CALIB_CONFIG_DIR:-${ROOT_DIR}/Data/config}"
+if [[ ${MINI_DATASET_DIR+x} == x && -z "${MINI_DATASET_DIR}" ]]; then
+	echo "Error: unsafe MINI_DATASET_DIR: path is empty"
+	exit 1
+fi
 MINI_DATASET_DIR="${MINI_DATASET_DIR:-${SELF_DIR}/.tmp_mini_train_dataset}"
+MINI_DATASET_DIR_INPUT="${MINI_DATASET_DIR}"
 MINI_CONFIG_PATH="${MINI_CONFIG_PATH:-${SELF_DIR}/.default_config.mini_override.yaml}"
+MINI_CONFIG_PATH_INPUT="${MINI_CONFIG_PATH}"
 MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SELF_DIR}/train_results_mini}"
+MINI_REQUIRE_FRESH_SCRATCH="${MINI_REQUIRE_FRESH_SCRATCH:-0}"
+MINI_REQUIRE_FRESH_CONFIG="${MINI_REQUIRE_FRESH_CONFIG:-0}"
 MINI_TARGET_SIZE="${MINI_TARGET_SIZE:-32,128,128}"
 MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-0,-20,-6,120,20,10}"
 MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-0,-20,-6,40,20,10}"
@@ -29,11 +37,32 @@ MINI_VAE_LATENT_DIM="${MINI_VAE_LATENT_DIM:-}"
 MINI_VAE_OCC_LOSS="${MINI_VAE_OCC_LOSS:-bce_dice}"
 MINI_TRAIN_SPLIT="${MINI_TRAIN_SPLIT:-0.8}"
 MINI_SPLIT_SEED="${MINI_SPLIT_SEED:-42}"
+MINI_LDM_DECODED_WEIGHT="${MINI_LDM_DECODED_WEIGHT:-}"
+MINI_LDM_DECODED_FP_WEIGHT="${MINI_LDM_DECODED_FP_WEIGHT:-}"
+MINI_LDM_DECODED_MASS_WEIGHT="${MINI_LDM_DECODED_MASS_WEIGHT:-}"
 MINI_LDM_HEIGHT_WEIGHT="${MINI_LDM_HEIGHT_WEIGHT:-0.02}"
+MINI_LDM_TOP_WEIGHT="${MINI_LDM_TOP_WEIGHT:-0.0}"
+MINI_LDM_TOP_OVERSHOOT_WEIGHT="${MINI_LDM_TOP_OVERSHOOT_WEIGHT:-0.0}"
 MINI_LDM_CONTINUITY_WEIGHT="${MINI_LDM_CONTINUITY_WEIGHT:-0.02}"
+MINI_LDM_DENSITY_WEIGHT="${MINI_LDM_DENSITY_WEIGHT:-0.0}"
+MINI_LDM_IR_FRUSTUM_OCC_WEIGHT="${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT:-0.0}"
+MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT="${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT:-0.0}"
+MINI_LDM_IR_FRUSTUM_TOP_WEIGHT="${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT:-0.0}"
+MINI_LDM_UNCERTAINTY_WEIGHT="${MINI_LDM_UNCERTAINTY_WEIGHT:-}"
+MINI_LDM_COLUMN_POSITIVE_WEIGHT="${MINI_LDM_COLUMN_POSITIVE_WEIGHT:-0.0}"
+MINI_LDM_COLUMN_NEGATIVE_WEIGHT="${MINI_LDM_COLUMN_NEGATIVE_WEIGHT:-0.0}"
+MINI_LDM_COLUMN_TEMPERATURE="${MINI_LDM_COLUMN_TEMPERATURE:-1.0}"
 
 MODE="${1:-all}"
-CUDA_DEVICES="${CUDA_DEVICES:-0}"
+if [[ -n "${CUDA_DEVICES:-}" ]]; then
+	SELECTED_CUDA_DEVICES="${CUDA_DEVICES}"
+elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+	SELECTED_CUDA_DEVICES="${CUDA_VISIBLE_DEVICES}"
+else
+	SELECTED_CUDA_DEVICES="0"
+fi
+export CUDA_DEVICES="${SELECTED_CUDA_DEVICES}"
+export CUDA_VISIBLE_DEVICES="${SELECTED_CUDA_DEVICES}"
 SAMPLES_PER_SCENE="${SAMPLES_PER_SCENE:-200}"
 
 MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-1}"
@@ -44,6 +73,85 @@ MINI_USE_AUG="${MINI_USE_AUG:-false}"
 MINI_VAE_EPOCHS="${MINI_VAE_EPOCHS:-3}"
 MINI_LDM_EPOCHS="${MINI_LDM_EPOCHS:-2}"
 MINI_CD_EPOCHS="${MINI_CD_EPOCHS:-1}"
+
+validate_mode() {
+	case "${MODE}" in
+		vae|ldm|cd|all|all_with_cd)
+			;;
+		*)
+			echo "Usage: $0 [vae|ldm|cd|all|all_with_cd]"
+			exit 1
+			;;
+	esac
+}
+
+validate_mini_dataset_dir() {
+	local normalized_path
+	local normalized_preprocessed_root
+	local normalized_results_dir
+
+	normalized_path="$(realpath -m -- "${MINI_DATASET_DIR}")"
+	normalized_preprocessed_root="$(realpath -m -- "${PREPROCESSED_ROOT}")"
+	normalized_results_dir="$(realpath -m -- "${MINI_RESULTS_DIR}")"
+	MINI_RESULTS_DIR="${normalized_results_dir}"
+
+	if [[ "${MINI_REQUIRE_FRESH_SCRATCH}" == "1" ]]; then
+		if [[ -e "${MINI_DATASET_DIR_INPUT}" || -L "${MINI_DATASET_DIR_INPUT}" ]]; then
+			echo "Error: fresh MINI_DATASET_DIR already exists or is a symlink: ${MINI_DATASET_DIR_INPUT}"
+			exit 1
+		fi
+		case "${normalized_path}" in
+			"${normalized_results_dir}"/*) ;;
+			*)
+				echo "Error: fresh MINI_DATASET_DIR must be inside MINI_RESULTS_DIR: ${normalized_path}"
+				exit 1
+				;;
+		esac
+	fi
+	if [[ "${MINI_REQUIRE_FRESH_CONFIG}" == "1" ]]; then
+		local normalized_config_path
+		local normalized_config_parent
+		if [[ -e "${MINI_CONFIG_PATH_INPUT}" || -L "${MINI_CONFIG_PATH_INPUT}" ]]; then
+			echo "Error: fresh MINI_CONFIG_PATH already exists or is a symlink: ${MINI_CONFIG_PATH_INPUT}"
+			exit 1
+		fi
+		normalized_config_path="$(realpath -m -- "${MINI_CONFIG_PATH_INPUT}")"
+		normalized_config_parent="$(realpath -m -- "$(dirname -- "${normalized_config_path}")")"
+		case "${normalized_config_parent}" in
+			"${normalized_results_dir}" | "${normalized_results_dir}"/*) ;;
+			*)
+				echo "Error: fresh MINI_CONFIG_PATH parent must be inside MINI_RESULTS_DIR: ${normalized_config_parent}"
+				exit 1
+				;;
+		esac
+		MINI_CONFIG_PATH="${normalized_config_path}"
+	fi
+	MINI_DATASET_DIR="${normalized_path}"
+
+	if [[ "${MINI_DATASET_DIR}" == "/" ||
+		"${MINI_DATASET_DIR}" == "/tmp" ||
+		"${MINI_DATASET_DIR}" == "${ROOT_DIR}" ||
+		"${MINI_DATASET_DIR}" == "${normalized_preprocessed_root}" ||
+		"${MINI_DATASET_DIR}" == "${normalized_results_dir}" ]]; then
+		echo "Error: unsafe MINI_DATASET_DIR: ${MINI_DATASET_DIR}"
+		exit 1
+	fi
+
+	if [[ "${MINI_DATASET_DIR}" == /tmp/* ]]; then
+		return 0
+	fi
+	if [[ "${MINI_DATASET_DIR}" == "${ROOT_DIR}/test/"* ]] &&
+		[[ "$(basename "${MINI_DATASET_DIR}")" == .tmp_* ]]; then
+		return 0
+	fi
+
+	echo "Error: unsafe MINI_DATASET_DIR: ${MINI_DATASET_DIR}"
+	echo "Allowed paths: a non-root path under /tmp, or ROOT_DIR/test/**/.tmp_*"
+	exit 1
+}
+
+validate_mode
+validate_mini_dataset_dir
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
 	PYTHON_CMD=("${PYTHON_BIN}")
@@ -115,12 +223,36 @@ echo "vae latent dim: ${MINI_VAE_LATENT_DIM:-preset}"
 echo "vae occupancy loss: ${MINI_VAE_OCC_LOSS}"
 echo "train split: ${MINI_TRAIN_SPLIT}"
 echo "split seed: ${MINI_SPLIT_SEED}"
+echo "ldm decoded occupancy weight: ${MINI_LDM_DECODED_WEIGHT:-config default}"
+echo "ldm decoded false-positive weight: ${MINI_LDM_DECODED_FP_WEIGHT:-config default}"
+echo "ldm decoded mass weight: ${MINI_LDM_DECODED_MASS_WEIGHT:-config default}"
 echo "ldm height distribution weight: ${MINI_LDM_HEIGHT_WEIGHT}"
+echo "ldm top height weight: ${MINI_LDM_TOP_WEIGHT}"
+echo "ldm top overshoot weight: ${MINI_LDM_TOP_OVERSHOOT_WEIGHT}"
 echo "ldm vertical continuity weight: ${MINI_LDM_CONTINUITY_WEIGHT}"
+echo "ldm density weight: ${MINI_LDM_DENSITY_WEIGHT}"
+echo "ldm IR frustum occupancy/top weights: ${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT}/${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT}"
+echo "ldm IR frustum negative weight: ${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT}"
+echo "ldm uncertainty weight: ${MINI_LDM_UNCERTAINTY_WEIGHT:-config default}"
+echo "ldm column positive/negative weights: ${MINI_LDM_COLUMN_POSITIVE_WEIGHT}/${MINI_LDM_COLUMN_NEGATIVE_WEIGHT}"
+echo "ldm column temperature: ${MINI_LDM_COLUMN_TEMPERATURE}"
 echo "=========================================="
 
-rm -rf "${MINI_DATASET_DIR}"
-mkdir -p "${MINI_DATASET_DIR}"
+if [[ "${MINI_REQUIRE_FRESH_SCRATCH}" == "1" ]]; then
+	mkdir -- "${MINI_DATASET_DIR}"
+	CREATED_DATASET_DIR="$(realpath -m -- "${MINI_DATASET_DIR}")"
+	case "${CREATED_DATASET_DIR}" in
+		"${MINI_RESULTS_DIR}"/*) ;;
+		*) echo "Error: created MINI_DATASET_DIR escaped MINI_RESULTS_DIR: ${CREATED_DATASET_DIR}"; exit 1 ;;
+	esac
+	if [[ "${CREATED_DATASET_DIR}" != "${MINI_DATASET_DIR}" || -L "${MINI_DATASET_DIR}" ]]; then
+		echo "Error: created MINI_DATASET_DIR changed unexpectedly: ${CREATED_DATASET_DIR}"
+		exit 1
+	fi
+else
+	rm -rf "${MINI_DATASET_DIR}"
+	mkdir -p "${MINI_DATASET_DIR}"
+fi
 if [[ -d "${CALIB_CONFIG_DIR}" ]]; then
 	ln -s "${CALIB_CONFIG_DIR}" "${MINI_DATASET_DIR}/config"
 else
@@ -179,7 +311,7 @@ done
 
 mkdir -p "${MINI_RESULTS_DIR}/vae" "${MINI_RESULTS_DIR}/ldm" "${MINI_RESULTS_DIR}/cd"
 
-"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" "${MINI_TARGET_SIZE}" "${MINI_SOURCE_PC_RANGE}" "${MINI_MODEL_PC_RANGE}" "${MINI_VAE_CONFIG_TYPE}" "${MINI_VAE_LATENT_DIM}" "${MINI_VAE_OCC_LOSS}" "${MINI_TRAIN_SPLIT}" "${MINI_SPLIT_SEED}" "${MINI_LDM_HEIGHT_WEIGHT}" "${MINI_LDM_CONTINUITY_WEIGHT}" <<'PY'
+"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" "${MINI_TARGET_SIZE}" "${MINI_SOURCE_PC_RANGE}" "${MINI_MODEL_PC_RANGE}" "${MINI_VAE_CONFIG_TYPE}" "${MINI_VAE_LATENT_DIM}" "${MINI_VAE_OCC_LOSS}" "${MINI_TRAIN_SPLIT}" "${MINI_SPLIT_SEED}" "${MINI_LDM_DECODED_WEIGHT}" "${MINI_LDM_DECODED_FP_WEIGHT}" "${MINI_LDM_DECODED_MASS_WEIGHT}" "${MINI_LDM_HEIGHT_WEIGHT}" "${MINI_LDM_TOP_WEIGHT}" "${MINI_LDM_TOP_OVERSHOOT_WEIGHT}" "${MINI_LDM_CONTINUITY_WEIGHT}" "${MINI_LDM_DENSITY_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT}" "${MINI_LDM_UNCERTAINTY_WEIGHT}" "${MINI_LDM_COLUMN_POSITIVE_WEIGHT}" "${MINI_LDM_COLUMN_NEGATIVE_WEIGHT}" "${MINI_LDM_COLUMN_TEMPERATURE}" "${MINI_REQUIRE_FRESH_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -203,9 +335,23 @@ import yaml
 		vae_occ_loss,
 		train_split,
 		split_seed,
+		ldm_decoded_weight,
+		ldm_decoded_fp_weight,
+		ldm_decoded_mass_weight,
 		ldm_height_weight,
+		ldm_top_weight,
+		ldm_top_overshoot_weight,
 		ldm_continuity_weight,
-) = sys.argv[1:22]
+		ldm_density_weight,
+		ldm_ir_frustum_occ_weight,
+		ldm_ir_frustum_negative_weight,
+		ldm_ir_frustum_top_weight,
+		ldm_uncertainty_weight,
+		ldm_column_positive_weight,
+		ldm_column_negative_weight,
+		ldm_column_temperature,
+		require_fresh_config,
+) = sys.argv[1:36]
 
 
 def parse_numbers(raw, caster):
@@ -248,9 +394,27 @@ cfg['ldm'] = dict(cfg.get('ldm') or {})
 cfg['ldm']['epochs'] = int(ldm_epochs)
 cfg['ldm']['save_every'] = 1
 cfg['ldm']['save_dir'] = f"{results_dir}/ldm"
-cfg['ldm']['uncertainty_loss_weight'] = float(cfg['ldm'].get('uncertainty_loss_weight', 0.05))
+if ldm_decoded_weight:
+		cfg['ldm']['decoded_loss_weight'] = float(ldm_decoded_weight)
+if ldm_decoded_fp_weight:
+		cfg['ldm']['decoded_false_positive_weight'] = float(ldm_decoded_fp_weight)
+if ldm_decoded_mass_weight:
+		cfg['ldm']['decoded_mass_weight'] = float(ldm_decoded_mass_weight)
+if ldm_uncertainty_weight:
+		cfg['ldm']['uncertainty_loss_weight'] = float(ldm_uncertainty_weight)
+else:
+		cfg['ldm']['uncertainty_loss_weight'] = float(cfg['ldm'].get('uncertainty_loss_weight', 0.05))
 cfg['ldm']['decoded_height_distribution_weight'] = float(ldm_height_weight)
+cfg['ldm']['decoded_top_height_weight'] = float(ldm_top_weight)
+cfg['ldm']['decoded_top_overshoot_weight'] = float(ldm_top_overshoot_weight)
 cfg['ldm']['decoded_vertical_continuity_weight'] = float(ldm_continuity_weight)
+cfg['ldm']['decoded_density_weight'] = float(ldm_density_weight)
+cfg['ldm']['decoded_ir_frustum_occupancy_weight'] = float(ldm_ir_frustum_occ_weight)
+cfg['ldm']['decoded_ir_frustum_negative_weight'] = float(ldm_ir_frustum_negative_weight)
+cfg['ldm']['decoded_ir_frustum_top_weight'] = float(ldm_ir_frustum_top_weight)
+cfg['ldm']['decoded_column_positive_weight'] = float(ldm_column_positive_weight)
+cfg['ldm']['decoded_column_negative_weight'] = float(ldm_column_negative_weight)
+cfg['ldm']['decoded_column_temperature'] = float(ldm_column_temperature)
 cfg['ldm']['fusion_voxel_shape'] = target_size
 cfg['ldm']['fusion_pc_range'] = model_pc_range
 
@@ -273,7 +437,8 @@ cfg['cd'] = {
 cfg.setdefault('optimization', {})
 cfg['optimization']['gradient_accumulation_steps'] = int(grad_accum)
 
-with open(dst_cfg, 'w', encoding='utf-8') as f:
+config_write_mode = 'x' if str(require_fresh_config).lower() in {'1', 'true', 'yes', 'on'} else 'w'
+with open(dst_cfg, config_write_mode, encoding='utf-8') as f:
 		yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 PY
 

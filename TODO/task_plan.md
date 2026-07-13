@@ -56,6 +56,7 @@
   - [x] Replace occupancy MSE with BCE+Dice while masking continuous-channel supervision
   - [x] Select VAE checkpoints by validation occupancy IoU and persist the exact VAE config
   - [x] Pass the 32-frame reconstruction overfit gate before any longer experiment
+  - [x] Add a manual Z=64 near-field VAE upper-bound runner without auto-starting training
   - [ ] Compare ultra-lightweight z4, lightweight z8, and lightweight z16 one variable at a time
   - [x] Reach validation IoU >= 0.50 and recall >= 0.65 on the 500-frame near-field experiment
   - [x] Resume LDM training only after the VAE upper-bound gate passes
@@ -84,11 +85,76 @@
     - [x] Implement differentiable height-distribution and vertical-continuity losses
     - [x] Integrate independent weights, once-per-batch decoding, and component logging
     - [x] Add mini-script controls and run one short finite-gradient smoke
+    - [x] Add structure-preserving empty-column density control and decoded/uncertainty weight controls
+    - [x] Add a guarded Z=64 LDM v5 runner with existing-result overwrite protection
+    - [x] Add top-height target-voxel supervision and a guarded Z=64 LDM v6 runner
+    - [x] Add strict IR calibration metadata, audit coverage, and mock IR/calib training logs
+    - [x] Add IR-feature-aware fusion gate and expose IR frustum masks
+    - [x] Add optional IR-frustum occupancy/top-height supervision for LDM v7
+    - [x] Add IR condition ablation diagnostic before any v7 long run
     - [x] Leave formal multi-epoch LDM retraining for an explicit experiment run
   - [ ] Re-evaluate all gate metrics on one independent validation/test set
+    - [x] Add saved-output LDM vertical-structure evaluation against LiDAR target voxels
+    - [x] Restrict saved-output evaluation to `*_voxel.npy` and ignore LDM sidecars
+    - [x] Preserve `[Z,X,Y,C]` prediction layout when `Z == 4`
+    - [x] Align raw target voxels to the model crop/resize protocol before vertical evaluation
+    - [x] Run the vertical-structure report on `ldm_near40_500_vertical_v1`
+    - [x] Compare the report with raw-LiDAR HTML visual observations before changing loss weights
+    - [x] Add a one-click v2 LDM vertical experiment runner
+    - [x] Add decoded density/precision regularization to control over-dense LDM predictions
+    - [x] Run a v4 LDM experiment with height recovery plus density control
+    - [x] Revert voxel-column visualization and restore original raw-LiDAR point-cloud comparison
+    - [x] Try a less blunt structure-preserving density control after visual review
+    - [x] Run Z=64 LDM v5 with uncertainty NLL disabled and empty-column density enabled
+    - [x] Run Z=64 LDM v6 with top-height supervision enabled
+    - [x] Run dataset audit and IR ablation on the current candidate checkpoint
+    - [x] Run guarded Z=64 LDM v7 with IR-frustum supervision after audit/ablation justified it
+    - [x] Re-scan v6/v7 thresholds and compare vertical metrics at the same 0.99 threshold
+    - [x] Run post-v7 real/zero/mock IR ablation on three training frames
+    - [x] Add target-aware IR ablation metrics to distinguish useful structure recovery from simple densification
+    - [x] Run the 32-frame validation target-aware IR ablation and compare real/zero/mock summaries
+    - [x] Decide the minimal v8 top-height correction after target-aware IR ablation
+    - [x] v8 Task 1: add an above-target top-overshoot loss aligned with the strict top-height metric
+    - [x] v8 Task 2: add balanced IR-frustum positive/negative occupancy supervision to control IR-driven over-density
+    - [x] v8 Task 3a: add a guarded Z64 runner with safe scratch paths and atomic experiment locking
+    - [x] v8 Task 3b: run v8 and compare v7/v8 on 32-frame ablation plus 500-frame task/vertical metrics
+    - [x] v9 Task 1: add recall-constrained threshold selection and report both quality/safety operating points
+    - [x] v9 Task 2: run one-variable short screens for top-overshoot `0.05 -> 0.02` and IR-negative `0.02 -> 0.01`
+    - [x] v9 Task 3: train only the winning screen for 10 epochs and re-run the fixed 32/500-frame protocol
+    - [x] v9 Task 4: add validation task/structure checkpoint selection before any CD distillation
+    - [x] v10 Task 1: evaluate saved v9 epoch checkpoints on a fixed validation subset and select by task/structure score rather than training loss
+    - [x] v10 Task 2: if no epoch passes, add a column-balanced objective that protects occupied-column recall while suppressing empty-space false positives
+    - [ ] v10 Task 3: repeat the fixed 32/500-frame gate only for the selected checkpoint or one isolated loss candidate
+      - [x] Add separately logged positive/negative column-existence losses using stable Z-axis logmeanexp aggregation
+      - [x] Keep new weights disabled by default and replace the old empty-column density term only in the v10 runner（已完成规格复审：allowlist、EXP 子路径审计、持锁后空目录复检、固定协议、非空 checkpoint、fresh scratch/config 无破坏链路）
+      - [x] Run finite-gradient smoke, then isolated 3-epoch A/B screens（A/B 均完成固定 32 帧验证，v10-A epoch3 胜出）
+      - [x] Train only one winning candidate for 10 epochs and select checkpoint by fixed validation structure metrics（已完成，但未复现 screen 门槛；定位到训练随机种子未固定）
+      - [x] Verify two short runs with the same `training_seed` reproduce training metrics/checkpoint outputs before retraining（CSV 完全一致，checkpoint 最大张量差 `7.04e-08`）
+      - [x] Re-run one seeded 3-epoch v10-A validation gate before authorizing another 10-epoch run（固定 32 帧验证未通过，禁止直接续训 10 epoch）
+      - [x] Run a bounded seeded loss-calibration screen that weakens empty-column suppression and restores occupied-column recall（C/D 均未通过，停止直接续训）
+        - [x] Extend the guarded v10 runner with isolated C (`pos=0.03, neg=0.01`) and D (`pos=0.02, neg=0.005`) variants
+        - [x] Train seeded C/D for three epochs without changing the VAE, split, or other loss weights
+        - [x] Evaluate every C/D epoch with the identical fixed 32-frame selector
+      - [ ] Require the calibrated candidate to pass the same fixed 32-frame gate before any 500-frame evaluation
+        - [x] Revisit the optimization strategy instead of continuing one-dimensional column-weight tuning
+        - [x] Approve the epoch-wise v11 column curriculum design
+        - [ ] Review the written v11 design specification before implementation planning
+        - [ ] Implement and smoke-test the v11 curriculum only after specification review
+      - [ ] Require both quantitative and raw-LiDAR 3D basic-structure gates before CD
+    - [ ] Consider thermal edge/semantic supervision only if v8 precision/top metrics remain bottlenecked
+    - [ ] Consider IR-backbone pretraining only after the loss-aligned v8 baseline is stable
+    - [ ] Promote v7/v8 weights into default config only after the final experiment protocol is selected
   - [ ] Start CD distillation only if a future LDM task/visual quality gate passes
 
 ## Notes
+
+## 2026-07-13 Result Directory Organization Continuation
+
+- [x] Move the confirmed named result leaves into the existing VAE/LDM/comparison categories.
+- [x] Group the unnamed root-level LDM/VAE/CD/scratch artifacts into one archive leaf without deleting files.
+- [x] Preserve existing v10-D lock directories beside their owning experiment; do not relocate active lock paths.
+- [x] Update generated config/report paths, live defaults, README, AGENTS, INDEX, and legacy plotting inputs.
+- [x] Run only static/minimal post-move verification; do not train, infer, or run full evaluation.
 
 - Treat the JSONL rollout file as external data only.
 - Do not tune extrinsics from global centroid dy/dz alone.
@@ -115,6 +181,24 @@
 | 1-sample VAE smoke failed in sandbox with OpenMPI socket errors | 1 | Reran the same short smoke outside the sandbox; it passed in 0.7s training time. |
 | 32-frame lightweight VAE failed before epoch 1 because GroupNorm used 32 groups for 24/72 channels | 1 | Made normalization select the largest valid divisor without changing channel/checkpoint shapes; 10 focused tests and two-stage review passed. |
 | GroupNorm quality re-review agent hit its usage limit | 1 | Dispatched a fresh independent reviewer and completed the review without changing implementation scope. |
-| Final regression referenced missing `test_unified_cd_entrypoint.py` | 1 | Located and ran the real `test/test_cd_training_entrypoints.py`; it passed. |
+| Final regression referenced missing `test_unified_cd_entrypoint.py` | 1 | Located and ran the real `test/unit/test_cd_training_entrypoints.py`; it passed. |
 | Phase 10 combined regression hit OpenMPI socket denial in sandbox | 1 | Re-run the same short verification outside the socket-restricted sandbox. |
 | LDM structure-loss test hit the same OpenMPI sandbox socket denial | 1 | Run the focused test outside the sandbox before Task 1 review. |
+| Visualization code-quality reviewer hit usage limit | 1 | Dispatched a fresh independent reviewer; the replacement review passed. |
+| Target-aware IR smoke hit OpenMPI socket denial in sandbox | 1 | Re-ran the same 1-frame/1-step diagnostic outside the socket-restricted sandbox; it completed and wrote all reports. |
+| v8 Task 3 safety-fix subagent hit its usage limit after writing RED tests | 1 | A fresh implementation agent resumed from the existing tests; later reviews closed the symlink, direct-run, and concurrency-lock gaps. |
+| v8 final regression hit OpenMPI socket denial in sandbox | 1 | Re-ran the exact short test suite outside the socket-restricted sandbox; all 111 focused tests passed. |
+| Full v8 evaluation through `conda run` stopped without a complete report | 2 | Used the same Conda environment Python directly in one PTY session; the 500-frame metrics and 32-frame GPU ablation completed successfully. |
+| Paired-statistics helper could not import pandas | 1 | Replaced pandas with Python CSV + NumPy/SciPy; no project dependency was added. |
+| Two final read-only analysis subagents reached their usage limit | 1 | Continued from the completed CSV/report artifacts and computed the paired statistics locally. |
+| Focused unittest module import failed because `test/` is not a package | 1 | Ran the established direct test file; all 96 tests passed after the protocol update. |
+| Sandbox could not communicate with the NVIDIA driver | 1 | Ran the explicitly approved bounded GPU training/evaluation commands outside the sandbox. |
+
+## Test Directory Organization
+
+- [x] 审计 `test/AGENTS.md`、`test/README.md`、`test/result/INDEX.md` 和全部相关源码/结果目录
+- [x] 按职责移动功能脚本和 22 个回归/协议测试到分类目录
+- [x] 保持 mini-test、未知结果、锁目录、临时目录和历史叶目录不变
+- [x] 修复移动后的 Python import、Shell 引用、默认结果路径和 Git 忽略规则
+- [x] 更新 `test/README.md` 和 `test/result/INDEX.md`
+- [x] 执行整理后的最小验证，不运行训练、完整推理或全量评估

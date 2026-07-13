@@ -28,3 +28,21 @@ test/*
 test/mini-test/*
 !test/mini-test/*.sh
 !test/mini-test/*.md
+
+# 测试源码分类目录
+!test/unit/
+!test/unit/**
+!test/evaluation/
+!test/evaluation/**
+!test/diagnostics/
+!test/diagnostics/**
+!test/ablation/
+!test/ablation/**
+!test/visualization/
+!test/visualization/**
+!test/utils/
+!test/utils/**
+
+# 分类目录内的 Python 生成缓存仍不纳入 Git
+test/**/__pycache__/
+test/**/*.py[cod]

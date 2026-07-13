@@ -21,7 +21,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from diffusion_consistency_radar.cm.vae_3d import VAE3D, build_vae_from_checkpoint, resolve_checkpoint_grid_config
     from diffusion_consistency_radar.cm.unet_optimized import OptimizedUNetModel
-    from diffusion_consistency_radar.cm.multimodal_fusion import CompleteDualModalityPerceptionNet
+    from diffusion_consistency_radar.cm.multimodal_fusion import (
+        CompleteDualModalityPerceptionNet,
+        migrate_ir_gate_state_dict,
+    )
     from diffusion_consistency_radar.cm.karras_diffusion import KarrasDenoiser
     from diffusion_consistency_radar.cm.dataset_loader import (
         CalibrationProvider,
@@ -33,7 +36,7 @@ try:
 except Exception:
     from cm.vae_3d import VAE3D, build_vae_from_checkpoint, resolve_checkpoint_grid_config
     from cm.unet_optimized import OptimizedUNetModel
-    from cm.multimodal_fusion import CompleteDualModalityPerceptionNet
+    from cm.multimodal_fusion import CompleteDualModalityPerceptionNet, migrate_ir_gate_state_dict
     from cm.karras_diffusion import KarrasDenoiser
     from cm.dataset_loader import (
         CalibrationProvider,
@@ -204,6 +207,7 @@ def build_inference_model(
             attention_type="linear",
         ).to(device)
     if state_dict:
+        state_dict = migrate_ir_gate_state_dict(model, state_dict)
         if strict:
             prefix = "unet_3d." if getattr(model, "is_multimodal", False) else ""
             critical_keys = (

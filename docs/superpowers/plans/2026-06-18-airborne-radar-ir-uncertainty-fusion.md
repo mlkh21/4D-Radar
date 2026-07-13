@@ -14,10 +14,10 @@
 
 ## Test Plan
 
-- `test/test_airborne_multimodal_refactor.py` 覆盖 radar encoder shape、uncertainty head 单调性、fusion 输出和 uncertainty 返回。
-- `test/test_probabilistic_mapping_uncertainty.py` 覆盖 Doppler variance、range、odom covariance、model uncertainty、calibration confidence 对 belief/reliability 的影响。
-- `test/test_multimodal_inference_interface.py` 覆盖新旧 checkpoint 加载和缺失 multimodal meta 的 mock fallback。
-- `test/test_multimodal_cd_training_interface.py` 覆盖 CD 多模态调用接口。
+- `test/unit/test_airborne_multimodal_refactor.py` 覆盖 radar encoder shape、uncertainty head 单调性、fusion 输出和 uncertainty 返回。
+- `test/unit/test_probabilistic_mapping_uncertainty.py` 覆盖 Doppler variance、range、odom covariance、model uncertainty、calibration confidence 对 belief/reliability 的影响。
+- `test/unit/test_multimodal_inference_interface.py` 覆盖新旧 checkpoint 加载和缺失 multimodal meta 的 mock fallback。
+- `test/unit/test_multimodal_cd_training_interface.py` 覆盖 CD 多模态调用接口。
 - 编译检查覆盖 `multimodal_fusion.py`、`probabilistic_mapping.py`、`inference.py`、`streaming_map_update.py`。
 
 ## Assumptions

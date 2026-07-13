@@ -15,8 +15,8 @@
 **Files:**
 - Modify: `diffusion_consistency_radar/scripts/cd_train_optimized.py`
 - Modify: `diffusion_consistency_radar/scripts/unified_train.py`
-- Test: `test/test_multimodal_cd_training_interface.py`
-- Test: `test/test_cd_training_entrypoints.py`
+- Test: `test/unit/test_multimodal_cd_training_interface.py`
+- Test: `test/unit/test_cd_training_entrypoints.py`
 
 - [x] Route student, EMA, and teacher CD denoising through one `call_cd_denoiser()` helper.
 - [x] Preserve legacy 8-channel latent concat checkpoints.
@@ -41,7 +41,7 @@
 
 **Files:**
 - Create: `diffusion_consistency_radar/scripts/audit_dataset_protocol.py`
-- Modify: `test/test_dataset_protocol_metadata.py`
+- Modify: `test/unit/test_dataset_protocol_metadata.py`
 
 - [x] Report IR coverage, target/radar frame counts, preprocess policy presence, alignment policy, and calibration fallback status.
 - [x] Add unit coverage for audit rows.
@@ -51,7 +51,7 @@
 **Files:**
 - Modify: `diffusion_consistency_radar/cm/probabilistic_mapping.py`
 - Modify: `diffusion_consistency_radar/scripts/streaming_map_update.py`
-- Modify: `test/test_probabilistic_mapping_uncertainty.py`
+- Modify: `test/unit/test_probabilistic_mapping_uncertainty.py`
 
 - [x] Add `speed_m_s` to map config and use it to adjust sliding window, decay, and far-range reliability.
 - [x] Add `--speed_m_s` and `--odom_cov_trace` to streaming map update.

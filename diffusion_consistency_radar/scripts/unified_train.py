@@ -12,9 +12,11 @@
 import argparse
 import math
 import os
+import random
 import shutil
 import sys
 import yaml
+import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -43,7 +45,11 @@ from cm.vae_3d import (
 from cm.unet_optimized import OptimizedUNetModel, create_lightweight_unet_config
 from cm.dataset_loader import NTU4DRadLM_VoxelDataset
 from cm.karras_diffusion import KarrasDenoiser
-from cm.multimodal_fusion import CompleteDualModalityPerceptionNet, heteroscedastic_gaussian_nll
+from cm.multimodal_fusion import (
+    CompleteDualModalityPerceptionNet,
+    heteroscedastic_gaussian_nll,
+    migrate_ir_gate_state_dict,
+)
 from scripts.cd_train_optimized import ConsistencyDistillationTrainer
 
 
@@ -178,6 +184,19 @@ def deterministic_split_indices(
     return indices[:train_size], indices[train_size:]
 
 
+def seed_training_run(training_seed: int) -> torch.Generator:
+    """统一固定模型初始化、数据增强与 DataLoader shuffle 的随机状态。"""
+    seed = int(training_seed)
+    if seed < 0 or seed > 2**32 - 1:
+        raise ValueError(f"data.training_seed 必须位于 [0, 2^32-1]，当前为 {training_seed}")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return torch.Generator().manual_seed(seed)
+
+
 def micro_occupancy_metrics(
     probability: torch.Tensor,
     target: torch.Tensor,
@@ -232,6 +251,7 @@ def decoded_vertical_structure_losses(
     decoded: torch.Tensor,
     target: torch.Tensor,
     occupancy_activation: str,
+    column_mask: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> Dict[str, torch.Tensor]:
     """计算仅由目标非空 Z 列监督的可微垂直结构损失。"""
@@ -254,19 +274,34 @@ def decoded_vertical_structure_losses(
     if occupancy_activation not in {"sigmoid", "raw"}:
         raise ValueError(f"不支持 occupancy_activation={occupancy_activation!r}")
 
-    decoded_occ = decoded[:, 0].float()
+    decoded_occ_raw = decoded[:, 0].float()
     if occupancy_activation == "sigmoid":
-        decoded_occ = torch.sigmoid(decoded_occ)
+        decoded_occ = torch.sigmoid(decoded_occ_raw)
     else:
         # 兼容历史 raw occupancy/probability 语义，区间外梯度按 clamp 处理。
-        decoded_occ = decoded_occ.clamp(0.0, 1.0)
+        decoded_occ = decoded_occ_raw.clamp(0.0, 1.0)
     target_occ = target[:, 0].clamp(0.0, 1.0).float()
     valid_columns = target_occ.sum(dim=1) > 0
+    if column_mask is not None:
+        if column_mask.ndim == 5:
+            column_mask = column_mask[:, 0].bool().any(dim=1)
+        elif column_mask.ndim == 4:
+            column_mask = column_mask[:, 0].bool() if column_mask.shape[1] == 1 else column_mask.bool().any(dim=1)
+        elif column_mask.ndim != 3:
+            raise ValueError(f"column_mask 必须能规约为 [B,X,Y]，实际形状为 {tuple(column_mask.shape)}")
+        if tuple(column_mask.shape) != tuple(valid_columns.shape):
+            raise ValueError(
+                "column_mask 与 target 的 B/X/Y 必须一致，"
+                f"实际分别为 {tuple(column_mask.shape)} 和 {tuple(valid_columns.shape)}"
+            )
+        valid_columns = valid_columns & column_mask.to(valid_columns.device)
     graph_zero = decoded_occ.sum() * 0.0
 
     if not valid_columns.any():
         return {
             "height_distribution_loss": graph_zero,
+            "top_height_loss": graph_zero,
+            "top_overshoot_loss": graph_zero,
             "vertical_continuity_loss": graph_zero,
         }
 
@@ -285,6 +320,37 @@ def decoded_vertical_structure_losses(
     )
     height_distribution_loss = cdf_difference.mean(dim=1)[valid_columns].mean()
 
+    z_indices = torch.arange(
+        decoded_occ.shape[1],
+        dtype=torch.long,
+        device=decoded_occ.device,
+    ).view(1, -1, 1, 1)
+    target_top_indices = torch.where(
+        target_occ > 0.0,
+        z_indices,
+        torch.full_like(z_indices, -1),
+    ).max(dim=1, keepdim=True).values.clamp_min(0)
+    if occupancy_activation == "sigmoid":
+        top_logits = torch.gather(decoded_occ_raw, dim=1, index=target_top_indices)
+        # 对 target 顶部体素用正类 BCE，避免高处漏检在 sigmoid 饱和区梯度太弱。
+        top_height_grid = torch.nn.functional.softplus(-top_logits).squeeze(1)
+    else:
+        top_probability = torch.gather(decoded_occ, dim=1, index=target_top_indices)
+        top_height_grid = (1.0 - top_probability).squeeze(1)
+    top_height_loss = top_height_grid[valid_columns].mean()
+
+    above_target_mask = (
+        (z_indices > target_top_indices) & valid_columns.unsqueeze(1)
+    )
+    if not above_target_mask.any():
+        top_overshoot_loss = graph_zero
+    elif occupancy_activation == "sigmoid":
+        # target top 以上均为负类，直接用 logits 形式 BCE 保持极端值数值稳定。
+        top_overshoot_grid = torch.nn.functional.softplus(decoded_occ_raw)
+        top_overshoot_loss = top_overshoot_grid[above_target_mask].mean()
+    else:
+        top_overshoot_loss = decoded_occ.square()[above_target_mask].mean()
+
     if decoded_occ.shape[1] < 2:
         vertical_continuity_loss = graph_zero
     else:
@@ -301,22 +367,258 @@ def decoded_vertical_structure_losses(
 
     return {
         "height_distribution_loss": height_distribution_loss,
+        "top_height_loss": top_height_loss,
+        "top_overshoot_loss": top_overshoot_loss,
         "vertical_continuity_loss": vertical_continuity_loss,
     }
+
+
+def decoded_density_precision_loss(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    occupancy_activation: str,
+) -> torch.Tensor:
+    """惩罚背景竖列假阳性，同时尽量保留树干/树冠所在竖列。"""
+    if decoded.ndim != 5 or target.ndim != 5:
+        raise ValueError(
+            "decoded 和 target 必须是 5 维 [B,C,Z,X,Y] 张量，"
+            f"实际分别为 {decoded.ndim} 维和 {target.ndim} 维"
+        )
+    if decoded.shape[1] < 1 or target.shape[1] < 1:
+        raise ValueError("decoded 和 target 必须至少 1 个通道")
+    decoded_grid = tuple(decoded.shape[index] for index in (0, 2, 3, 4))
+    target_grid = tuple(target.shape[index] for index in (0, 2, 3, 4))
+    if decoded_grid != target_grid:
+        raise ValueError(
+            "decoded 与 target 的 B/Z/X/Y 必须一致，"
+            f"实际分别为 {decoded_grid} 和 {target_grid}"
+        )
+    if occupancy_activation not in {"sigmoid", "raw"}:
+        raise ValueError(f"不支持 occupancy_activation={occupancy_activation!r}")
+
+    decoded_occ_raw = decoded[:, 0:1].float()
+    if occupancy_activation == "sigmoid":
+        decoded_occ = torch.sigmoid(decoded_occ_raw)
+    else:
+        # raw 兼容历史 VAE 概率输出；区间外预测按概率边界裁剪。
+        decoded_occ = decoded_occ_raw.clamp(0.0, 1.0)
+    target_occ = target[:, 0:1].float().clamp(0.0, 1.0)
+    target_column_has_occ = (target_occ.sum(dim=2, keepdim=True) > 0.0).float()
+    empty_column_mask = 1.0 - target_column_has_occ
+
+    # 只对 target 完全空的 (X,Y) 竖列施加强假阳性惩罚；已有障碍物的竖列
+    # 交给高度分布/连续性损失塑形，避免过早压掉树干的 Z 向补全。
+    expanded_empty_column_mask = empty_column_mask.expand_as(decoded_occ)
+    empty_column_denominator = expanded_empty_column_mask.sum().clamp_min(1.0)
+    if occupancy_activation == "sigmoid":
+        # 对 logit 使用空类 BCE，避免高置信背景柱在 sigmoid 饱和区梯度过弱。
+        false_positive_values = torch.nn.functional.softplus(decoded_occ_raw)
+    else:
+        false_positive_values = decoded_occ.square()
+    false_positive_loss = (
+        false_positive_values * expanded_empty_column_mask
+    ).sum() / empty_column_denominator
+    return false_positive_loss
+
+
+def _validate_decoded_occupancy_inputs(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    occupancy_activation: str,
+) -> None:
+    """校验解码 occupancy 损失共享的输入布局与激活语义。"""
+    if decoded.ndim != 5 or target.ndim != 5:
+        raise ValueError(
+            "decoded 和 target 必须是 5 维 [B,C,Z,X,Y] 张量，"
+            f"实际分别为 {decoded.ndim} 维和 {target.ndim} 维"
+        )
+    if decoded.shape[1] < 1 or target.shape[1] < 1:
+        raise ValueError("decoded 和 target 必须至少 1 个通道")
+    decoded_grid = tuple(decoded.shape[index] for index in (0, 2, 3, 4))
+    target_grid = tuple(target.shape[index] for index in (0, 2, 3, 4))
+    if decoded_grid != target_grid:
+        raise ValueError(
+            "decoded 与 target 的 B/Z/X/Y 必须一致，"
+            f"实际分别为 {decoded_grid} 和 {target_grid}"
+        )
+    if occupancy_activation not in {"sigmoid", "raw"}:
+        raise ValueError(f"不支持 occupancy_activation={occupancy_activation!r}")
+
+
+def decoded_column_balanced_losses(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    occupancy_activation: str,
+    temperature: float = 1.0,
+    target_threshold: float = 0.5,
+) -> Dict[str, torch.Tensor]:
+    """按正负竖列分别平均 column-existence 二分类损失。"""
+    _validate_decoded_occupancy_inputs(decoded, target, occupancy_activation)
+    if any(size == 0 for size in decoded.shape[2:]):
+        raise ValueError(
+            f"decoded 和 target 的 Z/X/Y 必须大于 0，实际为 {tuple(decoded.shape[2:])}"
+        )
+    if decoded.device != target.device:
+        raise ValueError(
+            "decoded 与 target 的 device 必须一致，"
+            f"实际分别为 {decoded.device} 和 {target.device}"
+        )
+    if not math.isfinite(temperature) or not 1e-3 <= temperature <= 100.0:
+        raise ValueError(
+            f"temperature 必须是 [1e-3,100.0] 内的有限数，实际为 {temperature!r}"
+        )
+    if not math.isfinite(target_threshold) or not 0.0 <= target_threshold <= 1.0:
+        raise ValueError(
+            f"target_threshold 必须是 [0,1] 内的有限数，实际为 {target_threshold!r}"
+        )
+
+    # 聚合统一提升到 float32，避免低精度输入放大 logsumexp 数值误差。
+    decoded_occ = decoded[:, 0:1].float()
+    if occupancy_activation == "sigmoid":
+        voxel_logits = decoded_occ
+    else:
+        voxel_logits = torch.logit(decoded_occ.clamp(1e-6, 1.0 - 1e-6))
+
+    z_size = voxel_logits.shape[2]
+    column_logits = temperature * (
+        torch.logsumexp(voxel_logits / temperature, dim=2)
+        - math.log(z_size)
+    )
+    positive_columns = (target[:, 0:1] >= target_threshold).any(dim=2)
+    negative_columns = ~positive_columns
+    graph_zero = column_logits.sum() * 0.0
+
+    positive_loss = (
+        torch.nn.functional.softplus(-column_logits)[positive_columns].mean()
+        if positive_columns.any()
+        else graph_zero
+    )
+    negative_loss = (
+        torch.nn.functional.softplus(column_logits)[negative_columns].mean()
+        if negative_columns.any()
+        else graph_zero
+    )
+    return {
+        "positive_loss": positive_loss,
+        "negative_loss": negative_loss,
+    }
+
+
+def decoded_ir_frustum_occupancy_loss(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    occupancy_activation: str,
+    frustum_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """只在 IR 视锥内的 target 正样本上强化 occupancy 召回。"""
+    _validate_decoded_occupancy_inputs(decoded, target, occupancy_activation)
+    decoded_occ_raw = decoded[:, 0:1].float()
+    target_occ = target[:, 0:1].float().clamp(0.0, 1.0)
+    graph_zero = decoded_occ_raw.sum() * 0.0
+    if frustum_mask is None:
+        return graph_zero
+    if frustum_mask.ndim != 5:
+        raise ValueError(f"frustum_mask 必须是 [B,1,Z,X,Y]，实际为 {tuple(frustum_mask.shape)}")
+    if frustum_mask.shape[0] != target_occ.shape[0]:
+        raise ValueError(
+            "frustum_mask 的 batch 必须与 target 一致，"
+            f"实际分别为 {frustum_mask.shape[0]} 和 {target_occ.shape[0]}"
+        )
+    if frustum_mask.shape[1] != 1:
+        raise ValueError(
+            "frustum_mask 的 channel 必须为 1，"
+            f"实际为 {frustum_mask.shape[1]}"
+        )
+    if tuple(frustum_mask.shape[-3:]) != tuple(target_occ.shape[-3:]):
+        frustum_mask = torch.nn.functional.interpolate(
+            frustum_mask.float(),
+            size=target_occ.shape[-3:],
+            mode="nearest",
+        ).bool()
+    positive_mask = (target_occ > 0.0) & frustum_mask.to(target_occ.device).bool()
+    if not positive_mask.any():
+        return graph_zero
+    if occupancy_activation == "sigmoid":
+        positive_loss = torch.nn.functional.softplus(-decoded_occ_raw)
+    elif occupancy_activation == "raw":
+        decoded_occ = decoded_occ_raw.clamp(0.0, 1.0)
+        positive_loss = 1.0 - decoded_occ
+    else:
+        raise ValueError(f"不支持 occupancy_activation={occupancy_activation!r}")
+    return positive_loss[positive_mask].mean()
+
+
+def decoded_ir_frustum_negative_occupancy_loss(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    occupancy_activation: str,
+    frustum_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """只在 IR 视锥内的 target 负样本上抑制 occupancy 假阳性。"""
+    _validate_decoded_occupancy_inputs(decoded, target, occupancy_activation)
+    decoded_occ_raw = decoded[:, 0:1].float()
+    target_occ = target[:, 0:1].float().clamp(0.0, 1.0)
+    graph_zero = decoded_occ_raw.sum() * 0.0
+    if frustum_mask is None:
+        return graph_zero
+    if frustum_mask.ndim != 5:
+        raise ValueError(f"frustum_mask 必须是 [B,1,Z,X,Y]，实际为 {tuple(frustum_mask.shape)}")
+    if frustum_mask.shape[0] != target_occ.shape[0]:
+        raise ValueError(
+            "frustum_mask 的 batch 必须与 target 一致，"
+            f"实际分别为 {frustum_mask.shape[0]} 和 {target_occ.shape[0]}"
+        )
+    if frustum_mask.shape[1] != 1:
+        raise ValueError(
+            "frustum_mask 的 channel 必须为 1，"
+            f"实际为 {frustum_mask.shape[1]}"
+        )
+    if tuple(frustum_mask.shape[-3:]) != tuple(target_occ.shape[-3:]):
+        frustum_mask = torch.nn.functional.interpolate(
+            frustum_mask.float(),
+            size=target_occ.shape[-3:],
+            mode="nearest",
+        ).bool()
+    negative_mask = (target_occ == 0.0) & frustum_mask.to(target_occ.device).bool()
+    if not negative_mask.any():
+        return graph_zero
+    if occupancy_activation == "sigmoid":
+        # 直接使用负类 BCE 的 logits 形式，避免高置信假阳性处梯度饱和。
+        negative_loss = torch.nn.functional.softplus(decoded_occ_raw)
+    elif occupancy_activation == "raw":
+        decoded_occ = decoded_occ_raw.clamp(0.0, 1.0)
+        negative_loss = decoded_occ.square()
+    else:
+        raise ValueError(f"不支持 occupancy_activation={occupancy_activation!r}")
+    return negative_loss[negative_mask].mean()
 
 
 LDM_LOSS_COMPONENT_NAMES = (
     "latent_loss",
     "decoded_occupancy_loss",
     "height_distribution_loss",
+    "top_height_loss",
+    "top_overshoot_loss",
     "vertical_continuity_loss",
+    "decoded_density_loss",
+    "ir_frustum_occupancy_loss",
+    "ir_frustum_negative_loss",
+    "ir_frustum_top_height_loss",
+    "column_positive_loss",
+    "column_negative_loss",
     "uncertainty_loss",
+)
+LDM_META_COMPONENT_NAMES = (
+    "mock_ir_ratio",
+    "mock_calib_ratio",
+    "ir_frustum_voxel_ratio",
 )
 LDM_METRICS_HEADER = (
     "epoch",
     "step",
     "loss",
     *LDM_LOSS_COMPONENT_NAMES,
+    *LDM_META_COMPONENT_NAMES,
     "lr",
     "time_seconds",
 )
@@ -373,9 +675,19 @@ def compute_ldm_loss_components(
     decoded_false_positive_weight: float,
     decoded_mass_weight: float,
     decoded_height_distribution_weight: float,
+    decoded_top_height_weight: float,
     decoded_vertical_continuity_weight: float,
-    uncertainty_loss_weight: float,
-    uncertainty: Optional[Dict[str, torch.Tensor]],
+    decoded_density_weight: float,
+    decoded_top_overshoot_weight: float = 0.0,
+    decoded_ir_frustum_occupancy_weight: float = 0.0,
+    decoded_ir_frustum_negative_weight: float = 0.0,
+    decoded_ir_frustum_top_weight: float = 0.0,
+    ir_frustum_mask: Optional[torch.Tensor] = None,
+    uncertainty_loss_weight: float = 0.0,
+    uncertainty: Optional[Dict[str, torch.Tensor]] = None,
+    decoded_column_positive_weight: float = 0.0,
+    decoded_column_negative_weight: float = 0.0,
+    decoded_column_temperature: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """汇总 LDM 主损失和解码辅助监督组件，必要时只解码一次。"""
     latent_loss = torch.nn.functional.mse_loss(denoised, z_target)
@@ -384,7 +696,15 @@ def compute_ldm_loss_components(
         "latent_loss": latent_loss,
         "decoded_occupancy_loss": graph_zero,
         "height_distribution_loss": graph_zero,
+        "top_height_loss": graph_zero,
+        "top_overshoot_loss": graph_zero,
         "vertical_continuity_loss": graph_zero,
+        "decoded_density_loss": graph_zero,
+        "ir_frustum_occupancy_loss": graph_zero,
+        "ir_frustum_negative_loss": graph_zero,
+        "ir_frustum_top_height_loss": graph_zero,
+        "column_positive_loss": graph_zero,
+        "column_negative_loss": graph_zero,
         "uncertainty_loss": graph_zero,
     }
     loss = latent_loss
@@ -408,7 +728,15 @@ def compute_ldm_loss_components(
             decoded_false_positive_weight,
             decoded_mass_weight,
             decoded_height_distribution_weight,
+            decoded_top_height_weight,
+            decoded_top_overshoot_weight,
             decoded_vertical_continuity_weight,
+            decoded_density_weight,
+            decoded_ir_frustum_occupancy_weight,
+            decoded_ir_frustum_negative_weight,
+            decoded_ir_frustum_top_weight,
+            decoded_column_positive_weight,
+            decoded_column_negative_weight,
         )
     )
     if needs_decoded:
@@ -430,6 +758,8 @@ def compute_ldm_loss_components(
             loss = loss + decoded_occ_loss
         if (
             decoded_height_distribution_weight > 0.0
+            or decoded_top_height_weight > 0.0
+            or decoded_top_overshoot_weight > 0.0
             or decoded_vertical_continuity_weight > 0.0
         ):
             structure_losses = decoded_vertical_structure_losses(
@@ -438,11 +768,69 @@ def compute_ldm_loss_components(
                 occupancy_activation=occupancy_activation,
             )
             height_loss = structure_losses["height_distribution_loss"]
+            top_loss = structure_losses["top_height_loss"]
+            top_overshoot_loss = structure_losses["top_overshoot_loss"]
             continuity_loss = structure_losses["vertical_continuity_loss"]
             components["height_distribution_loss"] = height_loss
+            components["top_height_loss"] = top_loss
+            components["top_overshoot_loss"] = top_overshoot_loss
             components["vertical_continuity_loss"] = continuity_loss
             loss = loss + decoded_height_distribution_weight * height_loss
+            loss = loss + decoded_top_height_weight * top_loss
+            loss = loss + decoded_top_overshoot_weight * top_overshoot_loss
             loss = loss + decoded_vertical_continuity_weight * continuity_loss
+        if decoded_density_weight > 0.0:
+            density_loss = decoded_density_precision_loss(
+                decoded,
+                target,
+                occupancy_activation=occupancy_activation,
+            )
+            components["decoded_density_loss"] = density_loss
+            loss = loss + decoded_density_weight * density_loss
+        if decoded_ir_frustum_occupancy_weight > 0.0:
+            ir_occ_loss = decoded_ir_frustum_occupancy_loss(
+                decoded,
+                target,
+                occupancy_activation=occupancy_activation,
+                frustum_mask=ir_frustum_mask,
+            )
+            components["ir_frustum_occupancy_loss"] = ir_occ_loss
+            loss = loss + decoded_ir_frustum_occupancy_weight * ir_occ_loss
+        if decoded_ir_frustum_negative_weight > 0.0:
+            ir_negative_loss = decoded_ir_frustum_negative_occupancy_loss(
+                decoded,
+                target,
+                occupancy_activation=occupancy_activation,
+                frustum_mask=ir_frustum_mask,
+            )
+            components["ir_frustum_negative_loss"] = ir_negative_loss
+            loss = loss + decoded_ir_frustum_negative_weight * ir_negative_loss
+        if decoded_ir_frustum_top_weight > 0.0:
+            ir_structure_losses = decoded_vertical_structure_losses(
+                decoded,
+                target,
+                occupancy_activation=occupancy_activation,
+                column_mask=ir_frustum_mask,
+            )
+            ir_top_loss = ir_structure_losses["top_height_loss"]
+            components["ir_frustum_top_height_loss"] = ir_top_loss
+            loss = loss + decoded_ir_frustum_top_weight * ir_top_loss
+        if (
+            decoded_column_positive_weight > 0.0
+            or decoded_column_negative_weight > 0.0
+        ):
+            column_losses = decoded_column_balanced_losses(
+                decoded,
+                target,
+                occupancy_activation=occupancy_activation,
+                temperature=decoded_column_temperature,
+            )
+            column_positive_loss = column_losses["positive_loss"]
+            column_negative_loss = column_losses["negative_loss"]
+            components["column_positive_loss"] = column_positive_loss
+            components["column_negative_loss"] = column_negative_loss
+            loss = loss + decoded_column_positive_weight * column_positive_loss
+            loss = loss + decoded_column_negative_weight * column_negative_loss
 
     return loss, components
 
@@ -1089,7 +1477,30 @@ class OptimizedLDMTrainer:
         self.decoded_false_positive_weight = float(ldm_config.get('decoded_false_positive_weight', 0.0))
         self.decoded_mass_weight = float(ldm_config.get('decoded_mass_weight', 0.0))
         self.decoded_height_distribution_weight = float(ldm_config.get('decoded_height_distribution_weight', 0.0))
+        self.decoded_top_height_weight = float(ldm_config.get('decoded_top_height_weight', 0.0))
+        self.decoded_top_overshoot_weight = float(ldm_config.get('decoded_top_overshoot_weight', 0.0))
         self.decoded_vertical_continuity_weight = float(ldm_config.get('decoded_vertical_continuity_weight', 0.0))
+        self.decoded_density_weight = float(ldm_config.get('decoded_density_weight', 0.0))
+        self.decoded_ir_frustum_occupancy_weight = float(ldm_config.get('decoded_ir_frustum_occupancy_weight', 0.0))
+        self.decoded_ir_frustum_negative_weight = float(ldm_config.get('decoded_ir_frustum_negative_weight', 0.0))
+        self.decoded_ir_frustum_top_weight = float(ldm_config.get('decoded_ir_frustum_top_weight', 0.0))
+        self.decoded_column_positive_weight = float(ldm_config.get('decoded_column_positive_weight', 0.0))
+        self.decoded_column_negative_weight = float(ldm_config.get('decoded_column_negative_weight', 0.0))
+        self.decoded_column_temperature = float(ldm_config.get('decoded_column_temperature', 1.0))
+        for name, weight in (
+            ("decoded_column_positive_weight", self.decoded_column_positive_weight),
+            ("decoded_column_negative_weight", self.decoded_column_negative_weight),
+        ):
+            if not math.isfinite(weight) or weight < 0.0:
+                raise ValueError(f"{name} 必须是有限非负数，实际为 {weight!r}")
+        if (
+            not math.isfinite(self.decoded_column_temperature)
+            or not 1e-3 <= self.decoded_column_temperature <= 100.0
+        ):
+            raise ValueError(
+                "decoded_column_temperature 必须是 [1e-3,100.0] 内的有限数，"
+                f"实际为 {self.decoded_column_temperature!r}"
+            )
         self.occupancy_activation = getattr(
             self.vae,
             "occupancy_activation",
@@ -1127,7 +1538,16 @@ class OptimizedLDMTrainer:
             "decoded_false_positive_weight": self.decoded_false_positive_weight,
             "decoded_mass_weight": self.decoded_mass_weight,
             "decoded_height_distribution_weight": self.decoded_height_distribution_weight,
+            "decoded_top_height_weight": self.decoded_top_height_weight,
+            "decoded_top_overshoot_weight": self.decoded_top_overshoot_weight,
             "decoded_vertical_continuity_weight": self.decoded_vertical_continuity_weight,
+            "decoded_density_weight": self.decoded_density_weight,
+            "decoded_ir_frustum_occupancy_weight": self.decoded_ir_frustum_occupancy_weight,
+            "decoded_ir_frustum_negative_weight": self.decoded_ir_frustum_negative_weight,
+            "decoded_ir_frustum_top_weight": self.decoded_ir_frustum_top_weight,
+            "decoded_column_positive_weight": self.decoded_column_positive_weight,
+            "decoded_column_negative_weight": self.decoded_column_negative_weight,
+            "decoded_column_temperature": self.decoded_column_temperature,
             "uncertainty_loss_weight": self.uncertainty_loss_weight,
         }
     
@@ -1162,7 +1582,7 @@ class OptimizedLDMTrainer:
         print(f"Resuming LDM from checkpoint: {ckpt_path}")
         ckpt = safe_torch_load(ckpt_path, map_location=self.device)
         
-        self.model.load_state_dict(ckpt['model_state_dict'])
+        self.model.load_state_dict(migrate_ir_gate_state_dict(self.model, ckpt['model_state_dict']))
         if 'optimizer_state_dict' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         
@@ -1175,6 +1595,7 @@ class OptimizedLDMTrainer:
     def _log_metrics(self, epoch: int, step: int, loss: float, epoch_time: float):
         """记录指标到 CSV 文件"""
         components = getattr(self, "last_epoch_loss_components", {})
+        meta_components = getattr(self, "last_epoch_meta_components", {})
         with open(self.csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -1185,6 +1606,10 @@ class OptimizedLDMTrainer:
                     f'{float(components.get(name, 0.0)):.6f}'
                     for name in LDM_LOSS_COMPONENT_NAMES
                 ],
+                *[
+                    f'{float(meta_components.get(name, 0.0)):.6f}'
+                    for name in LDM_META_COMPONENT_NAMES
+                ],
                 f'{self.optimizer.param_groups[0]["lr"]:.8f}',
                 f'{epoch_time:.2f}'
             ])
@@ -1194,6 +1619,7 @@ class OptimizedLDMTrainer:
         self.model.train()
         total_loss = 0
         total_components = {name: 0.0 for name in LDM_LOSS_COMPONENT_NAMES}
+        total_meta = {name: 0.0 for name in LDM_META_COMPONENT_NAMES}
         accumulation_count = 0
         
         # 创建进度条
@@ -1204,6 +1630,10 @@ class OptimizedLDMTrainer:
             target = target.to(self.device)
             cond = cond.to(self.device)
             meta_dict = move_meta_to_device(meta_dict, self.device)
+            if "is_mock_ir" in meta_dict:
+                total_meta["mock_ir_ratio"] += float(torch.as_tensor(meta_dict["is_mock_ir"]).float().mean().item())
+            if "is_mock_calib" in meta_dict:
+                total_meta["mock_calib_ratio"] += float(torch.as_tensor(meta_dict["is_mock_calib"]).float().mean().item())
             
             # 编码到潜空间
             with torch.no_grad():
@@ -1244,10 +1674,14 @@ class OptimizedLDMTrainer:
                         denoised, uncertainty = model_out
                     else:
                         denoised, uncertainty = model_out, None
+                    ir_frustum_mask = getattr(self.model, "last_ir_frustum_mask", None)
+                    if ir_frustum_mask is not None:
+                        total_meta["ir_frustum_voxel_ratio"] += float(ir_frustum_mask.float().mean().item())
                 else:
                     # Legacy batches without IR metadata still train the same 16-channel UNet backbone.
                     model_input = pad_ldm_input_to_sixteen_channels(torch.cat([noised_z, z_cond], dim=1))
                     denoised = self.model.unet_3d(model_input, sigmas)
+                    ir_frustum_mask = None
                 loss, loss_components = compute_ldm_loss_components(
                     denoised,
                     z_target,
@@ -1258,9 +1692,19 @@ class OptimizedLDMTrainer:
                     decoded_false_positive_weight=self.decoded_false_positive_weight,
                     decoded_mass_weight=self.decoded_mass_weight,
                     decoded_height_distribution_weight=self.decoded_height_distribution_weight,
+                    decoded_top_height_weight=self.decoded_top_height_weight,
+                    decoded_top_overshoot_weight=self.decoded_top_overshoot_weight,
                     decoded_vertical_continuity_weight=self.decoded_vertical_continuity_weight,
+                    decoded_density_weight=self.decoded_density_weight,
+                    decoded_ir_frustum_occupancy_weight=self.decoded_ir_frustum_occupancy_weight,
+                    decoded_ir_frustum_negative_weight=self.decoded_ir_frustum_negative_weight,
+                    decoded_ir_frustum_top_weight=self.decoded_ir_frustum_top_weight,
+                    ir_frustum_mask=ir_frustum_mask,
                     uncertainty_loss_weight=self.uncertainty_loss_weight,
                     uncertainty=uncertainty,
+                    decoded_column_positive_weight=self.decoded_column_positive_weight,
+                    decoded_column_negative_weight=self.decoded_column_negative_weight,
+                    decoded_column_temperature=self.decoded_column_temperature,
                 )
                 scaled_loss = loss / self.memory_opt.grad_accum_steps
             
@@ -1295,7 +1739,13 @@ class OptimizedLDMTrainer:
                 'loss': f'{batch_loss:.4f}',
                 'latent': f'{loss_components["latent_loss"].detach().item():.4f}',
                 'height': f'{loss_components["height_distribution_loss"].detach().item():.4f}',
+                'top': f'{loss_components["top_height_loss"].detach().item():.4f}',
+                'ir_top': f'{loss_components["ir_frustum_top_height_loss"].detach().item():.4f}',
+                'ir_neg': f'{loss_components["ir_frustum_negative_loss"].detach().item():.4f}',
                 'cont': f'{loss_components["vertical_continuity_loss"].detach().item():.4f}',
+                'dens': f'{loss_components["decoded_density_loss"].detach().item():.4f}',
+                'col_pos': f'{loss_components["column_positive_loss"].detach().item():.4f}',
+                'col_neg': f'{loss_components["column_negative_loss"].detach().item():.4f}',
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
             })
         
@@ -1320,6 +1770,22 @@ class OptimizedLDMTrainer:
             name: total_components[name] / len(train_loader)
             for name in LDM_LOSS_COMPONENT_NAMES
         }
+        self.last_epoch_meta_components = {
+            name: total_meta[name] / len(train_loader)
+            for name in LDM_META_COMPONENT_NAMES
+        }
+        if self.last_epoch_meta_components["mock_ir_ratio"] > 0.5:
+            self.logger.warning(
+                "LDM epoch %s mock IR ratio is %.3f; 当前结果不能作为真实红外融合收益。",
+                epoch,
+                self.last_epoch_meta_components["mock_ir_ratio"],
+            )
+        if self.last_epoch_meta_components["mock_calib_ratio"] > 0.5:
+            self.logger.warning(
+                "LDM epoch %s mock calib ratio is %.3f; IR 投影几何可信度较低。",
+                epoch,
+                self.last_epoch_meta_components["mock_calib_ratio"],
+            )
         return total_loss / len(train_loader)
     
     def train(self, train_loader: DataLoader):
@@ -1426,10 +1892,12 @@ def main():
     
     # 加载配置
     config = ConfigManager(args.config)
-    memory_opt = MemoryOptimizer(config)
-    
-    # 创建数据加载器
     data_config = config.get('data', {})
+    training_seed = int(data_config.get("training_seed", data_config.get("split_seed", 42)))
+    train_loader_generator = seed_training_run(training_seed)
+    memory_opt = MemoryOptimizer(config)
+
+    # 创建数据加载器
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
     align_ldm_grid_config(config, target_size, model_pc_range)
     train_dataset_base = NTU4DRadLM_VoxelDataset(
@@ -1463,6 +1931,7 @@ def main():
         shuffle=True,
         num_workers=data_config.get('num_workers', 4),
         pin_memory=False,
+        generator=train_loader_generator,
     )
     val_loader = DataLoader(
         val_dataset,

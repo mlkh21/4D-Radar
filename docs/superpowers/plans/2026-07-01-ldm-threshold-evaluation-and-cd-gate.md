@@ -23,7 +23,7 @@
 **Files:**
 - Modify: `diffusion_consistency_radar/scripts/sweep_occ_threshold.py:20-42`
 - Modify: `diffusion_consistency_radar/scripts/sweep_occ_threshold.py:111-129`
-- Test: `test/test_occ_threshold_grid_protocol.py`
+- Test: `test/unit/test_occ_threshold_grid_protocol.py`
 
 - [x] **Step 1: 写出物理裁剪失败测试**
 
@@ -64,7 +64,7 @@ class OccupancyThresholdGridProtocolTest(unittest.TestCase):
 Run:
 
 ```bash
-conda run -n Radar-Diffusion python test/test_occ_threshold_grid_protocol.py -v
+conda run -n Radar-Diffusion python test/unit/test_occ_threshold_grid_protocol.py -v
 ```
 
 Expected: FAIL，提示 `load_target_occ_resized()` 不接受新增网格参数。
@@ -96,7 +96,7 @@ parser.add_argument("--target_size", type=int, nargs=3, default=[32, 128, 128])
 - [x] **Step 4: 运行聚焦测试**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_occ_threshold_grid_protocol.py -v
+conda run -n Radar-Diffusion python test/unit/test_occ_threshold_grid_protocol.py -v
 conda run -n Radar-Diffusion python -m py_compile diffusion_consistency_radar/scripts/sweep_occ_threshold.py
 ```
 
@@ -105,7 +105,7 @@ Expected: 测试 PASS，编译无输出。
 - [ ] **Step 5: 提交**
 
 ```bash
-git add diffusion_consistency_radar/scripts/sweep_occ_threshold.py test/test_occ_threshold_grid_protocol.py
+git add diffusion_consistency_radar/scripts/sweep_occ_threshold.py test/unit/test_occ_threshold_grid_protocol.py
 git commit -m "fix: align occupancy threshold sweep grids"
 ```
 
@@ -114,7 +114,7 @@ git commit -m "fix: align occupancy threshold sweep grids"
 **Files:**
 - Modify: `diffusion_consistency_radar/scripts/sweep_occ_threshold.py:45-108`
 - Modify: `diffusion_consistency_radar/scripts/sweep_occ_threshold.py:131-257`
-- Test: `test/test_occ_threshold_grid_protocol.py`
+- Test: `test/unit/test_occ_threshold_grid_protocol.py`
 
 - [x] **Step 1: 写出固定划分与任务指标选择测试**
 
@@ -145,7 +145,7 @@ def test_task_bev_f1_is_primary_selection_metric(self):
 - [x] **Step 2: 运行测试并确认 RED**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_occ_threshold_grid_protocol.py -v
+conda run -n Radar-Diffusion python test/unit/test_occ_threshold_grid_protocol.py -v
 ```
 
 Expected: FAIL，提示两个选择函数尚不存在。
@@ -200,8 +200,8 @@ CSV/JSON 同时保留严格 voxel F1，明确标注它是辅助诊断，不作�
 - [x] **Step 5: 运行测试与既有指标回归**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_occ_threshold_grid_protocol.py -v
-conda run -n Radar-Diffusion python test/test_formal_task_metrics.py -v
+conda run -n Radar-Diffusion python test/unit/test_occ_threshold_grid_protocol.py -v
+conda run -n Radar-Diffusion python test/unit/test_formal_task_metrics.py -v
 ```
 
 Expected: 两组测试全部 PASS。
@@ -209,15 +209,15 @@ Expected: 两组测试全部 PASS。
 - [ ] **Step 6: 提交**
 
 ```bash
-git add diffusion_consistency_radar/scripts/sweep_occ_threshold.py test/test_occ_threshold_grid_protocol.py
+git add diffusion_consistency_radar/scripts/sweep_occ_threshold.py test/unit/test_occ_threshold_grid_protocol.py
 git commit -m "feat: calibrate occupancy threshold on validation task metrics"
 ```
 
 ### Task 3: 用已保存的 500 帧输出重新扫描
 
 **Files:**
-- Generate: `test/result/ldm_near40_500_v2/loop3_ldm_eval/occ_sweep_validation_metrics.csv`
-- Generate: `test/result/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json`
+- Generate: `test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval/occ_sweep_validation_metrics.csv`
+- Generate: `test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json`
 - Modify: `TODO/findings.md`
 - Modify: `TODO/progress.md`
 
@@ -225,7 +225,7 @@ git commit -m "feat: calibrate occupancy threshold on validation task metrics"
 
 ```bash
 conda run -n Radar-Diffusion python diffusion_consistency_radar/scripts/sweep_occ_threshold.py \
-  --pred_voxel_dir test/result/ldm_near40_500_v2/loop3_ldm_eval \
+  --pred_voxel_dir test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval \
   --target_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware/loop3/target_voxel \
   --thresholds 0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9 \
   --source_pc_range 0 -20 -6 120 20 10 \
@@ -237,8 +237,8 @@ conda run -n Radar-Diffusion python diffusion_consistency_radar/scripts/sweep_oc
   --range_bins 0-20,20-40 \
   --z_min -1 \
   --selection_metric task_bev_f1 \
-  --output_csv test/result/ldm_near40_500_v2/loop3_ldm_eval/occ_sweep_validation_metrics.csv \
-  --output_json test/result/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json
+  --output_csv test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval/occ_sweep_validation_metrics.csv \
+  --output_json test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json
 ```
 
 Expected: 只读取已有 `*_voxel.npy`；处理 100 个 validation frame；JSON 中记录 `evaluation_split=validation`、`model_pc_range` 终点为 `40`。
@@ -246,7 +246,7 @@ Expected: 只读取已有 `*_voxel.npy`；处理 100 个 validation frame；JSON
 - [x] **Step 2: 检查新推荐值的有效性**
 
 ```bash
-conda run -n Radar-Diffusion python -c "import json; p='test/result/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json'; d=json.load(open(p)); print(d['recommended_threshold']); print(d['metrics'][str(d['recommended_threshold'])])"
+conda run -n Radar-Diffusion python -c "import json; p='test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json'; d=json.load(open(p)); print(d['recommended_threshold']); print(d['metrics'][str(d['recommended_threshold'])])"
 ```
 
 Expected:
@@ -258,9 +258,9 @@ Expected:
 - [x] **Step 3: 固定阈值做一次正式复评**
 
 ```bash
-VALIDATED_THRESHOLD=$(python3 -c "import json; p='test/result/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json'; print(json.load(open(p))['recommended_threshold'])")
-MINI_RESULTS_DIR=test/result/vae_near40_500_v2 \
-MINI_INFERENCE_RESULTS_DIR=test/result/ldm_near40_500_v2_threshold_validated \
+VALIDATED_THRESHOLD=$(python3 -c "import json; p='test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json'; print(json.load(open(p))['recommended_threshold'])")
+MINI_RESULTS_DIR=test/result/vae/reconstruction/vae_near40_500_v2 \
+MINI_INFERENCE_RESULTS_DIR=test/result/ldm/evaluation/ldm_near40_500_v2_threshold_validated \
 MAX_INFER_FILES=500 \
 OCC_THRESHOLD="${VALIDATED_THRESHOLD}" \
 bash test/mini-test/inference_minimal.sh ldm
@@ -301,7 +301,7 @@ mean_pred_target_chamfer < mean_radar_target_chamfer
 ```bash
 SAMPLES_PER_SCENE=500 \
 MINI_CD_EPOCHS=20 \
-MINI_RESULTS_DIR=test/result/vae_near40_500_v2 \
+MINI_RESULTS_DIR=test/result/vae/reconstruction/vae_near40_500_v2 \
 bash test/mini-test/train_minimal.sh cd
 ```
 
@@ -310,9 +310,9 @@ Expected: 使用同目录 VAE/LDM checkpoint 生成 `cd/cd_best.pt`。该长训�
 - [ ] **Step 3: 分别评估 CD 1-step 与 4-step（BLOCKED by gate）**
 
 ```bash
-VALIDATED_THRESHOLD=$(python3 -c "import json; p='test/result/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json'; print(json.load(open(p))['recommended_threshold'])")
-MINI_RESULTS_DIR=test/result/vae_near40_500_v2 \
-MINI_INFERENCE_RESULTS_DIR=test/result/cd_near40_500_v2_1step \
+VALIDATED_THRESHOLD=$(python3 -c "import json; p='test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json'; print(json.load(open(p))['recommended_threshold'])")
+MINI_RESULTS_DIR=test/result/vae/reconstruction/vae_near40_500_v2 \
+MINI_INFERENCE_RESULTS_DIR=test/result/ldm/evaluation/ldm_near40_500_v2_threshold_validated/cd_1step \
 MAX_INFER_FILES=500 \
 OCC_THRESHOLD="${VALIDATED_THRESHOLD}" \
 STEPS=1 \
@@ -321,9 +321,9 @@ bash test/mini-test/inference_minimal.sh cd
 ```
 
 ```bash
-VALIDATED_THRESHOLD=$(python3 -c "import json; p='test/result/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json'; print(json.load(open(p))['recommended_threshold'])")
-MINI_RESULTS_DIR=test/result/vae_near40_500_v2 \
-MINI_INFERENCE_RESULTS_DIR=test/result/cd_near40_500_v2_4step \
+VALIDATED_THRESHOLD=$(python3 -c "import json; p='test/result/ldm/evaluation/ldm_near40_500_v2/loop3_ldm_eval/occ_threshold_validation_recommendation.json'; print(json.load(open(p))['recommended_threshold'])")
+MINI_RESULTS_DIR=test/result/vae/reconstruction/vae_near40_500_v2 \
+MINI_INFERENCE_RESULTS_DIR=test/result/ldm/evaluation/ldm_near40_500_v2_threshold_validated/cd_4step \
 MAX_INFER_FILES=500 \
 OCC_THRESHOLD="${VALIDATED_THRESHOLD}" \
 STEPS=4 \
@@ -336,9 +336,9 @@ Expected: 1-step 作为实时版本，4-step 作为质量版本；两者使用�
 - [x] **Step 4: 最终回归检查**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_occ_threshold_grid_protocol.py -v
-conda run -n Radar-Diffusion python test/test_formal_task_metrics.py -v
-conda run -n Radar-Diffusion python test/test_multimodal_inference_interface.py -v
+conda run -n Radar-Diffusion python test/unit/test_occ_threshold_grid_protocol.py -v
+conda run -n Radar-Diffusion python test/unit/test_formal_task_metrics.py -v
+conda run -n Radar-Diffusion python test/unit/test_multimodal_inference_interface.py -v
 conda run -n Radar-Diffusion python -m py_compile \
   diffusion_consistency_radar/scripts/sweep_occ_threshold.py \
   diffusion_consistency_radar/scripts/inference.py

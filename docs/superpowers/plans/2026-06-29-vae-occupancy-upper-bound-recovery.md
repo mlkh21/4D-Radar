@@ -28,16 +28,16 @@
 - 修改 `diffusion_consistency_radar/scripts/diagnose_vae_reconstruction.py`：从 checkpoint 自动恢复 VAE 配置，统一对 occupancy logits 做 sigmoid，并输出分距离指标。
 - 修改 `diffusion_consistency_radar/scripts/inference.py`：从 checkpoint 恢复 VAE 配置，避免固定创建 ultra-lightweight 模型。
 - 修改 `test/mini-test/train_minimal.sh`：增加 VAE 架构、epoch、验证划分和损失参数的环境变量。
-- 新建 `test/test_vae_sparse_occupancy_loss.py`：验证 BCE+Dice、稀疏梯度和激活协议。
-- 扩展 `test/test_vae_reconstruction_diagnostic.py`：验证 checkpoint 配置恢复和分距离汇总。
+- 新建 `test/unit/test_vae_sparse_occupancy_loss.py`：验证 BCE+Dice、稀疏梯度和激活协议。
+- 扩展 `test/unit/test_vae_reconstruction_diagnostic.py`：验证 checkpoint 配置恢复和分距离汇总。
 
 ### Task 1: 统一 occupancy 输出与诊断口径
 
 **Files:**
 - Modify: `diffusion_consistency_radar/cm/vae_3d.py`
 - Modify: `diffusion_consistency_radar/scripts/diagnose_vae_reconstruction.py`
-- Test: `test/test_vae_sparse_occupancy_loss.py`
-- Test: `test/test_vae_reconstruction_diagnostic.py`
+- Test: `test/unit/test_vae_sparse_occupancy_loss.py`
+- Test: `test/unit/test_vae_reconstruction_diagnostic.py`
 
 - [ ] **Step 1: 写失败测试，固定 occupancy 通道语义**
 
@@ -54,7 +54,7 @@ torch.testing.assert_close(prob, torch.sigmoid(logits))
 - [ ] **Step 2: 运行测试并确认失败**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_vae_sparse_occupancy_loss.py -v
+conda run -n Radar-Diffusion python test/unit/test_vae_sparse_occupancy_loss.py -v
 ```
 
 预期：因 `occupancy_probability()` 尚不存在而失败。
@@ -91,8 +91,8 @@ recon_occ_score = model.occupancy_probability(recon[:, 0]).detach().cpu().numpy(
 - [ ] **Step 5: 运行测试**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_vae_sparse_occupancy_loss.py -v
-conda run -n Radar-Diffusion python test/test_vae_reconstruction_diagnostic.py -v
+conda run -n Radar-Diffusion python test/unit/test_vae_sparse_occupancy_loss.py -v
+conda run -n Radar-Diffusion python test/unit/test_vae_reconstruction_diagnostic.py -v
 ```
 
 预期：全部通过。
@@ -102,7 +102,7 @@ conda run -n Radar-Diffusion python test/test_vae_reconstruction_diagnostic.py -
 **Files:**
 - Modify: `diffusion_consistency_radar/cm/vae_3d.py`
 - Modify: `diffusion_consistency_radar/scripts/unified_train.py`
-- Test: `test/test_vae_sparse_occupancy_loss.py`
+- Test: `test/unit/test_vae_sparse_occupancy_loss.py`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -162,7 +162,7 @@ occ_bce_loss,occ_dice_loss,continuous_loss,val_iou,val_recall,val_precision
 - [ ] **Step 4: 运行单元测试和编译检查**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_vae_sparse_occupancy_loss.py -v
+conda run -n Radar-Diffusion python test/unit/test_vae_sparse_occupancy_loss.py -v
 conda run -n Radar-Diffusion python -m py_compile \
   diffusion_consistency_radar/cm/vae_3d.py \
   diffusion_consistency_radar/scripts/unified_train.py
@@ -176,7 +176,7 @@ conda run -n Radar-Diffusion python -m py_compile \
 - Modify: `diffusion_consistency_radar/scripts/unified_train.py`
 - Modify: `diffusion_consistency_radar/scripts/diagnose_vae_reconstruction.py`
 - Modify: `diffusion_consistency_radar/scripts/inference.py`
-- Test: `test/test_vae_reconstruction_diagnostic.py`
+- Test: `test/unit/test_vae_reconstruction_diagnostic.py`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -222,8 +222,8 @@ LDM/CD 默认使用 `vae_best_iou.pt`。每个 checkpoint 写入 `vae_config`、
 - [ ] **Step 5: 运行测试**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_vae_reconstruction_diagnostic.py -v
-conda run -n Radar-Diffusion python test/test_multimodal_inference_interface.py
+conda run -n Radar-Diffusion python test/unit/test_vae_reconstruction_diagnostic.py -v
+conda run -n Radar-Diffusion python test/unit/test_multimodal_inference_interface.py
 ```
 
 预期：新旧 checkpoint 路径均通过。
@@ -232,7 +232,7 @@ conda run -n Radar-Diffusion python test/test_multimodal_inference_interface.py
 
 **Files:**
 - Modify: `test/mini-test/train_minimal.sh`
-- Output: `test/result/vae_overfit_32/`
+- Output: `test/result/vae/overfit/vae_overfit_32/`
 
 - [ ] **Step 1: 暴露 mini VAE 配置**
 
@@ -255,7 +255,7 @@ TRAIN_SCENES_OVERRIDE=loop3 \
 MINI_VAE_EPOCHS=100 \
 MINI_VAE_CONFIG_TYPE=lightweight \
 MINI_VAE_LATENT_DIM=8 \
-MINI_RESULTS_DIR=test/result/vae_overfit_32 \
+MINI_RESULTS_DIR=test/result/vae/overfit/vae_overfit_32 \
 bash test/mini-test/train_minimal.sh vae
 ```
 
@@ -265,9 +265,9 @@ bash test/mini-test/train_minimal.sh vae
 
 ```bash
 conda run -n Radar-Diffusion python diffusion_consistency_radar/scripts/diagnose_vae_reconstruction.py \
-  --vae_ckpt test/result/vae_overfit_32/vae/vae_best_iou.pt \
+  --vae_ckpt test/result/vae/overfit/vae_overfit_32/vae/vae_best_iou.pt \
   --target_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware/loop3/target_voxel \
-  --output_dir test/result/vae_overfit_32_diagnostic \
+  --output_dir test/result/vae/overfit/vae_overfit_32_diagnostic \
   --max_files 32 \
   --target_size 32,128,128 \
   --source_pc_range 0,-20,-6,120,20,10 \
@@ -288,7 +288,7 @@ conda run -n Radar-Diffusion python diffusion_consistency_radar/scripts/diagnose
 
 **Files:**
 - Modify: `test/mini-test/train_minimal.sh`
-- Output: `test/result/vae_ablation/`
+- Output: `test/result/vae/reconstruction/vae_ablation/`
 
 - [ ] **Step 1: 固定数据、损失、epoch**
 
@@ -311,7 +311,7 @@ for spec in ultra_lightweight:4 lightweight:8 lightweight:16; do
   MINI_VAE_EPOCHS=100 \
   MINI_VAE_CONFIG_TYPE="$vae_type" \
   MINI_VAE_LATENT_DIM="$latent_dim" \
-  MINI_RESULTS_DIR="test/result/vae_ablation/${vae_type}_z${latent_dim}" \
+  MINI_RESULTS_DIR="test/result/vae/reconstruction/vae_ablation/${vae_type}_z${latent_dim}" \
   bash test/mini-test/train_minimal.sh vae
 done
 ```
@@ -330,7 +330,7 @@ done
 ### Task 6: 500 帧训练/验证并决定是否解锁 LDM/CD
 
 **Files:**
-- Output: `test/result/vae_near40_500_v2/`
+- Output: `test/result/vae/reconstruction/vae_near40_500_v2/`
 - Update: `TODO/findings.md`
 - Update: `TODO/progress.md`
 - Update: `TODO/task_plan.md`
@@ -345,7 +345,7 @@ TRAIN_SCENES_OVERRIDE=loop3 \
 MINI_VAE_EPOCHS=50 \
 MINI_VAE_CONFIG_TYPE=lightweight \
 MINI_VAE_LATENT_DIM=8 \
-MINI_RESULTS_DIR=test/result/vae_near40_500_v2 \
+MINI_RESULTS_DIR=test/result/vae/reconstruction/vae_near40_500_v2 \
 bash test/mini-test/train_minimal.sh vae
 ```
 
@@ -353,9 +353,9 @@ bash test/mini-test/train_minimal.sh vae
 
 ```bash
 conda run -n Radar-Diffusion python diffusion_consistency_radar/scripts/diagnose_vae_reconstruction.py \
-  --vae_ckpt test/result/vae_near40_500_v2/vae/vae_best_iou.pt \
+  --vae_ckpt test/result/vae/reconstruction/vae_near40_500_v2/vae/vae_best_iou.pt \
   --target_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware/loop3/target_voxel \
-  --output_dir test/result/vae_near40_500_v2_diagnostic \
+  --output_dir test/result/vae/diagnostics/vae_near40_500_v2_diagnostic \
   --max_files 500 \
   --target_size 32,128,128 \
   --source_pc_range 0,-20,-6,120,20,10 \
@@ -376,10 +376,10 @@ conda run -n Radar-Diffusion python diffusion_consistency_radar/scripts/diagnose
 - [ ] **Step 4: 回归测试**
 
 ```bash
-conda run -n Radar-Diffusion python test/test_vae_sparse_occupancy_loss.py -v
-conda run -n Radar-Diffusion python test/test_vae_reconstruction_diagnostic.py -v
-conda run -n Radar-Diffusion python test/test_dataset_protocol_metadata.py -v
-conda run -n Radar-Diffusion python test/test_multimodal_inference_interface.py
+conda run -n Radar-Diffusion python test/unit/test_vae_sparse_occupancy_loss.py -v
+conda run -n Radar-Diffusion python test/unit/test_vae_reconstruction_diagnostic.py -v
+conda run -n Radar-Diffusion python test/unit/test_dataset_protocol_metadata.py -v
+conda run -n Radar-Diffusion python test/unit/test_multimodal_inference_interface.py
 conda run -n Radar-Diffusion python -m py_compile \
   diffusion_consistency_radar/cm/vae_3d.py \
   diffusion_consistency_radar/scripts/unified_train.py \
@@ -397,4 +397,3 @@ bash -n test/mini-test/train_minimal.sh
 - 不同时提高体素分辨率、模型容量、latent_dim 和损失权重：无法判断哪项真正有效。
 - 不用训练集最优阈值汇报正式性能：阈值必须由验证集确定。
 - 不把 mock IR 加入本轮 VAE 修复：VAE 当前只重建 target，先解决单模态上界。
-
