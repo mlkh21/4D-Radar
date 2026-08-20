@@ -1115,6 +1115,138 @@ far too small to explain the previous screen/full metric divergence.
   `docs/superpowers/specs/2026-07-13-ldm-column-curriculum-design.md`. A selective documentation
   commit was not created because the existing Git index already contains many unrelated staged
   test-file moves; committing would have exceeded the intended scope.
+- The implementation plan keeps the curriculum calculation as a pure function, computes effective
+  weights once per epoch, and records effective weights separately from raw positive/negative loss
+  components. This avoids changing the existing loss math or decoding frequency.
+- `test/AGENTS.md` prefers extending an existing script for parameter variants, so v11 will extend
+  the guarded column experiment runner rather than copy it into another near-duplicate script.
+
+## 2026-07-13 v11 Curriculum Task 1
+
+- Added a pure `column_curriculum_weights()` helper with no trainer side effects. It implements the
+  approved epoch-linear interpolation and returns the historical final weights when disabled.
+- The helper strictly validates integer epoch bounds, a real boolean enable flag, and finite
+  non-negative start/final weights. Boolean weight values are explicitly rejected before Python can
+  coerce them to `1.0/0.0`.
+- The exact three-epoch curve is `0.03/0.00`, `0.025/0.005`, `0.02/0.01`; a one-epoch enabled run
+  uses the start weights.
+- This task changes no effective training supervision yet because the trainer is not connected. It
+  does not alter target voxels, occupied-voxel counts, Z64 tensor dimensions, model parameters,
+  checkpoint format, or inference behavior.
+
+## 2026-07-13 v11 Curriculum Task 2
+
+- `OptimizedLDMTrainer` now computes the positive/negative column-loss weights once per epoch and
+  forwards those effective values to the existing loss function; the underlying column loss math
+  and decode frequency are unchanged.
+- The curriculum remains opt-in. When disabled, the effective values exactly equal the historical
+  fixed final weights, preserving old configurations and training behavior.
+- Epoch metrics now record both effective weights, and best/periodic checkpoints persist the full
+  schedule plus the effective epoch values. This makes resumed or audited runs self-describing.
+- This changes only the timing and auditability of LDM supervision. Target voxels, occupied-voxel
+  counts, Z64 geometry, VAE/network shapes, inference inputs, and evaluation thresholds are not
+  modified.
+
+## 2026-07-13 v11 Curriculum Task 3
+
+- The existing guarded v10 column experiment runner now also provides a `V11` variant; no duplicate
+  experiment script was introduced. V11 fixes the three-epoch schedule to positive `0.03 -> 0.02`
+  and negative `0.00 -> 0.01`.
+- Historical A-D variants explicitly disable the curriculum and use start weights equal to their
+  final weights, so their supervision remains fixed and reproducible.
+- The mini config generator strictly parses the curriculum enable flag and emits all three new YAML
+  keys. Ambiguous boolean text now fails before training rather than being silently coerced.
+- Runner protocol tests show hostile environment values cannot override V11's sample count, epochs,
+  Z64 grid, ranges, split, scene, or curriculum weights. The runner remains training-only.
+- These script changes do not modify targets, target occupied-voxel counts, VAE/model shapes,
+  inference data, or evaluation metrics; they only expose the approved supervision schedule.
+
+## 2026-07-13 v11 Curriculum Final Verification
+
+- Resume metadata now includes `curriculum_total_epochs`. New-format checkpoints must match the
+  curriculum enable flag, total epochs, and all four start/final weights before model or optimizer
+  state is loaded; legacy checkpoints with incomplete curriculum metadata remain compatible.
+- The final two-frame, one-epoch smoke produced finite loss `0.535496`. CSV, best checkpoint, and
+  epoch checkpoint all recorded effective weights `0.03/0.0`; both checkpoints recorded
+  `curriculum_total_epochs=1`.
+- V11 changes only the epoch timing of weighted positive/negative column supervision. Targets,
+  occupied-target voxel counts, Z64 tensor size, VAE/model architecture, inputs, and inference
+  threshold protocol are unchanged. Prediction voxel density may change by design and remains
+  controlled by the fixed 32-frame count-ratio and structure gates.
+- The smoke proves the training/log/checkpoint path, not obstacle-structure improvement. Formal
+  three-epoch results must pass the unchanged fixed 32-frame gate before 500-frame evaluation,
+  visualization acceptance, or CD.
+- Residual audit-only issue: the extended runner retains `.v10.lock` and a `v10 training complete`
+  message. This does not affect V11 locking or training semantics but can be renamed in a later
+  maintenance-only change.
+
+## 2026-07-15 v11 Fixed 32-Frame Evaluation
+
+- The formal seeded V11 run completed all three epochs with the intended effective column weights:
+  `0.03/0.00`, `0.025/0.005`, and `0.02/0.01`. Training loss decreased from `0.418417` to
+  `0.178341`, but training loss was not used for checkpoint selection.
+- The unchanged fixed validation protocol evaluated every epoch on the same 32 garden frames with
+  real IR, 20 Euler steps, seed 42, occupancy threshold `0.99`, and the established Z64 crop.
+- No epoch passed all five gates. The selector chose epoch2 by maximum worst normalized gate
+  satisfaction, but it passed only 2/5: BEV IoU/recall `0.3245/0.4778`, top `0.0644`, trunk
+  `0.2474`, connectivity `0.2347`, and prediction/target count ratio `0.6872`.
+- Relative to the seeded v10-A epoch1 reference, V11 epoch2 is lower by 15.6% BEV IoU, 15.3% BEV
+  recall, 18.9% top recall, 40.6% trunk recall, and 35.8% connectivity. Voxel recall also falls
+  36.9%; precision changes only -5.3%.
+- The curriculum did not solve missing obstacle bodies. Its best candidate is under-dense rather
+  than over-dense, so 500-frame loop3 evaluation, raw-LiDAR 3D acceptance, and CD remain blocked.
+- This evaluation did not alter supervision targets, target voxel counts, model/checkpoint weights,
+  or the threshold protocol. It only generated new fixed-protocol diagnostic files.
+
+## 2026-07-15 v11 Threshold-Calibration Diagnostic
+
+- A bounded threshold diagnostic on the selected epoch2 checkpoint shows a strong calibration
+  shift. At thresholds `0.99/0.95/0.94/0.93/0.925`, the candidate passes `2/5`, `3/5`, `4/5`,
+  `4/5`, and `5/5` gates respectively on the same fixed 32 validation frames.
+- At `0.925`, metrics are BEV IoU/recall `0.2919/0.8278`, top `0.1193`, trunk `0.6504`, vertical
+  connectivity `0.6147`, and prediction/target ratio `3.1422`. All five configured gates pass,
+  although voxel precision remains low at `0.1881`.
+- This does not retroactively pass the fixed `0.99` comparison protocol. It establishes a separate
+  calibrated operating-point candidate and shows that V11 retained more obstacle structure than
+  the `0.99` binary output suggests.
+- Retraining or CD should not start yet. The next evidence should be independent-scene validation
+  at both `0.99` and the preselected `0.925` threshold, followed by raw-LiDAR 3D inspection because
+  the calibrated prediction is roughly 3.14 times the target occupancy count.
+
+## 2026-07-15 v11 Independent loop3 Gate
+
+- Evaluated the preselected epoch2 checkpoint on 32 evenly spaced loop3 frames, using real IR,
+  20 Euler steps, seed 42, and the same Z64 geometry. The dataset loader explicitly selected only
+  `loop3` from the two-scene dataset root.
+- At `0.99`, loop3 passes only 1/5 gates: BEV IoU/recall `0.1669/0.2374`, top `0.0347`, trunk
+  `0.0730`, connectivity `0.1268`, and count ratio `0.6181`.
+- At the garden-calibrated `0.925`, loop3 still passes only 1/5: BEV IoU/recall `0.1869/0.5478`,
+  top `0.0667`, trunk `0.3151`, connectivity `0.3654`, and count ratio `3.1010`.
+- Frame-level instability is substantial at `0.925`: median trunk recall is `0.2784`, trunk P10 is
+  zero, and per-frame prediction/target ratio P90 is `8.31`. A single lower threshold therefore
+  trades missed structure for uncontrolled false positives on some loop3 frames.
+- The garden `0.925` operating point does not generalize. The main remaining issue is cross-scene
+  representation/calibration shift, not another scalar threshold or another small column-weight
+  adjustment. Raw-LiDAR 3D acceptance, 500-frame inference, and CD remain blocked.
+
+## 2026-07-15 garden/loop3 Distribution and Doppler Audit
+
+- Added a sparse-space audit that deterministically samples 500 paired frames per scene and measures
+  Radar/target occupancy, range and height bands, Doppler, Doppler variance, IR intensity, calibration,
+  and frustum coverage inside the exact near40 physical crop.
+- loop3 has 38.9% fewer Radar voxels and 75.7% fewer target voxels than garden. Its mean Radar/target
+  ratio is 0.973 versus 0.312, and its target distribution shifts from garden's near 0-10 m band toward
+  10-40 m. This confirms a large supervision-density/domain shift behind the independent-scene failure.
+- IR is present for every sampled frame, both scenes use the same real thermal calibration, and the Z64
+  near40 frustum coverage is 0.608. IR availability is not the dominant cross-scene difference.
+- The raw first-frame Doppler is zero in garden and approximately -0.002 m/s in loop3, while the matched
+  preprocessed frames are approximately -47.9 and -46.8 m/s. The current preprocessor's default fixed
+  `vx=50 m/s` compensation is therefore physically incompatible with this NTU ground-platform data.
+- In 70-76% of sampled frames, the per-frame P90 of voxel Doppler variance is still zero. Most occupied
+  voxels contain one Radar point, so within-voxel variance cannot carry the intended uncertainty signal.
+- Full garden retraining is blocked. The data protocol must first use explicit none/fixed/recorded
+  egomotion modes and validate corrected 32-frame outputs; recorded GNSS velocity also requires timestamp
+  matching and world-to-sensor rotation before use.
 
 ## 2026-07-13 Result Directory Organization Completion Notes
 
@@ -1128,3 +1260,464 @@ far too small to explain the previous screen/full metric divergence.
 - Final filesystem verification no longer finds the two V10-D lock directories recorded during the
   audit. They were not recreated because an empty lock directory could incorrectly block a future
   run; this external state discrepancy needs user confirmation if those lock markers are required.
+
+## 2026-07-15 TODO/26 Priority Audit
+
+- `TODO/26-7-15.md` is GB18030/GBK text rather than UTF-8. Read-only conversion recovers all 684
+  lines; the source file was not rewritten.
+- The review lists 6 P0, 10 P1, 5 P2, and 2 P3 issues. Its explicit first-stage order differs from
+  the handoff's Doppler-next order, so the TODO takes priority per the current user request.
+- Actual `unified_train.py` confirms P0-01: both base datasets use `split='train'`, then
+  `deterministic_split_indices()` partitions frames from the same scene. With a one-scene training
+  root, adjacent correlated frames can cross the train/validation boundary.
+- Actual `inference_ldm.sh` confirms P0-04: it defaults to `Data/NTU4DRadLM_Pre`, sets
+  `USE_MULTIMODAL_META=0`, and requires target/raw-LiDAR inputs for the launcher path.
+- Actual `inference.py` confirms conditional P0-06: `--adaptive_occ_from_target` loads each frame's
+  target occupancy count and derives the prediction threshold from that test target. The flag is
+  opt-in, but enabling it is oracle evaluation leakage.
+- `deterministic_split_indices()` is a seeded `torch.randperm()` over individual sample indices.
+  The formal launcher links only `garden`, and both base datasets use `split='train'`, so the
+  randomness is reproducible but does not prevent temporally adjacent leakage.
+- A read-only adjacency-ratio diagnostic was stopped after three command-level failures. The first
+  omitted a shell export; the next two counted zero files because the ignored data path was not
+  enumerated as expected. No dataset file was read or changed, and the static root-cause evidence
+  is sufficient for the design decision.
+- The worktree already contains 9 modified tracked files and 5 untracked files; these historical
+  V11/audit changes must be preserved. No production or test code has been modified in this audit.
+
+## 2026-07-15 P0-01 Temporal Block Split Design
+
+- The approved minimal scope keeps `loop3` as the independent test scene and changes only the
+  `garden` train/validation member assignment from a seeded random permutation to ordered prefix/tail
+  blocks.
+- The design intentionally does not change Dataset scene discovery, target generation, augmentation,
+  model structure, checkpoint schema, mini runners, or launch scripts.
+- Per-sample supervision and voxel counts remain unchanged. Validation metrics may decrease because
+  the new protocol measures temporal extrapolation instead of randomly interleaved neighboring frames.
+- The written specification is
+  `docs/superpowers/specs/2026-07-15-temporal-block-validation-split-design.md`.
+- The self-review found no placeholders, contradictions, ambiguous split semantics, or scope drift.
+  The specification was committed alone as `d363650`; no historical V11 or TODO change entered that
+  commit.
+
+## 2026-07-15 P0-01 Implementation Planning
+
+- The implementation plan uses one RED/GREEN cycle around a pure
+  `temporal_block_split_indices(dataset_size, train_split)` API, then wires the existing `Subset`
+  construction to it.
+- The plan keeps `training_seed` behavior unchanged and deliberately adds no split seed, embargo gap,
+  scene grouping, Dataset change, launcher change, or mini-config plumbing.
+- Because `unified_train.py` already contains historical V11 edits, the implementation commit must use
+  selective hunk staging and prove the cached diff excludes all curriculum changes.
+- The plan is stored at
+  `docs/superpowers/plans/2026-07-15-temporal-block-validation-split-implementation.md`.
+- Plan self-review found full spec coverage, no placeholders, and consistent helper/test signatures.
+  The 296-line plan was committed alone as `96df62c`.
+
+## 2026-07-15 `26-7-15.md` 分阶段修复续作审计
+
+- `TODO/26-7-15.md` 共 684 行，内容为 GB18030/GBK 编码；本轮通过 `iconv` 管道只读审阅，未改写源文件。
+- 当前工作区已有未提交的训练脚本、测试、三份 TODO 和新增诊断文件；这些均视为用户或既有任务改动，后续不得覆盖或混入无关重构。
+- 近期提交 `d363650` 与 `96df62c` 已分别固化 P0-01 连续时间块切分的设计和实施计划；当前工作区还显示对应实现/测试改动，需先验证而不是重复实现。
+- 审计文件按四阶段列出问题。第一阶段要求依次处理：时间块切分、禁用 target 自适应阈值、数据 manifest、正式真实 IR 推理与部署/评价解耦、正式 checkpoint 链。
+- 下一项修复必须保持单一根因、先 RED 后 GREEN；涉及监督或 target 的变更需单独说明监督信号、体素数量及评价指标变化。
+- P0-01 的测试文件差异仍保留 RED 阶段使用的模块级 `getattr()` 包装；是否已完成 GREEN 与最终重构不能只靠截断 diff 判断，需聚焦检查实现符号、主入口调用和测试结果。
+- P0-01 RED 已实测：21 项中仅 3 个时间块契约测试失败，统一原因为 `temporal_block_split_indices` 不存在；这证明测试确实覆盖缺失行为，而不是语法、导入或环境故障。
+- P0-01 GREEN 已实测：新 helper 生成有序前缀/后缀、划分完整且互斥，并且训练随机种子变化不再改变成员归属；主入口仍保留 `training_seed` 控制模型与 DataLoader 随机性。
+- 此修改不改变 target 内容、每帧 occupied 体素数、数据集总样本数、80/20 数量比例、网格尺寸、模型或 checkpoint；只改变 train/validation 的成员协议，历史随机交错验证指标不再可直接比较。
+- 审计文件第一阶段按风险依赖排序，而不是按问题编号排序；P0-01 后的下一项是 P0-06（禁止正式结果使用 `adaptive_occ_from_target`），随后才是 manifest、正式真实 IR 推理和 checkpoint 链。
+
+## 2026-07-15 P0-06 根因审计（只读）
+
+- `inference.py` 将 `--adaptive_occ_from_target` 作为公开布尔 CLI；开启后要求 `target_voxel_dir`，逐帧加载 LiDAR 派生 target，并用 target 占据体素数量反推该帧预测阈值。
+- `find_adaptive_occ_threshold()` 通过预测 occupancy 的第 k 大值使输出点数尽量匹配 target 数量；这不是普通评价读取，而是让测试真值直接改变部署输出。
+- 正式 `inference_ldm.sh` 当前没有开启该 flag，所以默认正式入口未触发泄漏；但通用推理 CLI 和 `test/mini-test/inference_minimal.sh` 仍允许无显式 oracle 标记地开启。
+- `compare_with_target` 只读取 target 计算指标，可以保留；P0-06 应只隔离“target 改变预测阈值”的路径，不能误删正常离线评价。
+- 现有 unit tests 没有覆盖 adaptive flag 的准入策略或 oracle 标记；下一步设计应先增加 CLI/策略级失败测试，再修改实现。
+- 可复用现有 `test/unit/test_multimodal_inference_interface.py` 测试通用推理协议，并在 `test/unit/test_mini_scripts_protocol.py` 静态约束 mini launcher；无需新建重复测试文件。
+- 最小可逆边界是“双重显式 opt-in”：保留 oracle 诊断能力，但单独增加 `allow_oracle` 准入，缺少第二确认时在模型加载和输出目录创建前失败；正常固定阈值与 `compare_with_target` 均不受影响。
+- 用户已选择更强的“移到独立诊断脚本”边界，上一条双重 opt-in 不再作为实施方案。
+- 现有 `sweep_occ_threshold.py` 选择验证集统一的全局阈值；旧 adaptive 功能为每帧匹配 target 数量，二者统计协议不同，不应放在同一运行模式中。
+- 推荐新增只消费已保存 `*_voxel.npy` 与 target 的 oracle 诊断入口；正式推理先保存不受 target 影响的预测体素，诊断脚本随后离线计算每帧 oracle 阈值、计数与明确标记的报告。
+- 需要用户确认的兼容策略只有一项：旧 `--adaptive_occ_from_target` 是保留为 fail-fast 迁移提示，还是直接成为 argparse 未知参数。
+- 用户确认采用“从 argparse 删除，但在解析前识别旧 flag 并输出迁移提示”，并要求独立诊断同时保存 CSV/JSON 与 oracle 点云。
+- 正式 `inference_metrics.csv` 中 `target_occ_count` 仅由旧 adaptive 路径填写，可随迁移删除；`effective_occ_threshold` 在固定阈值模式仍有审计价值，应保留并恒等于 CLI 固定阈值。
+- `find_matching_voxel_file()` 与 `voxel_to_pointcloud()` 仍服务正常 target 对比和固定阈值点云，不能随 adaptive 逻辑误删；`load_target_occ_resized()` 在 inference 中仅服务 adaptive，可移出正式入口。
+- 额外发现：`sweep_occ_threshold.py` 及 `test_occ_threshold_grid_protocol.py` 仍复制旧随机 train/validation 切分协议，与刚完成的训练时间块切分不一致。这不是 oracle 迁移本身，但会影响全局阈值正式验证，需作为 P0-01 后续单独修复，不能混入 P0-06 实现。
+- P0-06 设计已写入 `docs/superpowers/specs/2026-07-15-oracle-target-adaptation-diagnostic-design.md`；设计固定正式/诊断单向边界、旧参数迁移错误、CSV/JSON/点云输出协议、零 target 兼容语义和非空目录保护。
+- P0-06 RED/GREEN 实施计划已写入 `docs/superpowers/plans/2026-07-15-oracle-target-adaptation-diagnostic-implementation.md`；计划分为正式入口 RED/GREEN、独立诊断 RED/GREEN和最终聚焦验证，明确不提交。
+- 计划自审将新测试模块加载从可能与标准库 `test` 包冲突的名称导入，改为按绝对文件路径加载；规格/计划函数名与输出文件名一致。
+- P0-06 Task 1 RED 已证实两个缺失行为：正式 inference 没有旧 oracle 参数迁移检查；mini launcher 仍会把旧环境变量传入原 adaptive 路径。
+- P0-06 Task 2 GREEN 已将 oracle 计算、parser 参数、运行分支、日志和正式 CSV target count 移出 inference；固定阈值、正常 target/LiDAR 对比与点云转换保留。
+- mini launcher 现在在 checkpoint 检查前拒绝两个旧环境变量，避免它们被静默忽略或进入生成路径。
+- P0-06 Task 3 RED 的 6 项测试全部因独立诊断模块不存在而明确失败，覆盖算法、零 target 兼容、点云/报告、缺 target、错误 shape 与非空目录保护。
+- 独立诊断首次 GREEN 揭示旧 `float(np.nextafter(float32_value, -inf))` 实际产生 float64 前驱；NumPy 与 float32 数组比较时标量被舍入回原值，严格 `>` 只保留 `k-1` 点。改为同 dtype `nextafter` 后才真正实现 top-k 意图。
+- 独立脚本现可生成 `(N,4)` oracle 点云、逐帧 CSV 和 `deployable=false` JSON，并对缺 target、错误 prediction shape 和非空输出目录 fail-fast。
+- P0-06 最终聚焦回归共 25 项通过（inference 接口 16、mini 协议 3、oracle 诊断 6）；相关 Python 编译、shell 语法与 `git diff --check` 均通过。
+- 真实旧参数调用会在检查必填 checkpoint 前以 exit 2 退出，并指向 `test/diagnostics/occupancy/diagnose_oracle_target_adaptation.py`；正式帮助仅保留固定阈值接口。
+- 本项不改变训练监督、target 内容、网格尺寸、每帧预测体素值、模型或 checkpoint。固定阈值正式输出的占据点数不变；oracle 点数只存在于独立、明确不可部署的诊断结果中。
+- 正式 `inference_metrics.csv` 删除旧 adaptive 专用的 `target_occ_count` 列，因此旧表与新表的 schema 不完全一致；固定 `effective_occ_threshold` 及正常 target/LiDAR 评价指标继续保留。
+- 未运行训练、预处理、完整推理或全量评价，也未暂存或提交本轮修改。阈值扫描脚本仍复制旧随机 validation 切分，应作为下一项独立修复处理。
+
+## 2026-07-15 阈值扫描 validation 协议续修审计
+
+- `unified_train.py` 已使用 `temporal_block_split_indices()`，正式训练的 validation 是排序样本的连续后缀，且不再由 `split_seed` 决定成员归属。
+- `sweep_occ_threshold.py` 的 `select_evaluation_files()` 仍自行创建 `torch.Generator` 并执行 `torch.randperm()`；因此同一 `train_split` 下，阈值校准样本与正式 validation 已经不一致。
+- `test_occ_threshold_grid_protocol.py` 仍把“匹配训练 randperm”写成正确契约，说明问题不是调用参数偶发错误，而是测试与脚本共同固化了已废弃协议。
+- 当前工作区对 `sweep_occ_threshold.py` 和对应阈值测试没有现存差异，可以在不覆盖用户修改的前提下小步处理；`unified_train.py` 含 P0-01 与其他历史改动，不应为本项再次修改。
+- 历史阈值命令把包含 `000000` 至 `000499` 的完整预测目录传给脚本，再由脚本选出 100 帧；因此改为连续 validation 后缀可以在现有输入协议内完成，不需要先新增文件清单格式。
+- 历史示例实际对 `loop3` 预测目录执行 validation 子切分，但 P0-01 已把 `loop3` 定义为独立 test 场景；仅修正索引算法不能证明输入场景是训练场景的 validation。场景身份校验需要后续 dataset manifest 提供依据，本项至少应在帮助与输出元数据中明确调用方责任。
+- `split_seed` 现在只服务已废弃的随机成员选择；是否从阈值 CLI/JSON 删除属于兼容性选择，需在设计阶段明确，不能留下“参数存在但实际无效”的静默行为。
+- 用户确认彻底删除 `split_seed`，并批准旧参数在 argparse 解析前给出迁移错误；新 JSON 用显式 `split_protocol` 代替随机种子元数据。
+- 已写入 `docs/superpowers/specs/2026-07-15-threshold-sweep-temporal-validation-design.md`。占位符、内部一致性、范围和歧义自审通过，暂存区保持为空。
+- 已写入 `docs/superpowers/plans/2026-07-15-threshold-sweep-temporal-validation-implementation.md`；计划将成员切分与 CLI/JSON 迁移拆成两个独立 RED/GREEN，再做集中验证。
+- 计划自审发现成员选择示例曾包含省略号占位，已替换为完整校验实现；最终占位符、接口签名、规格覆盖和空白检查通过。
+- `sweep_occ_threshold.py` 现按输入顺序返回连续 train 前缀或 validation 后缀；既有纯数字帧、连续帧、非空划分和划分后 `max_files` 保护均保留。
+- `split_seed` 已从选择函数、准备函数、argparse、主调用链和新 JSON schema 删除。源代码中的字符串只用于精确识别旧参数并给出迁移错误，不再影响成员选择。
+- 新推荐 JSON 使用 `split_protocol=temporal_block_prefix_train_suffix_validation`；旧 JSON 的 `split_seed` 字段不再生成，因此历史与新 schema 需分开解释。
+- 最终聚焦测试 30/30 通过，相关 Python 编译、真实 CLI 迁移、帮助文本、`git diff --check` 和空暂存区检查均符合设计。
+- 修改不改变监督信号、target、网格尺寸、每帧预测体素内容、模型或 checkpoint；相同 `train_split` 的样本数量不变，但成员和聚合指标可能变化，历史推荐阈值不可直接比较。
+- 本轮没有运行训练、完整推理或全量阈值扫描，没有重写历史结果。历史 `loop3` 校准仍不自动视为合法 validation，后续 manifest 必须提供场景身份和预处理版本的机器校验。
+
+## 2026-07-15 Dataset Manifest 根因审计
+
+- 正式训练 launcher 固定读取 `Data/NTU4DRadLM_Pre_sensor_aware`，正式 LDM/CD 推理 launcher 仍固定读取 `Data/NTU4DRadLM_Pre`；同一 checkpoint 链的训练和推理预处理根目录天然不一致。
+- 预处理脚本已经为每个场景写 `preprocess_policy.json`，Dataset 也会把它作为可选字典塞进 meta，但缺失时静默使用空字典，不校验场景名、协议版本、源索引或产物完整性。
+- 现有 `audit_dataset_protocol.py` 只报告 policy 是否存在以及 IR/标定覆盖，不产生不可变文件清单，也不让训练/推理入口 fail-fast。
+- Dataset 的场景发现只要求 `radar_voxel` 与 `target_voxel` 目录存在；随后按目录文件名组样本。目录内混入不同预处理批次时，当前加载链无法识别。
+- 项目已有实验级 `dataset_manifest_sha256()`，但其输入为相对路径、大小和 mtime，适合确认候选实验使用同一目录快照，不足以作为可跨复制验证的预处理产物内容协议。
+- 真实 `Data/NTU4DRadLM_Pre_sensor_aware` 没有任何 `preprocess_policy.json` 或 `target_policy.json`。因此现有 Dataset 对 garden/loop3 都静默返回空 policy，无法知道实际生成参数。
+- sensor-aware garden 的 4014 个 radar 文件全部是指向旧 `NTU4DRadLM_Pre/garden/radar_voxel` 的绝对符号链接；loop3 的 `000000` 至 `000119` 共 120 帧同样链接旧根，剩余 6330 帧为普通文件。
+- sensor-aware garden 的 target/lidar/IR 各有 4014 个普通文件；loop3 的 target/lidar/IR 各有 6450 个普通文件。Radar 单模态已明确包含不同来源形态，且 symlink 目标可被外部目录修改，不能视为不可变数据集。
+- 现有 metadata 单测允许 policy 缺失并验证 mock fallback；若 formal 路径改为 strict manifest，必须把“通用 Dataset/临时单测兼容”与“正式 launcher fail-closed”区分，避免破坏诊断和小测试。
+- `data_loading_config.yml` 明确 garden=train、loop3=test。三个正式推理 launcher 均仍指向旧 Pre；这属于下一阶段真实 sensor-aware/IR 入口修复，manifest 本项不应通过猜路径替代它。
+- 用户选择严格方案 1：per-scene、per-frame 内容 SHA-256 manifest；正式入口缺失或不匹配时直接拒绝，不提供 warning-only 或 legacy adoption。
+- 设计已写入 `docs/superpowers/specs/2026-07-15-strict-dataset-manifest-design.md`，并补充不可覆盖的原子发布及预处理非空输出目录 preflight，防止“先覆盖旧数据、后生成 manifest”。
+- 规格的占位符、内部一致性、范围和歧义自审通过；暂存区保持为空，未创建提交。
+- 计划前复核发现 `cm/__init__.py` 会导入整套 Torch/模型模块；为保持 manifest 核心纯标准库、避免预处理新增重依赖，核心文件位置调整为包根 `diffusion_consistency_radar/dataset_manifest.py`，CLI 路径不变。
+- 严格 manifest 实施计划已写入 `docs/superpowers/plans/2026-07-15-strict-dataset-manifest-implementation.md`，拆为核心内容协议、CLI/预处理集成、四个正式 launcher gate 和最终验证四项。
+- 计划自审补齐了目录级 symlink、非连续帧、policy/manifest 篡改和 provenance symlink 覆盖；最终无实现占位或旧 `cm/` 路径引用。
+
+## 2026-07-15 Dataset Manifest 方案 1 实施结论
+
+- 新增 per-scene manifest v1，以逐帧文件内容 SHA-256 固化 radar、lidar、target、IR 四模态；记录路径均为场景内相对路径，不含绝对路径、mtime 或生成时间，复制到其他根目录后仍可验证。
+- 核心生成与验证会拒绝缺失/错场景 policy、模态错帧、非连续帧、未知文件、目录或文件 symlink、内容/大小/hash 篡改、缺失 provenance 和已有 manifest 覆盖。
+- 预处理器只接受不存在或为空的场景输出目录，所有 worker 和 `preprocess_policy.json` 完成后才原子发布 manifest；任一场景失败会令主进程非零退出，未签署的失败输出保留用于诊断但不会被视为正式数据。
+- 四个正式 launcher 没有兼容或跳过开关：训练在删除 `.tmp_train_dataset` 前验证全部 train scene，推理在调用 `inference.py` 前验证全部 test scene。
+- 当前真实 sensor-aware 数据没有 policy/manifest，且 radar 中存在旧根 symlink，因此严格入口会按设计阻断。只读实测 `loop3` 返回 exit 2 且未创建 manifest；没有为 legacy 数据自动补签。
+- 23 项聚焦测试全部通过，相关 Python 编译、shell 语法与差异格式检查通过。未运行长训练、完整预处理、正式推理或全量内容 hash。
+- 监督信号、target、网格和每帧体素内容均未修改；现有体素文件数量也未变化。指标计算公式不变，但旧数据生成的指标缺少新协议来源证明，不可作为新正式实验结果直接比较或汇总。
+
+## 2026-07-15 正式真实 IR 与部署/评价解耦初步证据
+
+- 正式训练和正式推理的数据根不同：训练为 sensor-aware，LDM/CD/unified 推理仍为旧 Pre；真实 IR 因而没有进入默认正式推理数据流。
+- `--use_multimodal_meta` 当前只是可选开关；LDM launcher 默认值为 0，CD launcher同样默认关闭，unified launcher没有传入该参数。
+- IR 文件缺失不会在正式生成前失败，而会进入 mock thermal 路径；`is_mock_ir` 目前只参与元数据/不确定性处理，不能证明融合分支已关闭。
+- target/LiDAR 只用于后处理评价，但正式 launcher 把它们与生成参数绑定，造成部署入口在结构上依赖离线真值。
+- 模型 checkpoint 的 state dict 已可区分 `CompleteDualModalityPerceptionNet` 和 legacy 单模态 UNet；严格真实 IR 要求可以绑定到多模态 checkpoint，而不是无条件套到所有历史模型。
+- `CalibrationProvider.load_with_metadata()` 已能拒绝把 radar-to-Livox 当作 thermal 外参，并报告 `is_mock_calib`；不过 thermal K/D 的真实解析属于审计第二阶段，不纳入当前第一阶段最小修复。
+- `CompleteDualModalityPerceptionNet.forward()` 无论 `is_mock_ir` 为何都会编码、投影并门控 `ir_img`；该标志只增加 uncertainty，不能作为 Radar-only 降级开关。
+- 现有离线评价实现分散：生成质量诊断覆盖 prediction/target/radar，垂直结构评估覆盖已保存 prediction/target，raw LiDAR Chamfer 仍嵌在 `inference.py` 的生成循环里。
+- 将“评价 launcher”继续指向 `inference.py` 只会重新生成一次随机预测，并没有实现部署/评价数据流分离；正式评价应消费部署阶段已经保存的同一批 `*_voxel.npy`。
+- `NTU4DRadLM_VoxelDataset._get_mock_calibration()` 对真实/回退标定都会增加 `0.01m` 同步位移，`load_multimodal_meta_for_radar()` 当前只在 mock 标定时增加；这会让正式真实 IR 投影偏离训练协议，需在第一阶段做一致性修复。
+- 用户已复核并同意书面规格；实施拆为严格 IR preflight、纯 runtime 产物、已保存预测离线评价、正式 shell 边界和最终验证五个 TDD 单元。
+- 实施计划固定所有公开接口和验证命令，并明确保留现有脏工作区、不暂存、不提交；当前尚未修改本项生产/测试实现。
+
+## 2026-07-20 正式真实 IR 与部署/评价解耦实施结论
+
+- `inference.py` 新增 `--require_real_ir`：正式模式先验证 checkpoint 多模态属性、全部待推理 frame 的普通 IR 文件、有限值/可接受维度和真实 thermal 外参，再创建输出目录；缺失项不回退 mock。
+- 真实 thermal 外参 inference 现在与 Dataset 共同使用现有 `+0.01m` legacy x 同步补偿；该值已明确标注为固定历史协议，不等价于真实逐帧动力学同步。
+- 无 target/raw LiDAR 评价参数的部署生成写 `inference_runtime.csv` 与 `inference_run.json`；显式兼容评价仍写历史 `inference_metrics.csv`。运行 metadata 固化实际 target/source/model grid、voxel size、阈值和模态信息。
+- 新 `evaluate_saved_predictions.py` 只消费已保存 `*_voxel.npy`，严格配对 Radar/target frame，使用 metadata voxel size 转坐标，支持 fixed-threshold target/radar/near/raw-LiDAR/uncertainty 指标，并在输出前拒绝缺失、错配、非法数组、索引越界和非空目录。
+- 三个正式生成 launcher 已统一 sensor-aware 根、manifest gate、`--require_real_ir` 和 `_deploy` 输出；新 `evaluate_inference.sh` 只调用保存预测 evaluator，target/raw LiDAR 参数不再进入部署生成。
+- 监督信号、target 生成、模型结构、checkpoint、网格大小和数据文件数量未改变；正式预测值/占据点数可能因真实 IR 替换 mock/disabled IR 及训练一致的固定同步位移而改变，旧结果不可直接合并。
+- 最终修正前聚焦回归为 50/50；协议细节修正后 formal protocol 已扩展为 10 项，下一步重跑总计 54 项聚焦回归和静态验证。
+
+## 2026-07-20 P1-06 正式 checkpoint 链续修
+
+- 只读审计确认 `Result/train_results/vae/vae_best.pt` 与 `Result/train_results/ldm/ldm_best.pt` 缺失；现有 `Result/train_results/cd/cd_best.pt` 只有旧的 216 个 legacy UNet state key，缺少 `model_config`、融合范围、Radar encoder 和 uncertainty head，不能与新 sensor-aware VAE/LDM 组成正式链。
+- `test/result/archive/ldm_sensor_aware_partial_20260713/vae/vae_best.pt` 和 `ldm/ldm_best.pt` 虽然具备部分自描述字段，但不是当前正式路径，且 archive LDM 缺少当前 fusion 网格字段；没有将它们复制、重命名或伪装成正式权重。
+- 新增 `diffusion_consistency_radar/checkpoint_chain.py`，协议名为 `formal_chain_v1`：逐阶段安全读取普通文件，验证 `data_grid_config`、LDM/CD `model_config`、VAE latent_dim、父 checkpoint SHA-256 和四类实际持久化多模态 state 前缀；投影几何由 fusion 配置校验，错误聚合后 fail-closed。
+- 新增独立 `scripts/diagnose_checkpoint_chain.py`。默认只读 CPU metadata validate；`--construct` 才按 checkpoint 配置构建并严格加载三阶段模型，不读取数据、不执行 forward，报告只在成功且目标目录为空时原子发布。
+- VAE/LDM/CD 新保存 payload 增加协议版本、stage、实际训练网格、fusion shape/range 和父权重 hash；LDM/CD 仍保留旧构造函数兼容性，但缺父 hash 或 legacy 模型的产物会被正式门禁拒绝。
+- CD 训练器对 legacy 教师仍可兼容运行，但其新保存 payload 标记为 `legacy_cd_v0`，只有多模态学生才写 `formal_chain_v1`，避免把兼容产物误称为正式链。
+- LDM/CD 训练入口只计算父 checkpoint SHA-256 并传入 trainer，没有启动训练；target、监督通道、体素数量、模型前向和指标算法均未改变。
+- 三份正式生成 launcher 现在在 manifest/第一帧生成前调用 checkpoint-chain 门禁；unified 不再对缺失 LDM/CD 打印 warning 后跳过，而是整链直接失败。离线评价入口未改为加载 checkpoint。
+- 新增协议测试覆盖有效链、网格/父 hash/legacy/symlink 拒绝、报告目录保护和 CPU strict construct 调用；checkpoint-chain 6/6、formal inference protocol 11/11 通过，VAE payload 22/22 通过，静态编译和 shell 语法通过。
+- 该项没有生成或改写任何正式权重；下一步只需完成聚焦总回归和对当前 `Result/train_results` 的只读失败诊断，然后将正式 VAE/LDM/CD 重训作为显式长任务安排。
+
+## 2026-07-20 P0-06 独立诊断依赖边界加固
+
+- 复查发现 P0-06 诊断脚本虽然不执行模型 forward，但仍直接导入 `inference.py` 和 `sweep_occ_threshold.py`；这会把正式入口的模型/MPI 依赖带入离线 oracle 诊断，违背“只读取已保存预测与 target”的隔离目标。
+- 新增 `diffusion_consistency_radar/diagnostics/occupancy_helpers.py`，仅依赖 NumPy/PyTorch，内置 target 稀疏加载、物理范围裁剪、通道感知重采样和体素转点云协议；没有模型、checkpoint、正式评价入口或数据集扫描依赖。
+- `diagnose_oracle_target_adaptation.py` 改为只调用上述轻量辅助模块；保留原有 top-k 阈值、target 配对、CSV/JSON 和非空输出保护，避免复制正式脚本的导入副作用。
+- 新增回归测试静态检查两类正式入口路径不出现在独立诊断脚本中；oracle 聚焦测试 7/7 通过。
+- 本轮只改变诊断工具的依赖边界和代码位置，不改变监督信号、target 内容、网格尺寸、预测体素、正式固定阈值输出或任何指标公式；oracle 结果仍明确 `deployable=false`。
+- 未运行训练、预处理、模型采样、全量阈值扫描，未修改或删除数据、checkpoint、日志和历史结果；未暂存或提交。
+
+## 2026-07-20 P0-03 多普勒运动补偿协议修复与代码审查
+
+- 根因确认：预处理 shell 的 `--vx=50` 虽可被参数覆盖，但旧调用链没有运动模式，默认会把固定速度传入每一帧 Radar/LiDAR 体素化；在当前 NTU 数据上会把接近零的原始 Doppler 推成约 `-47 m/s`，且没有速度来源或时间匹配证据。
+- 新增 `NTU4DRadLM_pre_processing/motion_protocol.py`，把速度解析固定为 `none/fixed/recorded` 三种显式模式；`recorded` 只接受严格递增的 `timestamp,vx,vy,vz` 表，并要求最近邻时间差不超过 `velocity_max_delta`。
+- 速度接口明确规定来源坐标系为 Radar 或 LiDAR；worker 在 Radar/LiDAR 对齐后只使用标定旋转转换速度，不把外参平移量加入速度。`align_to=radar` 现在同步变换 LiDAR 点云，避免两模态落在不同坐标系后再生成 target。
+- 默认模式改为 `none`，`50 m/s` 仅保留为显式 fixed 参数；recorded 源文件 basename、行数、SHA-256、坐标系和时间容差写入 `preprocess_policy.json`/`target_policy.json`，便于审计实际补偿来源。
+- 代码审查发现并修复直接执行接口冲突：脚本文件名会遮蔽同名包，导致 `python NTU4DRadLM_pre_processing/NTU4DRadLM_pre_processing.py --help` 无法导入新模块；现在包导入和文件路径执行均有明确回退路径。
+- 同时增加旧 Namespace 的安全默认值、有限数校验、空帧零进程 fail-fast；不会把旧隐式固定补偿悄悄恢复。
+- 监督信号、target 定义、体素网格尺寸和指标公式未改变；未来重新预处理时默认 Doppler/空间同步补偿会改变，这是预期的物理协议修正，现有数据、checkpoint、日志和结果未被改写。
+- 未运行训练、完整预处理、推理或全量评价；未暂存或提交。
+
+## 2026-07-20 P0-05 LiDAR 未观测空间与 free evidence 修复
+
+- 根因复核确认：`SlidingProbabilisticGridMap.update_from_voxel()` 先把每个 BEV 单元的 `max_z(occupancy)` 作为观测，再把整张 reliability map 传给 D-S 融合；因此空白但未被 LiDAR/Radar 射线观测的单元会由 `1-p` 产生 free mass。原有 snapshot 也没有暴露 unknown mass，调用方无法区分“未知”和“低占据”。
+- 采用保守兼容边界：没有显式 `observed_mask` 时只把当前帧确实含 occupied voxel 的 BEV 单元视为已观测，其余单元 reliability 置零并保留 D-S unknown/ignorance；显式 mask 支持 `(X,Y)` 或 `(X,Y,Z)`，且 occupied 单元即使漏标也不会被屏蔽。
+- `streaming_map_update.py` 新增按帧 `<frame>_observed_mask.npy/.npz` 输入、有限值/shape 校验、CSV 的 mask 使用量与 `unknown_fraction`，快照/最终结果新增 `unknown_mass`。同目录 mask 会从 voxel 文件列表排除，mask 目录在输出目录创建前校验并拒绝 symlink，避免接口误配或输出副作用。
+- `update_from_voxel()` 新参数追加在既有参数末尾，保持旧位置参数调用兼容；体素和 mask 在时间衰减及地图写入前校验，错误不会部分更新地图。稀疏 `.npz` mask 复用现有 `coords/features/shape` 协议。
+- RED 阶段复现了旧行为：空白单元 `occ_prob` 被推向 free（约 0.3619），并且旧接口不接受 `observed_mask`；GREEN 后 P0-05 聚焦测试 12/12 通过。
+- 本轮只修复地图更新的安全边界和 mask 输入契约，没有重生成数据、改变 target/监督通道、体素网格数量、模型结构或指标公式；现有无 mask 历史数据会更保守地保持 unknown。离线射线投射 mask 的生产与 VAE “只监督可见 free”训练链仍需以独立数据协议继续设计，不能由空白体素反推 free。
+- 最终静态检查：相关 Python `py_compile`、streaming CLI `--help`、`git diff --check` 和空暂存区检查通过；未运行训练、预处理、推理或全量地图更新，未暂存/提交。
+
+## 2026-07-20 P0-05 训练监督链续修
+
+- 训练侧调用链确认：`NTU4DRadLM_VoxelDataset.__getitem__ → meta_dict → unified_train.train_epoch → VAE3D.compute_loss` 原先没有任何可见性 mask，`bce_dice` 会对所有 target 空白体素计算负类损失。
+- Dataset 现在优先读取配对 `lidar_voxel`，从传感器原点向 occupied 端点投射 `(X,Y,Z)` observed mask；同一离散方向只保留最近端点，避免重复计算遮挡后的共线射线。缺少独立 LiDAR 文件时安全退化为 occupied-only mask，不把 target 空白推断为 free。
+- mask 与 target 一起经过物理范围 crop、目标尺寸 resize，并作为 `occupancy_observed_mask` 放入 metadata；现有 Voxel/Cutout/Composed 几何增强在收到 mask 时同步 flip/rotate，避免监督错位。
+- VAE 的 BCE、Dice、连续通道损失和 legacy MSE 可选接收 `observed_mask`；unknown 空白不参与负类监督，occupied target 始终强制保留。无 mask 时仍沿用旧全网格行为；trainer 仅在 batch 提供 mask 时传新关键字，兼容旧模型替身/旧 batch。
+- RED 发现一个真实接口问题：旧 trainer 单测替身不接受新关键字；已改为无 mask 时走三参数旧接口，随后训练损失 20 项、Dataset metadata 11 项、概率地图 12 项、多模态投影 9 项和 sensor-aware target 4 项全部通过。
+- 本续修改变新训练样本的监督有效区域：target 内容、occupied 体素数量、网格尺寸和模型输出通道不变，但未观测空白不再贡献 free 负类梯度；历史 checkpoint 不被修改，缺 LiDAR 的旧样本保持 occupied-only 保守语义。
+
+## 2026-07-20 P1-01 多传感器时间戳对齐与容差修复
+
+- 根因确认：`unpack_rosbag.py` 只使用 bag receipt time；Radar/LiDAR 索引和预处理 IR 匹配均按文件名最近邻且没有最大时间差，丢帧时会静默配入错误模态帧。
+- RED 阶段新增 `test/unit/test_timestamp_alignment_protocol.py`，5 项均因缺少统一 helper/`generate_scene_indices` 而失败；没有读取真实 bag 或执行长预处理。
+- 新增标准库模块 `NTU4DRadLM_pre_processing/timestamp_alignment.py`：优先 `msg.header.stamp`，支持 ROS `to_sec()` 与 `secs/nsecs`，无效时显式回退 receipt；最近邻 helper 校验有限、严格递增序列，返回实际绝对 delta，并在超出独立容差时抛出 `ValueError`。
+- `NTU4DRadLM_timestamp_index.py` 改为按数值时间戳排序，先在内存完成全部 Radar/LiDAR 匹配，再原子写入两份索引和 `radar_lidar_sync.csv`；CSV 固化 Radar/LiDAR 时间戳、绝对 delta 和带符号 delta。默认 Radar-LiDAR 容差为 30ms，可通过 CLI/环境变量覆盖。
+- `unpack_rosbag.py` 的点云/图像文件名和非点云 CSV 均改用 header 优先时间戳；直接文件执行使用相对模块导入，避免同名 `NTU4DRadLM_pre_processing.py` 遮蔽轻量 helper 并引入 ROS/OpenCV 隐式依赖。
+- 预处理器新增独立 `--radar_ir_max_delta`（默认 20ms）和 `--radar_lidar_max_delta`；IR 匹配在主进程预计算并超限即失败，worker 使用已验证索引；输出写入 `radar_ir_sync.csv`，policy 记录两类容差和同步记录文件名。直接绕过 Step 1 时，缺失/错配/超限的 `radar_lidar_sync.csv` 也会 fail-fast。
+- 代码审查将输出目录创建延后到所有时间和索引检查之后，避免失败场景留下不能重跑的半成品；保留 `dt_sync` 作为显式 legacy 固定补偿，真实逐帧 signed delta 已持久化，后续动力学补偿可按明确的时间方向约定消费，未擅自改变现有点云位移符号。
+- 聚焦验证：时间戳协议 5/5、预处理运动协议 8/8、manifest 10/10、airborne 多模态 9/9、sensor-aware target 4/4、Dataset metadata 11/11 通过；相关 Python 编译、直接入口 `--help`、Shell 语法和 `git diff --check` 通过。
+- 本项不改模型结构、checkpoint、target 通道或体素网格；未来重新解包/预处理时，header 时间戳、超限拒绝和帧配对变化可能改变有效帧数量、target 对应的 Radar/LiDAR/IR 样本和指标，旧结果不可与新同步协议直接混合。未重生成数据、未运行训练/完整预处理/推理/全量评价，未暂存或提交。
+
+## 2026-07-20 P1-02 Thermal 标定与 IR 投影几何统一
+
+- 根因确认：`CalibrationProvider` 只解析 Radar→thermal 的 R/T，K 硬编码为旧值；`Data/config/calib_cam_thermal.txt` 中的原始尺寸 `640×512`、K 和 D 未被使用，模型输入却固定为 `640×480`。训练 Dataset 与 inference 还分别复制了 `t_vec[0] += 0.01`。
+- RED：新增 `test/unit/test_thermal_calibration_protocol.py` 3 项，分别锁定 K/D/S 解析缩放、去畸变效果和训练/推理同步函数身份；初始均因旧接口/硬编码而失败。
+- `CalibrationProvider` 现在统一读取 `calib_cam_thermal.txt` 的 `S_00/K_00/D_00`，按输出尺寸缩放 K（fx/cx 按宽度，fy/cy 按高度），并在 metadata 中保存原始/输出尺寸、D、来源和是否具备真实内参。
+- `_prepare_ir_array()`/`_resize_or_pad_ir_tensor()` 共用同一图像协议：先调整到 `640×480`，再用缩放后的 K 和 D 执行 OpenCV 去畸变；训练 Dataset 与逐帧 inference 均通过该函数，投影层接收与图像尺寸一致的 K。
+- `apply_legacy_sync_compensation()` 成为训练和推理的唯一固定同步补偿函数；真实逐帧动力学同步仍未伪装成该 legacy 位移，现有 `0.01m` 协议数值保持不变。
+- 严格 `--require_real_ir` 现在同时要求真实 Radar→thermal 外参和完整 `calib_cam_thermal.txt (S/K/D)`；非严格兼容路径可使用默认 K，但 metadata 明确标记 `thermal_intrinsics_source=default`。独立 `audit_dataset_protocol.py` 移除重复硬编码 K，改用 Provider 的实际结果。
+- 回归通过：thermal 协议 3/3、multimodal inference 26/26、Dataset metadata 11/11、airborne 多模态 9/9、sensor-aware target 4/4；当前真实 `Data/config` 只读解析得到 K≈`[[471.964,0,339.031],[0,442.956,260.382],[0,0,1]]`、D 五项和 `640×512→640×480` 缩放。
+- 监督 target、体素网格、模型结构和 checkpoint 未改变；未来重新训练/推理时 IR 像素采样会因真实 K/D 去畸变和缩放而变化，真实 IR 预测与指标不可和旧“硬编码 K/未去畸变”结果直接混合。未运行长训练、完整预处理或推理，未修改数据/结果，未暂存或提交。
+
+## 2026-07-20 P1-03 PointCloud2 字段 schema 固定化
+
+- 根因确认：`unpack_rosbag.save_pointcloud()` 用 `None` 占位后过滤字段，再把 `read_points()` 返回的短 tuple 直接保存；缺 intensity 时 Doppler 左移到 col3，后续体素化固定读取 `pcl[:,3]`/`pcl[:,4]` 后产生强度与速度错位。
+- RED：新增 `test/unit/test_pointcloud_schema_protocol.py`，缺 intensity 与缺 Doppler 两个用例初始均得到 `(N,4)` 而非固定 `(N,5)`，证明测试能捕获原问题。
+- GREEN：PointCloud2 按字段名和大小写不敏感别名读取（intensity/reflectivity/power/rcs/snr、velocity/doppler/v_r/radial_velocity），显式构造 `[x,y,z,intensity,doppler]`；缺失特征填零，缺少坐标则拒绝该帧。
+- 每个 Radar PointCloud2 输出目录增加原子 `pointcloud_schema.json`，记录固定列顺序、源字段、实际映射、缺失字段、shape 和 dtype；`.json` 不会被时间戳索引当作点云帧。
+- 下游 `voxelize_pcl_airborne_optimized()` 的五列接口、四通道体素监督和网格尺寸保持不变；修复只影响重新解包时的字段解释，历史错误列数据不会被自动改写或伪装修复，旧结果与新解包结果需按 schema 分开比较。
+- 回归通过：PointCloud2 2/2、时间戳 5/5、运动协议 8/8、Airborne 多模态 9/9、sensor-aware target 4/4；Python 编译、`git diff --check` 和空暂存区检查通过。未读取真实 bag、未执行完整预处理/训练/推理、未修改数据和实验结果。
+
+## 2026-07-22 P1-04 初始审计
+
+- 审计目标来自 `26-7-15.md`：原始 9.6M 体素下采样到模型网格时，强度/Doppler 没有单位协议，现有 variance resize 只是普通插值，不满足合并后的二阶矩公式。
+- 下游体素化固定把 col3/col4 聚合为强度均值、Doppler 均值，并以 `E[v²]-E[v]²` 生成局部方差；P1-04 需要先明确 Dataset 下采样究竟消费局部统计量还是重新聚合原始点，避免仅在网络入口做表面缩放。
+- 当前工作区包含用户此前多项未提交修改；本项继续原地小步修改，不覆盖、暂存或提交既有变更。
+- `resize_voxel_channels()` 当前对通道 1～3 统一执行 `interpolate(channel*occ)/interpolate(occ)`；这对均值通道近似成立，但对 variance 只是在插值局部方差，完全丢失不同细体素均值之间的离散项。
+- 预处理体素已经保存局部 Doppler mean/variance，但没有保存每个细体素的原始点数。依据审计文档给出的 `E[Var_local + Mean_local²]-E[Mean_local]²`，现有四通道能实现“按 occupied 细体素等权”的二阶矩合并；若要求按原始 Radar 点数精确加权，则必须扩展原始体素协议，属于更大兼容性变更。
+- Dataset 和逐文件 inference 都直接调用同一个 `resize_voxel_channels()`，因此方差修复必须位于共享 helper；否则训练/推理会发生隐式接口分叉。
+- `NTU4DRadLM_VoxelDataset` 当前没有归一化统计参数；训练、CD 和 inference 都只传 target size/物理范围。若新增统计协议，必须在三个入口共享同一解析器，并把统计文件身份写入 checkpoint/运行 metadata，否则推理可能静默使用另一套量纲。
+- 现有 `data_loading_config.yml` 只声明 `garden` 为 train、`loop3` 为 test；已有分布审计按稀疏体素读取 Doppler/variance，但没有统计 intensity 分位数，也没有生成可直接消费的训练集 normalization artifact。
+- 动态按样本或按场景归一化会泄漏验证/测试分布并破坏物理幅值；硬编码常量则无法证明来源。更可审计的边界是：只从训练场景生成冻结 JSON，Dataset/inference 显式加载并记录 hash，正式路径缺失或不匹配时 fail-closed。
+- 现有 v11 只读审计确认 garden/loop3 的 Doppler 均值约为 `-48.13/-53.54 m/s`，且局部 variance 均值仅约 `5.56e-4/4.03e-4`；这与旧预处理的固定自运动补偿协议一致，也证明 normalization artifact 必须绑定预处理 policy，不能跨新 `velocity_mode=none` 数据复用。
+- 20 帧轻量抽样中，garden intensity 中位数约 `11.65`、p1～p99 约 `5.28～21.44`；loop3 中位数约 `10.44`、p1～p99 约 `5.02～21.41`。强度适合由训练场景冻结 `log1p + median/IQR`，而不是逐场景归一化。
+- Doppler 建议用显式物理量程做对称缩放并裁剪，保留正负号；variance 保持 `(m/s)^2` 供现有不确定性头消费，并在 resize 中通过 `E[var+mean²]-E[mean]²` 重算。若同时把 variance 除以量程平方，现有 `UncertaintyHead` 的物理语义会被破坏。
+- 正式 checkpoint 链目前只验证网格、父权重 hash 和多模态 state 前缀，没有 Radar normalization 协议。LDM/CD 的 Radar encoder 依赖输入量纲，因此两阶段必须携带并校验相同 normalization metadata/hash；VAE 不消费 Radar，可不绑定该统计。
+- `inference_run.json` 当前记录网格、阈值和模态信息，但没有输入 normalization 身份。正式推理必须从实际加载的 LDM/CD checkpoint 取得协议并写入运行 metadata，不能仅从本机数据目录猜测。
+- 仓库内未找到 Radar 硬件的无模糊 Doppler 量程或可作为权威来源的传感器型号配置；只有飞行速度 `35～70m/s` 的任务约束。因而不能把训练分位数或任意 `80/100m/s` 常量伪装成传感器物理量程。
+- 当前 `Data/NTU4DRadLM_Pre_sensor_aware/{garden,loop3}` 都缺少 `preprocess_policy.json`，再次证明现有历史体素不能自动获得可信的运动/单位 provenance。新 normalization builder 应要求调用方显式给出正有限 `doppler_scale_mps`，并记录训练场景和输入 policy/manifest 身份；不在代码中猜默认值。
+- 增强顺序存在隐形单位依赖：`VoxelAugmentation` 会对 target/condition 同时施加物理 Doppler shift，并对 condition 全通道加噪。Radar normalization 必须放在 resize 和增强之后；若先归一化，`0.1` 对 target 表示 `0.1m/s`、对 condition 却表示 `0.1*doppler_scale_mps`，两者不再一致。
+- `default_config.yaml` 已有 `data.augmentation`，但 `unified_train.py` 没有把它传给 Dataset，当前实际使用 Dataset 内部默认 jitter。P1-04 不应顺便全面修复 P2-01，但必须让 normalization 的顺序对现有默认增强安全，并在设计中标出该剩余问题。
+- 用户批准方案 1：冻结训练场景 artifact、Dataset/inference 共享入口归一化、LDM/CD checkpoint/hash 绑定；正式入口对缺失协议的旧 checkpoint fail-closed，Doppler 量程由配置显式给出且不猜默认值。
+- 设计规格已写入 `docs/superpowers/specs/2026-07-22-radar-normalization-variance-resampling-design.md`；自审补齐 `formal` 标记、逐场景 manifest SHA-256 和目标文件原子发布边界，未发现 TBD、相互矛盾或范围外重构。
+- 用户已复核并确认书面规格；进入详细 RED/GREEN 实施计划编写阶段，尚未修改生产代码。
+- `RadarGenerator._load_model()` 当前丢弃生成 checkpoint 的非模型 metadata；实施时必须保存完整 checkpoint metadata/normalization spec 到 generator，再让 `load_radar_voxel_as_tensor()` 消费，不能从 state dict 反推。
+- formal chain 的测试 fixture 可直接增加共享 `radar_normalization` 与 hash，并添加 LDM/CD 缺失和不一致用例；VAE fixture保持无 normalization，符合已批准边界。
+- 计划前复核发现 Radar tensor 同时可能进入 VAE condition encoder 和多模态 `radar_encoder`；必须继续确认训练/推理中 `z_cond` 的实际使用，避免 normalization 只适配一条分支而破坏另一条隐形输入。
+- 实际数据流已确认：`unified_train.py` 的多模态 LDM 分支会计算 `z_cond=vae.get_latent(cond)`，但模型调用不消费它；`cd_train_optimized.py` 的多模态 denoiser 同样忽略 `z_cond`；`inference.py` 只借该 latent 推导 shape，采样模型仍直接消费 Radar voxel。正式多模态链应删除这条无效 VAE 条件编码，训练从 `z_target`、推理从 VAE shape API 取得潜空间尺寸；显式 legacy 单模态诊断才保留 `z_cond`。
+- 该收紧不会改变多模态模型实际前向结果，因为原 `z_cond` 未进入正式多模态 denoiser；它会消除一次无效 VAE 编码，并防止后续把规范化 Radar 数值误解释为 target 的 occupancy/intensity/Doppler/variance 语义。
+- `resize_voxel_channels()` 还是 target、LiDAR observed mask 等通用通道的既有接口，不能把 Radar 方差二阶矩规则无条件套到所有四通道体素。实施应新增语义明确的 `resize_radar_voxel_channels()`，仅替换 Dataset condition、normalization builder 与逐文件 Radar inference 的调用；通用 target/mask resize 保持不变。
+- `dataset_manifest.validate_scene_manifest(scene_dir, expected_scene)` 会重扫逐帧文件并返回已验证 manifest，其中 `content_sha256` 可作为 normalization artifact 的逐场景 provenance；builder 无需复制一套 manifest 校验实现。
+- 实施计划自审移除了两个范围外分支：P1-04 不接通尚未生效的 augmentation YAML，也不让 shell 复制 Python 的 JSON/schema 校验。当前默认/直接传入增强仍必须满足“物理增强后归一化”，正式 fail-fast 以 Python 入口为唯一权威。
+- 当前 condition 高斯噪声会连 occupancy 一起扰动，并可能把约 `1e-4` 量级 variance 变为负数；若不收紧，后置 normalization 无法维持 occupancy/variance 物理语义。P1-04 只保留 occupancy、将增强后 variance 限制为非负，其他 augmentation 配置接线仍留给 P2-01。
+- Task 1 基线确认现有 Dataset/推理接口测试通过；Airborne 并行命令输出为空，不能仅凭并行调用完成就声称通过，后续独立复跑。第一批新测试只锁定可由现有四通道精确表达的 occupied-voxel 等权二阶矩，不引入原始点数这一不可用权重。
+- Task 1 已建立严格四通道边界：专用 resize 用 `E[var+mean²]-E[mean]²`，normalization loader 同时约束 JSON schema、网格、显式 Doppler scale、formal 标记、manifest provenance 和真实文件 hash；target/mask 通用 resize 未改。
+- Airborne 外部回归不是失败断言：前 5 项通过，第 6 项长时间停在融合前向且没有新输出，最终未取得完整退出码。P1-04 的纯函数与 Dataset metadata 回归均已独立通过，因此继续 Task 2，但最终审查仍需避免把 Airborne 记为全通过。
+- Task 2 builder 复用 `validate_scene_manifest()` 的全内容重算结果并要求 Radar 帧数等于 manifest；统计严格按 `crop → resize_radar_voxel_channels → occupied log1p`，目标 JSON 只在全部统计和 spec 自校验完成后原子发布。`max_frames>0` 的小样本即使覆盖了全部现有帧也固定为 `formal=false`。
+- 本轮仅在 `TemporaryDirectory` 生成小体素并调用 mock manifest，没有读取 `Data/` 真实场景，也没有猜测或写入实际 Doppler scale；正式 artifact 仍需用户后续明确硬件量程后单独生成。
+- Task 3 首轮 GREEN 发现旧 `audit_dataset_protocol.py` 通过顶层 `cm.dataset_loader` 导入；此时 `from ..radar_normalization` 抛 `ValueError: attempted relative import beyond top-level package`，而不是 `ImportError`。Dataset loader 的兼容分支已同时捕获两类导入失败，继续支持包内正式导入和旧顶层诊断导入。
+
+## 2026-07-22 P1-04 实施结论
+
+- 新增严格 `radar_normalization_v1`：强度使用 occupied `log1p` 的冻结 median/IQR，Doppler 使用显式 `doppler_scale_mps` 对称缩放并裁剪；没有默认量程、运行时重估或 validation/test 泄漏。
+- 新增 Radar 专用四通道 resize。occupancy 继续 max-pool，intensity/Doppler 按 occupied 权重合并，Doppler variance 按 `E[var + mean^2] - E[mean]^2` 计算总方差；通用 target/observed-mask resize 未被改写。
+- artifact builder 只接受显式训练场景，先验证 scene manifest，再按真实 crop/resize 顺序统计；`max_frames>0` 的抽样产物固定 `formal=false`，已有路径和 symlink 均拒绝覆盖。本轮未生成真实正式 artifact。
+- Dataset 默认缺 spec 即失败，物理增强完成后才归一化 Radar；occupancy 不再加入高斯噪声，occupied variance 保持非负，空体素仍为零。legacy 只能显式启用且进入 sample metadata。
+- LDM/CD checkpoint 保存完整 spec 与 artifact 文件 SHA-256；CD 在输出目录前比较配置 artifact 与教师 LDM，resume 在加载 model/EMA/optimizer 前比较协议。VAE 不消费 Radar，因此 checkpoint 不绑定该字段。
+- formal checkpoint chain 现在拒绝 LDM/CD 缺字段、缺 hash、非正式 spec、内容/hash 不一致和 VAE 错带 normalization；报告记录统一 protocol/hash。
+- 推理只从实际 LDM/CD checkpoint 读取 spec，不接受 CLI 统计覆盖；逐文件和 Dataset 两条入口复用同一 Radar resize/normalize。`inference_run.json` 记录完整 spec/hash 与 `formal_protocol`，旧 checkpoint 仅能用显式 legacy 开关并标记非正式。
+- 正式多模态训练/推理不再把 Radar condition 送入 target VAE；VAE 只编码 target 或提供公开 latent shape。legacy 单模态仍显式保留 `z_cond`，避免 `None` 拼接和 shape 接口错误。
+- 代码审查额外发现并修复两处隐形依赖：LDM 原子保存后旧测试仍 mock 底层 `torch.save`；IR 消融 Dataset 固定 legacy、generator 默认 formal 且先创建输出目录。测试现改 mock 公共原子保存接口；消融先校验 generator，再继承其 grid/spec/hash 构造 Dataset，最后创建输出。
+- mini train/inference 和两个历史 v7 诊断 runner 显式声明 legacy；正式 train 和三个 formal inference launcher 均不包含 legacy 开关。
+- 监督与体素影响：target、observed mask、occupied 坐标、网格尺寸、每帧体素总数、四通道模型结构和损失/指标公式不变；变化只发生在 Radar condition 的 intensity/Doppler 数值尺度及下采样 variance。variance 新增组间均值差贡献，因此不确定性输入、预测及最终指标可能变化。
+- 可比性边界：缺协议的旧 LDM/CD checkpoint 与新正式链不兼容；旧结果不能与新 normalization/variance 协议结果直接混合。默认 YAML 的空 artifact 路径和 null scale 是故意的 fail-closed 未配置状态。
+- 最终聚焦验证通过 212 项 unittest 和 2 份直接接口测试；相关 Python 编译、9 份 shell 语法、`git diff --check` 与空暂存区检查均为 exit 0。未运行训练、完整预处理、正式 artifact 全量统计、模型采样或全量评价。
+
+## 2026-07-22 P1-01 真实数据时间容差续修
+
+- 用户首次执行 `preprocess-v2.sh` 时，严格索引在 garden 首个 LiDAR 时间戳处失败：目标 `1652439548.528784990`、最近 Radar `1652439548.579992056`，偏差 `51.207066ms` 超过当前 `30ms`。
+- 该失败发生在索引生成、候选体素目录创建和全量预处理之前；当前证据尚不能判断是单个启动边界帧，还是 Radar/LiDAR 异步帧率使 30ms 对整个序列过严，禁止直接把阈值改成 60ms 后重跑。
+- 全量文件名时间戳只读统计排除了“仅首个边界帧”解释：garden 的 4014 个 LiDAR 主轴帧有 1251 个最近 Radar 偏差超过 30ms，重叠区最大 `63.858ms`；loop3 的 6450 帧有 1858 个超过 30ms，重叠区最大 `63.322ms`。两场景各只有 2 个主轴帧位于另一传感器时间边界之外。
+- Radar-LiDAR 最近邻偏差中位数为 garden `22.442ms`、loop3 `21.150ms`；P99 分别为 `57.958ms`、`45.643ms`。直接改为 60ms 仍会遗漏少量重叠区帧，而且会把来源不明的接收抖动合法化。
+- Radar-IR 最近邻偏差也并非严格落在 20ms 内：garden 4816 个 Radar 帧中 52 个超过 20ms、最大 `22.401ms`；loop3 7738 帧中 96 个超过 20ms、最大 `22.927ms`。需先核验当前 Raw 文件名是否仍来自旧 receipt-time 解包。
+- 当前 Raw provenance 已由 bag 首帧直接确认：garden `/radar_pcl` header=`1652439548.553762913`、receipt=`1652439548.579992294`，现有文件名为 `1652439548.579992.npy`；`/livox/lidar` header=`1652439548.559700966`、receipt=`1652439548.528785467`，现有文件名为 `1652439548.528785.npy`。现有 Radar/LiDAR/IR 文件名都匹配 receipt，而非 P1-01 新实现要求的 header 优先协议。
+- 因此 30ms 大量失败的根因是当前 `Data/NTU4DRadLM_Raw` 属于旧解包产物，包含各 ROS 通道不同的传输/写包时延；直接放宽阈值会掩盖旧时间源。应从原始 bag 用新 `unpack_rosbag.py` 解包到独立 Raw 候选目录，并在切换前验证 header-based 30ms/20ms 分布。
+- 对 4 个原始 bag 的全部相关消息直接读取 header 后，30ms 仍不成立：garden Radar-LiDAR 重叠区中位/P99/max 为 `26.472/39.440/43.569ms`，1527 对超过 30ms；loop3 为 `20.631/43.391/81.049ms`，1790 对超过 30ms。原因是约 12Hz Radar 与 10Hz LiDAR 的异步节拍，正常最近邻上限接近半个 Radar 周期 `41.7ms`，不是代码故障。
+- loop3 的 `81.049ms` 最大值明显超过正常半周期窗口，符合 Radar 掉帧/间隙异常；不应为了保留该帧把全局阈值提高到 85ms。更合理的协议是以约 45ms 接受正常异步相位，并显式拒绝、记录少量掉帧型候选，而不是任意一帧超限就使整个场景无产出。
+- header-based Radar-IR 的 P99/max 为 garden `20.518/22.461ms`、loop3 `19.969/22.658ms`；20ms 分别拒绝 70 和 72 帧。Thermal 约 25Hz，理论半周期 20ms 加少量抖动，25ms 是比当前 20ms 更符合采样周期的候选上限，仍需以测试锁定。
+- receipt-header 偏差呈明显通道差异：garden Radar 中位 `+10.922ms`、LiDAR `-28.874ms`、IR `+5.886ms`；loop3 Radar `+8.146ms`、LiDAR `-48.970ms`、IR `+5.733ms`。这进一步确认必须重解包为 header 时间源，不能继续基于旧 Raw 调参。
+- 按新解包脚本实际的 6 位文件名精度只读重算，45ms 门禁仅拒绝 garden `1/4014`（`0.0249%`）和 loop3 `18/6450`（`0.2791%`）个 LiDAR 主轴候选，均明显低于 1% 门禁；最大偏差约 `64.248/81.049ms`，会进入 `radar_lidar_rejected.csv` 而不会被强行配对。
+- 最终协议采用 Radar-LiDAR `45ms + skip_unmatched + 1% reject gate`、Radar-IR `25ms fail-closed`。前者适配 12Hz/10Hz 正常异步相位且保留掉帧审计，后者覆盖 25Hz Thermal 半周期与已测抖动。
+- 代码审查发现正式 conda 环境缺少 pandas，而解包器在解析 `--help` 前就导入 pandas；同时 open3d 仅服务于已注释的预览代码。已改用标准库 `csv.DictWriter` 并保留动态字段并集，移除两项无效依赖，正式解包入口现可直接启动。
+- 解包器遇到任一损坏 bag 由“继续并最终报告成功”改为立即抛错；v2 脚本在索引前同时检查 Radar、LiDAR、Thermal 三类场景目录，避免不完整数据延迟到体素 worker 才失败。
+- 最终聚焦回归共 37 项通过：时间戳 8、PointCloud/解包 4、运动协议 8、manifest 10、Thermal 3、sensor-aware target 4；相关 Python 编译、两个 shell 语法、索引/解包直接 `--help`、`git diff --check` 和候选目录不存在保护均为 exit 0。
+- 监督与数量影响：按当前 bag 只读统计，新索引预计保留 garden `4013`、loop3 `6432` 对，分别审计拒绝 1 和 18 对；target 定义、每帧网格尺寸和通道数不变，但帧成员及 Radar/LiDAR/IR 配对会改变。后续新 normalization、checkpoint 和指标不得与旧 receipt-time 数据链混用。
+- 本轮没有执行完整解包、预处理、normalization 全量统计、训练、推理或评价，没有创建候选 Raw/体素目录，也没有删除或覆盖旧数据、checkpoint、日志和结果。
+
+## 2026-08-20 P1-05 移动平台局部地图更新启动
+
+- 当前 `SlidingProbabilisticGridMap` 的状态全部是 `(X,Y)`；`update_from_voxel()` 对输入 `(X,Y,Z,C)` 直接沿 Z 取 max，并要求输入 XY 与地图完全同形，没有接收传感器到局部地图的位姿。
+- `streaming_map_update.py` 使用 `timestamp=i*dt`，只把 `odom_cov_trace` 作为观测可靠度折扣；没有逐帧真实时间戳或 `T_local_body` 输入，所以移动平台上的静态障碍会按机体系网格索引直接叠加。
+- P0-05 已在同一调用链加入 observed/free/unknown 语义和 sidecar 读取；P1-05 必须保留这些未提交改动，位姿 warp 后 observed mask、occupancy、uncertainty 与 DEM 需要使用同一坐标映射。
+- 最小兼容边界：保留现有 2D `occ_prob/belief/plausibility/unknown_mass` 作为分层状态的 BEV 聚合输出，同时新增 `(X,Y,Z)` 分层证据；旧调用方不传位姿时继续采用单位变换，正式 pose-aware 模式则必须逐帧提供有效位姿和时间戳。
+- 仓库内 `SlidingProbabilisticGridMap` 只有 streaming 入口和单元测试调用，现有快照消费者只读取既有 2D 键；因此可通过“保留旧键、追加 layers/pose metadata”扩展而不破坏现有离线消费者。
+- 既有 roadmap 明确 ROS/PX4/HIL 需等离线地图在 35/50/70m/s 档稳定后再设计，本轮不越界新增 ROS service/action；先完成可由离线测试验证的局部坐标、时间和高度协议。
+- 位姿输入拟采用每帧 CSV：`frame,timestamp,tx,ty,tz,qx,qy,qz,qw`，四元数表示从当前 body 到固定 local map 的旋转；帧覆盖、时间严格递增、有限数、单位四元数和刚体矩阵均在创建输出目录前校验。
+- 第二批 GREEN 暴露旧布局猜测的隐形依赖：推理保存的是 `(C,Z,X,Y)`，预处理体素是 `(X,Y,Z,C)`；旧 `to_xyzc()` 只按首/末维是否小于 8 猜测，小尺寸或低分辨率输入会歧义并静默交换 XY。正式入口需支持显式 layout，auto 遇到两种解释同时成立时拒绝。
+- P1-05 最终实现采用固定 `local` 地图系和严格 body→local CSV；帧覆盖、时间递增、四元数归一化、刚体方向、体素布局、prior DEM shape 和 target 帧覆盖均在输出目录创建前校验。`map_run.json` 记录 pose hash、方向、layout、网格、阈值和指标坐标系。
+- 权威地图状态新增 `(X,Y,Z)` 的 occupancy/belief/plausibility/unknown 四层，旧 `(X,Y)` 键继续保留。`128×128×32` 网格新增持久分层状态约 `4×524288×4 = 8 MiB`；稀疏 warp 只为 observed/occupied 单元构造坐标，避免每帧为全网格建立多组 float64 meshgrid。
+- 代码审查修复了三态质量不一致：旧实现会把未观测 `p=0.5` 重新解释成 occupied/free 各半的高可靠先验，使 unknown 从 1 降到 0.1。现在直接融合已有 D-S 质量，使用 `m_occ + 0.5*m_unknown` 输出 pignistic occupancy，并让时间衰减把 occupied/free 质量转回 unknown。
+- 最近障碍查询在提供 `z_m` 时使用三维层和当前 body 原点；逐帧 target 点先用同一 `T_local_body` 变换到 local，再与分层地图评价。现有 obstacle precision/recall 仍由 `occupancy_prf` 在 BEV XY 单元上计算，因此数值会因位姿对齐和阈值概率语义修正而变化，不能与旧 body/`z=0` 日志直接混合。
+- `streaming_map_update.py` 的直接入口不再导入完整 `cm/__init__.py` 训练栈，`--help` 不触发 Torch/OpenMPI。单帧输入若带 batch 维必须 `batch=1`，不再静默丢弃其余样本。
+- 本项不改变模型、训练监督、target 生成、单帧输入体素数或 checkpoint。地图持久单元由旧 `X×Y` 扩展为权威 `X×Y×Z`，并保留旧 BEV；输出快照与指标协议已变化。
+- 动态障碍仍没有可信 evidence 来源。本轮没有从 Doppler 猜测动态阈值，因为 P0-03/P1-04 后通道可能处于不同物理/归一化协议；应单独定义显式动态 mask 或跟踪器输出、来源 metadata 和更快衰减，再接入独立动态层。
+- 动态层续修全仓搜索没有发现现成动态障碍 mask、跟踪器或可消费动态层；测试中的 `dynamic_*channels` 指模型通道配置，不是运动目标 evidence。
+- 预处理 channel 2 标注为 egomotion-compensated mean Doppler，但正式 Dataset/inference 会按 normalization artifact 的 `scale_mps` 归一化；streaming 输入还可能是生成体素，不能仅凭数组通道位置判断当前值是 m/s、归一化值还是生成特征。
+- 因此动态层入口必须消费显式二值/概率 sidecar 及 provenance，而不是在 `SlidingProbabilisticGridMap` 内新增隐式 Doppler 阈值。未提供 evidence 时动态状态应保持未启用，避免固定增加约 8 MiB 三态层内存。
+- inference 逐文件模式保存生成体素并在完成后发布 `inference_run.json`；预处理场景则用 `preprocess_policy.json` 记录 `velocity_mode`、速度文件 hash 和 channel 语义。这些 run/policy 文件可作为外部动态分类器的输入 provenance，但现有地图入口未校验它们。
+- 动态 evidence 帧文件设计为 `<frame>_dynamic_evidence.npz`，同时包含 `(X,Y,Z)` 的 `probability` 与显式布尔 `observed`。这样 `probability=0` 只在 `observed=1` 时表示静态证据，未观察位置继续是 unknown，不复发 P0-05 的空白即 free 错误。
+- 目录级 `dynamic_evidence.json` 应固定 `body_voxel` 坐标、概率/observed 语义、网格/pc_range、帧数、来源类型和 64 位来源 artifact hash；streaming 用同一 `T_local_body` warp evidence，并在最终 map metadata 记录实际消费文件聚合 hash。
+
+## 2026-08-20 Codex VS Code 历史会话读取修复
+
+- VS Code 扩展为 `openai.chatgpt@26.818.21641`，捆绑 Codex CLI `0.148.0-alpha.21`；终端默认 CLI 为 `0.142.4`，本次验证固定使用扩展版本。
+- 会话数据没有丢失：`state_5.sqlite` quick check 为 `ok`，共 219 条线程（216 活跃、3 归档），全部 rollout 路径存在；`session_index.jsonl` 169 行均为合法 JSON。
+- 根因是用户配置把提供方设为自定义 `OpenAI`（大写），旧会话记录为内置 `openai`（小写）。app-server 的 `thread/list.modelProviders` 是精确过滤；实际复现中 `OpenAI` 只返回 2 条新会话，`openai` 能返回旧历史。
+- 旧会话内容可读：对 2026-04-29 会话执行 `thread/read(includeTurns=true)` 成功返回完整 turns，排除 JSONL/SQLite 损坏。
+- `disable_response_storage`、`network_access`、`windows_wsl_setup_acknowledged` 均为当前扩展 CLI 的未知旧字段；其中有效历史策略仍是 `history.persistence=save-all`。
+- 修复将 `model_provider` 统一为内置 `openai`，删除重复的 `[model_providers.OpenAI]` 和三个未知旧字段。原配置备份为 `/home/zxj/.codex/config.toml.bak-20260820-codex-history-fix`。
+- 候选配置已通过 `app-server --strict-config`、按 `openai` 枚举旧会话和旧会话全文读取；未改动 SQLite、session index、sessions 或 archived sessions。
+- 本修改只涉及 Codex 用户配置，不改变项目监督信号、体素数量、模型结构、checkpoint 或指标结果。
+
+## 2026-08-20 P1-05 动态层代码审查
+
+- 首轮 GREEN 的兼容快照分别用 `max/max/min` 合并静态与动态 belief、plausibility、unknown，结果可能不再满足 `unknown = plausibility - belief`，也无法由同一组 D-S 质量解释。兼容的静态并动态状态必须先合并 belief/plausibility，再统一推导 unknown 与 pignistic probability。
+- 动态 sidecar 是外部分类器/跟踪器的显式输出，不能隐式复用 Radar 距离衰减、Doppler 方差或生成模型 uncertainty。动态 probability 表达分类结果，`observed` 表达有效域；融合可靠度只额外折扣 body→local 位姿的 odometry 置信度。
+- `GridMapConfig` 的直接 Python API 需要保证两项衰减率均为有限非负数；“动态严格快于静态”的关系只在实际提供动态 evidence 时、且必须在任何状态修改前验证。速度缩放同时作用于两者，因此不会改变已验证的次序。
+- 严格 JSON 协议当前会把数字字符串和布尔值转换成 `pc_range` 浮点数，形成“JSON schema 看似严格、实际自动降级”的接口不匹配；需显式要求六个 JSON number（拒绝 bool/string），并严格要求 `shape_xyz` 为三个正整数。
+- `map_run.json` 只记录速度缩放后的 `dynamic_decay_rate`，无法区分用户输入与 35/50/70m/s 速度修正；审计输出应同时记录静态/动态 base 与 effective 衰减率。
+- 聚焦回归后的兼容性复审发现：若在 `GridMapConfig` 构造期无条件要求动态衰减快于静态衰减，会使从未启用动态 sidecar 的旧静态调用也受新参数约束。正确边界是两项衰减率始终要求有限非负，但“动态严格更快”仅在实际提供动态 evidence 时、且在任何地图状态修改前校验；CLI 同样只在指定 `--dynamic_evidence_dir` 时启用该关系门禁。
+- streaming 协议 loader 首轮只预检 metadata、文件名和普通文件属性，NPZ 的 key/shape/数值却到逐帧循环才验证；若后续帧损坏，输出目录和早期快照已经产生。正式协议应在创建输出前逐文件解析校验并记录 SHA-256，运行时重新读取后对照预检 hash，避免损坏输入留下可误用半成品并检测预检后的文件替换。
+- 动态快照首轮先复制既有静态状态，再为 `static_*` 键重复复制一遍同一数组。`static_*` 可以安全引用快照内已经与内部地图隔离的第一份副本；后续替换 legacy 组合键不会改变该引用，可减少常用 `128×128×32` 快照约 8 MiB 的重复三维副本。
+- D-S envelope 复审发现更深一层语义问题：动态层 `unknown=1` 表示外部分类器未覆盖，不是独立传感器报告“可能有任意动态障碍”。若与静态 plausibility 直接取最大，启用一个稀疏 sidecar 就会把其他位置已经确认的 static free 全部抬回 unknown。兼容总 occupancy 应采用动态占用覆盖：仅当动态 pignistic probability `>0.5` 且高于静态 probability 时，选择该动态单元完整的 probability/belief/plausibility/unknown 状态，否则完整保留静态状态；这样既保持 D-S 一致，也不让未覆盖域污染总图。
+- 文件名协议允许同时出现 `<frame>.npy` 与 `<frame>_voxel.npy`，二者会映射到同一 frame 键；identity 模式此前不会像 pose loader 一样拒绝，动态 sidecar 还可能被重复消费。主入口现在对所有模式线性预检 frame 键唯一性。
+- `source_artifact_sha256` 是外部 producer 在 metadata 中声明的模型/规则 artifact hash，当前目录协议没有提供可本地解析的 source artifact 路径，地图端不能把它表述为已验证。run metadata 需显式记录 `declared_by_metadata_unresolved`，同时继续用实际读取的 metadata/逐帧 NPZ hash 审计本次输入。
+- 最终动态协议不改变模型监督、LiDAR target、单帧输入体素数量或 checkpoint。未启用 sidecar 时不分配动态三维状态；启用后常用 `128×128×32` 网格新增四个持久 float32 动态状态约 8 MiB，快照还需序列化分离与组合状态，但已移除约 8 MiB 的重复静态副本。
+- 提供动态 evidence 后，旧 `occ_prob*` 键变为 static 与明确 dynamic-occupied 的一致覆盖，障碍查询、precision/recall、unknown 统计可能变化，不能与无动态协议旧日志直接混合。仓库仍不包含可信动态分类器/跟踪器；本项实现的是严格消费、位姿对齐、独立衰减和审计层，不从未校准 Doppler 生成伪标签。
+- 最终验证为 36/36 聚焦测试通过，相关三份 Python 编译、streaming 直接 `--help`、`git diff --check` 与 `git diff --cached --quiet` 均为 exit 0；没有运行真实数据重放、预处理、训练、推理或全量评价，也没有暂存、提交或推送。
+
+## 2026-08-20 P1-07 LDM 验证与 CD 训练语义审计
+
+- `VAETrainer` 已有独立 `validate()`、`best_iou` 与同 epoch checkpoint 一致性；`OptimizedLDMTrainer` 仍只有 `best_loss`，训练循环直接用 epoch train loss 保存 `ldm_best.pt`，没有 LDM validation loader 或验证选择协议。
+- LDM checkpoint 已经由 P1-04/P1-06 补齐 `model_config`、fusion voxel/pc range、VAE SHA-256 和 Radar normalization，P1-07 不重复改造这些字段，只扩展验证选择与恢复状态。
+- standalone CD 会加载冻结 LDM checkpoint 并用其初始化 CD/EMA 参数，但逐步 consistency target 实际来自 `cd_model_ema`，并非每步调用冻结 LDM；因此本轮按已批准边界准确声明“LDM 初始化后的 EMA consistency training”，不把它伪装成持续 LDM teacher distillation，也不在同一项重写算法。
+- 最小实施边界：正式 LDM 必须接收独立 validation loader，按验证期的任务相关指标选择 best，并在 checkpoint 中记录 selector、验证指标和 split 语义；legacy/旧测试需显式兼容，不能把缺字段 checkpoint 自动补签为新正式协议。
+- `main()` 已构造无增强、无 shuffle 的连续时间后缀 `val_loader`，VAE 会消费它，但 LDM 当前只调用 `trainer.train(train_loader)`；因此无需重新设计数据切分，只需把已有独立 loader 接入 LDM，并锁定接口不允许隐式回退到训练集。
+- 现有 `test/evaluation/ldm/select_ldm_checkpoint.py` 使用固定 32 帧、20 步完整生成、IR real-only 和结构门槛做最终候选选择，适合正式训练后的离线 gate，不适合每 epoch 内嵌。训练期应使用固定 seed/sigma/noise 的单步 denoising validation proxy，至少记录 val loss 与解码 occupancy IoU；最终生成质量仍由既有固定协议选择器裁决，两者名称必须区分。
+- LDM 训练期 best 建议采用 `max val_denoising_occupancy_iou`、同 IoU 时 `min val_loss`，并记录固定 validation seed/sigma/occupancy threshold。这样 best 不再依赖 train loss，同时不会把单步代理指标冒充 20 步生成指标。
+- `OptimizedLDMTrainer.train()` 现强制接收独立 `val_loader`，并拒绝空 loader、同一个 DataLoader 或同一个 Dataset；统一入口已把既有连续时间后缀验证集接入 LDM，不再存在训练集隐式回退。
+- 每轮验证固定使用 seed `42`、sigma `0.5` 和 occupancy threshold `0.5`。同一固定噪声序列计算单步 denoising latent MSE，并将输出经冻结 VAE 解码后累计 micro occupancy IoU；这些名称均带 `denoising`，避免与既有 20 步完整生成门禁混淆。
+- `ldm_best.pt` 现按最大验证 denoising occupancy IoU 选择，同 IoU 才比较更小的验证 latent loss；训练 loss 只作为 `best_train_loss`/兼容 `best_loss` 审计字段保留。CSV、epoch checkpoint 和 best checkpoint 都记录当前/历史最优验证状态及 selector。
+- 新协议 checkpoint 恢复时严格比较 protocol、split、selector、seed、sigma 和 threshold，并验证 best 不劣于 current；所有比较在加载 model/optimizer state 前完成。无 `ldm_validation` 的旧 checkpoint 仍可恢复，但不会被自动补签，必须经过下一轮独立验证后才能保存新正式 checkpoint。
+- CD 算法没有被改写：LDM checkpoint 仍只初始化 `cd_model`/`cd_model_ema`，逐步目标仍来自持续更新的 `cd_model_ema`。checkpoint 新增 `training_semantics=ldm_initialized_ema_consistency_v1`、`ldm_role=initialization_checkpoint` 和 `consistency_target_source=cd_model_ema`，旧 `teacher_model_path` 仅作为兼容配置名保留。
+- 本项不改变 target、每帧 occupied target 体素数、训练样本成员、网格尺寸、LDM/CD 网络结构或训练损失公式。每 epoch 新增一次完整验证集的 LDM 前向和 VAE decode；`ldm_best.pt` 与历史按 train loss 选择的结果不可直接等同，最终生成质量仍须通过固定 32 帧离线 gate。
+- 聚焦回归通过：LDM validation 协议 5 项、LDM 结构/训练器 81 项、VAE/checkpoint 23 项、多模态推理 31 项、离线 LDM selector 10 项、机载多模态 9 项，以及两个 CD 脚本式接口测试；相关 Python 编译和 `git diff --check` 通过，未运行长时间训练、全量预处理或真实数据推理。
+
+## 2026-08-20 Radar normalization 零 IQR 初步诊断
+
+- 候选数据预处理和两个场景 manifest 已完成，失败只发生在步骤 6 的 garden normalization artifact 统计。
+- `build_radar_normalization.py` 对 occupied Radar 体素的 `log1p(intensity)` 使用 Q25/Q75 IQR；当前报错证明合并后的中间 50% intensity 完全相同，但尚不能据此判断是源数据常量、体素聚合量化或通道读取错误。
+- 现有失败保护是正确的 fail-closed 行为，不能直接把 IQR 硬编码为任意常数；需先比较 manifest、原始 `.npy/.npz` 四通道和 crop/resize 后分布。
+- 已生成的候选 Raw/体素目录不得删除或覆盖；修复后应只重跑步骤 6，不重复执行全量解包和预处理。
+- 候选 garden manifest、`preprocess_policy.json` 和 `target_policy.json` 均存在，记录 4013 帧、四通道 `[occupancy, mean_intensity, mean_doppler, doppler_variance]`、`velocity_mode=none` 和 45ms Radar-LiDAR 容差；normalization artifact 不存在，说明原子发布前失败，没有半成品。
+- 体素化实现确实从点云第 4 列计算 occupied voxel 的 mean intensity；Dataset/normalization loader 也按通道 1 读取，静态调用链暂未发现通道索引错位。
+- 新 `unpack_rosbag.py` 将 PointCloud2 固定导出为 `[x,y,z,intensity,doppler]`，但 intensity 支持多个 alias；下一步需要核对实际 schema 的 selected/missing fields，并直接统计候选 Raw 与体素 intensity 的唯一值和分位数。
+- 全量 garden Raw 共有 4816 帧、3432896 个点，intensity Q25/median/Q75 为 `9.70/11.78/14.02`；候选 4013 个体素帧在 resize 前共有 2399425 个 occupied voxel，intensity Q25/median/Q75 为 `9.69/11.68/13.83`。源数据与体素化均非退化，排除 intensity channel 缺失或常数化。
+- 真实均匀抽取 16 帧验证了重采样根因：现算法先用 adaptive max 标记 coarse occupancy，却用 trilinear 中心采样计算 intensity，导致 14829 个 coarse occupied voxel 中 `76.49%` 的 intensity 被错误置零，log Q25/Q50/Q75 全为零。
+- 使用与 occupancy 相同 adaptive 分箱的 occupied-weighted average 后，相同 14829 个 coarse occupied voxel 的 intensity 零比例为 `0%`，Q25/median/Q75 恢复为 `9.28/11.27/13.48`，log IQR 约 `0.343`。修复应统一分箱，而不是放宽 IQR fail-closed 条件。
+- 同一错位也会把 coarse occupied voxel 的 Doppler 均值/总方差错误清零，因此这是训练输入监督条件的重采样 bug，不只是 artifact builder 的统计问题。
+- 调用端复核确认训练 Dataset、正式 inference Radar loader 和 normalization builder 都复用 `resize_radar_voxel_channels()`；本次单点修复能保持三条链一致。target/observed mask 和离线 prediction 评价继续使用各自的通用重采样，不受影响。
+- 修复后用真实 garden 前 32 帧执行不落盘 builder 烟测：`log_median=2.486572`、`log_iqr=0.366153`，IQR 已恢复为正有限数；烟测显式为 `formal=false` 且 writer 被 mock，没有生成可误用 artifact。
+- 最终聚焦回归共 73 项通过：normalization 12、builder 4、Dataset metadata 13、sensor-aware target 4、多模态 inference 31、机载多模态 9；相关 Python 编译和 `git diff --check` 通过。
+- 本修复不改变磁盘上的 Radar/target/IR/LiDAR 文件、manifest、target 内容、coarse occupancy 体素数量或网格尺寸；会恢复此前错误清零的 Radar intensity、Doppler 和 variance 条件值。旧错误重采样下的模型输入与指标不可同新正式协议直接比较，当前尚未开始正式训练，因此应先生成 artifact 再训练。
+- 本阶段结束时步骤 6 的目标 artifact 尚不存在，只能重跑 normalization CLI，不能重复 `preprocess-v2.sh`；该状态已由下一节记录的用户重跑结果解除。
+
+## 2026-08-20 正式 Radar normalization 与训练入口切换
+
+- 用户已成功生成正式 artifact：`radar_normalization_garden_32x128x128_full120_86p8_v1.json`，SHA-256 为 `2c9c92650b98ec686d621b53eccb5e7f376cb6b8ea1047d4fb594349af90c4d5`；其训练来源为 garden 全 4013 帧，网格 `[32,128,128]`，source/model pc range 均为 `[0,-20,-6,120,20,10]`，Doppler scale 为 `86.8 m/s`。
+- 用户的正式输入验收通过：garden manifest 为 4013 帧、loop3 为 6432 帧；首个 target/Radar 均为 `(4,32,128,128)`，Radar occupied 为 1028，真实 IR 与真实 calibration 均可用。
+- `default_config.yaml` 已从故意未配置状态切换为该正式协议，并显式冻结 target size、source/model range、artifact 和 scale。VAE/LDM/CD 保存目录统一隔离到 `Result/train_results/formal_p1_04_full120_86p8_v1/`，避免覆盖或误续训旧结果。
+- `train_unified.sh` 在重建临时训练链接前依次校验训练场景 manifest、artifact schema/grid/scale、固定 SHA-256、training scene 和 frame count；生成的 override 使用绝对数据/artifact/结果路径，消除启动工作目录造成的相对路径漂移。
+- 已移除 launcher 的隐式 checkpoint 探测恢复。任一阶段结果目录非空时默认 fail-closed；只有用户显式设置 `ALLOW_RESUME=1` 且对应 best checkpoint 存在时才传 `--resume`，随后 Python 层继续校验 LDM/CD normalization spec/hash 和 checkpoint 协议。
+- 三个正式生成 launcher 使用同一 candidate loop3 输入及新 checkpoint 根，输出目录携带 `formal_p1_04_full120_86p8_v1`；独立评价入口同步使用 candidate preprocessed 根、header-time Raw 根和相同部署目录映射，避免新预测与旧 Raw/index 跨协议配对。
+- 代码审查发现 mini 训练复制正式默认 YAML 后仍传 `--allow_legacy_radar_units`，会触发正式/legacy 互斥。现已仅在 mini 派生配置中显式清空 artifact/scale；正式 launcher 继续禁止 legacy 降级。
+- 本轮不改变磁盘数据、target 定义、单帧通道或体素网格。garden 4013 帧按连续时间块产生 3210 个训练样本和 803 个验证样本，loop3 6432 帧保持独立测试；每样本仍为四通道 `32×128×128`。旧 receipt-time/旧 normalization checkpoint 与后续新指标不可直接混合，输出协议名已物理隔离。
+- 最终验证通过 202 项具名 unittest 与两份 CD 直接接口测试；7 份相关 shell 通过 `bash -n`，默认 config/artifact/result 对照、candidate 路径存在性和 `git diff --check` 均通过。没有启动训练、模型采样、推理或全量评价，正式结果根仍不存在且可安全开始新训练。
+
+## 2026-08-20 正式训练入口导入路径续修
+
+- 用户首次执行正式 VAE launcher 时在参数解析前失败：`unified_train.py` 和 `cd_train_optimized.py` 只把 `diffusion_consistency_radar/` 加入 `sys.path`，可解析旧式 `cm.*`，却无法解析新增的 `diffusion_consistency_radar.checkpoint_chain` 包路径。
+- 原 fallback 将 `checkpoint_chain.py` 当顶层模块导入，但该模块内部仍依赖 `diffusion_consistency_radar.radar_normalization`，因此直接脚本接口与包内接口不匹配；同时捕获整个 `ModuleNotFoundError` 可能掩盖依赖内部真正缺包。
+- 两个训练入口现在同时显式引导仓库根与包目录，并统一使用 `diffusion_consistency_radar.*` 唯一包名；删除失效 fallback，避免同一 `cd_train_optimized.py` 以 `scripts.*` 和 `diffusion_consistency_radar.scripts.*` 双重身份加载。
+- 新测试从临时工作目录清除 `PYTHONPATH`，分别执行两个入口的 `--help`；RED 复现与用户相同异常，GREEN 后均成功。checkpoint 链 8 项、VAE checkpoint 23 项、mini launcher 6 项及两份 CD 接口测试通过，Python 编译、Bash 语法和 `git diff --check` 通过。
+- 失败发生在 Trainer、DataLoader 和输出目录创建前，正式结果根仍不存在，没有 checkpoint 或训练日志需要恢复。本修复不改变监督信号、target、样本数、体素数量、模型结构、normalization 或指标定义。
+
+## 2026-08-20 正式 VAE batch metadata 续修
+
+- 第二次启动已成功进入 VAE epoch 1，但首个 batch 在 worker 的 `default_collate` 失败；异常发生在 batch 交付前，没有执行前向、反向或优化器更新。
+- 真实 garden 样本的顶层 metadata 全部可拼接；唯一根因是 `preprocess_policy` 内 `velocity_mode=none` 对应的 `v_drone`、`velocity_file`、`velocity_file_sha256`、`velocity_record_count` 为合法 JSON null。将其伪造为 0/空字符串会破坏 provenance 语义。
+- 新共享 `collate_voxel_samples()` 继续用 PyTorch `default_collate` 严格拼接 target、Radar、observed mask 和多模态字段，仅将审计用 `preprocess_policy` 保留为逐样本字典列表；其他非法 metadata 仍 fail-closed。
+- 调用链审查发现统一训练的 train/val、standalone CD、条件推理共四个 Dataset DataLoader，现已全部显式使用同一 collator，避免只修 VAE 后在 LDM/CD/推理复发接口不匹配。
+- 真实 garden 前两个样本、多 worker 烟测通过：target/Radar 为 `(2,4,32,128,128)`，observed mask 为 `(2,1,32,128,128)`，两个 policy 的 `v_drone` 均原样为 `None`。
+- 零 epoch 失败目录只有 header-only `metrics.csv` 和启动日志，无 checkpoint，已无损归档到 `Result/train_results/formal_p1_04_full120_86p8_v1/failed_starts/vae_20260820_212426_collate_failure/`；active `vae/` 已释放，可 fresh 重跑且不需要 `ALLOW_RESUME=1`。
+- 本修复不改变 target/监督、4013 个基础样本、3210/803 时间块划分、每样本体素数量、网络、loss、normalization 或指标定义。Dataset metadata 进入 batch 后，`preprocess_policy` 的接口由递归字典张量改为逐样本原始字典列表。
+
+## 2026-08-21 8 GB 单卡 formal mini 训练审计
+
+- 历史 `train_minimal.sh` 默认为 legacy Radar 单位、旧数据根和已有 `test/mini-test/train_results_mini/`，不能代表已验收的 `formal_p1_04_full120_86p8_v1`；现保留该默认兼容，同时增加显式 formal 分支。
+- formal mini 固定 candidate garden、artifact SHA-256 `2c9c92650b98ec686d621b53eccb5e7f376cb6b8ea1047d4fb594349af90c4d5`、`86.8 m/s` 和 source/model full120。每帧仍为四通道 `32×128×128`，即 524288 个空间体素、2097152 个通道值；只把默认抽样降为 16 帧和每阶段 1 epoch，不改变单帧监督定义或体素数量。
+- mini VAE/LDM/CD checkpoint 统一写入 `formal_mini_chain_v1`；正式 `formal_chain_v1` 校验器已用行为测试确认拒绝整条 mini 链，避免短训练权重被误用于正式部署或指标报告。
+- 新入口 `run_formal_mini_8gb.sh` 只允许 `vae|ldm|cd` 单阶段，固定 batch 1、worker 0、梯度累积 1、ultra-lightweight VAE、checkpointing 开启、AMP/FP16 关闭；最多 32 帧、20 分钟，启动温度不高于 65°C、运行达到 80°C 中止，总/空闲显存门槛为 7500/6000 MiB。
+- 温度读取失败、过热或超时会对独立训练进程组按 `INT → TERM → KILL` 逐级中止。每阶段 scratch/config 独立且要求 fresh，非空阶段输出拒绝覆盖；历史数据、checkpoint、日志和结果均未删除或覆盖。
+- 代码审查发现 `conda run -n Radar-Diffusion python -` 在当前环境会返回 0 却不转发 heredoc stdin，导致 artifact Python 校验被静默跳过。现改为 `conda run --no-capture-output ...`，并增加错误 SHA 必须在任何写入前失败的回归测试。
+- 真实只读预检确认设备为 RTX 4070 Laptop GPU、8188 MiB；最终观测空闲 7186 MiB、37°C，artifact hash/full120/scene 校验通过。预检路径 `/tmp/formal_mini_8gb_preflight_codex` 未创建，没有启动 CUDA 训练。
+- mini 脚本协议 11 项、配置/路径安全 103 项、checkpoint 链 10 项、VAE payload 23 项和 CD 入口测试均通过；相关 shell `bash -n`、Python 编译和差异检查纳入最终验收。formal mini 指标只用于调用链烟测，不与 garden 全量训练或 loop3 正式测试结果比较。

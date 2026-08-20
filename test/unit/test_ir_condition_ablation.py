@@ -209,6 +209,29 @@ class IRConditionAblationUtilityTest(unittest.TestCase):
         self.assertIn("--max_samples \"${ABLATION_MAX_SAMPLES}\"", text)
         self.assertIn("--occ_threshold \"${OCC_THRESHOLD}\"", text)
 
+    def test_ablation_inherits_generator_radar_protocol_before_output_creation(self):
+        script_path = os.path.join(
+            ROOT,
+            "test",
+            "ablation",
+            "diagnose_ir_condition_ablation.py",
+        )
+        with open(script_path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+
+        self.assertIn('"--allow_legacy_radar_units"', text)
+        self.assertIn(
+            "allow_legacy_radar_units=args.allow_legacy_radar_units",
+            text,
+        )
+        self.assertIn("radar_normalization=generator.radar_normalization", text)
+        self.assertIn(
+            "radar_normalization_sha256=generator.radar_normalization_sha256",
+            text,
+        )
+        self.assertLess(text.index("generator = RadarGenerator("), text.index("os.makedirs(args.output_dir"))
+        self.assertLess(text.index("generator = RadarGenerator("), text.index("dataset = NTU4DRadLM_VoxelDataset("))
+
 
 if __name__ == "__main__":
     unittest.main()

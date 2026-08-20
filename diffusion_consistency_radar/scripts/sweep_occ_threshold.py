@@ -28,6 +28,22 @@ from cm.evaluation_metrics import (
 )
 
 
+REMOVED_SPLIT_ARGUMENT = "--split_seed"
+SPLIT_PROTOCOL = "temporal_block_prefix_train_suffix_validation"
+
+
+def reject_removed_split_seed_arguments(argv: Sequence[str]) -> None:
+    """拒绝旧随机切分参数，并提示迁移到固定时间块协议。"""
+    for argument in argv:
+        if argument == REMOVED_SPLIT_ARGUMENT or argument.startswith(
+            f"{REMOVED_SPLIT_ARGUMENT}="
+        ):
+            raise ValueError(
+                "阈值扫描已改为固定时间块划分；请删除 --split_seed，"
+                "并确保输入是训练场景的完整连续预测清单"
+            )
+
+
 def load_sparse_voxel(path: str) -> np.ndarray:
     data = np.load(path)
     voxel = np.zeros(data["shape"], dtype=np.float32)
@@ -100,9 +116,8 @@ def select_evaluation_files(
     files: Sequence[str],
     evaluation_split: str,
     train_split: float,
-    split_seed: int,
 ) -> List[str]:
-    """使用与 unified_train 完全一致的 torch.randperm 规则选择评估文件。"""
+    """按正式训练的连续时间块协议选择评估文件。"""
     ordered = list(files)
     if evaluation_split == "all":
         return ordered
@@ -131,25 +146,22 @@ def select_evaluation_files(
             f"train_split={train_split} 导致空划分："
             f"dataset_size={len(ordered)}, train_size={train_size}"
         )
-    generator = torch.Generator().manual_seed(int(split_seed))
-    indices = torch.randperm(len(ordered), generator=generator).tolist()
-    selected = indices[:train_size] if evaluation_split == "train" else indices[train_size:]
-    return [ordered[index] for index in selected]
+    if evaluation_split == "train":
+        return ordered[:train_size]
+    return ordered[train_size:]
 
 
 def prepare_evaluation_files(
     files: Sequence[str],
     evaluation_split: str,
     train_split: float,
-    split_seed: int,
     max_files: int,
 ) -> List[str]:
-    """先在完整预测清单上复现数据划分，再限制实际评估帧数。"""
+    """先在完整预测清单上复现时间块划分，再限制实际评估帧数。"""
     selected = select_evaluation_files(
         files,
         evaluation_split=evaluation_split,
         train_split=train_split,
-        split_seed=split_seed,
     )
     if int(max_files) > 0:
         return selected[: int(max_files)]
@@ -576,10 +588,12 @@ def main():
         "--evaluation_split",
         choices=("train", "validation", "all"),
         default="validation",
-        help="按训练时相同随机规则选择评估子集",
+        help=(
+            "按连续时间块选择训练场景的评估子集；"
+            "validation 只能用于阈值标定"
+        ),
     )
     parser.add_argument("--train_split", type=float, default=0.8)
-    parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--range_bins", type=str, default="0-20,20-40")
     parser.add_argument("--bev_cell_size", type=float, default=0.5)
     parser.add_argument(
@@ -599,6 +613,10 @@ def main():
     parser.add_argument("--z_min", type=float, default=-1.0)
     parser.add_argument("--output_json", type=str, default="",
                         help="Recommended threshold JSON, default: <pred_voxel_dir>/occ_threshold_recommendation.json")
+    try:
+        reject_removed_split_seed_arguments(sys.argv[1:])
+    except ValueError as exc:
+        parser.error(str(exc))
     args = parser.parse_args()
 
     thresholds = parse_thresholds(args.thresholds)
@@ -609,7 +627,6 @@ def main():
         pred_files,
         evaluation_split=args.evaluation_split,
         train_split=args.train_split,
-        split_seed=args.split_seed,
         max_files=args.max_files,
     )
     range_bins = parse_range_bins(args.range_bins)
@@ -875,7 +892,7 @@ def main():
                 "z_min": float(args.z_min),
                 "evaluation_split": args.evaluation_split,
                 "train_split": float(args.train_split),
-                "split_seed": int(args.split_seed),
+                "split_protocol": SPLIT_PROTOCOL,
                 "range_bins": [
                     {"label": label, "x_min": float(lo), "x_max": float(hi)}
                     for label, lo, hi in range_bins

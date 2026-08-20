@@ -138,8 +138,23 @@
       - [ ] Require the calibrated candidate to pass the same fixed 32-frame gate before any 500-frame evaluation
         - [x] Revisit the optimization strategy instead of continuing one-dimensional column-weight tuning
         - [x] Approve the epoch-wise v11 column curriculum design
-        - [ ] Review the written v11 design specification before implementation planning
-        - [ ] Implement and smoke-test the v11 curriculum only after specification review
+        - [x] Review the written v11 design specification before implementation planning
+        - [x] Write and self-review the v11 TDD implementation plan
+        - [x] Implement and smoke-test the v11 curriculum task by task
+          - [x] Task 1: add and review the pure epoch curriculum function
+          - [x] Task 2: wire trainer, metrics, and checkpoint metadata
+          - [x] Task 3: wire mini config and guarded V11 runner
+          - [x] Task 4: run focused regression and bounded smoke
+        - [x] Train V11 for three epochs and run the unchanged fixed 32-frame selector
+        - [ ] Pass the fixed 32-frame gate before authorizing 500-frame evaluation (V11 failed 2/5)
+        - [x] Diagnose V11 epoch2 threshold calibration on the same fixed 32 frames
+        - [x] Evaluate fixed `0.99` and calibrated `0.925` on 32 independent loop3 frames
+        - [ ] Pass the independent-scene structure/calibration gate before 500-frame inference or CD
+        - [x] Audit garden/loop3 Radar、target、IR、range/height 与 Doppler 分布（各 500 帧）
+        - [x] Confirm fixed 50 m/s preprocessing corrupts NTU raw Doppler and block full-data retraining
+        - [ ] Replace implicit fixed-speed compensation with explicit `none/fixed/recorded` protocol
+        - [ ] Rebuild and audit a 32-frame corrected preprocessing subset before any full regeneration
+        - [ ] Add neighborhood or temporal Doppler variance because per-voxel variance is mostly zero
       - [ ] Require both quantitative and raw-LiDAR 3D basic-structure gates before CD
     - [ ] Consider thermal edge/semantic supervision only if v8 precision/top metrics remain bottlenecked
     - [ ] Consider IR-backbone pretraining only after the loss-aligned v8 baseline is stable
@@ -193,6 +208,9 @@
 | Two final read-only analysis subagents reached their usage limit | 1 | Continued from the completed CSV/report artifacts and computed the paired statistics locally. |
 | Focused unittest module import failed because `test/` is not a package | 1 | Ran the established direct test file; all 96 tests passed after the protocol update. |
 | Sandbox could not communicate with the NVIDIA driver | 1 | Ran the explicitly approved bounded GPU training/evaluation commands outside the sandbox. |
+| Scene-audit unit test imported the PyTorch/OpenMPI calibration chain | 2 | Moved calibration/frustum imports into the real audit function; pure unit tests then passed without MPI initialization. |
+| P0-01 adjacency diagnostic did not pass the shell frame count into `conda run` | 1 | Changed from an unexported environment lookup to an explicit command-line argument. |
+| Ignored dataset files produced a zero frame count in the P0-01 diagnostic | 2 | Tried `rg --files -uu`, then stopped after the third total diagnostic failure; the static call chain already proves frame-level random splitting. |
 
 ## Test Directory Organization
 
@@ -202,3 +220,265 @@
 - [x] 修复移动后的 Python import、Shell 引用、默认结果路径和 Git 忽略规则
 - [x] 更新 `test/README.md` 和 `test/result/INDEX.md`
 - [x] 执行整理后的最小验证，不运行训练、完整推理或全量评估
+
+## 2026-07-15 TODO/26 优先问题修复
+
+- [x] 按顺序读取适用 `AGENTS.md`、`CODEX_HANDOFF.md` 并检查 Git 现场
+- [x] 以 GB18030 只读转码方式完整审阅 `TODO/26-7-15.md`
+- [x] 对照实际代码核验第一阶段 P0 问题及其调用链
+- [x] 与用户确认本轮单一修复边界，避免同时打包多个研究协议变更
+- [x] 提出 P0-01 单场景连续时间块设计并取得口头批准
+- [x] 写入、自审并独立提交 P0-01 书面规格
+- [x] 用户复核书面规格
+- [x] 编写并自审 P0-01 RED/GREEN 实现计划
+- [x] 选择计划执行方式后开始 RED
+- [x] 按 RED/GREEN TDD 实施获批修复并执行小范围验证
+- [x] 说明监督信号、体素数量和指标协议影响，禁止长时间训练或完整推理
+
+## 2026-07-15 `26-7-15.md` 分阶段修复续作
+
+- [x] 用 GB18030 只读转码审阅问题清单，不改写原始审计文件
+- [x] 检查工作区、近期提交、现有 TODO 记录和 `test/AGENTS.md`
+- [x] 确认并完成此前只写完 RED/计划的 P0-01
+- [x] 为第一阶段下一项 P0-06 完成根因、调用链、工作样例与最小假设审计
+- [x] 提出 P0-06 隔离策略并取得独立诊断脚本设计批准
+- [x] 写入并复核 P0-06 设计规格与 RED/GREEN 实施计划
+- [x] 按 TDD 实施单一修复并运行聚焦回归
+- [ ] 逐项重复上述流程；不自动运行长训练、完整预处理或全量推理
+- [x] 完成 P0-01/P0-06 的监督信号、体素数量与指标协议说明，并同步三份 TODO 记录
+
+### P0-06 完成状态
+
+- [x] RED：正式 inference 与 mini launcher 的旧 oracle 入口测试按预期失败
+- [x] GREEN：移除正式 adaptive 参数/分支并加入迁移提示，固定阈值与正常离线评价保持可用
+- [x] RED/GREEN：新增独立 oracle 诊断脚本，输出点云、CSV 与 `deployable=false` JSON
+- [x] 安全保护：缺 target、错误 shape、非空输出目录均在写结果前失败
+- [x] 聚焦回归：25/25 通过；Python 编译、shell 语法和差异格式检查通过
+- [x] 未运行训练、预处理、完整推理或全量评价；未暂存或提交
+- [x] 下一项单独统一 `sweep_occ_threshold.py` 的 validation 切分协议，不能与 P0-06 混改
+
+### P0-06 独立诊断依赖边界加固（2026-07-20）
+
+- [x] 复查独立 oracle 诊断的 import 调用链，确认其不应加载正式 inference/阈值扫描入口
+- [x] RED：新增测试锁定正式入口路径不得出现在诊断脚本中
+- [x] GREEN：提取轻量 occupancy 诊断辅助模块并切断正式入口耦合
+- [x] 回归 oracle 阈值、点云、CSV/JSON 和非空输出保护协议
+- [x] 记录监督信号、体素数量和指标协议均不变；未运行长任务且未暂存/提交
+
+### P0-03 多普勒运动补偿协议修复与代码审查（2026-07-20）
+
+- [x] 追踪 shell、parser、场景控制器、worker 和体素化函数的速度调用链
+- [x] RED：新增 none/fixed/recorded、时间匹配和坐标变换契约测试
+- [x] GREEN：默认 none，显式 fixed，严格 recorded 速度表及逐帧解析
+- [x] 修复 Radar/LiDAR 对齐后的速度坐标接口，记录速度源 hash 和协议元数据
+- [x] 代码审查并修复直接文件执行的同名包导入冲突、非法值和空帧接口问题
+- [x] 聚焦回归与静态验证通过；不重生成数据、不训练、不推理、不暂存/提交
+
+### P0-05 LiDAR 未观测空间与 free evidence 修复（2026-07-20）
+
+- [x] 追踪 D-S 融合、地图更新和 streaming 入口，确认空白 voxel 被误当作 free evidence 的调用链
+- [x] RED：覆盖无 mask unknown、显式 free mask、shape fail-fast、同目录 mask 排除和稀疏 `.npz` 读取
+- [x] GREEN：无 mask 采用 occupied-only observed，显式 mask 才产生 free evidence，并暴露 `unknown_mass`
+- [x] 接入 streaming `--observed_mask_dir`、CSV/快照 unknown 统计和输入路径校验
+- [x] 代码审查：拒绝 symlink mask 目录，避免输出目录副作用；保持旧 `update_from_voxel` 位置参数兼容
+- [x] 聚焦回归 12/12、Python 编译、CLI 帮助、`git diff --check` 和空暂存区检查通过
+- [x] 接入 LiDAR 射线 observed mask、VAE 可见区域损失和增强同步接口
+- [x] 修复旧 trainer/model 三参数接口兼容，并完成方向去重性能审查
+- [x] 记录监督有效区域变化、体素数量/指标协议影响；未重生成数据、训练、推理、全量地图更新或暂存/提交
+
+### 阈值扫描 validation 协议续修
+
+- [x] 检查正式训练、阈值扫描和既有测试的切分调用链
+- [x] 确认校准数据范围与成功标准
+- [x] 比较可选实现边界并取得用户批准
+- [x] 写入、自审并复核设计规格
+- [x] 按 RED/GREEN TDD 修改脚本与既有测试
+- [x] 执行聚焦回归并记录监督、体素数量和指标可比性影响
+- [ ] 下一项按第一阶段顺序设计 dataset manifest，固化场景与预处理版本
+
+### Dataset Manifest 根因审计
+
+- [x] 追踪预处理、Dataset、训练与推理入口的数据根目录
+- [x] 核验现有 `preprocess_policy.json`、协议审计和实验 hash 的能力边界
+- [x] 核验真实场景目录的混用证据与现有 policy 内容
+- [x] 确认 manifest 的生成/校验入口和旧数据兼容策略
+- [x] 比较方案并取得用户批准
+- [x] 写入规格和实施计划，完成 manifest 核心 RED/GREEN（7/7）
+- [x] 按 TDD 接入 CLI、预处理器和正式 launcher
+- [x] 执行聚焦回归并记录真实旧数据 fail-closed 结果
+- [ ] 下一项单独修复正式推理的 sensor-aware/真实 IR 路径，并拆分部署与离线评价入口
+
+### 正式真实 IR 与部署/评价解耦
+
+- [x] 追踪 launcher、checkpoint 模态、IR/标定加载和评价调用链
+- [x] 明确正式入口缺失 IR/标定时采用 fail-closed，不使用 mock/Radar-only 降级
+- [x] 比较部署/评价拆分方案并取得用户批准
+- [x] 写入、自审并复核设计规格
+- [x] 写入并自审 RED/GREEN 实施计划
+- [x] 按 RED/GREEN TDD 小步实施，不运行完整推理
+- [x] 执行聚焦回归并记录监督、体素数量和指标协议影响
+
+### Errors / Attempts
+
+| Issue | Attempts | Resolution |
+| --- | ---: | --- |
+| 首次三文件追加补丁因 `progress.md` 尾部上下文不精确而整体未应用 | 1 | 改用各文件精确尾部上下文重新应用，不重复原补丁 |
+| `iconv -f gb18030 ... | rg` 在扫描完整审计文件时报告第 3 行不可转换 | 1 | 不重复相同管道；后续改用容错只读转码并用已知行段定位编号 |
+| 首次 GREEN 在收集测试时因旧 helper 直接导入而 ImportError | 1 | 提前执行既定测试导入重构，改为直接导入新 helper 后重跑 |
+| 完成前复验在沙箱内触发 OpenMPI 本地 socket 限制 | 1 | 在沙箱外重跑完全相同的短测试/编译/差异检查，全部 exit 0 |
+| 设计文档提交请求未获批准，文件曾单独暂存 | 1 | 未创建提交；已将该文件撤出暂存并确认暂存区恢复为空，继续未提交实施 |
+| 首次新增 P0-06 实施计划的补丁正文缺少一行 `+` 标记 | 1 | 补丁整体未应用；修正新增标记后成功写入并自审 |
+| 诊断首次 GREEN 的 top-k 三项测试只得到 `k-1` 点 | 1 | 复现实验证明 float64 前驱被比较规则舍入回 float32 原值；改用 prediction dtype 的 `nextafter` 后 6/6 通过 |
+| 阈值时间块 Task 1 首次 GREEN 剩余主入口 TypeError | 1 | 计划错误地把删除旧关键字调用放在 Task 2；将该必要调用链修改前移后再复验 |
+| 完成检查组合命令因 `rg` 无匹配返回 1 | 1 | 无未完成 Step 正是预期；拆分差异、暂存区和未完成项检查，避免把预期无匹配误报为整体失败 |
+| 严格 manifest 计划自审 `rg` 使用不支持的 look-around | 1 | 文件未改动；拆为普通 `rg` 模式重新检查，不重复该正则 |
+| Manifest Task 1 首次 RED 找不到顶层 namespace package | 1 | 测试直接执行未加入项目根；先修测试 `sys.path`，再重跑确认因目标模块缺失失败 |
+| Manifest 最终组合验证触发 OpenMPI 本地 socket 限制 | 1 | 未改变测试范围；在沙箱外重跑完全相同的短测试/编译/shell/diff 命令，23/23 聚焦测试通过 |
+| Manifest 完成记录的首次多文件补丁上下文不匹配 | 1 | 补丁整体未应用；按实际文件尾部分开更新三份 TODO 和实施计划 |
+| 用 GB18030 转码实际 UTF-8 的 `26-7-15.md` 得到乱码 | 1 | `file` 确认文件为 UTF-8；后续直接按 UTF-8 只读，不重复错误转码 |
+| 正式 IR 实施计划首次多文件补丁上下文不匹配 | 1 | 补丁整体未应用；改为先单独新增计划，再按实际尾部分别更新三份 TODO |
+| Task 4 首次 GREEN 的调用顺序断言误命中 evaluator 存在性检查 | 1 | 根因定位到测试搜索首个变量引用；收窄为实际 `conda run` 调用，不修改正确的 manifest-first 生产流程 |
+| Task 5 首次真实 manifest 验证使用旧 CLI 参数 | 1 | CLI 错误明确要求 `--scene_dir/--expected_scene`；按实际接口重跑，不涉及数据写入 |
+| P1-01 首次 RED 时间戳协议测试因 helper/新索引接口缺失而全部 ERROR | 1 | 新增标准库时间戳 helper 与 `generate_scene_indices`，随后 5/5 GREEN |
+| 直接执行时间戳索引脚本误解析同名预处理模块并触发 cv2 缺失 | 1 | 改为按 `__package__` 选择相对/同目录导入，直接 `--help` 不再加载重依赖 |
+| 初版索引容差校验使用不存在的 `os.path.isfinite` | 1 | 改用 `math.isfinite`，重新通过协议测试和静态编译 |
+| v2 全量脚本首次运行在旧 receipt-time Raw 上被 30ms 门禁拒绝 | 1 | 不重复原命令；bag/header 全量审计后改为独立 Raw 重解包与物理采样窗口协议 |
+| P1-01 首次 GREEN 大补丁因目标注释文本与实际文件不一致而未应用 | 1 | 补丁未产生修改；按实际行号拆成小补丁后成功应用 |
+| 最终静态组合命令未使用 fail-fast，解包器 `--help` 缺 pandas 虽失败但组合退出码仍为 0 | 1 | 不把该次组合命令记为通过；移除非必要依赖后单独复验入口，并在最终检查中分别收集退出码 |
+| P1-05 第一轮核心补丁同时匹配新 helper 与旧函数上下文失败 | 1 | 该补丁整体未应用；读取当前函数顺序后拆为 helper、fusion、update 三个小补丁 |
+| P1-05 streaming GREEN 小体素输出 XY 维互换 | 1 | 定位为旧 `to_xyzc` 用维度大小猜布局；改为可显式声明 `xyzc/czxy`，auto 只接受无歧义形状 |
+| P1-05 显式 layout 补丁重复指定同一目标文件 | 1 | 补丁整体未应用；合并为同一文件的一组 update 后成功应用 |
+| P1-05 首次静态组合检查的 CLI `--help` 触发 OpenMPI socket 失败 | 1 | 不把组合命令记为全通过；切断 `cm/__init__.py` 重依赖后单独复验 CLI 成功 |
+| P1-05 最终记录补丁两次因同文件重复操作或 hunk 逆序失败 | 2 | 两次均整体未应用；按实际顺序和单文件操作重新写入 |
+| P1-02 RED 暴露硬编码 K、IR helper 不接收标定和同步函数重复 | 1 | 新增 thermal 标定/去畸变/共享补偿协议，再完成 GREEN |
+| 代码审查发现 audit_dataset_protocol.py 仍复制旧 K | 1 | 改为复用 `CalibrationProvider` 的实际 K，避免第三套投影参数 |
+
+### P0-01 完成状态
+
+- [x] RED：三个时间块契约测试因缺少新 API 按预期失败
+- [x] GREEN：实现连续训练前缀/验证后缀并接入正式训练入口
+- [x] 聚焦回归：21/21 通过
+- [x] 静态验证：无旧 helper 引用，`py_compile` 与 `git diff --check` 通过
+- [x] 记录监督信号、体素数量、样本数量与指标可比性影响
+- [x] 保持现有脏工作区和暂存区，不自动提交
+
+### P1-06 正式 VAE/LDM/CD checkpoint 链
+
+- [x] 审计正式权重目录：当前只有旧 CD，正式 VAE/LDM 路径缺失；历史 archive 权重与正式 CD 不是同一协议链
+- [x] 写入协议设计与实施计划，明确不伪造/覆盖旧权重
+- [x] 新增 `formal_chain_v1` 核心校验：普通文件、阶段、网格、latent、父 SHA-256、多模态关键权重
+- [x] 新增独立 `diagnose_checkpoint_chain.py`，支持只读 validate 和 CPU strict construct，不执行 forward
+- [x] VAE/LDM/CD 新保存 payload 写入协议、网格、融合 config 和父 checkpoint hash
+- [x] 三个正式生成入口增加全链门禁，unified 不再缺阶段静默跳过
+- [x] 完成 checkpoint-chain、VAE/CD payload、正式入口聚焦回归与当前旧链只读诊断；正式 VAE/LDM/CD 重训仍作为后续显式长任务
+
+### P1-01 多传感器时间戳对齐与容差
+
+- [x] 阅读 bag 解包、Radar/LiDAR 索引、IR 匹配和 preprocess shell 的完整调用链
+- [x] RED：锁定 header 优先、最近邻超限拒绝、索引 delta 落盘和不产生半成品输出的测试契约
+- [x] GREEN：新增标准库时间戳 helper，统一 header/receipt 回退和最近邻容差
+- [x] GREEN：按数值时间排序并原子写入 Radar-LiDAR 索引、绝对/带符号 delta；预处理严格校验同步记录
+- [x] GREEN：IR 使用独立容差，写入逐帧 `radar_ir_sync.csv`；解包和脚本参数完成接线
+- [x] 代码审查：修复直接文件执行的同名模块遮蔽、旧索引绕过、输出目录副作用和非法时间戳接口
+- [x] 聚焦回归与静态验证通过；未重生成数据、训练、推理、全量评价或暂存/提交
+- [x] 记录同步协议对帧成员、监督配对和指标可比性的影响；`dt_sync` 保持显式 legacy 语义，后续按物理符号约定消费 signed delta
+
+### P1-02 Thermal 标定与 IR 投影几何统一
+
+- [x] 追踪 CalibrationProvider、Dataset、inference、投影层和审计脚本的 K/D/S 与同步补偿调用链
+- [x] RED：锁定原始尺寸/K/D 解析、resize 后 K 缩放、去畸变和共享补偿函数契约
+- [x] GREEN：Provider 统一解析 `calib_cam_thermal.txt`，输出缩放 K、D、S 和来源 metadata
+- [x] GREEN：训练/推理共用 IR resize+undistort 与 legacy sync compensation；严格真实 IR 缺失 S/K/D 时拒绝
+- [x] 代码审查：移除 audit 脚本的重复硬编码 K，并保留 mock/旧测试兼容边界
+- [x] 聚焦回归和真实配置只读解析通过；未重生成数据、训练、推理或暂存/提交
+- [x] 记录对 IR 像素采样、监督/体素/指标可比性的影响
+
+### P1-03 PointCloud2 字段 schema 固定化
+
+- [x] 追踪 `unpack_rosbag.save_pointcloud → radar_pcl/*.npy → voxelize_pcl_airborne_optimized` 的固定列依赖
+- [x] RED：覆盖缺 intensity、缺 Doppler 时的列位置保持和 schema 元数据输出
+- [x] GREEN：按字段名/别名读取 PointCloud2，固定输出 `[x,y,z,intensity,doppler]`，缺失特征显式补零
+- [x] GREEN：在点云目录原子写入 `pointcloud_schema.json`，记录来源字段、映射、缺失列、shape 和 dtype
+- [x] 代码审查：保留旧 PointCloud v1、Livox 分支与下游五列接口，不改变已有数据文件
+- [x] 聚焦回归、静态编译和差异检查通过；未解包真实 bag、重建体素、训练或推理
+- [x] 记录字段协议对强度/Doppler 监督通道、体素数量和指标可比性的影响
+
+### P1-04 Radar 物理通道规范化与统计方差重采样
+
+- [x] 审计预处理四通道生成、Dataset crop/resize、训练/推理配置和现有场景统计
+- [x] 比较稳健统计量的生成/消费边界、旧数据兼容策略和方差合并方案并取得设计批准
+- [x] 写入并自审设计规格与 RED/GREEN 实施计划
+- [x] RED：锁定强度/Doppler 规范化协议、二阶矩方差合并和 metadata 传播
+- [x] GREEN：按批准方案小步实现，未运行完整预处理或训练
+- [x] 代码审查：消除训练/推理隐式默认、shape/单位接口不匹配和错误 legacy 降级
+- [x] 聚焦回归、静态检查与轻量只读统计通过
+- [x] 记录对监督信号、体素数量、checkpoint/指标可比性的影响
+- [x] 为训练场景 garden 生成并验收 4013 帧正式 artifact，写入匹配的 `86.8 m/s` 与固定网格配置
+- [x] 将训练/生成/评价 launcher 切换到 candidate 数据和独立 `formal_p1_04_full120_86p8_v1` 结果协议，默认拒绝隐式续训
+- [ ] 显式长任务：在独立结果根从头训练正式 VAE/LDM/CD；不得把旧 checkpoint 自动补签为新协议
+
+### P1-01 真实数据时间容差续修（2026-07-22）
+
+- [x] 只读统计 garden/loop3 的 Radar、LiDAR 帧率与最近邻时间差分布
+- [x] 区分启动/结束边界无重叠帧与正常重叠区间的异步采样偏差
+- [x] 先写聚焦 RED 测试，再最小修改索引协议或执行脚本参数（RED 3 项已确认）
+- [x] 运行时间戳、manifest、运动协议聚焦回归和真实数据只读索引验证
+- [x] 记录帧成员、监督配对、体素数量和指标可比性影响
+
+### Codex VS Code 历史会话读取修复（2026-08-20）
+
+- [x] 核对官方 OpenAI Codex 文档入口、扩展版本和专用日志
+- [x] 只读验证会话 JSONL、索引和 `state_5.sqlite` 完整性
+- [x] 使用扩展捆绑 app-server 复现提供方过滤导致的旧历史缺失
+- [x] 在 `/tmp` 候选配置上通过严格解析、旧会话列表和全文读取回归
+- [x] 备份并修复用户级 `~/.codex/config.toml`，未修改任何历史会话文件
+- [x] 记录修改、验证和回滚路径；由用户在本轮结束后重载 VS Code 窗口
+
+### P1-05 移动平台局部地图更新（2026-08-20）
+
+- [x] 审计 `prediction voxel → streaming_map_update → SlidingProbabilisticGridMap` 的坐标、时间和输出调用链
+- [x] 设计保持现有 2D 调用兼容的位姿变换与分高度层最小接口
+- [x] RED：锁定已知机体位移/旋转后的静态障碍对齐、缺失位姿拒绝和高度层保持
+- [x] GREEN：接入逐帧时间戳与 `T_local_body`，输出可审计的分层 occupancy/unknown 状态
+- [x] 代码审查：处理坐标系方向、边界、接口不匹配和旧 2D consumer 兼容
+- [x] 运行聚焦回归与静态检查，记录地图单元数量、监督/指标和实时内存影响
+- [x] 动态层审计：确认现有 Doppler 单位、推理输出和可复用的 mask/provenance 接口
+- [x] RED：锁定显式动态 evidence、pose warp、静态/动态分离、快速衰减和缺失 sidecar 行为
+- [x] GREEN：增加可选动态三态层及严格 sidecar metadata，未启用时不分配额外三维状态
+- [x] 代码审查与回归：消除单位猜测、帧覆盖、shape、坐标系和旧调用接口不匹配
+
+### P1-07 LDM 验证与 CD 训练语义（2026-08-20）
+
+- [x] 审计 LDM/CD 的训练、验证、best checkpoint、教师目标和既有协议字段调用链
+- [x] RED：锁定独立 validation、best 选择依据、checkpoint 恢复及 CD 语义声明
+- [x] GREEN：为 LDM 接入独立验证与可审计 best 选择，并准确标记 EMA consistency 训练
+- [x] 代码审查与回归：消除 train/val 接口、旧 checkpoint、resume 和正式入口不匹配
+
+### Radar normalization 零 IQR 续修（2026-08-20）
+
+- [x] 只读核验候选 manifest、Radar 四通道统计和 resize 前后 intensity 分布
+- [x] 定位零 IQR 根因，明确统计退化策略及其物理/监督影响
+- [x] RED/GREEN：补充退化分布测试并实施最小修复
+- [x] 代码审查与聚焦回归，提供只重跑步骤 6 的安全命令
+
+### 正式训练协议切换（2026-08-20）
+
+- [x] 验收 garden/loop3 manifest、正式 normalization artifact 和一个真实 IR/标定训练样本
+- [x] RED/GREEN：默认 YAML 精确绑定 candidate 数据、32×128×128 网格、full120 pc range、86.8 m/s 和 artifact SHA-256
+- [x] 训练输出隔离到 `formal_p1_04_full120_86p8_v1`，已有非空阶段目录默认拒绝；仅 `ALLOW_RESUME=1` 允许同协议恢复
+- [x] 三个正式生成入口及独立评价入口统一 candidate preprocessed/Raw、checkpoint 根和带协议标识的输出目录
+- [x] 代码审查修复 mini legacy 配置继承正式 artifact 的互斥冲突，并同步 README
+- [x] 完成聚焦回归、shell 语法、路径存在性、配置/artifact 对照和差异检查
+- [x] 修复直接训练入口缺失仓库包根、失效 fallback 与模块双重身份问题，并增加脱离工作目录的 `--help` 回归
+- [x] 修复真实 preprocess policy 中 JSON null 导致的 batch 拼接失败，统一 train/val、standalone CD 与条件推理 collator
+- [x] 无损归档零 epoch 失败日志，保持非空结果门禁且恢复 fresh VAE 输出路径
+- [ ] 由用户显式启动正式 VAE 长训练，完成后依次训练 LDM 与 CD
+
+### 8 GB 单卡正式协议 mini 训练（2026-08-21）
+
+- [x] 审计现有 mini 脚本的旧数据根、legacy Radar 单位、输出复用与硬件负载风险
+- [x] RED：覆盖正式 candidate/artifact、独立结果根、短时 epoch/sample 配置和温度预检
+- [x] GREEN：最小扩展现有 mini 入口，不复制新训练实现、不覆盖历史结果
+- [x] 对 RTX 4070 Laptop 给出单阶段执行与停止条件，不自动启动训练
+- [x] 运行聚焦单元测试、Bash 语法和无训练配置预检
+- [x] 记录监督信号、样本/体素数量、指标可比性与笔记本热负载影响

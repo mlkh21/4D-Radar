@@ -16,7 +16,20 @@ SCRIPT_DIR="${PROJECT_DIR}/scripts"
 DEFAULT_CONFIG_PATH="${PROJECT_DIR}/config/default_config.yaml"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 
-PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware}"
+MINI_RADAR_PROTOCOL="${MINI_RADAR_PROTOCOL:-legacy}"
+case "${MINI_RADAR_PROTOCOL}" in
+	legacy)
+		DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware"
+		;;
+	formal)
+		DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
+		;;
+	*)
+		echo "Error: MINI_RADAR_PROTOCOL must be legacy or formal"
+		exit 1
+		;;
+esac
+PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${DEFAULT_PREPROCESSED_ROOT}}"
 CALIB_CONFIG_DIR="${CALIB_CONFIG_DIR:-${ROOT_DIR}/Data/config}"
 if [[ ${MINI_DATASET_DIR+x} == x && -z "${MINI_DATASET_DIR}" ]]; then
 	echo "Error: unsafe MINI_DATASET_DIR: path is empty"
@@ -29,9 +42,14 @@ MINI_CONFIG_PATH_INPUT="${MINI_CONFIG_PATH}"
 MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SELF_DIR}/train_results_mini}"
 MINI_REQUIRE_FRESH_SCRATCH="${MINI_REQUIRE_FRESH_SCRATCH:-0}"
 MINI_REQUIRE_FRESH_CONFIG="${MINI_REQUIRE_FRESH_CONFIG:-0}"
+MINI_PREFLIGHT_ONLY="${MINI_PREFLIGHT_ONLY:-0}"
 MINI_TARGET_SIZE="${MINI_TARGET_SIZE:-32,128,128}"
 MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-0,-20,-6,120,20,10}"
 MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-0,-20,-6,40,20,10}"
+MINI_RADAR_NORMALIZATION_PATH="${MINI_RADAR_NORMALIZATION_PATH:-${PROJECT_DIR}/config/radar_normalization_garden_32x128x128_full120_86p8_v1.json}"
+MINI_DOPPLER_SCALE_MPS="${MINI_DOPPLER_SCALE_MPS:-86.8}"
+MINI_CHECKPOINT_PROTOCOL="${MINI_CHECKPOINT_PROTOCOL:-formal_mini_chain_v1}"
+EXPECTED_FORMAL_ARTIFACT_SHA256="${EXPECTED_FORMAL_ARTIFACT_SHA256:-2c9c92650b98ec686d621b53eccb5e7f376cb6b8ea1047d4fb594349af90c4d5}"
 MINI_VAE_CONFIG_TYPE="${MINI_VAE_CONFIG_TYPE:-ultra_lightweight}"
 MINI_VAE_LATENT_DIM="${MINI_VAE_LATENT_DIM:-}"
 MINI_VAE_OCC_LOSS="${MINI_VAE_OCC_LOSS:-bce_dice}"
@@ -49,6 +67,9 @@ MINI_LDM_IR_FRUSTUM_OCC_WEIGHT="${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT:-0.0}"
 MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT="${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT:-0.0}"
 MINI_LDM_IR_FRUSTUM_TOP_WEIGHT="${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT:-0.0}"
 MINI_LDM_UNCERTAINTY_WEIGHT="${MINI_LDM_UNCERTAINTY_WEIGHT:-}"
+MINI_LDM_COLUMN_CURRICULUM_ENABLED="${MINI_LDM_COLUMN_CURRICULUM_ENABLED:-false}"
+MINI_LDM_COLUMN_POSITIVE_START_WEIGHT="${MINI_LDM_COLUMN_POSITIVE_START_WEIGHT:-0.0}"
+MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT="${MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT:-0.0}"
 MINI_LDM_COLUMN_POSITIVE_WEIGHT="${MINI_LDM_COLUMN_POSITIVE_WEIGHT:-0.0}"
 MINI_LDM_COLUMN_NEGATIVE_WEIGHT="${MINI_LDM_COLUMN_NEGATIVE_WEIGHT:-0.0}"
 MINI_LDM_COLUMN_TEMPERATURE="${MINI_LDM_COLUMN_TEMPERATURE:-1.0}"
@@ -150,15 +171,71 @@ validate_mini_dataset_dir() {
 	exit 1
 }
 
+validate_mini_radar_protocol() {
+	if [[ "${MINI_RADAR_PROTOCOL}" == "legacy" ]]; then
+		return 0
+	fi
+	if [[ "${MINI_CHECKPOINT_PROTOCOL}" != "formal_mini_chain_v1" ]]; then
+		echo "Error: formal mini checkpoint protocol must be formal_mini_chain_v1"
+		exit 1
+	fi
+	if [[ ! -f "${MINI_RADAR_NORMALIZATION_PATH}" ]]; then
+		echo "Error: formal mini normalization artifact not found: ${MINI_RADAR_NORMALIZATION_PATH}"
+		exit 1
+	fi
+
+	"${PYTHON_CMD[@]}" - \
+		"${ROOT_DIR}" \
+		"${MINI_RADAR_NORMALIZATION_PATH}" \
+		"${EXPECTED_FORMAL_ARTIFACT_SHA256}" \
+		"${MINI_TARGET_SIZE}" \
+		"${MINI_SOURCE_PC_RANGE}" \
+		"${MINI_MODEL_PC_RANGE}" \
+		"${MINI_DOPPLER_SCALE_MPS}" <<'PY'
+import sys
+
+root, artifact, expected_sha256, target_raw, source_raw, model_raw, scale_raw = sys.argv[1:]
+if root not in sys.path:
+    sys.path.insert(0, root)
+
+from diffusion_consistency_radar.radar_normalization import (
+    load_radar_normalization_artifact,
+)
+
+target_size = [int(value) for value in target_raw.split(',')]
+source_pc_range = [float(value) for value in source_raw.split(',')]
+model_pc_range = [float(value) for value in model_raw.split(',')]
+_spec, actual_sha256 = load_radar_normalization_artifact(
+    artifact,
+    target_size=target_size,
+    source_pc_range=source_pc_range,
+    model_pc_range=model_pc_range,
+    doppler_scale_mps=float(scale_raw),
+    require_formal=True,
+)
+if actual_sha256 != expected_sha256:
+    raise SystemExit(
+        "formal mini normalization SHA-256 mismatch: "
+        f"expected={expected_sha256}, actual={actual_sha256}"
+    )
+print(f"Formal mini Radar normalization validated: {actual_sha256}")
+PY
+}
+
 validate_mode
 validate_mini_dataset_dir
+if [[ "${MINI_PREFLIGHT_ONLY}" != "0" && "${MINI_PREFLIGHT_ONLY}" != "1" ]]; then
+	echo "Error: MINI_PREFLIGHT_ONLY must be 0 or 1"
+	exit 1
+fi
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
 	PYTHON_CMD=("${PYTHON_BIN}")
 elif python -c "import torch" >/dev/null 2>&1; then
 	PYTHON_CMD=(python)
 elif command -v conda >/dev/null 2>&1; then
-	PYTHON_CMD=(conda run -n Radar-Diffusion python)
+	# conda run 默认捕获模式不会可靠转发 heredoc stdin；正式 artifact 校验依赖 stdin 脚本。
+	PYTHON_CMD=(conda run --no-capture-output -n Radar-Diffusion python)
 else
 	PYTHON_CMD=(python)
 fi
@@ -170,6 +247,8 @@ elif python -c "import yaml" >/dev/null 2>&1; then
 else
 	CONFIG_PYTHON_CMD=("${PYTHON_CMD[@]}")
 fi
+
+validate_mini_radar_protocol
 
 if [[ ! -f "${DATA_LOADING_CONFIG}" ]]; then
 	echo "Error: data loading config not found: ${DATA_LOADING_CONFIG}"
@@ -205,6 +284,18 @@ if [[ ${#TRAIN_SCENES[@]} -eq 0 ]]; then
 	exit 1
 fi
 
+for SCENE in "${TRAIN_SCENES[@]}"; do
+	SRC_SCENE_DIR="${PREPROCESSED_ROOT}/${SCENE}"
+	if [[ ! -d "${SRC_SCENE_DIR}/radar_voxel" || ! -d "${SRC_SCENE_DIR}/target_voxel" ]]; then
+		echo "Error: missing radar_voxel/target_voxel in ${SRC_SCENE_DIR}"
+		exit 1
+	fi
+	if [[ "${MINI_RADAR_PROTOCOL}" == "formal" && ! -d "${SRC_SCENE_DIR}/ir_image" ]]; then
+		echo "Error: formal mini missing ir_image in ${SRC_SCENE_DIR}"
+		exit 1
+	fi
+done
+
 echo "=========================================="
 echo "Minimal training setup"
 echo "mode: ${MODE}"
@@ -218,6 +309,9 @@ echo "mini dataset dir: ${MINI_DATASET_DIR}"
 echo "target size [Z,X,Y]: ${MINI_TARGET_SIZE}"
 echo "source pc range: ${MINI_SOURCE_PC_RANGE}"
 echo "model pc range: ${MINI_MODEL_PC_RANGE}"
+echo "radar protocol: ${MINI_RADAR_PROTOCOL}"
+echo "radar normalization: ${MINI_RADAR_NORMALIZATION_PATH}"
+echo "checkpoint protocol: ${MINI_CHECKPOINT_PROTOCOL}"
 echo "vae config type: ${MINI_VAE_CONFIG_TYPE}"
 echo "vae latent dim: ${MINI_VAE_LATENT_DIM:-preset}"
 echo "vae occupancy loss: ${MINI_VAE_OCC_LOSS}"
@@ -234,9 +328,16 @@ echo "ldm density weight: ${MINI_LDM_DENSITY_WEIGHT}"
 echo "ldm IR frustum occupancy/top weights: ${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT}/${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT}"
 echo "ldm IR frustum negative weight: ${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT}"
 echo "ldm uncertainty weight: ${MINI_LDM_UNCERTAINTY_WEIGHT:-config default}"
+echo "ldm column curriculum enabled: ${MINI_LDM_COLUMN_CURRICULUM_ENABLED}"
+echo "ldm column positive/negative start weights: ${MINI_LDM_COLUMN_POSITIVE_START_WEIGHT}/${MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT}"
 echo "ldm column positive/negative weights: ${MINI_LDM_COLUMN_POSITIVE_WEIGHT}/${MINI_LDM_COLUMN_NEGATIVE_WEIGHT}"
 echo "ldm column temperature: ${MINI_LDM_COLUMN_TEMPERATURE}"
 echo "=========================================="
+
+if [[ "${MINI_PREFLIGHT_ONLY}" == "1" ]]; then
+	echo "Mini training preflight passed; no scratch/config/output was created."
+	exit 0
+fi
 
 if [[ "${MINI_REQUIRE_FRESH_SCRATCH}" == "1" ]]; then
 	mkdir -- "${MINI_DATASET_DIR}"
@@ -311,7 +412,7 @@ done
 
 mkdir -p "${MINI_RESULTS_DIR}/vae" "${MINI_RESULTS_DIR}/ldm" "${MINI_RESULTS_DIR}/cd"
 
-"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" "${MINI_TARGET_SIZE}" "${MINI_SOURCE_PC_RANGE}" "${MINI_MODEL_PC_RANGE}" "${MINI_VAE_CONFIG_TYPE}" "${MINI_VAE_LATENT_DIM}" "${MINI_VAE_OCC_LOSS}" "${MINI_TRAIN_SPLIT}" "${MINI_SPLIT_SEED}" "${MINI_LDM_DECODED_WEIGHT}" "${MINI_LDM_DECODED_FP_WEIGHT}" "${MINI_LDM_DECODED_MASS_WEIGHT}" "${MINI_LDM_HEIGHT_WEIGHT}" "${MINI_LDM_TOP_WEIGHT}" "${MINI_LDM_TOP_OVERSHOOT_WEIGHT}" "${MINI_LDM_CONTINUITY_WEIGHT}" "${MINI_LDM_DENSITY_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT}" "${MINI_LDM_UNCERTAINTY_WEIGHT}" "${MINI_LDM_COLUMN_POSITIVE_WEIGHT}" "${MINI_LDM_COLUMN_NEGATIVE_WEIGHT}" "${MINI_LDM_COLUMN_TEMPERATURE}" "${MINI_REQUIRE_FRESH_CONFIG}" <<'PY'
+"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" "${MINI_TARGET_SIZE}" "${MINI_SOURCE_PC_RANGE}" "${MINI_MODEL_PC_RANGE}" "${MINI_RADAR_PROTOCOL}" "${MINI_RADAR_NORMALIZATION_PATH}" "${MINI_DOPPLER_SCALE_MPS}" "${MINI_CHECKPOINT_PROTOCOL}" "${MINI_VAE_CONFIG_TYPE}" "${MINI_VAE_LATENT_DIM}" "${MINI_VAE_OCC_LOSS}" "${MINI_TRAIN_SPLIT}" "${MINI_SPLIT_SEED}" "${MINI_LDM_DECODED_WEIGHT}" "${MINI_LDM_DECODED_FP_WEIGHT}" "${MINI_LDM_DECODED_MASS_WEIGHT}" "${MINI_LDM_HEIGHT_WEIGHT}" "${MINI_LDM_TOP_WEIGHT}" "${MINI_LDM_TOP_OVERSHOOT_WEIGHT}" "${MINI_LDM_CONTINUITY_WEIGHT}" "${MINI_LDM_DENSITY_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT}" "${MINI_LDM_UNCERTAINTY_WEIGHT}" "${MINI_LDM_COLUMN_CURRICULUM_ENABLED}" "${MINI_LDM_COLUMN_POSITIVE_START_WEIGHT}" "${MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT}" "${MINI_LDM_COLUMN_POSITIVE_WEIGHT}" "${MINI_LDM_COLUMN_NEGATIVE_WEIGHT}" "${MINI_LDM_COLUMN_TEMPERATURE}" "${MINI_REQUIRE_FRESH_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -330,6 +431,10 @@ import yaml
 		target_size_raw,
 		source_pc_range_raw,
 		model_pc_range_raw,
+		radar_protocol,
+		radar_normalization_path,
+		doppler_scale_mps,
+		checkpoint_protocol,
 		vae_config_type,
 		vae_latent_dim,
 		vae_occ_loss,
@@ -347,15 +452,29 @@ import yaml
 		ldm_ir_frustum_negative_weight,
 		ldm_ir_frustum_top_weight,
 		ldm_uncertainty_weight,
+		ldm_column_curriculum_enabled,
+		ldm_column_positive_start_weight,
+		ldm_column_negative_start_weight,
 		ldm_column_positive_weight,
 		ldm_column_negative_weight,
 		ldm_column_temperature,
 		require_fresh_config,
-) = sys.argv[1:36]
+) = sys.argv[1:43]
 
 
 def parse_numbers(raw, caster):
 		return [caster(v.strip()) for v in str(raw).split(',') if v.strip()]
+
+
+def parse_strict_bool(raw, variable_name):
+		value = str(raw).strip().lower()
+		if value in {'1', 'true', 'yes', 'on'}:
+				return True
+		if value in {'0', 'false', 'no', 'off'}:
+				return False
+		raise SystemExit(
+				f"{variable_name} must be one of 1,true,yes,on,0,false,no,off; got {raw!r}"
+		)
 
 with open(src_cfg, 'r', encoding='utf-8') as f:
 		cfg = yaml.safe_load(f) or {}
@@ -378,6 +497,22 @@ cfg['data']['source_pc_range'] = source_pc_range
 cfg['data']['model_pc_range'] = model_pc_range
 cfg['data']['train_split'] = float(train_split)
 cfg['data']['split_seed'] = int(split_seed)
+if radar_protocol == 'formal':
+		if checkpoint_protocol != 'formal_mini_chain_v1':
+			raise SystemExit('formal mini checkpoint protocol must be formal_mini_chain_v1')
+		cfg['data']['radar_normalization_path'] = radar_normalization_path
+		cfg['data']['doppler_scale_mps'] = float(doppler_scale_mps)
+		cfg['data']['checkpoint_protocol'] = checkpoint_protocol
+		cfg.setdefault('hardware', {})
+		cfg['hardware']['device'] = 'cuda'
+		cfg['hardware']['num_gpus'] = 1
+elif radar_protocol == 'legacy':
+		# legacy mini 必须移除从正式默认配置继承的 artifact。
+		cfg['data']['radar_normalization_path'] = ''
+		cfg['data']['doppler_scale_mps'] = None
+		cfg['data'].pop('checkpoint_protocol', None)
+else:
+		raise SystemExit(f'unsupported MINI_RADAR_PROTOCOL={radar_protocol!r}')
 
 cfg['vae'] = dict(cfg.get('vae') or {})
 cfg['vae']['epochs'] = int(vae_epochs)
@@ -412,6 +547,9 @@ cfg['ldm']['decoded_density_weight'] = float(ldm_density_weight)
 cfg['ldm']['decoded_ir_frustum_occupancy_weight'] = float(ldm_ir_frustum_occ_weight)
 cfg['ldm']['decoded_ir_frustum_negative_weight'] = float(ldm_ir_frustum_negative_weight)
 cfg['ldm']['decoded_ir_frustum_top_weight'] = float(ldm_ir_frustum_top_weight)
+cfg['ldm']['decoded_column_curriculum_enabled'] = parse_strict_bool(ldm_column_curriculum_enabled, 'MINI_LDM_COLUMN_CURRICULUM_ENABLED')
+cfg['ldm']['decoded_column_positive_start_weight'] = float(ldm_column_positive_start_weight)
+cfg['ldm']['decoded_column_negative_start_weight'] = float(ldm_column_negative_start_weight)
 cfg['ldm']['decoded_column_positive_weight'] = float(ldm_column_positive_weight)
 cfg['ldm']['decoded_column_negative_weight'] = float(ldm_column_negative_weight)
 cfg['ldm']['decoded_column_temperature'] = float(ldm_column_temperature)
@@ -436,6 +574,11 @@ cfg['cd'] = {
 
 cfg.setdefault('optimization', {})
 cfg['optimization']['gradient_accumulation_steps'] = int(grad_accum)
+if radar_protocol == 'formal':
+	# 8 GB formal mini 显式保留 checkpointing；AMP 当前因 VAE dtype 接口不兼容而关闭。
+	cfg['optimization']['use_checkpoint'] = True
+	cfg['optimization']['use_amp'] = False
+	cfg['optimization']['use_fp16'] = False
 
 config_write_mode = 'x' if str(require_fresh_config).lower() in {'1', 'true', 'yes', 'on'} else 'w'
 with open(dst_cfg, config_write_mode, encoding='utf-8') as f:
@@ -445,10 +588,16 @@ PY
 echo "Mini config: ${MINI_CONFIG_PATH}"
 echo "Mini dataset: ${MINI_DATASET_DIR}"
 
+RADAR_PROTOCOL_ARGS=()
+if [[ "${MINI_RADAR_PROTOCOL}" == "legacy" ]]; then
+	RADAR_PROTOCOL_ARGS+=(--allow_legacy_radar_units)
+fi
+
 run_vae() {
 	CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_CMD[@]}" "${SCRIPT_DIR}/unified_train.py" \
 		--mode vae \
-		--config "${MINI_CONFIG_PATH}"
+		--config "${MINI_CONFIG_PATH}" \
+		"${RADAR_PROTOCOL_ARGS[@]}"
 }
 
 run_ldm() {
@@ -462,7 +611,8 @@ run_ldm() {
 	CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${PYTHON_CMD[@]}" "${SCRIPT_DIR}/unified_train.py" \
 		--mode ldm \
 		--config "${MINI_CONFIG_PATH}" \
-		--vae_ckpt "${vae_ckpt}"
+		--vae_ckpt "${vae_ckpt}" \
+		"${RADAR_PROTOCOL_ARGS[@]}"
 }
 
 run_cd() {
@@ -483,7 +633,8 @@ run_cd() {
 		--mode cd \
 		--config "${MINI_CONFIG_PATH}" \
 		--vae_ckpt "${vae_ckpt}" \
-		--ldm_ckpt "${ldm_ckpt}"
+		--ldm_ckpt "${ldm_ckpt}" \
+		"${RADAR_PROTOCOL_ARGS[@]}"
 }
 
 case "${MODE}" in

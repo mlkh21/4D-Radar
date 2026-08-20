@@ -1,5 +1,5 @@
 #!/bin/bash
-# 完整推理示例 - 演示如何使用 LDM 和 CD 模型
+# 统一正式部署生成入口：LDM/CD 均只读取 sensor-aware Radar+IR
 
 set -euo pipefail  # 遇到错误立即退出
 
@@ -7,10 +7,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
+MANIFEST_SCRIPT="${PROJECT_DIR}/scripts/dataset_manifest.py"
+CHECKPOINT_CHAIN_SCRIPT="${PROJECT_DIR}/scripts/diagnose_checkpoint_chain.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 DEFAULT_CONFIG="${PROJECT_DIR}/config/default_config.yaml"
-PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
-RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
+PROTOCOL_TAG="formal_p1_04_full120_86p8_v1"
+RESULTS_DIR="${ROOT_DIR}/Result/train_results/${PROTOCOL_TAG}"
+PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
 
 INFER_DEFAULTS=$(python - "${DEFAULT_CONFIG}" <<'PY'
 import sys
@@ -53,9 +56,15 @@ echo "empty fallback top-k: ${EMPTY_FALLBACK_TOPK} (0 means disabled)"
 echo "occ threshold: ${OCC_THRESHOLD}"
 
 # 检查模型是否存在
-VAE_CKPT="${ROOT_DIR}/Result/train_results/vae/vae_best.pt"
-LDM_CKPT="${ROOT_DIR}/Result/train_results/ldm/ldm_best.pt"
-CD_CKPT="${ROOT_DIR}/Result/train_results/cd/cd_best.pt"
+VAE_CKPT="${RESULTS_DIR}/vae/vae_best.pt"
+LDM_CKPT="${RESULTS_DIR}/ldm/ldm_best.pt"
+CD_CKPT="${RESULTS_DIR}/cd/cd_best.pt"
+
+echo "校验正式 VAE/LDM/CD checkpoint 链"
+python "${CHECKPOINT_CHAIN_SCRIPT}" validate \
+    --vae_ckpt "${VAE_CKPT}" \
+    --ldm_ckpt "${LDM_CKPT}" \
+    --cd_ckpt "${CD_CKPT}"
 
 if [ ! -f "${DATA_LOADING_CONFIG}" ]; then
     echo "错误: 配置文件不存在: ${DATA_LOADING_CONFIG}"
@@ -85,27 +94,16 @@ if [ ${#TEST_SCENES[@]} -eq 0 ]; then
     exit 1
 fi
 
-if [ ! -f "$VAE_CKPT" ]; then
-    echo "错误: VAE 模型不存在: $VAE_CKPT"
-    echo "请先运行: bash launch/train_unified.sh vae"
-    exit 1
-fi
+# 统一入口只校验一次全部场景，后续各采样分支复用该结果。
+for SCENE in "${TEST_SCENES[@]}"; do
+    SCENE_DIR="${PREPROCESSED_ROOT}/${SCENE}"
+    python "${MANIFEST_SCRIPT}" validate \
+        --scene_dir "${SCENE_DIR}" \
+        --expected_scene "${SCENE}"
+done
 
-if [ ! -f "$LDM_CKPT" ]; then
-    echo "警告: LDM 模型不存在: $LDM_CKPT"
-    echo "跳过 LDM 推理..."
-    RUN_LDM=false
-else
-    RUN_LDM=true
-fi
-
-if [ ! -f "$CD_CKPT" ]; then
-    echo "警告: CD 模型不存在: $CD_CKPT"
-    echo "跳过 CD 推理..."
-    RUN_CD=false
-else
-    RUN_CD=true
-fi
+RUN_LDM=true
+RUN_CD=true
 
 # LDM 推理
 if [ "$RUN_LDM" = true ]; then
@@ -116,10 +114,7 @@ if [ "$RUN_LDM" = true ]; then
     
     for SCENE in "${TEST_SCENES[@]}"; do
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
-        TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
-        RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
-        LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-        LDM_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_ldm_eval"
+        LDM_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_${PROTOCOL_TAG}_ldm_deploy"
 
         echo "  - 场景: ${SCENE}"
         python "${INFER_SCRIPT}" \
@@ -132,13 +127,10 @@ if [ "$RUN_LDM" = true ]; then
             --max_files "${MAX_INFER_FILES}" \
             --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
-            --target_voxel_dir "${TARGET_VOXEL_DIR}" \
-            --compare_with_target \
+            --require_real_ir \
             --save_voxel \
             --save_pointcloud \
-            --compare_with_lidar \
-            --raw_livox_dir "${RAW_LIVOX_DIR}" \
-            --lidar_index_file "${LIDAR_INDEX_FILE}" \
+            --save_uncertainty \
             --output_dir "${LDM_OUTPUT_DIR}" \
             --device cuda
     done
@@ -155,10 +147,7 @@ if [ "$RUN_CD" = true ]; then
     
     for SCENE in "${TEST_SCENES[@]}"; do
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
-        TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
-        RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
-        LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-        CD_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_1step_eval"
+        CD_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_${PROTOCOL_TAG}_cd_1step_deploy"
 
         echo "  - 场景: ${SCENE}"
         python "${INFER_SCRIPT}" \
@@ -171,13 +160,10 @@ if [ "$RUN_CD" = true ]; then
             --max_files "${MAX_INFER_FILES}" \
             --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
-            --target_voxel_dir "${TARGET_VOXEL_DIR}" \
-            --compare_with_target \
+            --require_real_ir \
             --save_voxel \
             --save_pointcloud \
-            --compare_with_lidar \
-            --raw_livox_dir "${RAW_LIVOX_DIR}" \
-            --lidar_index_file "${LIDAR_INDEX_FILE}" \
+            --save_uncertainty \
             --output_dir "${CD_OUTPUT_DIR}" \
             --device cuda
     done
@@ -192,10 +178,7 @@ if [ "$RUN_CD" = true ]; then
     
     for SCENE in "${TEST_SCENES[@]}"; do
         RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
-        TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
-        RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
-        LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-        CD4_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_4step_eval"
+        CD4_OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_${PROTOCOL_TAG}_cd_4step_deploy"
 
         echo "  - 场景: ${SCENE}"
         python "${INFER_SCRIPT}" \
@@ -208,13 +191,10 @@ if [ "$RUN_CD" = true ]; then
             --max_files "${MAX_INFER_FILES}" \
             --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
-            --target_voxel_dir "${TARGET_VOXEL_DIR}" \
-            --compare_with_target \
+            --require_real_ir \
             --save_voxel \
             --save_pointcloud \
-            --compare_with_lidar \
-            --raw_livox_dir "${RAW_LIVOX_DIR}" \
-            --lidar_index_file "${LIDAR_INDEX_FILE}" \
+            --save_uncertainty \
             --output_dir "${CD4_OUTPUT_DIR}" \
             --device cuda
     done
@@ -229,5 +209,6 @@ echo "=========================================="
 echo "test 场景列表: ${TEST_SCENES[*]}"
 echo "输入根目录: ${PREPROCESSED_ROOT}"
 echo "输出根目录: ${ROOT_DIR}/Result/inference_results"
-echo "每个输出目录包含: *_pcl.npy + *_voxel.npy + inference_metrics.csv"
+echo "每个输出目录包含: *_pcl.npy + *_voxel.npy + 可用的 *_uncertainty.npy"
+echo "运行协议文件: inference_runtime.csv + inference_run.json"
 echo ""

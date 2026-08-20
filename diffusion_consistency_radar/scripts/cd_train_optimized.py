@@ -1,18 +1,25 @@
 # -- coding: utf-8 --
 """
-优化的 Consistency Distillation 训练脚本
+LDM 初始化的 EMA Consistency 训练脚本
 
 改进点：
-1. 清晰的蒸馏流程 - 从 LDM 教师蒸馏 CD 学生模型
+1. 清晰的训练语义 - LDM 仅初始化 CD/EMA，训练目标来自 CD EMA
 2. 显存优化 - 梯度累积、检查点、混合精度
-3. 规范的实现 - 遵循 Consistency Distillation 论文
+3. checkpoint 显式记录初始化来源和一致性目标
 4. 模块化设计 - 易于理解和维护
 """
 
 import sys
 import os
-# 添加父目录到 Python 路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 直接执行本文件时同时暴露仓库根和包目录：前者支持
+# diffusion_consistency_radar.*，后者兼容既有 cm.* 导入。
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PACKAGE_ROOT = os.path.dirname(_SCRIPT_DIR)
+_PROJECT_ROOT = os.path.dirname(_PACKAGE_ROOT)
+for _import_root in (_PACKAGE_ROOT, _PROJECT_ROOT):
+    if _import_root not in sys.path:
+        sys.path.insert(0, _import_root)
 
 import torch
 import torch.nn as nn
@@ -27,17 +34,34 @@ from typing import Any, Dict, Optional, Tuple
 from tqdm import tqdm
 import yaml
 
-from cm.unet_optimized import OptimizedUNetModel
-from cm.multimodal_fusion import CompleteDualModalityPerceptionNet
-from cm.karras_diffusion import KarrasDenoiser
-from cm.vae_3d import (
+from diffusion_consistency_radar.cm.unet_optimized import OptimizedUNetModel
+from diffusion_consistency_radar.cm.multimodal_fusion import (
+    CompleteDualModalityPerceptionNet,
+)
+from diffusion_consistency_radar.cm.karras_diffusion import KarrasDenoiser
+from diffusion_consistency_radar.cm.vae_3d import (
     VAE3D,
     build_vae_from_checkpoint,
     create_lightweight_vae_config,
     create_standard_vae_config,
     create_ultra_lightweight_vae_config,
 )
-from cm.dataset_loader import NTU4DRadLM_VoxelDataset
+from diffusion_consistency_radar.cm.dataset_loader import (
+    NTU4DRadLM_VoxelDataset,
+    collate_voxel_samples,
+)
+from diffusion_consistency_radar.checkpoint_chain import (
+    FORMAL_CHECKPOINT_PROTOCOL,
+    resolve_training_checkpoint_protocol,
+    sha256_file,
+)
+from diffusion_consistency_radar.radar_normalization import (
+    RadarNormalizationError,
+    assert_checkpoint_radar_normalization,
+    assert_same_radar_normalization,
+    load_radar_normalization_artifact,
+    radar_normalization_from_checkpoint,
+)
 
 
 def safe_torch_load(path, map_location):
@@ -79,6 +103,46 @@ def resolve_data_grid_config(data_config: Dict[str, Any]):
         tuple(float(v) for v in source_pc_range),
         tuple(float(v) for v in model_pc_range),
     )
+
+
+def resolve_cd_radar_normalization(
+    ldm_checkpoint,
+    configured_spec,
+    configured_sha256,
+    *,
+    data_grid_config,
+    allow_legacy_radar_units=False,
+):
+    """在 CD 输出目录创建前校验配置 artifact 与教师 LDM 完全一致。"""
+    if type(allow_legacy_radar_units) is not bool:
+        raise RadarNormalizationError("allow_legacy_radar_units 必须是 bool")
+    has_embedded = isinstance(ldm_checkpoint, dict) and (
+        "radar_normalization" in ldm_checkpoint
+        or "radar_normalization_sha256" in ldm_checkpoint
+    )
+    if allow_legacy_radar_units:
+        if configured_spec is not None or configured_sha256 or has_embedded:
+            raise RadarNormalizationError(
+                "CD legacy 开关与正式 Radar normalization 不能同时启用"
+            )
+        return None, ""
+    if configured_spec is None or not configured_sha256:
+        raise RadarNormalizationError("正式 CD 缺少配置 Radar normalization")
+    teacher_spec, teacher_sha256 = radar_normalization_from_checkpoint(
+        ldm_checkpoint,
+        target_size=data_grid_config.get("target_size"),
+        source_pc_range=data_grid_config.get("source_pc_range"),
+        model_pc_range=data_grid_config.get("model_pc_range"),
+        context="CD teacher LDM checkpoint",
+    )
+    assert_same_radar_normalization(
+        configured_spec,
+        configured_sha256,
+        teacher_spec,
+        teacher_sha256,
+        context="CD teacher/config",
+    )
+    return teacher_spec, teacher_sha256
 
 
 def create_vae_from_config(config: Optional[Dict[str, Any]] = None) -> VAE3D:
@@ -190,6 +254,15 @@ def has_multimodal_meta(meta: Optional[Dict[str, Any]]) -> bool:
     return all(torch.is_tensor((meta or {}).get(key)) for key in required)
 
 
+def encode_cd_training_latents(vae, target, condition, meta_dict):
+    """正式多模态只编码 target；legacy batch 才构造 condition latent。"""
+    z_target = vae.get_latent(target)
+    z_cond = None
+    if not has_multimodal_meta(meta_dict):
+        z_cond = vae.get_latent(condition)
+    return z_target, z_cond
+
+
 def move_meta_to_device(meta: Optional[Dict[str, Any]], device: torch.device) -> Dict[str, Any]:
     moved = {}
     for key, value in (meta or {}).items():
@@ -229,7 +302,7 @@ def pad_latent_input_to_sixteen_channels(model_input: torch.Tensor) -> torch.Ten
 def call_cd_denoiser(
     model: nn.Module,
     x_t: torch.Tensor,
-    z_cond: torch.Tensor,
+    z_cond: Optional[torch.Tensor],
     timesteps: torch.Tensor,
     radar_voxel: Optional[torch.Tensor] = None,
     meta_dict: Optional[Dict[str, Any]] = None,
@@ -246,19 +319,23 @@ def call_cd_denoiser(
                 timesteps,
                 noised_latent=x_t,
             )
+        if z_cond is None:
+            raise ValueError("缺少 legacy multimodal CD condition latent")
         model_input = pad_latent_input_to_sixteen_channels(torch.cat([x_t, z_cond], dim=1))
         return model.unet_3d(model_input, timesteps)
+    if z_cond is None:
+        raise ValueError("缺少 legacy CD condition latent")
     return model(torch.cat([x_t, z_cond], dim=1), timesteps)
 
 
 class ConsistencyDistillationTrainer:
     """
-    Consistency Distillation 训练器
+    LDM 初始化的 EMA consistency 训练器
     
     流程：
-    1. 加载预训练的 LDM 教师模型
-    2. 创建 CD 学生模型
-    3. 蒸馏学生模型使其快速生成
+    1. 加载预训练 LDM 作为一次性初始化来源
+    2. 从相同权重创建 CD 模型和 EMA 目标模型
+    3. 训练 CD 输出逼近持续更新的 CD EMA 目标
     """
     
     def __init__(
@@ -270,9 +347,43 @@ class ConsistencyDistillationTrainer:
     ):
         self.device = device
         self.config = config or {}
+        self.data_grid_config = dict(
+            self.config.get("data_grid_config", {}) or {}
+        )
+        self.allow_legacy_radar_units = self.config.get(
+            "allow_legacy_radar_units", False
+        )
+        self.checkpoint_protocol = resolve_training_checkpoint_protocol(
+            self.config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+        )
+        teacher_checkpoint = safe_torch_load(ldm_ckpt_path, map_location="cpu")
+        self.radar_normalization, self.radar_normalization_sha256 = (
+            resolve_cd_radar_normalization(
+                teacher_checkpoint,
+                self.config.get("radar_normalization"),
+                self.config.get("radar_normalization_sha256", ""),
+                data_grid_config=self.data_grid_config,
+                allow_legacy_radar_units=self.allow_legacy_radar_units,
+            )
+        )
+        self._preloaded_ldm_checkpoint = teacher_checkpoint
+        resume_path = self.config.get('resume_path')
+        if resume_path and os.path.exists(resume_path):
+            resume_checkpoint = safe_torch_load(resume_path, map_location="cpu")
+            assert_checkpoint_radar_normalization(
+                resume_checkpoint,
+                self.radar_normalization,
+                self.radar_normalization_sha256,
+                target_size=self.data_grid_config.get("target_size"),
+                source_pc_range=self.data_grid_config.get("source_pc_range"),
+                model_pc_range=self.data_grid_config.get("model_pc_range"),
+                allow_legacy_radar_units=self.allow_legacy_radar_units,
+                context="CD resume preflight",
+            )
+            self._preloaded_resume_checkpoint = resume_checkpoint
         
         # 设置保存目录和日志
-        self.save_dir = config.get('save_dir', './Result/train_results/cd')
+        self.save_dir = self.config.get('save_dir', './Result/train_results/cd')
         os.makedirs(self.save_dir, exist_ok=True)
         
         # 初始化训练状态
@@ -281,8 +392,31 @@ class ConsistencyDistillationTrainer:
         self.is_resumed = False
         self.model_config = dict(self.config.get("ldm", {}) or self.config.get("model", {}) or {})
         self.model_config.setdefault("latent_dim", int(vae.latent_dim))
+        self.vae_checkpoint_sha256 = str(self.config.get("vae_checkpoint_sha256", "") or "")
+        self.ldm_checkpoint_sha256 = str(self.config.get("ldm_checkpoint_sha256", "") or "")
+        self.model_config.setdefault(
+            "fusion_voxel_shape",
+            list(self.data_grid_config.get("target_size", [32, 128, 128])),
+        )
+        self.model_config.setdefault(
+            "fusion_latent_shape",
+            list(self.model_config["fusion_voxel_shape"]),
+        )
+        self.model_config.setdefault(
+            "fusion_pc_range",
+            list(self.data_grid_config.get("model_pc_range", [0, -20, -6, 120, 20, 10])),
+        )
+        self.data_grid_config.setdefault(
+            "target_size", list(self.model_config["fusion_voxel_shape"])
+        )
+        self.data_grid_config.setdefault(
+            "source_pc_range", list(self.data_grid_config.get("model_pc_range", [0, -20, -6, 120, 20, 10]))
+        )
+        self.data_grid_config.setdefault(
+            "model_pc_range", list(self.model_config["fusion_pc_range"])
+        )
         
-        # 加载 LDM 教师模型
+        # LDM 仅提供初始权重；后续 consistency target 来自 CD EMA。
         self.ldm_model = self._load_ldm_model(ldm_ckpt_path)
         self.use_multimodal = bool(getattr(self.ldm_model, "is_multimodal", False))
         self.vae = vae.to(device)
@@ -302,7 +436,7 @@ class ConsistencyDistillationTrainer:
         # 优化器
         self.optimizer = torch.optim.AdamW(
             self.cd_model.parameters(),
-            lr=config.get('lr', 5e-5),
+            lr=self.config.get('lr', 5e-5),
             weight_decay=1e-4,
         )
         
@@ -326,7 +460,6 @@ class ConsistencyDistillationTrainer:
         self.csv_file = os.path.join(self.save_dir, 'metrics.csv')
         
         # 检查是否恢复训练
-        resume_path = config.get('resume_path')
         if resume_path and os.path.exists(resume_path):
             self.is_resumed = True
         
@@ -344,7 +477,9 @@ class ConsistencyDistillationTrainer:
         old_stdout = sys.stdout
         sys.stdout = StringIO()
         
-        ckpt = safe_torch_load(ckpt_path, map_location='cpu')
+        ckpt = getattr(self, "_preloaded_ldm_checkpoint", None)
+        if ckpt is None:
+            ckpt = safe_torch_load(ckpt_path, map_location='cpu')
         state_dict = checkpoint_state_dict(ckpt)
         resolved_config = resolve_cd_generation_config(
             ckpt,
@@ -365,7 +500,7 @@ class ConsistencyDistillationTrainer:
         for param in model.parameters():
             param.requires_grad = False
         
-        print(f"Loaded LDM teacher model from {ckpt_path}")
+        print(f"Loaded LDM initialization checkpoint from {ckpt_path}")
         return model
     
     def _create_ema_model(self, model: nn.Module) -> nn.Module:
@@ -421,7 +556,19 @@ class ConsistencyDistillationTrainer:
     def _resume_from_checkpoint(self, ckpt_path: str):
         """从检查点恢复训练"""
         print(f"Resuming CD from checkpoint: {ckpt_path}")
-        ckpt = safe_torch_load(ckpt_path, map_location=self.device)
+        ckpt = getattr(self, "_preloaded_resume_checkpoint", None)
+        if ckpt is None:
+            ckpt = safe_torch_load(ckpt_path, map_location=self.device)
+        assert_checkpoint_radar_normalization(
+            ckpt,
+            self.radar_normalization,
+            self.radar_normalization_sha256,
+            target_size=self.data_grid_config.get("target_size"),
+            source_pc_range=self.data_grid_config.get("source_pc_range"),
+            model_pc_range=self.data_grid_config.get("model_pc_range"),
+            allow_legacy_radar_units=self.allow_legacy_radar_units,
+            context="CD resume checkpoint",
+        )
         
         # 加载模型
         self.cd_model.load_state_dict(ckpt['model_state_dict'])
@@ -453,7 +600,7 @@ class ConsistencyDistillationTrainer:
         if not self.is_resumed:
             self.cd_model.load_state_dict(self.ldm_model.state_dict())
             self.cd_model_ema.load_state_dict(self.ldm_model.state_dict())
-            print("Initialized CD model from LDM teacher")
+            print("Initialized CD model and EMA target from LDM checkpoint")
     
     def _update_ema(self, ema_rate: float = 0.999):
         """更新 EMA 模型"""
@@ -503,7 +650,7 @@ class ConsistencyDistillationTrainer:
     def train_step(
         self,
         z_target: torch.Tensor,
-        z_cond: torch.Tensor,
+        z_cond: Optional[torch.Tensor],
         num_scales: int = 40,
         radar_voxel: Optional[torch.Tensor] = None,
         meta_dict: Optional[Dict[str, Any]] = None,
@@ -553,9 +700,9 @@ class ConsistencyDistillationTrainer:
             meta_dict=meta_dict,
         )
         
-        # 教师模型（EMA）：从 x(t_n) 推进到 x(t_{n+1})，再预测
+        # CD EMA 目标模型：从 x(t_n) 推进到 x(t_{n+1})，再预测。
         with torch.no_grad():
-            # 使用 EMA 教师模型
+            # 该模型由 CD 参数持续 EMA 更新，不是冻结的 LDM 教师。
             x_t_next = self._euler_solver(
                 self.cd_model_ema,
                 x_t_n,
@@ -566,7 +713,7 @@ class ConsistencyDistillationTrainer:
                 meta_dict=meta_dict,
             )
             
-            # 教师在 t_{n+1} 的预测
+            # EMA 目标在 t_{n+1} 的预测
             teacher_denoised = call_cd_denoiser(
                 self.cd_model_ema,
                 x_t_next,
@@ -576,7 +723,7 @@ class ConsistencyDistillationTrainer:
                 meta_dict=meta_dict,
             )
         
-        # NOTE: 一致性目标：学生一步输出逼近教师多步推进后的输出。
+        # NOTE: 一致性目标：CD 一步输出逼近 CD EMA 推进后的输出。
         loss = F.mse_loss(student_denoised, teacher_denoised)
         
         return loss
@@ -603,8 +750,12 @@ class ConsistencyDistillationTrainer:
             
             # 编码到潜空间
             with torch.no_grad():
-                z_target = self.vae.get_latent(target)
-                z_cond = self.vae.get_latent(cond)
+                z_target, z_cond = encode_cd_training_latents(
+                    self.vae,
+                    target,
+                    cond,
+                    meta_dict,
+                )
             
             # 计算损失
             loss = self.train_step(
@@ -638,6 +789,40 @@ class ConsistencyDistillationTrainer:
             self._update_ema(ema_rate=0.999)
         
         return total_loss / len(train_loader)
+
+    def _checkpoint_payload(self, epoch: int, loss: float, best_loss: float) -> Dict[str, Any]:
+        """构造带完整网格和父 checkpoint hash 的正式 CD checkpoint。"""
+        payload = {
+            "epoch": epoch,
+            "loss": loss,
+            "best_loss": best_loss,
+            "model_state_dict": self.cd_model.state_dict(),
+            "ema_model_state_dict": self.cd_model_ema.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "latent_dim": int(self.model_config["latent_dim"]),
+            "model_config": dict(self.model_config),
+            "checkpoint_protocol": (
+                getattr(
+                    self,
+                    "checkpoint_protocol",
+                    FORMAL_CHECKPOINT_PROTOCOL,
+                )
+                if self.use_multimodal and self.radar_normalization is not None
+                else "legacy_cd_v0"
+            ),
+            "stage": "cd",
+            "data_grid_config": dict(self.data_grid_config),
+            "vae_checkpoint_sha256": self.vae_checkpoint_sha256,
+            "ldm_checkpoint_sha256": self.ldm_checkpoint_sha256,
+            "model_family": "multimodal" if self.use_multimodal else "legacy",
+            "training_semantics": "ldm_initialized_ema_consistency_v1",
+            "ldm_role": "initialization_checkpoint",
+            "consistency_target_source": "cd_model_ema",
+        }
+        if self.radar_normalization is not None:
+            payload["radar_normalization"] = dict(self.radar_normalization)
+            payload["radar_normalization_sha256"] = self.radar_normalization_sha256
+        return payload
     
     def train(
         self,
@@ -680,32 +865,20 @@ class ConsistencyDistillationTrainer:
             if loss < self.best_loss:
                 self.best_loss = loss
                 best_ckpt = os.path.join(self.save_dir, "cd_best.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'loss': loss,
-                    'best_loss': self.best_loss,
-                    'model_state_dict': self.cd_model.state_dict(),
-                    'ema_model_state_dict': self.cd_model_ema.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'latent_dim': int(self.model_config["latent_dim"]),
-                    'model_config': dict(self.model_config),
-                }, best_ckpt)
+                torch.save(
+                    self._checkpoint_payload(epoch, loss, self.best_loss),
+                    best_ckpt,
+                )
                 msg = f"  ✓ Saved best model (loss: {loss:.4f})"
                 self.logger.info(msg)
             
             # 定期保存检查点
             if epoch % save_every == 0:
                 ckpt_path = os.path.join(self.save_dir, f"cd_epoch{epoch:04d}.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'loss': loss,
-                    'best_loss': self.best_loss,
-                    'model_state_dict': self.cd_model.state_dict(),
-                    'ema_model_state_dict': self.cd_model_ema.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'latent_dim': int(self.model_config["latent_dim"]),
-                    'model_config': dict(self.model_config),
-                }, ckpt_path)
+                torch.save(
+                    self._checkpoint_payload(epoch, loss, self.best_loss),
+                    ckpt_path,
+                )
                 self.logger.info(f"  Saved checkpoint: {ckpt_path}")
         
         msg = "\nTraining completed!"
@@ -724,6 +897,11 @@ def main():
     parser.add_argument("--save_dir", type=str, default="./Result/train_results/cd")
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--grad_accum_steps", type=int, default=8)
+    parser.add_argument(
+        "--allow_legacy_radar_units",
+        action="store_true",
+        help="仅供 mini-test/旧诊断保留未归一化 Radar；正式 CD 禁止使用",
+    )
     
     args = parser.parse_args()
     
@@ -735,6 +913,31 @@ def main():
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
     ldm_config.setdefault("fusion_voxel_shape", list(target_size))
     ldm_config.setdefault("fusion_pc_range", list(model_pc_range))
+    artifact_path = data_config.get("radar_normalization_path")
+    scale_mps = data_config.get("doppler_scale_mps")
+    path_configured = isinstance(artifact_path, str) and bool(artifact_path.strip())
+    scale_configured = scale_mps not in (None, "")
+    if args.allow_legacy_radar_units:
+        if path_configured or scale_configured:
+            raise RadarNormalizationError(
+                "CD legacy 开关与正式 normalization 配置不能同时启用"
+            )
+        radar_normalization, radar_normalization_sha256 = None, ""
+    else:
+        if not path_configured or not scale_configured:
+            raise RadarNormalizationError(
+                "正式 CD 必须配置 radar_normalization_path 和 doppler_scale_mps"
+            )
+        radar_normalization, radar_normalization_sha256 = (
+            load_radar_normalization_artifact(
+                artifact_path.strip(),
+                target_size=target_size,
+                source_pc_range=source_pc_range,
+                model_pc_range=model_pc_range,
+                doppler_scale_mps=scale_mps,
+                require_formal=True,
+            )
+        )
 
     # 加载 VAE
     ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
@@ -752,6 +955,9 @@ def main():
         target_size=target_size,
         source_pc_range=source_pc_range,
         model_pc_range=model_pc_range,
+        radar_normalization=radar_normalization,
+        radar_normalization_sha256=radar_normalization_sha256,
+        allow_legacy_radar_units=args.allow_legacy_radar_units,
     )
     train_loader = DataLoader(
         dataset,
@@ -759,6 +965,7 @@ def main():
         shuffle=True,
         num_workers=4,
         pin_memory=False,
+        collate_fn=collate_voxel_samples,
     )
     
     cd_save_dir = cd_config.get("save_dir", args.save_dir)
@@ -777,6 +984,19 @@ def main():
             'save_dir': cd_save_dir,
             'resume_path': resume_path,
             'ldm': ldm_config,
+            'data_grid_config': {
+                'target_size': list(target_size),
+                'source_pc_range': list(source_pc_range),
+                'model_pc_range': list(model_pc_range),
+            },
+            'vae_checkpoint_sha256': sha256_file(args.vae_ckpt),
+            'ldm_checkpoint_sha256': sha256_file(args.ldm_ckpt),
+            'radar_normalization': radar_normalization,
+            'radar_normalization_sha256': radar_normalization_sha256,
+            'allow_legacy_radar_units': args.allow_legacy_radar_units,
+            'checkpoint_protocol': data_config.get(
+                'checkpoint_protocol', FORMAL_CHECKPOINT_PROTOCOL
+            ),
         },
     )
     

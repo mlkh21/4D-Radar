@@ -13,14 +13,14 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cm.dataset_loader import CalibrationProvider  # noqa: E402
+from cm.dataset_loader import (  # noqa: E402
+    CalibrationProvider,
+    DEFAULT_THERMAL_K,
+)
 
 DEFAULT_PC_RANGE = (0.0, -20.0, -6.0, 120.0, 20.0, 10.0)
 DEFAULT_TARGET_SIZE = (32, 128, 128)
-DEFAULT_K = np.array(
-    [[457.2, 0.0, 323.1], [0.0, 457.9, 242.5], [0.0, 0.0, 1.0]],
-    dtype=np.float32,
-)
+DEFAULT_K = DEFAULT_THERMAL_K
 MOCK_R_CAM_TO_LIDAR = np.array(
     [[0.012, -0.999, -0.015], [0.024, -0.015, 0.999], [-0.999, -0.012, 0.024]],
     dtype=np.float32,
@@ -95,7 +95,6 @@ def audit_scene(dataset_root: str, scene: str) -> Dict[str, object]:
         # 与 NTU4DRadLM_VoxelDataset._get_mock_calibration 的训练路径保持一致。
         r_np = MOCK_R_CAM_TO_LIDAR
         t_np = MOCK_T_CAM_TO_LIDAR
-        k_np = DEFAULT_K
     frustum_ratio = _frustum_voxel_ratio(
         r_np,
         t_np,

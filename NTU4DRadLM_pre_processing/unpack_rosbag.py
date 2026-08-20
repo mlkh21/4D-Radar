@@ -3,14 +3,21 @@
 import rosbag
 import os
 import argparse
+import csv
+import json
 import numpy as np
-import pandas as pd
 import sensor_msgs.point_cloud2 as pc2
-import open3d as o3d
 import glob
 import re
 import cv2
 from tqdm import tqdm  # ──► 新增引用：工业级流式进度条组件
+
+if __package__:
+    # 作为项目模块调用时使用相对路径，避免同名脚本遮蔽命名空间包。
+    from .timestamp_alignment import preferred_message_timestamp
+else:
+    # 直接执行脚本时，脚本所在目录位于 sys.path 中。
+    from timestamp_alignment import preferred_message_timestamp  # type: ignore[no-redef]
 
 """NTU4DRadLM 解包脚本。
 
@@ -37,8 +44,112 @@ ALLOWED_TOPICS = {
     "ublox/fix_velocity",
     "vectornav/imu",
 }
+
+# PointCloud2 导出协议：无论原消息字段是否完整，保存文件都固定为这五列。
+POINTCLOUD_COLUMNS = ("x", "y", "z", "intensity", "doppler")
+POINTCLOUD_SCHEMA_FILENAME = "pointcloud_schema.json"
+_INTENSITY_FIELD_ALIASES = ("intensity", "reflectivity", "power", "rcs", "snr")
+_DOPPLER_FIELD_ALIASES = ("velocity", "doppler", "v_r", "radial_velocity")
+
+
+def _resolve_pointcloud_field(field_names, aliases):
+    """按不区分大小写的别名查找消息中的实际字段名。"""
+    by_lower_name = {str(name).lower(): name for name in field_names}
+    for alias in aliases:
+        if alias in by_lower_name:
+            return by_lower_name[alias]
+    return None
+
+
+def _write_pointcloud_schema(save_dir, schema):
+    """原子写入点云列协议，避免中断时留下半截 JSON。"""
+    schema_path = os.path.join(save_dir, POINTCLOUD_SCHEMA_FILENAME)
+    temp_path = schema_path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(schema, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temp_path, schema_path)
+
+
+def _read_pointcloud2_fixed_columns(msg):
+    """按字段名读取 PointCloud2，并构造固定的 ``[x,y,z,intensity,doppler]``。"""
+    source_field_names = [str(field.name) for field in msg.fields]
+    field_mapping = {
+        "x": _resolve_pointcloud_field(source_field_names, ("x",)),
+        "y": _resolve_pointcloud_field(source_field_names, ("y",)),
+        "z": _resolve_pointcloud_field(source_field_names, ("z",)),
+        "intensity": _resolve_pointcloud_field(
+            source_field_names, _INTENSITY_FIELD_ALIASES
+        ),
+        "doppler": _resolve_pointcloud_field(
+            source_field_names, _DOPPLER_FIELD_ALIASES
+        ),
+    }
+    missing_coordinates = [
+        name for name in ("x", "y", "z") if field_mapping[name] is None
+    ]
+    if missing_coordinates:
+        raise ValueError(
+            "PointCloud2 缺少必需坐标字段: " + ", ".join(missing_coordinates)
+        )
+
+    selected_fields = [
+        field_mapping[name]
+        for name in POINTCLOUD_COLUMNS
+        if field_mapping[name] is not None
+    ]
+    selected_columns = [
+        name for name in POINTCLOUD_COLUMNS if field_mapping[name] is not None
+    ]
+    selected_indices = {name: index for index, name in enumerate(selected_columns)}
+
+    points = []
+    for raw_point in pc2.read_points(
+        msg, field_names=selected_fields, skip_nans=True
+    ):
+        values = list(raw_point)
+        if len(values) != len(selected_fields):
+            raise ValueError(
+                "PointCloud2.read_points 返回列数与请求字段不一致: "
+                f"expected={len(selected_fields)}, got={len(values)}"
+            )
+        point = np.zeros(len(POINTCLOUD_COLUMNS), dtype=np.float32)
+        for column_index, column_name in enumerate(POINTCLOUD_COLUMNS):
+            source_name = field_mapping[column_name]
+            if source_name is not None:
+                point[column_index] = float(values[selected_indices[column_name]])
+        points.append(point.tolist())
+
+    schema = {
+        "schema_version": 1,
+        "storage_format": "npy",
+        "columns": list(POINTCLOUD_COLUMNS),
+        "column_indices": {name: index for index, name in enumerate(POINTCLOUD_COLUMNS)},
+        "source_fields": source_field_names,
+        "selected_fields": selected_fields,
+        "field_mapping": field_mapping,
+        "missing_fields": [
+            name for name in ("intensity", "doppler") if field_mapping[name] is None
+        ],
+    }
+    return points, schema
+
+
 def _topic_key(topic_name: str) -> str:
     return topic_name.strip('/')
+
+
+def _write_csv_records(path, records):
+    """使用标准库写入动态字段记录，避免解包入口隐式依赖 pandas。"""
+    fieldnames = []
+    for record in records:
+        for name in record:
+            if name not in fieldnames:
+                fieldnames.append(name)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
 
 def get_scene_name(bag_path):
     """
@@ -58,10 +169,11 @@ def save_pointcloud(msg, save_dir, timestamp):
     """
     保存点云为 .npy 文件，保留所有关键属性。
     Livox: [x, y, z, reflectivity]
-    Radar (PointCloud v1): [x, y, z, intensity, velocity]
+    Radar (PointCloud v1/PointCloud2): [x, y, z, intensity, doppler]
     """
     try:
         points_list = []
+        schema = None
 
         # NOTE: 1) Livox CustomMsg
         # 结构: x, y, z, reflectivity, tag, line
@@ -72,38 +184,7 @@ def save_pointcloud(msg, save_dir, timestamp):
 
         # NOTE: 2) 标准 PointCloud2
         elif hasattr(msg, 'width'): # Duck typing for PointCloud2
-            # 尝试读取常用字段
-            # 注意：不同雷达的字段名可能不同，这里尝试读取 intensity 和 velocity/doppler
-            field_names = [f.name for f in msg.fields]
-            read_fields = ['x', 'y', 'z']
-
-            if 'intensity' in field_names:
-                read_fields.append('intensity')
-            elif 'reflectivity' in field_names:
-                read_fields.append('reflectivity')
-            else:
-                read_fields.append(None) # 占位
-
-            # 尝试读取速度字段
-            if 'velocity' in field_names:
-                read_fields.append('velocity')
-            elif 'doppler' in field_names:
-                read_fields.append('doppler')
-            else:
-                read_fields.append(None) # 占位
-
-            # 过滤掉 None
-            actual_fields = [f for f in read_fields if f is not None]
-
-            gen = pc2.read_points(msg, field_names=actual_fields, skip_nans=True)
-
-            # 统一填充为 5 维: [x, y, z, intensity, velocity]
-            # 如果原始数据缺失某维，填 0
-            for p in gen:
-                point_data = list(p)
-                # 补齐维度逻辑... 这里简化处理，直接存原始读取到的数据
-                # 后续处理时根据 shape 判断
-                points_list.append(point_data)
+            points_list, schema = _read_pointcloud2_fixed_columns(msg)
 
         # NOTE: 3) 标准 PointCloud (v1) - 常见于 4D Radar
         # 结构: points[], channels[name, values[]]
@@ -148,6 +229,11 @@ def save_pointcloud(msg, save_dir, timestamp):
         # 保存为 .npy
         filename_npy = os.path.join(save_dir, f"{timestamp:.6f}.npy")
         np.save(filename_npy, pc_np)
+
+        if schema is not None:
+            schema["shape"] = [int(size) for size in pc_np.shape]
+            schema["dtype"] = str(pc_np.dtype)
+            _write_pointcloud_schema(save_dir, schema)
 
         # 可选：同时保存一份仅含 XYZ 的 PCD 用于可视化预览
         # pcd = o3d.geometry.PointCloud()
@@ -205,8 +291,9 @@ def process_ntu_dataset(input_root, output_root):
         try:
             bag = rosbag.Bag(bag_path)
         except Exception as e:
-            print(f"\n      [ERROR] Could not open bag {bag_filename}: {e}")
-            continue
+            raise RuntimeError(
+                f"无法打开 rosbag 分卷，拒绝继续生成不完整场景: {bag_path}"
+            ) from e
 
         info = bag.get_type_and_topic_info()
         csv_buffers = {} # 用于缓存非点云数据
@@ -225,7 +312,10 @@ def process_ntu_dataset(input_root, output_root):
                 continue
 
             msg_type = info.topics[topic].msg_type
-            timestamp = t.to_sec()
+            # 优先使用消息头时间戳，只有消息头缺失/无效时才使用 bag 接收时间。
+            # 这样不同传感器的硬件采样时刻不会被 ROS bag 写入时刻覆盖。
+            receipt_timestamp = t.to_sec()
+            timestamp, timestamp_source = preferred_message_timestamp(msg, receipt_timestamp)
 
             # 准备话题对应的子文件夹名，例如 /livox/lidar -> livox_lidar
             topic_clean = topic.strip('/').replace('/', '_')
@@ -246,7 +336,7 @@ def process_ntu_dataset(input_root, output_root):
                 if topic not in csv_buffers:
                     csv_buffers[topic] = []
 
-                data_row = {'timestamp': timestamp}
+                data_row = {'timestamp': timestamp, 'timestamp_source': timestamp_source}
 
                 if hasattr(msg, 'header'):
                     data_row['seq'] = msg.header.seq
@@ -305,14 +395,8 @@ def process_ntu_dataset(input_root, output_root):
             topic_dir = os.path.join(scene_output_dir, topic_clean)
             os.makedirs(topic_dir, exist_ok=True)
 
-            df = pd.DataFrame(data_list)
-            # 将时间戳移到第一列
-            if 'timestamp' in df.columns:
-                cols = ['timestamp'] + [c for c in df.columns if c != 'timestamp']
-                df = df[cols]
-
             csv_filename = f"data_{bag_base_name}.csv"
-            df.to_csv(os.path.join(topic_dir, csv_filename), index=False)
+            _write_csv_records(os.path.join(topic_dir, csv_filename), data_list)
 
     print("\nAll extraction tasks completed successfully!")
 

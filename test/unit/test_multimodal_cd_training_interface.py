@@ -14,6 +14,7 @@ if PROJECT_ROOT not in sys.path:
 from diffusion_consistency_radar.scripts.cd_train_optimized import (
     build_cd_vae_from_checkpoint,
     call_cd_denoiser,
+    encode_cd_training_latents,
     has_multimodal_state_dict,
     create_cd_model,
 )
@@ -158,6 +159,35 @@ def test_multimodal_cd_denoiser_passes_radar_ir_and_noised_latent():
     assert torch.equal(model.last["timesteps"], t)
 
 
+def test_multimodal_cd_encodes_only_target_but_legacy_encodes_condition():
+    class CountingVAE:
+        def __init__(self):
+            self.inputs = []
+
+        def get_latent(self, value):
+            self.inputs.append(value)
+            return value[:, :1]
+
+    target = torch.randn(1, 4, 2, 2, 2)
+    condition = torch.randn_like(target)
+    vae = CountingVAE()
+
+    z_target, z_cond = encode_cd_training_latents(
+        vae,
+        target,
+        condition,
+        _meta(batch_size=1),
+    )
+    assert z_target.shape[0] == 1
+    assert z_cond is None
+    assert vae.inputs == [target]
+
+    vae = CountingVAE()
+    _z_target, z_cond = encode_cd_training_latents(vae, target, condition, {})
+    assert z_cond is not None
+    assert vae.inputs == [target, condition]
+
+
 if __name__ == "__main__":
     test_cd_vae_checkpoint_metadata_precedes_fallback_config()
     test_cd_legacy_vae_requires_explicit_fallback()
@@ -165,4 +195,5 @@ if __name__ == "__main__":
     test_multimodal_checkpoint_detection()
     test_legacy_cd_denoiser_keeps_eight_channel_path()
     test_multimodal_cd_denoiser_passes_radar_ir_and_noised_latent()
+    test_multimodal_cd_encodes_only_target_but_legacy_encodes_condition()
     print("test_multimodal_cd_training_interface passed")

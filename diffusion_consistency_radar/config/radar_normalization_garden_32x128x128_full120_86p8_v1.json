@@ -1,0 +1,56 @@
+{
+  "doppler": {
+    "clip": [
+      -1.0,
+      1.0
+    ],
+    "scale_mps": 86.8,
+    "transform": "symmetric_physical_scale"
+  },
+  "formal": true,
+  "frame_count": 4013,
+  "input_provenance": {
+    "dataset_manifest_sha256": {
+      "garden": "2b5030528bbe3c839b072c276151384737788493dd1575fedbb9436f5fd62144"
+    }
+  },
+  "intensity": {
+    "clip": [
+      -5.0,
+      5.0
+    ],
+    "log_iqr": 0.32912278175354004,
+    "log_median": 2.50797176361084,
+    "transform": "log1p_robust_zscore"
+  },
+  "model_pc_range": [
+    0.0,
+    -20.0,
+    -6.0,
+    120.0,
+    20.0,
+    10.0
+  ],
+  "protocol": "radar_normalization_v1",
+  "source_pc_range": [
+    0.0,
+    -20.0,
+    -6.0,
+    120.0,
+    20.0,
+    10.0
+  ],
+  "target_size": [
+    32,
+    128,
+    128
+  ],
+  "training_scenes": [
+    "garden"
+  ],
+  "variance": {
+    "aggregation": "occupied_voxel_equal_weight_total_variance",
+    "transform": "identity",
+    "unit": "m2_s2"
+  }
+}

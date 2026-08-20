@@ -6,19 +6,41 @@
 
 set -euo pipefail
 
+if [[ -n "${ADAPTIVE_OCC_FROM_TARGET+x}" || -n "${ADAPTIVE_TARGET_THRESHOLD+x}" ]]; then
+  echo "Error: adaptive target threshold 已从推理入口移除；请运行 test/diagnostics/occupancy/diagnose_oracle_target_adaptation.py"
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PROJECT_DIR="${ROOT_DIR}/diffusion_consistency_radar"
 
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
-PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware}"
-RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
+MINI_RADAR_PROTOCOL="${MINI_RADAR_PROTOCOL:-legacy}"
+case "${MINI_RADAR_PROTOCOL}" in
+  legacy)
+    DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware"
+    DEFAULT_RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
+    DEFAULT_MODEL_PC_RANGE="0,-20,-6,40,20,10"
+    ;;
+  formal)
+    DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
+    DEFAULT_RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw_p1_01_candidate"
+    DEFAULT_MODEL_PC_RANGE="0,-20,-6,120,20,10"
+    ;;
+  *)
+    echo "Error: MINI_RADAR_PROTOCOL must be legacy or formal"
+    exit 1
+    ;;
+esac
+PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${DEFAULT_PREPROCESSED_ROOT}}"
+RAW_ROOT="${RAW_ROOT:-${DEFAULT_RAW_ROOT}}"
 MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SCRIPT_DIR}/train_results_mini}"
 MINI_INFERENCE_RESULTS_DIR="${MINI_INFERENCE_RESULTS_DIR:-${SCRIPT_DIR}/inference_results_mini}"
 MINI_TARGET_SIZE="${MINI_TARGET_SIZE:-32,128,128}"
 MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-0,-20,-6,120,20,10}"
-MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-0,-20,-6,40,20,10}"
+MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-${DEFAULT_MODEL_PC_RANGE}}"
 
 MODEL_TYPE="${1:-ldm}"
 MAX_INFER_FILES="${MAX_INFER_FILES:-20}"
@@ -26,12 +48,18 @@ MAX_INFER_FILES="${MAX_INFER_FILES:-20}"
 # OCC_THRESHOLD when calibrating a different checkpoint/protocol.
 OCC_THRESHOLD="${OCC_THRESHOLD:-0.5}"
 EMPTY_FALLBACK_TOPK="${EMPTY_FALLBACK_TOPK:-2000}"
-ADAPTIVE_OCC_FROM_TARGET="${ADAPTIVE_OCC_FROM_TARGET:-0}"
-ADAPTIVE_TARGET_THRESHOLD="${ADAPTIVE_TARGET_THRESHOLD:--1}"
 TRAIN_DURATION_SECONDS="${TRAIN_DURATION_SECONDS:--1}"
 DEVICE="${DEVICE:-cuda}"
 USE_MINI_CHECKPOINTS="${USE_MINI_CHECKPOINTS:-1}"
 USER_OUTPUT_DIR="${OUTPUT_DIR:-}"
+
+RADAR_PROTOCOL_ARGS=()
+REAL_IR_ARGS=()
+if [[ "${MINI_RADAR_PROTOCOL}" == "legacy" ]]; then
+  RADAR_PROTOCOL_ARGS+=(--allow_legacy_radar_units)
+else
+  REAL_IR_ARGS+=(--require_real_ir)
+fi
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
   PYTHON_CMD=("${PYTHON_BIN}")
@@ -141,10 +169,10 @@ echo "steps/sampler: ${STEPS}/${SAMPLER}"
 echo "max files per scene: ${MAX_INFER_FILES}"
 echo "occ_threshold: ${OCC_THRESHOLD}"
 echo "empty_fallback_topk: ${EMPTY_FALLBACK_TOPK}"
-echo "adaptive_occ_from_target: ${ADAPTIVE_OCC_FROM_TARGET} (adaptive_target_threshold=${ADAPTIVE_TARGET_THRESHOLD})"
 echo "target size [Z,X,Y]: ${MINI_TARGET_SIZE}"
 echo "source pc range: ${MINI_SOURCE_PC_RANGE}"
 echo "model pc range: ${MINI_MODEL_PC_RANGE}"
+echo "radar protocol: ${MINI_RADAR_PROTOCOL}"
 echo "=========================================="
 
 for SCENE in "${TEST_SCENES[@]}"; do
@@ -176,17 +204,6 @@ for SCENE in "${TEST_SCENES[@]}"; do
     EXTRA_COMPARE_ARGS+=(--compare_with_target)
   fi
 
-  EXTRA_ADAPTIVE_ARGS=()
-  if [[ "${ADAPTIVE_OCC_FROM_TARGET}" == "1" ]]; then
-    if [[ ! -d "${TARGET_VOXEL_DIR}" ]]; then
-      echo "Warning: adaptive mode requested but missing ${TARGET_VOXEL_DIR}; fallback to fixed occ_threshold"
-    else
-      EXTRA_ADAPTIVE_ARGS+=(--adaptive_occ_from_target)
-      EXTRA_ADAPTIVE_ARGS+=(--target_voxel_dir "${TARGET_VOXEL_DIR}")
-      EXTRA_ADAPTIVE_ARGS+=(--adaptive_target_threshold "${ADAPTIVE_TARGET_THRESHOLD}")
-    fi
-  fi
-
   echo "Running minimal inference for scene: ${SCENE}"
   "${PYTHON_CMD[@]}" "${INFER_SCRIPT}" \
     --vae_ckpt "${VAE_CKPT}" \
@@ -210,8 +227,9 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --save_uncertainty \
     --save_pointcloud \
     --output_dir "${OUTPUT_DIR}" \
+    "${RADAR_PROTOCOL_ARGS[@]}" \
+    "${REAL_IR_ARGS[@]}" \
     "${MULTIMODAL_META_ARGS[@]}" \
-    "${EXTRA_ADAPTIVE_ARGS[@]}" \
     "${EXTRA_COMPARE_ARGS[@]}"
 
 done

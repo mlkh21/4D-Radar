@@ -6,6 +6,7 @@
 
 import argparse
 import csv
+import json
 import os
 import sys
 import time
@@ -30,7 +31,12 @@ try:
         CalibrationProvider,
         NTU4DRadLM_VoxelDataset,
         _resize_or_pad_ir_tensor,
+        apply_legacy_sync_compensation,
+        LEGACY_SYNC_DISPLACEMENT_X_M,
+        DEFAULT_THERMAL_K,
         crop_voxel_channels_to_pc_range,
+        collate_voxel_samples,
+        resize_radar_voxel_channels,
         resize_voxel_channels,
     )
 except Exception:
@@ -42,8 +48,30 @@ except Exception:
         CalibrationProvider,
         NTU4DRadLM_VoxelDataset,
         _resize_or_pad_ir_tensor,
+        apply_legacy_sync_compensation,
+        LEGACY_SYNC_DISPLACEMENT_X_M,
+        DEFAULT_THERMAL_K,
         crop_voxel_channels_to_pc_range,
+        collate_voxel_samples,
+        resize_radar_voxel_channels,
         resize_voxel_channels,
+    )
+
+try:
+    from diffusion_consistency_radar.radar_normalization import (
+        LEGACY_RADAR_NORMALIZATION_PROTOCOL,
+        RadarNormalizationError,
+        apply_radar_normalization,
+        radar_normalization_from_checkpoint,
+        validate_radar_normalization_sha256,
+    )
+except ImportError:
+    from radar_normalization import (
+        LEGACY_RADAR_NORMALIZATION_PROTOCOL,
+        RadarNormalizationError,
+        apply_radar_normalization,
+        radar_normalization_from_checkpoint,
+        validate_radar_normalization_sha256,
     )
 
 try:
@@ -83,6 +111,120 @@ TASK_METRIC_FIELDS = [
     "uncertainty_nll",
     "uncertainty_error_corr",
 ]
+
+REMOVED_ORACLE_ARGUMENTS = (
+    "--adaptive_occ_from_target",
+    "--adaptive_target_threshold",
+)
+
+RUNTIME_FIELDS = [
+    "index",
+    "radar_file",
+    "radar_point_count",
+    "effective_occ_threshold",
+    "inference_seconds",
+    "pred_point_count",
+    "is_empty_frame",
+    "used_topk_fallback",
+    "train_duration_seconds",
+    "total_infer_seconds",
+    "avg_infer_seconds",
+    "avg_pred_point_count",
+    "empty_frame_rate",
+]
+
+
+def _uses_legacy_evaluation(args) -> bool:
+    """判断是否显式启用了兼容的生成时真值评价分支。"""
+    return bool(
+        args.compare_with_target
+        or args.compare_with_lidar
+        or args.report_task_metrics
+    )
+
+
+def inference_csv_name(args) -> str:
+    """部署运行时与兼容评价使用不同的 CSV 文件名。"""
+    return (
+        "inference_metrics.csv"
+        if _uses_legacy_evaluation(args)
+        else "inference_runtime.csv"
+    )
+
+
+def resolve_effective_voxel_size(voxel_size, pc_range, target_size):
+    """按实际 C-Z-X-Y 输出网格解析 XYZ 体素尺寸。"""
+    if voxel_size is not None:
+        return [float(value) for value in voxel_size]
+    z_size, x_size, y_size = [int(value) for value in target_size]
+    return [
+        (float(pc_range[3]) - float(pc_range[0])) / max(x_size, 1),
+        (float(pc_range[4]) - float(pc_range[1])) / max(y_size, 1),
+        (float(pc_range[5]) - float(pc_range[2])) / max(z_size, 1),
+    ]
+
+
+def build_inference_run_metadata(args, generator, frame_count: int):
+    """记录离线 evaluator 复现坐标和阈值协议所需的实际参数。"""
+    return {
+        "stage": "deployment_generation",
+        "target_size": [int(value) for value in args.target_size],
+        "source_pc_range": [float(value) for value in args.source_pc_range],
+        "model_pc_range": [float(value) for value in args.pc_range],
+        "voxel_size": resolve_effective_voxel_size(
+            args.voxel_size,
+            args.pc_range,
+            args.target_size,
+        ),
+        "occ_threshold": float(args.occ_threshold),
+        "model_type": str(args.model_type),
+        "steps": int(args.steps),
+        "sampler": str(args.sampler),
+        "model_is_multimodal": bool(
+            getattr(generator.model, "is_multimodal", False)
+        ),
+        "require_real_ir": bool(args.require_real_ir),
+        "radar_normalization_protocol": (
+            generator.radar_normalization["protocol"]
+            if generator.radar_normalization is not None
+            else LEGACY_RADAR_NORMALIZATION_PROTOCOL
+        ),
+        "radar_normalization": generator.radar_normalization,
+        "radar_normalization_sha256": generator.radar_normalization_sha256,
+        "allow_legacy_radar_units": bool(generator.allow_legacy_radar_units),
+        "formal_protocol": bool(
+            generator.radar_normalization is not None
+            and generator.radar_normalization.get("formal") is True
+        ),
+        "frame_count": int(frame_count),
+        "legacy_sync_displacement_x_m": (
+            LEGACY_SYNC_DISPLACEMENT_X_M if args.require_real_ir else None
+        ),
+    }
+
+
+def _write_json_atomic(path: str, payload) -> None:
+    """通过同目录临时文件原子发布 JSON 运行记录。"""
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temp_path, path)
+
+
+def reject_removed_oracle_arguments(argv) -> None:
+    """拒绝已从正式推理移除的 target 自适应参数。"""
+    for token in argv:
+        text = str(token)
+        if any(
+            text == name or text.startswith(f"{name}=")
+            for name in REMOVED_ORACLE_ARGUMENTS
+        ):
+            raise ValueError(
+                f"{text.split('=', 1)[0]} 已从正式推理移除；"
+                "请先用固定 --occ_threshold 保存预测体素，再运行 "
+                "test/diagnostics/occupancy/diagnose_oracle_target_adaptation.py"
+            )
 
 
 def safe_torch_load(path, map_location):
@@ -265,7 +407,7 @@ def _mock_multimodal_meta(batch_size: int, device):
         "ir_img": ir_img,
         "r_mat": torch.eye(3, device=device).unsqueeze(0).repeat(batch_size, 1, 1),
         "t_vec": torch.zeros(batch_size, 3, device=device),
-        "k_mat": torch.tensor([[457.2, 0.0, 323.1], [0.0, 457.9, 242.5], [0.0, 0.0, 1.0]], device=device).unsqueeze(0).repeat(batch_size, 1, 1),
+        "k_mat": torch.from_numpy(DEFAULT_THERMAL_K).to(device).unsqueeze(0).repeat(batch_size, 1, 1),
         "is_mock_ir": torch.ones(batch_size, device=device),
         "is_mock_calib": torch.ones(batch_size, device=device),
         "odom_cov_trace": torch.zeros(batch_size, device=device),
@@ -288,29 +430,103 @@ def prepare_multimodal_meta(meta_dict, batch_size: int, device):
     return meta
 
 
-def load_multimodal_meta_for_radar(radar_path: str, device):
+def validate_real_ir_model(model):
+    """正式真实 IR 模式只接受实际构建出的多模态生成模型。"""
+    if not bool(getattr(model, "is_multimodal", False)):
+        raise RuntimeError(
+            "--require_real_ir requires a multimodal Radar+IR checkpoint"
+        )
+
+
+def _load_ir_array(ir_path: str, require_real_ir: bool) -> np.ndarray:
+    """读取并验证逐帧 IR；严格模式额外拒绝链接和非普通文件。"""
+    if require_real_ir and os.path.islink(ir_path):
+        raise RuntimeError(f"严格真实 IR 模式拒绝符号链接: {ir_path}")
+    if require_real_ir and not os.path.isfile(ir_path):
+        raise RuntimeError(f"严格真实 IR 模式缺少普通 IR 文件: {ir_path}")
+
+    array = np.load(ir_path).astype(np.float32)
+    if array.ndim not in (2, 3):
+        raise RuntimeError(f"IR 数组维度非法 {array.shape}: {ir_path}")
+    if not np.isfinite(array).all():
+        raise RuntimeError(f"IR 数组含非有限值: {ir_path}")
+    return array
+
+
+def load_multimodal_meta_for_radar(
+    radar_path: str,
+    device,
+    require_real_ir: bool = False,
+):
+    """加载逐帧 IR/标定元数据，并可启用正式 fail-closed 协议。"""
     scene_dir = os.path.dirname(os.path.dirname(radar_path))
     dataset_root = os.path.dirname(scene_dir)
     frame_id = os.path.splitext(os.path.basename(radar_path))[0].replace("_voxel", "")
     ir_path = os.path.join(scene_dir, "ir_image", f"{frame_id}_ir.npy")
     meta = {}
-    if os.path.exists(ir_path):
-        arr = np.load(ir_path).astype(np.float32)
-        meta["ir_img"] = _resize_or_pad_ir_tensor(torch.from_numpy(arr)).to(device)
+
+    provider = CalibrationProvider(dataset_root)
+    r_mat, t_vec, k_mat, calib_meta = provider.load_with_metadata()
+    is_mock = bool(calib_meta["is_mock_calib"])
+    if require_real_ir and (
+        is_mock or not bool(calib_meta["calib_is_thermal"])
+    ):
+        raise RuntimeError(
+            "严格真实 IR 模式需要 calib_radar_to_thermal.txt: "
+            f"scene={scene_dir}, source={calib_meta['calib_source']}, "
+            f"reason={calib_meta['calib_fallback_reason']}"
+        )
+    if require_real_ir and not bool(calib_meta.get("has_thermal_intrinsics", False)):
+        raise RuntimeError(
+            "严格真实 IR 模式需要 calib_cam_thermal.txt（S/K/D）: "
+            f"scene={scene_dir}, source={calib_meta.get('thermal_intrinsics_source', 'unknown')}"
+        )
+
+    if os.path.lexists(ir_path):
+        arr = _load_ir_array(ir_path, require_real_ir=require_real_ir)
+        meta["ir_img"] = _resize_or_pad_ir_tensor(
+            torch.from_numpy(arr), calib_meta
+        ).to(device)
         meta["is_mock_ir"] = torch.zeros(1, device=device)
+    elif require_real_ir:
+        raise RuntimeError(
+            f"严格真实 IR 模式缺少 IR: scene={scene_dir}, frame={frame_id}"
+        )
     else:
         meta["is_mock_ir"] = torch.ones(1, device=device)
-    provider = CalibrationProvider(dataset_root)
-    r_mat, t_vec, k_mat, is_mock = provider.load()
-    if is_mock:
-        t_vec = t_vec.clone()
-        t_vec[0] += 0.01
+
+    # NOTE: 真实和 fallback 外参都执行与训练 Dataset 相同的 legacy 位移。
+    t_vec = apply_legacy_sync_compensation(t_vec)
     meta["r_mat"] = r_mat.to(device)
     meta["t_vec"] = t_vec.to(device)
     meta["k_mat"] = k_mat.to(device)
     meta["is_mock_calib"] = torch.ones(1, device=device) if is_mock else torch.zeros(1, device=device)
     meta["odom_cov_trace"] = torch.zeros(1, device=device)
+    meta["legacy_sync_displacement_x_m"] = LEGACY_SYNC_DISPLACEMENT_X_M
+    meta["calib_source"] = calib_meta["calib_source"]
+    meta["thermal_intrinsics_source"] = calib_meta["thermal_intrinsics_source"]
+    meta["thermal_intrinsics_path"] = calib_meta["thermal_intrinsics_path"]
+    meta["thermal_source_size"] = calib_meta["thermal_source_size"]
+    meta["thermal_output_size"] = calib_meta["thermal_output_size"]
+    meta["thermal_distortion"] = calib_meta["thermal_distortion"]
+    meta["has_thermal_intrinsics"] = bool(calib_meta["has_thermal_intrinsics"])
     return meta
+
+
+def preflight_real_ir_inputs(model, radar_paths):
+    """在创建输出目录前验证全部正式帧，禁止留下部分正式结果。"""
+    validate_real_ir_model(model)
+    for radar_path in radar_paths:
+        meta = load_multimodal_meta_for_radar(
+            radar_path,
+            torch.device("cpu"),
+            require_real_ir=True,
+        )
+        if (
+            float(meta["is_mock_ir"].item()) != 0.0
+            or float(meta["is_mock_calib"].item()) != 0.0
+        ):
+            raise RuntimeError(f"严格真实 IR preflight 得到 mock meta: {radar_path}")
 
 
 def resolve_inference_grid_config(
@@ -328,6 +544,37 @@ def resolve_inference_grid_config(
     )
 
 
+def resolve_inference_radar_normalization(
+    checkpoint_metadata,
+    *,
+    target_size,
+    source_pc_range,
+    model_pc_range,
+    allow_legacy_radar_units=False,
+):
+    """从生成模型 checkpoint 解析唯一 Radar 量纲；默认 fail-closed。"""
+    if type(allow_legacy_radar_units) is not bool:
+        raise RadarNormalizationError("allow_legacy_radar_units 必须是 bool")
+    checkpoint = checkpoint_metadata if isinstance(checkpoint_metadata, dict) else {}
+    has_embedded = (
+        "radar_normalization" in checkpoint
+        or "radar_normalization_sha256" in checkpoint
+    )
+    if allow_legacy_radar_units:
+        if has_embedded:
+            raise RadarNormalizationError(
+                "显式 legacy Radar 单位与正式 radar_normalization 不能同时启用"
+            )
+        return None, ""
+    return radar_normalization_from_checkpoint(
+        checkpoint,
+        target_size=target_size,
+        source_pc_range=source_pc_range,
+        model_pc_range=model_pc_range,
+        context="推理生成模型 checkpoint",
+    )
+
+
 class RadarGenerator:
     """雷达数据生成器"""
     
@@ -341,6 +588,7 @@ class RadarGenerator:
         pc_range=None,
         source_pc_range=None,
         vae_fallback_config_type=None,
+        allow_legacy_radar_units=False,
     ):
         """
         Args:
@@ -352,6 +600,7 @@ class RadarGenerator:
         self.device = torch.device(device)
         self.model_type = model_type
         self.vae_fallback_config_type = vae_fallback_config_type
+        self.allow_legacy_radar_units = allow_legacy_radar_units
         
         # NOTE: 变分自编码器（VAE）负责体素空间与潜空间之间的编码/解码。
         print(f"Loading VAE from {vae_path}...")
@@ -397,6 +646,17 @@ class RadarGenerator:
     def _load_model(self, ckpt_path):
         """加载 LDM 或 CD 模型"""
         ckpt = safe_torch_load(ckpt_path, map_location=self.device)
+        self.model_checkpoint_metadata = ckpt if isinstance(ckpt, dict) else {}
+        (
+            self.radar_normalization,
+            self.radar_normalization_sha256,
+        ) = resolve_inference_radar_normalization(
+            self.model_checkpoint_metadata,
+            target_size=self.target_size,
+            source_pc_range=self.source_pc_range,
+            model_pc_range=self.pc_range,
+            allow_legacy_radar_units=self.allow_legacy_radar_units,
+        )
         state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
         model_config = resolve_generation_model_config(
             ckpt,
@@ -439,20 +699,29 @@ class RadarGenerator:
             print(f"\nGenerating {num_samples} samples with {steps} steps ({sampler} sampler)...")
         self.last_uncertainty = None
         
-        # NOTE: 条件分支将雷达观测编码到潜空间，保证与采样噪声同尺度。
+        # NOTE: 正式多模态模型直接消费物理 Radar 体素；legacy UNet 才使用条件潜变量。
         condition_voxel = None
+        is_multimodal = bool(getattr(self.model, "is_multimodal", False))
         if condition is not None:
             condition = condition.to(self.device)
             condition_voxel = condition
-            z_cond = self.vae.get_latent(condition)
-            # FIXME: 噪声潜变量与条件潜变量形状必须严格一致，否则拼接后会在 UNet 前向报错。
-            z_shape = tuple(z_cond.shape)
+            if is_multimodal:
+                latent_spatial = self.vae.latent_spatial_shape(self.target_size)
+                z_shape = (
+                    condition.shape[0],
+                    int(self.vae.latent_dim),
+                    *latent_spatial,
+                )
+                z_cond = None
+            else:
+                z_cond = self.vae.get_latent(condition)
+                z_shape = tuple(z_cond.shape)
             num_samples = z_shape[0]
         else:
             # NOTE: 无条件采样按已加载 VAE 架构推导潜空间，避免固定 z4/default grid。
             latent_spatial = self.vae.latent_spatial_shape(self.target_size)
             z_shape = (num_samples, int(self.vae.latent_dim), *latent_spatial)
-            z_cond = torch.zeros(z_shape, device=self.device)
+            z_cond = None if is_multimodal else torch.zeros(z_shape, device=self.device)
             vae_config = (
                 getattr(self, "vae_checkpoint_metadata", {}) or {}
             ).get("vae_config", {})
@@ -613,7 +882,11 @@ def load_radar_voxel_as_tensor(
     target_size=(32, 128, 128),
     source_pc_range=(0, -20, -6, 120, 20, 10),
     model_pc_range=None,
+    radar_normalization=None,
+    radar_normalization_sha256="",
+    allow_legacy_radar_units=False,
 ):
+    """按训练一致的物理重采样和冻结 artifact 加载 Radar 条件。"""
     if path.endswith('.npz'):
         radar_voxel = load_sparse_voxel(path)
     else:
@@ -623,7 +896,26 @@ def load_radar_voxel_as_tensor(
     if model_pc_range is None:
         model_pc_range = source_pc_range
     radar_tensor = crop_voxel_channels_to_pc_range(radar_tensor, source_pc_range, model_pc_range)
-    radar_tensor = resize_voxel_channels(radar_tensor, target_size)
+    radar_tensor = resize_radar_voxel_channels(radar_tensor, target_size)
+    if radar_normalization is None:
+        if not allow_legacy_radar_units:
+            raise RadarNormalizationError(
+                "正式推理缺少 radar_normalization；历史诊断需显式启用 legacy"
+            )
+        if radar_normalization_sha256:
+            raise RadarNormalizationError(
+                "legacy Radar 单位不得携带 normalization SHA-256"
+            )
+    else:
+        if allow_legacy_radar_units:
+            raise RadarNormalizationError(
+                "legacy Radar 单位与正式 radar_normalization 不能同时启用"
+            )
+        validate_radar_normalization_sha256(
+            radar_normalization_sha256,
+            context="逐文件推理 Radar normalization",
+        )
+        radar_tensor = apply_radar_normalization(radar_tensor, radar_normalization)
 
     return radar_tensor.to(device)
 
@@ -647,25 +939,6 @@ def count_raw_radar_pcl_points(path):
     if pts.ndim == 0:
         return 0
     return int(pts.shape[0])
-
-
-def load_target_occ_resized(
-    path,
-    device,
-    target_size=(32, 128, 128),
-    source_pc_range=(0, -20, -6, 120, 20, 10),
-    model_pc_range=None,
-):
-    """加载 target_voxel 并按模型网格重采样，返回 Occ 通道。"""
-    target_tensor = load_voxel_as_czxy(
-        path,
-        device,
-        mask_channel=3,
-        target_size=target_size,
-        source_pc_range=source_pc_range,
-        model_pc_range=model_pc_range,
-    )
-    return target_tensor[0]
 
 
 def load_voxel_as_czxy(
@@ -699,21 +972,6 @@ def find_matching_voxel_file(folder, frame_id):
         if os.path.exists(path):
             return path
     return ""
-
-
-def find_adaptive_occ_threshold(pred_occ: np.ndarray, target_count: int) -> float:
-    """按目标占据体素数量反推预测 occ 的阈值。"""
-    flat = pred_occ.reshape(-1)
-    n = int(flat.shape[0])
-    k = int(min(max(target_count, 1), n))
-
-    if k >= n:
-        return float(np.nextafter(flat.min(), -np.inf))
-
-    topk_idx = np.argpartition(flat, -k)[-k:]
-    kth_value = float(flat[topk_idx].min())
-    # NOTE: 由于后续是严格大于 '>', 取略小于 kth 的阈值，尽量包含第 k 个点。
-    return float(np.nextafter(kth_value, -np.inf))
 
 
 def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.1, empty_fallback_topk=0):
@@ -836,14 +1094,20 @@ def main():
                         help="Optional training duration in seconds for experiment tracking (negative means unknown)")
     parser.add_argument("--seed", type=int, default=-1,
                         help="Random seed for reproducible inference (negative disables fixed seed)")
-    parser.add_argument("--adaptive_occ_from_target", action="store_true",
-                        help="Adapt per-frame occ threshold to match target_voxel occupancy count")
     parser.add_argument("--target_voxel_dir", type=str, default="",
-                        help="Directory containing target_voxel files for adaptive occupancy threshold")
-    parser.add_argument("--adaptive_target_threshold", type=float, default=-1.0,
-                        help="Threshold used to count target occupancy in adaptive mode (negative uses --occ_threshold)")
+                        help="Directory containing target_voxel files for offline comparison")
     parser.add_argument("--use_multimodal_meta", action="store_true",
                         help="Use IR/calibration metadata when the checkpoint is multimodal")
+    parser.add_argument(
+        "--require_real_ir",
+        action="store_true",
+        help="正式多模态模式：在写输出前要求全部帧具有真实 IR 和 thermal 外参",
+    )
+    parser.add_argument(
+        "--allow_legacy_radar_units",
+        action="store_true",
+        help="仅用于历史 checkpoint/诊断；正式入口不得启用",
+    )
     parser.add_argument("--report_task_metrics", action="store_true",
                         help="Report shared-visible obstacle metrics in inference_metrics.csv")
     parser.add_argument("--task_range_bins", type=str, default="0-20,20-40,40-80,80-120",
@@ -851,7 +1115,13 @@ def main():
     parser.add_argument("--task_z_mins", type=str, default="-1,0",
                         help="Comma-separated z_min filters for task metrics")
 
+    try:
+        reject_removed_oracle_arguments(sys.argv[1:])
+    except ValueError as exc:
+        parser.error(str(exc))
     args = parser.parse_args()
+    if args.require_real_ir and not args.radar_voxel_dir:
+        parser.error("--require_real_ir requires --radar_voxel_dir")
     if args.seed >= 0:
         set_random_seed(args.seed)
     
@@ -865,13 +1135,12 @@ def main():
         pc_range=args.pc_range,
         source_pc_range=args.source_pc_range,
         vae_fallback_config_type=args.vae_config_type,
+        allow_legacy_radar_units=args.allow_legacy_radar_units,
     )
     args.target_size = generator.target_size
     args.source_pc_range = generator.source_pc_range
     args.pc_range = generator.pc_range
     
-    os.makedirs(args.output_dir, exist_ok=True)
-
     if args.radar_voxel_dir:
         # NOTE: 逐文件推理模式：每个 radar_voxel 输入生成一个对应输出。
         radar_files = sorted([
@@ -884,10 +1153,10 @@ def main():
 
         if not radar_files:
             raise RuntimeError(f"No radar voxel files found in {args.radar_voxel_dir}")
-        needs_target_voxel = args.adaptive_occ_from_target or args.compare_with_target
+        needs_target_voxel = args.compare_with_target
         if needs_target_voxel and (not args.target_voxel_dir or not os.path.isdir(args.target_voxel_dir)):
             raise RuntimeError(
-                "--adaptive_occ_from_target/--compare_with_target requires a valid --target_voxel_dir"
+                "--compare_with_target requires a valid --target_voxel_dir"
             )
 
         lidar_files = []
@@ -912,44 +1181,55 @@ def main():
                 with open(args.lidar_index_file, 'r', encoding='utf-8') as f:
                     lidar_indices = [int(line.strip()) for line in f.readlines()]
 
-        merged_csv_path = os.path.join(args.output_dir, "inference_metrics.csv")
+        if args.require_real_ir:
+            preflight_real_ir_inputs(
+                generator.model,
+                [os.path.join(args.radar_voxel_dir, name) for name in radar_files],
+            )
+
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        legacy_evaluation = _uses_legacy_evaluation(args)
+        merged_csv_path = os.path.join(args.output_dir, inference_csv_name(args))
         merged_csv_file = open(merged_csv_path, 'w', newline='')
         merged_writer = csv.writer(merged_csv_file)
-        metric_header = [
-            "index",
-            "radar_file",
-            "radar_point_count",
-            "effective_occ_threshold",
-            "target_occ_count",
-            "target_file",
-            "target_point_count",
-            "pred_target_chamfer",
-            "radar_target_chamfer",
-            "pred_target_count_ratio",
-            "pred_target_dx",
-            "pred_target_dy",
-            "pred_target_dz",
-            "radar_target_dx",
-            "radar_target_dy",
-            "radar_target_dz",
-            "lidar_file",
-            "inference_seconds",
-            "pred_point_count",
-            "lidar_point_count",
-            "raw_lidar_chamfer",
-            "is_empty_frame",
-            "used_topk_fallback",
-            "train_duration_seconds",
-            "total_infer_seconds",
-            "avg_infer_seconds",
-            "avg_pred_point_count",
-            "empty_frame_rate",
-            "mean_pred_target_chamfer",
-            "mean_radar_target_chamfer",
-            "mean_raw_lidar_chamfer",
-        ]
-        if args.report_task_metrics:
-            append_task_metric_headers(metric_header)
+        if legacy_evaluation:
+            metric_header = [
+                "index",
+                "radar_file",
+                "radar_point_count",
+                "effective_occ_threshold",
+                "target_file",
+                "target_point_count",
+                "pred_target_chamfer",
+                "radar_target_chamfer",
+                "pred_target_count_ratio",
+                "pred_target_dx",
+                "pred_target_dy",
+                "pred_target_dz",
+                "radar_target_dx",
+                "radar_target_dy",
+                "radar_target_dz",
+                "lidar_file",
+                "inference_seconds",
+                "pred_point_count",
+                "lidar_point_count",
+                "raw_lidar_chamfer",
+                "is_empty_frame",
+                "used_topk_fallback",
+                "train_duration_seconds",
+                "total_infer_seconds",
+                "avg_infer_seconds",
+                "avg_pred_point_count",
+                "empty_frame_rate",
+                "mean_pred_target_chamfer",
+                "mean_radar_target_chamfer",
+                "mean_raw_lidar_chamfer",
+            ]
+            if args.report_task_metrics:
+                append_task_metric_headers(metric_header)
+        else:
+            metric_header = list(RUNTIME_FIELDS)
         merged_writer.writerow(metric_header)
 
         log_path = os.path.join(args.output_dir, "inference_runtime.log")
@@ -968,10 +1248,8 @@ def main():
         log_file.write(f"target_size: {list(args.target_size)}\n")
         log_file.write(f"source_pc_range: {args.source_pc_range}\n")
         log_file.write(f"model_pc_range: {args.pc_range}\n")
-        log_file.write(f"adaptive_occ_from_target: {int(args.adaptive_occ_from_target)}\n")
         log_file.write(f"compare_with_target: {int(args.compare_with_target)}\n")
         log_file.write(f"target_voxel_dir: {args.target_voxel_dir}\n")
-        log_file.write(f"adaptive_target_threshold: {args.adaptive_target_threshold}\n")
         log_file.write(f"empty_fallback_topk: {args.empty_fallback_topk}\n")
         log_file.write(f"train_duration_seconds: {args.train_duration_seconds:.3f}\n")
         log_file.write(f"num_files: {len(radar_files)}\n")
@@ -1019,9 +1297,20 @@ def main():
                 target_size=args.target_size,
                 source_pc_range=args.source_pc_range,
                 model_pc_range=args.pc_range,
+                radar_normalization=generator.radar_normalization,
+                radar_normalization_sha256=generator.radar_normalization_sha256,
+                allow_legacy_radar_units=generator.allow_legacy_radar_units,
             )
             condition_data = condition_data.unsqueeze(0)
-            meta_dict = load_multimodal_meta_for_radar(radar_path, generator.device) if args.use_multimodal_meta else None
+            meta_dict = (
+                load_multimodal_meta_for_radar(
+                    radar_path,
+                    generator.device,
+                    require_real_ir=args.require_real_ir,
+                )
+                if args.use_multimodal_meta or args.require_real_ir
+                else None
+            )
 
             file_start = time.perf_counter()
 
@@ -1043,7 +1332,6 @@ def main():
             pcl = np.zeros((0, 4), dtype=np.float32)
             used_topk_fallback = False
             effective_occ_threshold = float(args.occ_threshold)
-            target_occ_count = ""
             task_values = {}
 
             if args.save_voxel:
@@ -1060,23 +1348,6 @@ def main():
                     np.save(out_unc, unc_np)
 
             if args.save_pointcloud or args.compare_with_lidar or args.compare_with_target:
-                if args.adaptive_occ_from_target:
-                    frame_id = os.path.splitext(fname)[0]
-                    target_path = find_matching_voxel_file(args.target_voxel_dir, frame_id)
-                    if os.path.exists(target_path):
-                        target_occ = load_target_occ_resized(
-                            target_path,
-                            generator.device,
-                            target_size=args.target_size,
-                            source_pc_range=args.source_pc_range,
-                            model_pc_range=args.pc_range,
-                        )
-                        target_th = args.occ_threshold if args.adaptive_target_threshold < 0 else args.adaptive_target_threshold
-                        target_occ_count = int(np.count_nonzero(target_occ > target_th))
-                        effective_occ_threshold = find_adaptive_occ_threshold(sample[0], target_occ_count)
-                    else:
-                        log_file.write(f"warning: target voxel not found for {fname}, fallback to fixed occ_threshold\n")
-
                 pcl, used_topk_fallback = voxel_to_pointcloud(
                     sample,
                     voxel_size=args.voxel_size,
@@ -1223,41 +1494,65 @@ def main():
                     if np.isfinite(chamfer_val):
                         raw_lidar_chamfer_values.append(chamfer_val)
 
-            row = [
-                i,
-                fname,
-                radar_point_count,
-                f"{effective_occ_threshold:.8f}",
-                target_occ_count,
-                target_file,
-                target_point_count,
-                pred_target_chamfer,
-                radar_target_chamfer,
-                pred_target_count_ratio,
-                pred_target_dx,
-                pred_target_dy,
-                pred_target_dz,
-                radar_target_dx,
-                radar_target_dy,
-                radar_target_dz,
-                lidar_file,
-                f"{file_infer_sec:.6f}",
-                pred_point_count,
-                lidar_point_count,
-                raw_lidar_chamfer,
-                is_empty_frame,
-                int(used_topk_fallback if (args.save_pointcloud or args.compare_with_lidar or args.compare_with_target) else 0),
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-            ]
-            if args.report_task_metrics:
-                build_task_metric_row(row, metric_header, task_values)
+            if legacy_evaluation:
+                row = [
+                    i,
+                    fname,
+                    radar_point_count,
+                    f"{effective_occ_threshold:.8f}",
+                    target_file,
+                    target_point_count,
+                    pred_target_chamfer,
+                    radar_target_chamfer,
+                    pred_target_count_ratio,
+                    pred_target_dx,
+                    pred_target_dy,
+                    pred_target_dz,
+                    radar_target_dx,
+                    radar_target_dy,
+                    radar_target_dz,
+                    lidar_file,
+                    f"{file_infer_sec:.6f}",
+                    pred_point_count,
+                    lidar_point_count,
+                    raw_lidar_chamfer,
+                    is_empty_frame,
+                    int(
+                        used_topk_fallback
+                        if (
+                            args.save_pointcloud
+                            or args.compare_with_lidar
+                            or args.compare_with_target
+                        )
+                        else 0
+                    ),
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]
+                if args.report_task_metrics:
+                    build_task_metric_row(row, metric_header, task_values)
+            else:
+                row = [
+                    i,
+                    fname,
+                    radar_point_count,
+                    f"{effective_occ_threshold:.8f}",
+                    f"{file_infer_sec:.6f}",
+                    pred_point_count,
+                    is_empty_frame,
+                    int(used_topk_fallback if args.save_pointcloud else 0),
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]
             merged_writer.writerow(row)
 
         merged_csv_file.flush()
@@ -1270,21 +1565,33 @@ def main():
 
         summary_row = [""] * len(metric_header)
         summary_row[0] = "__summary__"
-        summary_row[23] = f"{args.train_duration_seconds:.3f}"
-        summary_row[24] = f"{total_infer_sec:.6f}"
-        summary_row[25] = f"{avg_infer_sec:.6f}"
-        summary_row[26] = f"{avg_pred_point_count:.3f}"
-        summary_row[27] = f"{empty_frame_rate:.6f}"
-        summary_row[28] = f"{mean_pred_target_chamfer:.6f}" if np.isfinite(mean_pred_target_chamfer) else ""
-        summary_row[29] = f"{mean_radar_target_chamfer:.6f}" if np.isfinite(mean_radar_target_chamfer) else ""
-        summary_row[30] = f"{mean_raw_lidar_chamfer:.6f}" if np.isfinite(mean_raw_lidar_chamfer) else ""
-        if args.report_task_metrics:
-            task_summary = {
-                key: float(np.mean(values)) if values else float("nan")
-                for key, values in task_acc.items()
-            }
-            build_task_metric_summary_row(summary_row, metric_header, task_summary)
+        if legacy_evaluation:
+            summary_row[23] = f"{args.train_duration_seconds:.3f}"
+            summary_row[24] = f"{total_infer_sec:.6f}"
+            summary_row[25] = f"{avg_infer_sec:.6f}"
+            summary_row[26] = f"{avg_pred_point_count:.3f}"
+            summary_row[27] = f"{empty_frame_rate:.6f}"
+            summary_row[28] = f"{mean_pred_target_chamfer:.6f}" if np.isfinite(mean_pred_target_chamfer) else ""
+            summary_row[29] = f"{mean_radar_target_chamfer:.6f}" if np.isfinite(mean_radar_target_chamfer) else ""
+            summary_row[30] = f"{mean_raw_lidar_chamfer:.6f}" if np.isfinite(mean_raw_lidar_chamfer) else ""
+            if args.report_task_metrics:
+                task_summary = {
+                    key: float(np.mean(values)) if values else float("nan")
+                    for key, values in task_acc.items()
+                }
+                build_task_metric_summary_row(summary_row, metric_header, task_summary)
+        else:
+            summary_row[8] = f"{args.train_duration_seconds:.3f}"
+            summary_row[9] = f"{total_infer_sec:.6f}"
+            summary_row[10] = f"{avg_infer_sec:.6f}"
+            summary_row[11] = f"{avg_pred_point_count:.3f}"
+            summary_row[12] = f"{empty_frame_rate:.6f}"
         merged_writer.writerow(summary_row)
+
+        _write_json_atomic(
+            os.path.join(args.output_dir, "inference_run.json"),
+            build_inference_run_metadata(args, generator, len(radar_files)),
+        )
 
         log_file.write("\n")
         log_file.write(f"total_infer_sec: {total_infer_sec:.6f}\n")
@@ -1316,6 +1623,7 @@ def main():
         print(f"Saved runtime log to {log_path}")
 
     else:
+        os.makedirs(args.output_dir, exist_ok=True)
         # NOTE: 简单模式下可从验证集抽取一个条件样本。
         if args.use_condition:
             print(f"Loading dataset from {args.dataset_dir}...")
@@ -1325,8 +1633,16 @@ def main():
                 target_size=args.target_size,
                 source_pc_range=args.source_pc_range,
                 model_pc_range=args.pc_range,
+                radar_normalization=generator.radar_normalization,
+                radar_normalization_sha256=generator.radar_normalization_sha256,
+                allow_legacy_radar_units=generator.allow_legacy_radar_units,
             )
-            dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+            dataloader = DataLoader(
+                dataset,
+                batch_size=1,
+                shuffle=True,
+                collate_fn=collate_voxel_samples,
+            )
             # FIXME: 当验证集为空时这里会触发 StopIteration，后续可改为显式空集检查。
             batch = next(iter(dataloader))
             condition_data = batch[1]

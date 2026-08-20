@@ -358,6 +358,11 @@ def main() -> None:
     parser.add_argument("--occ_threshold", type=float, default=0.5)
     parser.add_argument("--target_threshold", type=float, default=0.5)
     parser.add_argument(
+        "--allow_legacy_radar_units",
+        action="store_true",
+        help="仅用于缺少 normalization 协议的历史 checkpoint 诊断",
+    )
+    parser.add_argument(
         "--variants",
         default="real,zero,mock",
         help="逗号分隔的 IR 条件变体；checkpoint 选择可使用 real 以减少推理量",
@@ -365,23 +370,7 @@ def main() -> None:
     args = parser.parse_args()
     variants = parse_variants(args.variants)
 
-    os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device)
-    dataset = NTU4DRadLM_VoxelDataset(
-        args.dataset_root,
-        split=args.split,
-        use_augmentation=False,
-        target_size=tuple(args.target_size) if args.target_size else (32, 128, 128),
-        source_pc_range=tuple(args.source_pc_range) if args.source_pc_range else (0, -20, -6, 120, 20, 10),
-        model_pc_range=tuple(args.model_pc_range) if args.model_pc_range else (0, -20, -6, 40, 20, 10),
-    )
-    if len(dataset) == 0:
-        raise RuntimeError(f"dataset 为空: {args.dataset_root}")
-    sample_indices = select_sample_indices(len(dataset), args.sample_index, args.max_samples)
-    if args.require_sample_count > 0 and len(sample_indices) != args.require_sample_count:
-        raise RuntimeError(
-            f"固定验证协议要求 {args.require_sample_count} 帧，实际只能抽取 {len(sample_indices)} 帧"
-        )
     initial_fingerprints = _source_fingerprints(
         args.model_ckpt, args.vae_ckpt, args.dataset_root
     )
@@ -393,9 +382,29 @@ def main() -> None:
         target_size=tuple(args.target_size) if args.target_size else None,
         source_pc_range=tuple(args.source_pc_range) if args.source_pc_range else None,
         pc_range=tuple(args.model_pc_range) if args.model_pc_range else None,
+        allow_legacy_radar_units=args.allow_legacy_radar_units,
     )
+    dataset = NTU4DRadLM_VoxelDataset(
+        args.dataset_root,
+        split=args.split,
+        use_augmentation=False,
+        target_size=generator.target_size,
+        source_pc_range=generator.source_pc_range,
+        model_pc_range=generator.pc_range,
+        radar_normalization=generator.radar_normalization,
+        radar_normalization_sha256=generator.radar_normalization_sha256,
+        allow_legacy_radar_units=generator.allow_legacy_radar_units,
+    )
+    if len(dataset) == 0:
+        raise RuntimeError(f"dataset 为空: {args.dataset_root}")
+    sample_indices = select_sample_indices(len(dataset), args.sample_index, args.max_samples)
+    if args.require_sample_count > 0 and len(sample_indices) != args.require_sample_count:
+        raise RuntimeError(
+            f"固定验证协议要求 {args.require_sample_count} 帧，实际只能抽取 {len(sample_indices)} 帧"
+        )
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    pc_range = tuple(args.model_pc_range) if args.model_pc_range else (0, -20, -6, 40, 20, 10)
+    pc_range = generator.pc_range
     detailed_rows: List[Dict[str, object]] = []
     legacy_rows: List[Dict[str, object]] = []
     for position, sample_index in enumerate(sample_indices, start=1):
@@ -488,9 +497,13 @@ def main() -> None:
                     "occ_threshold": float(args.occ_threshold),
                     "target_threshold": float(args.target_threshold),
                     "variants": list(variants),
-                    "target_size": list(args.target_size) if args.target_size else [32, 128, 128],
-                    "source_pc_range": list(args.source_pc_range) if args.source_pc_range else [0, -20, -6, 120, 20, 10],
-                    "model_pc_range": list(args.model_pc_range) if args.model_pc_range else [0, -20, -6, 40, 20, 10],
+                    "target_size": list(generator.target_size),
+                    "source_pc_range": list(generator.source_pc_range),
+                    "model_pc_range": list(generator.pc_range),
+                    "radar_normalization": generator.radar_normalization,
+                    "radar_normalization_sha256": generator.radar_normalization_sha256,
+                    "allow_legacy_radar_units": generator.allow_legacy_radar_units,
+                    "formal_protocol": generator.radar_normalization is not None,
                     "sample_indices": list(sample_indices),
                 },
                 "rows": legacy_rows,

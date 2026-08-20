@@ -543,11 +543,52 @@ class VAE3D(nn.Module):
         """返回最近一次损失分量的浅拷贝，避免外部替换内部字典。"""
         return dict(self._loss_components)
 
-    def _compute_legacy_reconstruction_loss(self, x, x_recon, reduction):
+    @staticmethod
+    def _resolve_observed_mask(observed_mask, occupancy_target):
+        """校验并广播可见性 mask；occupied target 始终保留监督。"""
+        if observed_mask is None:
+            valid = torch.ones_like(occupancy_target, dtype=torch.bool)
+        else:
+            valid = torch.as_tensor(
+                observed_mask,
+                device=occupancy_target.device,
+            )
+            if valid.ndim == 4:
+                valid = valid.unsqueeze(0)
+            if valid.ndim != 5:
+                raise ValueError(
+                    "observed_mask 必须是 (B,1,D,H,W) 或 (1,D,H,W)，"
+                    f"当前为 {tuple(valid.shape)}"
+                )
+            if not torch.isfinite(valid).all():
+                raise ValueError("observed_mask 必须全部为有限数")
+            if valid.shape[1] != 1 or tuple(valid.shape[2:]) != tuple(occupancy_target.shape[2:]):
+                raise ValueError(
+                    "observed_mask 空间形状必须匹配 occupancy target: "
+                    f"mask={tuple(valid.shape)}, target={tuple(occupancy_target.shape)}"
+                )
+            if valid.shape[0] not in (1, occupancy_target.shape[0]):
+                raise ValueError(
+                    "observed_mask batch 维必须为 1 或与 target 一致: "
+                    f"mask={valid.shape[0]}, target={occupancy_target.shape[0]}"
+                )
+            valid = valid.expand(occupancy_target.shape[0], -1, -1, -1, -1) > 0.5
+        return valid | occupancy_target.bool()
+
+    def _compute_legacy_reconstruction_loss(
+        self,
+        x,
+        x_recon,
+        reduction,
+        observed_mask=None,
+    ):
         """保留历史加权 MSE 重建行为，兼容旧配置与旧实验。"""
         diff = (x_recon - x) ** 2
         occ_mask = (x[:, 0:1] > 0).float()
+        observed = self._resolve_observed_mask(observed_mask, occ_mask)
+        observed_float = observed.to(dtype=diff.dtype)
         spatial_weight = self.empty_weight + occ_mask * (self.occupied_weight - self.empty_weight)
+        spatial_weight = spatial_weight * observed_float
         diff = diff * spatial_weight
         if self.channel_weights is not None and self.channel_weights.shape[1] == diff.shape[1]:
             diff = diff * self.channel_weights.to(device=diff.device, dtype=diff.dtype)
@@ -568,15 +609,16 @@ class VAE3D(nn.Module):
         if reduction == "mean":
             occ_target = x[:, 0:1]
             occ_pred = x_recon[:, 0:1]
-            empty_mask = (occ_target <= 0).float()
+            empty_mask = ((occ_target <= 0) & observed).float()
             fp_loss = x_recon.new_zeros(())
             if self.false_positive_weight > 0.0:
                 fp_loss = (torch.relu(occ_pred - occ_target) ** 2 * empty_mask).mean()
 
             mass_loss = x_recon.new_zeros(())
             if self.occupancy_mass_weight > 0.0:
-                pred_mass = torch.relu(occ_pred).mean()
-                target_mass = torch.relu(occ_target).mean()
+                valid_count = observed_float.sum().clamp_min(1.0)
+                pred_mass = (torch.relu(occ_pred) * observed_float).sum() / valid_count
+                target_mass = (torch.relu(occ_target) * observed_float).sum() / valid_count
                 mass_loss = torch.abs(pred_mass - target_mass)
 
             recon_loss = (
@@ -586,40 +628,51 @@ class VAE3D(nn.Module):
             )
         return recon_loss
 
-    def _compute_sparse_reconstruction_loss(self, x, x_recon):
+    def _compute_sparse_reconstruction_loss(self, x, x_recon, observed_mask=None):
         """计算稀疏 occupancy 分类损失和有效体素内的连续通道损失。"""
         # NOTE: 大体素网格在 AMP 下可能超过 FP16 精确计数范围，分类统计统一使用 FP32。
         occupancy_target = (x[:, 0:1] > 0.5).to(dtype=torch.float32)
         occupancy_logits = x_recon[:, 0:1].float()
-        positive_count = occupancy_target.sum()
-        total_count = occupancy_target.new_tensor(occupancy_target.numel())
-        negative_count = total_count - positive_count
-        pos_weight = torch.where(
-            positive_count > 0,
-            negative_count / positive_count.clamp_min(1.0),
-            occupancy_logits.new_ones(()),
-        ).clamp(max=self.occupancy_pos_weight_cap)
-        occ_bce_loss = F.binary_cross_entropy_with_logits(
-            occupancy_logits,
-            occupancy_target,
-            pos_weight=pos_weight,
-        )
+        observed = self._resolve_observed_mask(observed_mask, occupancy_target)
+        valid_logits = occupancy_logits[observed]
+        valid_target = occupancy_target[observed]
+        if valid_logits.numel() == 0:
+            occ_bce_loss = occupancy_logits.new_zeros(())
+            occ_dice_loss = occupancy_logits.new_zeros(())
+        else:
+            positive_count = valid_target.sum()
+            total_count = valid_target.new_tensor(valid_target.numel())
+            negative_count = total_count - positive_count
+            pos_weight = torch.where(
+                positive_count > 0,
+                negative_count / positive_count.clamp_min(1.0),
+                occupancy_logits.new_ones(()),
+            ).clamp(max=self.occupancy_pos_weight_cap)
+            occ_bce_loss = F.binary_cross_entropy_with_logits(
+                valid_logits,
+                valid_target,
+                pos_weight=pos_weight,
+            )
 
-        occupancy_probability = self.occupancy_probability(occupancy_logits)
-        intersection = (occupancy_probability * occupancy_target).sum()
-        denominator = occupancy_probability.sum() + occupancy_target.sum()
-        occ_dice_loss = 1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
+            valid_probability = self.occupancy_probability(valid_logits)
+            intersection = (valid_probability * valid_target).sum()
+            denominator = valid_probability.sum() + valid_target.sum()
+            occ_dice_loss = 1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
 
         continuous_loss = x_recon.new_zeros(())
         if x.shape[1] > 1:
-            valid_mask = occupancy_target.bool()
+            continuous_valid = observed & occupancy_target.bool()
             if x.shape[1] > 3:
-                valid_mask = valid_mask | (x[:, 3:4] > 0.5)
-            valid_mask = valid_mask.expand(-1, x.shape[1] - 1, -1, -1, -1)
-            if valid_mask.any():
+                continuous_valid = continuous_valid | (
+                    observed & (x[:, 3:4] > 0.5)
+                )
+            continuous_valid = continuous_valid.expand(
+                -1, x.shape[1] - 1, -1, -1, -1
+            )
+            if continuous_valid.any():
                 continuous_loss = F.smooth_l1_loss(
-                    x_recon[:, 1:][valid_mask],
-                    x[:, 1:].to(dtype=x_recon.dtype)[valid_mask],
+                    x_recon[:, 1:][continuous_valid],
+                    x[:, 1:].to(dtype=x_recon.dtype)[continuous_valid],
                     reduction="mean",
                 )
 
@@ -630,7 +683,14 @@ class VAE3D(nn.Module):
         )
         return recon_loss, occ_bce_loss, occ_dice_loss, continuous_loss
 
-    def compute_loss(self, x, x_recon, posterior, reduction: str = "mean"):
+    def compute_loss(
+        self,
+        x,
+        x_recon,
+        posterior,
+        reduction: str = "mean",
+        observed_mask=None,
+    ):
         """
         计算 VAE 损失
 
@@ -639,6 +699,7 @@ class VAE3D(nn.Module):
             x_recon: 重建
             posterior: (mean, logvar)
             reduction: 损失聚合方式
+            observed_mask: 可选可见体素 mask，形状为 (B,1,D,H,W) 或 (1,D,H,W)
         Returns:
             total_loss: 总损失
             recon_loss: 重建损失
@@ -648,7 +709,12 @@ class VAE3D(nn.Module):
 
         zero = x_recon.new_zeros(())
         if self.occupancy_loss_type == "legacy_mse":
-            recon_loss = self._compute_legacy_reconstruction_loss(x, x_recon, reduction)
+            recon_loss = self._compute_legacy_reconstruction_loss(
+                x,
+                x_recon,
+                reduction,
+                observed_mask=observed_mask,
+            )
             occ_bce_loss = zero
             occ_dice_loss = zero
             continuous_loss = zero
@@ -656,7 +722,11 @@ class VAE3D(nn.Module):
             if reduction != "mean":
                 raise ValueError("bce_dice occupancy 损失当前仅支持 reduction='mean'")
             recon_loss, occ_bce_loss, occ_dice_loss, continuous_loss = (
-                self._compute_sparse_reconstruction_loss(x, x_recon)
+                self._compute_sparse_reconstruction_loss(
+                    x,
+                    x_recon,
+                    observed_mask=observed_mask,
+                )
             )
         
         # NOTE: 相对熵（KL）散度损失

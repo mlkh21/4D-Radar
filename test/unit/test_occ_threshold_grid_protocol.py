@@ -3,6 +3,7 @@
 """验证占用阈值扫描时 target 的物理裁剪与目标网格协议。"""
 
 import os
+import io
 import json
 import sys
 import tempfile
@@ -153,35 +154,34 @@ class OccThresholdGridProtocolTest(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(occupancy)), 1)
         self.assertEqual(float(occupancy[1, 1, 2]), 1.0)
 
-    def test_validation_split_matches_training_randperm_protocol(self):
+    def test_validation_split_returns_temporal_suffix(self):
         files = [f"{index:06d}_voxel.npy" for index in range(10)]
-        expected_indices = torch.randperm(
-            10,
-            generator=torch.Generator().manual_seed(42),
-        ).tolist()[8:]
 
-        first = select_evaluation_files(files, "validation", 0.8, 42)
-        second = select_evaluation_files(files, "validation", 0.8, 42)
+        selected = select_evaluation_files(files, "validation", 0.8)
 
-        self.assertEqual(first, second)
-        self.assertEqual(len(first), 2)
-        self.assertEqual(first, [files[index] for index in expected_indices])
+        self.assertEqual(selected, files[8:])
+
+    def test_train_split_returns_temporal_prefix(self):
+        files = [f"{index:06d}_voxel.npy" for index in range(10)]
+
+        selected = select_evaluation_files(files, "train", 0.8)
+
+        self.assertEqual(selected, files[:8])
 
     def test_validation_split_rejects_missing_prediction_frame(self):
         files = ["000000_voxel.npy", "000002_voxel.npy", "000003_voxel.npy"]
 
         with self.assertRaisesRegex(ValueError, "连续"):
-            select_evaluation_files(files, "validation", 0.8, 42)
+            select_evaluation_files(files, "validation", 0.8)
 
     def test_max_files_is_applied_after_validation_split(self):
         files = [f"{index:06d}_voxel.npy" for index in range(10)]
-        full_validation = select_evaluation_files(files, "validation", 0.8, 42)
+        full_validation = select_evaluation_files(files, "validation", 0.8)
 
         selected = prepare_evaluation_files(
             files,
             evaluation_split="validation",
             train_split=0.8,
-            split_seed=42,
             max_files=1,
         )
 
@@ -194,7 +194,6 @@ class OccThresholdGridProtocolTest(unittest.TestCase):
             files,
             evaluation_split="all",
             train_split=0.8,
-            split_seed=42,
             max_files=3,
         )
 
@@ -532,6 +531,25 @@ class OccThresholdGridProtocolTest(unittest.TestCase):
         self.assertEqual(fallback["constraints"], {"min_task_bev_recall": 0.95})
         self.assertIsInstance(fallback["constraint_reason"], str)
         self.assertEqual(fallback["unconstrained_recommended_threshold"], 0.2)
+        self.assertEqual(
+            constrained["split_protocol"],
+            "temporal_block_prefix_train_suffix_validation",
+        )
+        self.assertNotIn("split_seed", constrained)
+
+    def test_removed_split_seed_argument_reports_temporal_migration(self):
+        for argument in ("--split_seed", "--split_seed=42"):
+            with self.subTest(argument=argument):
+                with mock.patch(
+                    "sys.argv", ["sweep_occ_threshold.py", argument]
+                ), mock.patch(
+                    "sys.stderr", new_callable=io.StringIO
+                ) as stderr, self.assertRaises(SystemExit) as raised:
+                    main()
+
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("时间块", stderr.getvalue())
+                self.assertIn("删除 --split_seed", stderr.getvalue())
 
     def test_task_metrics_cover_range_bands_and_do_not_follow_voxel_f1_only(self):
         pc_range = (0.0, -6.0, -2.0, 40.0, 6.0, 2.0)

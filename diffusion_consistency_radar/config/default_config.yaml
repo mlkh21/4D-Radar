@@ -4,12 +4,21 @@
 
 # --- Data Configuration ---
 data:
-  dataset_dir: "./Data/NTU4DRadLM_Pre"
+  # 已验收的 header-time、sensor-aware 正式候选数据根。
+  dataset_dir: "./Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
   batch_size: 2
   num_workers: 4
   train_split: 0.8
   alignment_size: 32
   use_augmentation: true
+  # 显式冻结训练/推理共用网格，必须与 normalization artifact 一致。
+  target_size: [32, 128, 128]
+  source_pc_range: [0, -20, -6, 120, 20, 10]
+  model_pc_range: [0, -20, -6, 120, 20, 10]
+  # 仅由训练场景 garden 全 4013 帧生成的正式统计文件。
+  radar_normalization_path: "./diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_full120_86p8_v1.json"
+  # 传感器 Doppler 显式物理量程（m/s），与 artifact 严格匹配。
+  doppler_scale_mps: 86.8
   augmentation:
     # Keep viewpoint geometry fixed for forward-looking radar densification.
     enable_flip: false
@@ -39,7 +48,7 @@ vae:
   epochs: 100
   lr: 1.0e-4
   save_every: 10
-  save_dir: "./Result/train_results/vae"
+  save_dir: "./Result/train_results/formal_p1_04_full120_86p8_v1/vae"
 
 # --- Latent Diffusion Model Configuration ---
 ldm:
@@ -53,6 +62,10 @@ ldm:
   sigma_max: 80.0
   sigma_min: 0.002
   rho: 7.0
+  # 每轮独立验证使用固定单步去噪代理；最终模型仍须通过离线固定帧生成门禁。
+  validation_seed: 42
+  validation_sigma: 0.5
+  validation_occupancy_threshold: 0.5
   decoded_loss_weight: 0.05
   decoded_false_positive_weight: 0.10
   decoded_mass_weight: 0.05
@@ -63,13 +76,13 @@ ldm:
   epochs: 200 # Number of training epochs
   lr: 1.0e-4
   save_every: 10 # Save checkpoint every N epochs
-  save_dir: "./Result/train_results/ldm"
+  save_dir: "./Result/train_results/formal_p1_04_full120_86p8_v1/ldm"
 
 # --- Consistency Distillation Configuration ---
 cd:
-  # Distillation from LDM to CD model
-  teacher_model_path: "" # LDM checkpoint path
-  # Distillation parameters
+  # 兼容字段名：该 LDM checkpoint 只初始化 CD/EMA，不作为持续冻结教师。
+  teacher_model_path: "" # LDM initialization checkpoint path
+  # EMA consistency training parameters
   training_mode: "consistency_distillation"
   target_ema_mode: "fixed"
   start_ema: 0.95
@@ -82,7 +95,7 @@ cd:
   # Training parameters
   lr: 5.0e-5
   save_every: 10 # Save checkpoint every N epochs
-  save_dir: "./Result/train_results/cd"
+  save_dir: "./Result/train_results/formal_p1_04_full120_86p8_v1/cd"
 
 # --- Optimization Configuration ---
 optimization:

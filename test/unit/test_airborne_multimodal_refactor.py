@@ -74,6 +74,7 @@ class DatasetIRMetaTest(unittest.TestCase):
                 use_augmentation=False,
                 return_path=True,
                 sequence_length=1,
+                allow_legacy_radar_units=True,
             )
             target, radar, meta, path = ds[0]
 
@@ -298,7 +299,12 @@ class UnifiedTrainBatchTest(unittest.TestCase):
             latent_dim = 4
 
         cfg = DummyConfig()
-        trainer = OptimizedLDMTrainer(DummyVAE(), cfg, MemoryOptimizer(cfg))
+        trainer = OptimizedLDMTrainer(
+            DummyVAE(),
+            cfg,
+            MemoryOptimizer(cfg),
+            allow_legacy_radar_units=True,
+        )
 
         self.assertEqual(trainer.model.in_channels, 16)
         self.assertEqual(trainer.model.__class__.__name__, "CompleteDualModalityPerceptionNet")

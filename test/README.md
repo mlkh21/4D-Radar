@@ -13,6 +13,7 @@ test/
 │   └── comparison/        # radar/LiDAR/target 比较指标
 ├── diagnostics/
 │   ├── alignment/         # 坐标、配准和共享可见性诊断
+│   ├── occupancy/         # 占用阈值与 oracle 协议诊断
 │   ├── radar/             # 雷达坐标轴约定诊断
 │   ├── infrared/          # 红外输入诊断预留目录
 │   └── vertical_structure/# 垂直结构问题定位预留目录
@@ -102,6 +103,32 @@ conda run -n Radar-Diffusion python \
   --output_dir test/result/comparison/dataset_protocol_audit_v7
 ```
 
+训练域与独立验证域的稀疏体素、Doppler 和 IR 分布审计：
+
+```bash
+conda run -n Radar-Diffusion python \
+  test/diagnostics/radar/audit_scene_distribution_shift.py \
+  --dataset_root Data/NTU4DRadLM_Pre_sensor_aware \
+  --scenes garden,loop3 \
+  --max_frames 500 \
+  --output_dir test/result/comparison/scene_distribution_audit_v11
+```
+
+该脚本在物理坐标中直接读取稀疏 NPZ，不构造完整稠密体素，也不修改训练数据。
+
+逐帧 target 数量匹配的 oracle 上限诊断：
+
+```bash
+conda run -n Radar-Diffusion python \
+  test/diagnostics/occupancy/diagnose_oracle_target_adaptation.py \
+  --pred_voxel_dir <固定阈值推理输出目录> \
+  --target_voxel_dir <对应场景的target_voxel目录> \
+  --output_dir <全新的oracle诊断输出目录>
+```
+
+该脚本读取已保存的 `*_voxel.npy`，输出逐帧 oracle 阈值、CSV、JSON 和
+`XYZ+intensity` 点云。结果使用测试 target 改变逐帧输出，只能用于上限诊断，不能作为正式推理或部署性能；输出目录已存在且非空时脚本会拒绝覆盖。
+
 ## 可视化入口
 
 ```bash
@@ -114,6 +141,10 @@ conda run -n Radar-Diffusion python \
 ## Mini-test 入口
 
 ```bash
+# RTX 4070 Laptop 8 GB：正式数据协议、单阶段保护运行
+bash test/mini-test/run_formal_mini_8gb.sh vae
+
+# 历史 legacy mini
 bash test/mini-test/train_minimal.sh all
 bash test/mini-test/inference_minimal.sh ldm
 bash test/mini-test/inference_minimal.sh cd
@@ -124,10 +155,13 @@ bash test/mini-test/diagnose_minimal.sh
 默认 mini 输出保留在：
 
 ```text
+test/result/formal_mini_p1_04_8gb_v1/
 test/mini-test/train_results_mini/
 test/mini-test/inference_results_mini/
 test/mini-test/.tmp_mini_train_dataset/
 ```
+
+`run_formal_mini_8gb.sh` 必须按 `vae → ldm → cd` 分阶段执行，并在阶段间冷却；它保持 full120 正式监督协议，但 checkpoint 标记为 `formal_mini_chain_v1`，不能送入正式 checkpoint 链。完整门禁与推理烟测命令见 `test/mini-test/README.md`。
 
 ## 结果保存规则
 
@@ -144,6 +178,7 @@ test/result/ldm/ablation/
 test/result/ldm/visualization/
 test/result/comparison/alignment_check/
 test/result/comparison/dataset_protocol_audit_v7/
+test/result/comparison/scene_distribution_audit_v11/
 test/result/archive/
 ```
 

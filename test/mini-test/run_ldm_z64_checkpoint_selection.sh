@@ -71,6 +71,7 @@ for checkpoint in "${CHECKPOINTS[@]}"; do
       --output_dir "${candidate_dir}" \
       --split validation \
       --variants real \
+      --allow_legacy_radar_units \
       --max_samples 32 \
       --require_sample_count 32 \
       --steps 20 \

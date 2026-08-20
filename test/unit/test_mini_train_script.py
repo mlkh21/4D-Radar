@@ -72,6 +72,10 @@ CONFIG_ARGUMENT_CONTRACT = [
     ("MINI_TARGET_SIZE", "target_size_raw"),
     ("MINI_SOURCE_PC_RANGE", "source_pc_range_raw"),
     ("MINI_MODEL_PC_RANGE", "model_pc_range_raw"),
+    ("MINI_RADAR_PROTOCOL", "radar_protocol"),
+    ("MINI_RADAR_NORMALIZATION_PATH", "radar_normalization_path"),
+    ("MINI_DOPPLER_SCALE_MPS", "doppler_scale_mps"),
+    ("MINI_CHECKPOINT_PROTOCOL", "checkpoint_protocol"),
     ("MINI_VAE_CONFIG_TYPE", "vae_config_type"),
     ("MINI_VAE_LATENT_DIM", "vae_latent_dim"),
     ("MINI_VAE_OCC_LOSS", "vae_occ_loss"),
@@ -89,6 +93,9 @@ CONFIG_ARGUMENT_CONTRACT = [
     ("MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT", "ldm_ir_frustum_negative_weight"),
     ("MINI_LDM_IR_FRUSTUM_TOP_WEIGHT", "ldm_ir_frustum_top_weight"),
     ("MINI_LDM_UNCERTAINTY_WEIGHT", "ldm_uncertainty_weight"),
+    ("MINI_LDM_COLUMN_CURRICULUM_ENABLED", "ldm_column_curriculum_enabled"),
+    ("MINI_LDM_COLUMN_POSITIVE_START_WEIGHT", "ldm_column_positive_start_weight"),
+    ("MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT", "ldm_column_negative_start_weight"),
     ("MINI_LDM_COLUMN_POSITIVE_WEIGHT", "ldm_column_positive_weight"),
     ("MINI_LDM_COLUMN_NEGATIVE_WEIGHT", "ldm_column_negative_weight"),
     ("MINI_LDM_COLUMN_TEMPERATURE", "ldm_column_temperature"),
@@ -163,7 +170,12 @@ class MiniTrainScriptTest(unittest.TestCase):
                 f"配置生成参数顺序不匹配: {actual_contract!r}"
             )
 
-    def _generate_config(self, latent_dim):
+    def _run_config_generator(
+        self,
+        latent_dim,
+        curriculum_enabled="true",
+        radar_protocol="legacy",
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             source_path = temp_path / "source.yaml"
@@ -184,6 +196,10 @@ class MiniTrainScriptTest(unittest.TestCase):
                 "MINI_TARGET_SIZE": "32,128,128",
                 "MINI_SOURCE_PC_RANGE": "0,-20,-6,120,20,10",
                 "MINI_MODEL_PC_RANGE": "0,-20,-6,40,20,10",
+                "MINI_RADAR_PROTOCOL": radar_protocol,
+                "MINI_RADAR_NORMALIZATION_PATH": str(temp_path / "artifact.json"),
+                "MINI_DOPPLER_SCALE_MPS": "86.8",
+                "MINI_CHECKPOINT_PROTOCOL": "formal_mini_chain_v1",
                 "MINI_VAE_CONFIG_TYPE": "ultra_lightweight",
                 "MINI_VAE_LATENT_DIM": latent_dim,
                 "MINI_VAE_OCC_LOSS": "bce_dice",
@@ -201,20 +217,39 @@ class MiniTrainScriptTest(unittest.TestCase):
                 "MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT": "0.5625",
                 "MINI_LDM_IR_FRUSTUM_TOP_WEIGHT": "0.4375",
                 "MINI_LDM_UNCERTAINTY_WEIGHT": "0.25",
+                "MINI_LDM_COLUMN_CURRICULUM_ENABLED": curriculum_enabled,
+                "MINI_LDM_COLUMN_POSITIVE_START_WEIGHT": "0.09375",
+                "MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT": "0.015625",
                 "MINI_LDM_COLUMN_POSITIVE_WEIGHT": "0.03125",
                 "MINI_LDM_COLUMN_NEGATIVE_WEIGHT": "0.0625",
                 "MINI_LDM_COLUMN_TEMPERATURE": "0.75",
                 "MINI_REQUIRE_FRESH_CONFIG": "0",
             }
             arguments = [values[name] for name in self.shell_argument_names]
-            subprocess.run(
+            result = subprocess.run(
                 [sys.executable, "-", *arguments],
                 input=self.config_generator,
                 text=True,
-                check=True,
                 capture_output=True,
             )
-            return yaml.safe_load(output_path.read_text(encoding="utf-8"))
+            generated = None
+            if output_path.is_file():
+                generated = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+            return result, generated
+
+    def _generate_config(
+        self,
+        latent_dim,
+        curriculum_enabled="true",
+        radar_protocol="legacy",
+    ):
+        result, generated = self._run_config_generator(
+            latent_dim,
+            curriculum_enabled=curriculum_enabled,
+            radar_protocol=radar_protocol,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        return generated
 
     def test_shell_arguments_match_python_argv_unpacking(self):
         self._assert_config_call_contract(self.script)
@@ -247,6 +282,9 @@ class MiniTrainScriptTest(unittest.TestCase):
             "MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT": "0.0",
             "MINI_LDM_IR_FRUSTUM_TOP_WEIGHT": "0.0",
             "MINI_LDM_UNCERTAINTY_WEIGHT": "",
+            "MINI_LDM_COLUMN_CURRICULUM_ENABLED": "false",
+            "MINI_LDM_COLUMN_POSITIVE_START_WEIGHT": "0.0",
+            "MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT": "0.0",
             "MINI_LDM_COLUMN_POSITIVE_WEIGHT": "0.0",
             "MINI_LDM_COLUMN_NEGATIVE_WEIGHT": "0.0",
             "MINI_LDM_COLUMN_TEMPERATURE": "1.0",
@@ -277,6 +315,9 @@ class MiniTrainScriptTest(unittest.TestCase):
             "MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT",
             "MINI_LDM_IR_FRUSTUM_TOP_WEIGHT",
             "MINI_LDM_UNCERTAINTY_WEIGHT",
+            "MINI_LDM_COLUMN_CURRICULUM_ENABLED",
+            "MINI_LDM_COLUMN_POSITIVE_START_WEIGHT",
+            "MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT",
             "MINI_LDM_COLUMN_POSITIVE_WEIGHT",
             "MINI_LDM_COLUMN_NEGATIVE_WEIGHT",
             "MINI_LDM_COLUMN_TEMPERATURE",
@@ -307,6 +348,9 @@ class MiniTrainScriptTest(unittest.TestCase):
             "cfg['ldm']['decoded_ir_frustum_negative_weight'] = float(ldm_ir_frustum_negative_weight)",
             "cfg['ldm']['decoded_ir_frustum_top_weight'] = float(ldm_ir_frustum_top_weight)",
             "cfg['ldm']['uncertainty_loss_weight'] = float(ldm_uncertainty_weight)",
+            "cfg['ldm']['decoded_column_curriculum_enabled'] = parse_strict_bool(ldm_column_curriculum_enabled, 'MINI_LDM_COLUMN_CURRICULUM_ENABLED')",
+            "cfg['ldm']['decoded_column_positive_start_weight'] = float(ldm_column_positive_start_weight)",
+            "cfg['ldm']['decoded_column_negative_start_weight'] = float(ldm_column_negative_start_weight)",
             "cfg['ldm']['decoded_column_positive_weight'] = float(ldm_column_positive_weight)",
             "cfg['ldm']['decoded_column_negative_weight'] = float(ldm_column_negative_weight)",
             "cfg['ldm']['decoded_column_temperature'] = float(ldm_column_temperature)",
@@ -332,6 +376,29 @@ class MiniTrainScriptTest(unittest.TestCase):
         self.assertEqual(generated["vae"]["latent_dim"], 8)
         self.assertIsInstance(generated["vae"]["latent_dim"], int)
 
+    def test_formal_mini_writes_artifact_scale_protocol_and_single_gpu(self):
+        generated = self._generate_config("", radar_protocol="formal")
+
+        self.assertTrue(
+            generated["data"]["radar_normalization_path"].endswith("artifact.json")
+        )
+        self.assertEqual(generated["data"]["doppler_scale_mps"], 86.8)
+        self.assertEqual(
+            generated["data"]["checkpoint_protocol"],
+            "formal_mini_chain_v1",
+        )
+        self.assertEqual(generated["hardware"]["num_gpus"], 1)
+        self.assertTrue(generated["optimization"]["use_checkpoint"])
+        self.assertFalse(generated["optimization"]["use_amp"])
+        self.assertFalse(generated["optimization"]["use_fp16"])
+
+    def test_legacy_mini_still_clears_formal_radar_fields(self):
+        generated = self._generate_config("", radar_protocol="legacy")
+
+        self.assertEqual(generated["data"]["radar_normalization_path"], "")
+        self.assertIsNone(generated["data"]["doppler_scale_mps"])
+        self.assertNotIn("checkpoint_protocol", generated["data"])
+
     def test_ldm_structure_env_values_are_written_to_generated_yaml(self):
         generated = self._generate_config("")
 
@@ -347,9 +414,30 @@ class MiniTrainScriptTest(unittest.TestCase):
         self.assertEqual(generated["ldm"]["decoded_ir_frustum_negative_weight"], 0.5625)
         self.assertEqual(generated["ldm"]["decoded_ir_frustum_top_weight"], 0.4375)
         self.assertEqual(generated["ldm"]["uncertainty_loss_weight"], 0.25)
+        self.assertIs(generated["ldm"]["decoded_column_curriculum_enabled"], True)
+        self.assertEqual(generated["ldm"]["decoded_column_positive_start_weight"], 0.09375)
+        self.assertEqual(generated["ldm"]["decoded_column_negative_start_weight"], 0.015625)
         self.assertEqual(generated["ldm"]["decoded_column_positive_weight"], 0.03125)
         self.assertEqual(generated["ldm"]["decoded_column_negative_weight"], 0.0625)
         self.assertEqual(generated["ldm"]["decoded_column_temperature"], 0.75)
+
+    def test_column_curriculum_boolean_accepts_only_explicit_true_and_false_tokens(self):
+        for token in ("1", "true", "yes", "on", "TRUE", "On"):
+            with self.subTest(token=token):
+                generated = self._generate_config("", curriculum_enabled=token)
+                self.assertIs(generated["ldm"]["decoded_column_curriculum_enabled"], True)
+        for token in ("0", "false", "no", "off", "FALSE", "Off"):
+            with self.subTest(token=token):
+                generated = self._generate_config("", curriculum_enabled=token)
+                self.assertIs(generated["ldm"]["decoded_column_curriculum_enabled"], False)
+
+    def test_column_curriculum_boolean_rejects_ambiguous_values(self):
+        for token in ("", "2", "enabled", "none"):
+            with self.subTest(token=token):
+                result, generated = self._run_config_generator("", curriculum_enabled=token)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(generated)
+                self.assertIn("MINI_LDM_COLUMN_CURRICULUM_ENABLED", result.stdout + result.stderr)
 
     def test_fresh_config_generator_exclusively_creates_new_file_and_rejects_race(self):
         shell_names, _, generator = self._parse_config_call(self.script)
@@ -369,10 +457,17 @@ class MiniTrainScriptTest(unittest.TestCase):
                 "MINI_TARGET_SIZE": "32,128,128",
                 "MINI_SOURCE_PC_RANGE": "0,-20,-6,120,20,10",
                 "MINI_MODEL_PC_RANGE": "0,-20,-6,40,20,10",
+                "MINI_RADAR_PROTOCOL": "legacy",
+                "MINI_RADAR_NORMALIZATION_PATH": "",
+                "MINI_DOPPLER_SCALE_MPS": "",
+                "MINI_CHECKPOINT_PROTOCOL": "formal_mini_chain_v1",
                 "MINI_VAE_CONFIG_TYPE": "ultra_lightweight",
                 "MINI_VAE_LATENT_DIM": "", "MINI_VAE_OCC_LOSS": "bce_dice",
                 "MINI_TRAIN_SPLIT": "0.8", "MINI_SPLIT_SEED": "42",
                 "MINI_LDM_UNCERTAINTY_WEIGHT": "0",
+                "MINI_LDM_COLUMN_CURRICULUM_ENABLED": "false",
+                "MINI_LDM_COLUMN_POSITIVE_START_WEIGHT": "0",
+                "MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT": "0",
                 "MINI_LDM_COLUMN_TEMPERATURE": "1",
                 "MINI_REQUIRE_FRESH_CONFIG": "1",
             })
@@ -411,6 +506,9 @@ class MiniTrainScriptTest(unittest.TestCase):
             "MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT",
             "MINI_LDM_IR_FRUSTUM_TOP_WEIGHT",
             "MINI_LDM_UNCERTAINTY_WEIGHT",
+            "MINI_LDM_COLUMN_CURRICULUM_ENABLED",
+            "MINI_LDM_COLUMN_POSITIVE_START_WEIGHT",
+            "MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT",
             "MINI_LDM_COLUMN_POSITIVE_WEIGHT",
             "MINI_LDM_COLUMN_NEGATIVE_WEIGHT",
             "MINI_LDM_COLUMN_TEMPERATURE",
@@ -557,10 +655,17 @@ class MiniTrainSafetyBehaviorTest(unittest.TestCase):
             results_dir = Path(temp_dir) / "experiment"
             results_dir.mkdir()
             scratch = results_dir / ".tmp_mini_train_dataset"
+            source_scene = results_dir / "missing_source" / "missing_scene"
+            radar_dir = source_scene / "radar_voxel"
+            target_dir = source_scene / "target_voxel"
+            radar_dir.mkdir(parents=True)
+            target_dir.mkdir()
+            (radar_dir / "000000.npz").write_bytes(b"stub")
+            (target_dir / "000000.npz").write_bytes(b"stub")
             result = self._run_fresh_scratch(scratch, results_dir)
-            self.assertNotEqual(result.returncode, 0, msg="缺失源场景应在 scratch 创建后失败")
+            self.assertNotEqual(result.returncode, 0, msg="缺少 VAE checkpoint 应在 scratch 创建后失败")
             self.assertTrue(scratch.is_dir(), msg=result.stdout + result.stderr)
-            self.assertIn("missing radar_voxel/target_voxel", result.stdout + result.stderr)
+            self.assertIn("minimal VAE checkpoint not found", result.stdout + result.stderr)
 
     def _run_fresh_config(self, config_path, results_dir):
         scratch = results_dir / ".tmp_dataset"
@@ -1875,7 +1980,7 @@ class LDMZ64V10ColumnExperimentTest(unittest.TestCase):
         fake_bash = bin_dir / "bash"
         fake_bash.write_text(
             "#!/bin/sh\n"
-            "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$*\" "
+            "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$*\" "
             "\"$MINI_LDM_COLUMN_POSITIVE_WEIGHT\" \"$MINI_LDM_COLUMN_NEGATIVE_WEIGHT\" "
             "\"$MINI_LDM_COLUMN_TEMPERATURE\" \"$MINI_LDM_DECODED_WEIGHT\" "
             "\"$MINI_LDM_DECODED_FP_WEIGHT\" \"$MINI_LDM_DECODED_MASS_WEIGHT\" "
@@ -1886,6 +1991,10 @@ class LDMZ64V10ColumnExperimentTest(unittest.TestCase):
             "\"$MINI_LDM_UNCERTAINTY_WEIGHT\" \"$SAMPLES_PER_SCENE\" \"$MINI_LDM_EPOCHS\" "
             "\"$MINI_TARGET_SIZE\" \"$MINI_SPLIT_SEED\" \"$TRAIN_SCENES_OVERRIDE\" "
             "\"$MINI_DATASET_DIR\" \"$MINI_CONFIG_PATH\" \"$CUDA_DEVICES\" \"$CUDA_VISIBLE_DEVICES\" "
+            "\"$MINI_LDM_COLUMN_CURRICULUM_ENABLED\" "
+            "\"$MINI_LDM_COLUMN_POSITIVE_START_WEIGHT\" "
+            "\"$MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT\" "
+            "\"$MINI_SOURCE_PC_RANGE\" \"$MINI_MODEL_PC_RANGE\" "
             ">> \"$CALL_LOG\"\n"
             "mkdir -p \"$EXP_DIR/ldm\"\n"
             "if [ \"${FAKE_EMPTY_FINAL:-0}\" = 1 ]; then : > \"$EXP_DIR/ldm/ldm_best.pt\"; "
@@ -1954,16 +2063,54 @@ class LDMZ64V10ColumnExperimentTest(unittest.TestCase):
         self.assertEqual(values_b[:3], ["0.02", "0.02", "1.0"])
         self.assertEqual(values_c[:3], ["0.03", "0.01", "1.0"])
         self.assertEqual(values_d[:3], ["0.02", "0.005", "1.0"])
+        self.assertEqual(values_a[24:27], ["false", "0.02", "0.01"])
+        self.assertEqual(values_b[24:27], ["false", "0.02", "0.02"])
+        self.assertEqual(values_c[24:27], ["false", "0.03", "0.01"])
+        self.assertEqual(values_d[24:27], ["false", "0.02", "0.005"])
         for candidate in (values_b, values_c, values_d):
             self.assertEqual(values_a[3:20], candidate[3:20])
-            self.assertEqual(values_a[22:], candidate[22:])
+            self.assertEqual(values_a[22:25], candidate[22:25])
+            self.assertEqual(values_a[27:29], candidate[27:29])
+
+    def test_v11_defines_exact_three_epoch_column_curriculum(self):
+        result, exp_v11, calls = self._run("V11")
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        values = calls[0].split("|")
+        self.assertEqual(values[1:4], ["0.02", "0.01", "1.0"])
+        self.assertEqual(values[25:28], ["true", "0.03", "0.0"])
+
+        result_a, exp_a, calls_a = self._run("A")
+        self.assertEqual(result_a.returncode, 0, msg=result_a.stdout + result_a.stderr)
+        values_a = calls_a[0].split("|")
+        self.assertEqual(values[0], values_a[0])
+        self.assertEqual(values[1:21], values_a[1:21])
+        self.assertEqual(
+            Path(values[21]).relative_to(exp_v11),
+            Path(values_a[21]).relative_to(exp_a),
+        )
+        self.assertEqual(Path(values[21]).name, ".tmp_mini_train_dataset")
+        self.assertEqual(
+            Path(values[22]).relative_to(exp_v11),
+            Path(values_a[22]).relative_to(exp_a),
+        )
+        self.assertEqual(Path(values[22]).name, ".tmp_ldm_config.yaml")
+        self.assertEqual(values[23:25], values_a[23:25])
+        self.assertEqual(values[28:30], values_a[28:30])
+
+    def test_v11_default_output_directory_is_named_for_curriculum_screen(self):
+        script = Z64_LDM_V10_RUNNER.read_text(encoding="utf-8")
+        self.assertIn(
+            'DEFAULT_EXP_DIR="${ROOT_DIR}/test/result/ldm/ablation/'
+            'ldm_near40_500_z64_column_curriculum_v11_screen"',
+            script,
+        )
 
     def test_unknown_variant_is_rejected_before_writing_or_training(self):
         result, exp_dir, calls = self._run("unknown")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(calls)
         self.assertFalse(exp_dir.exists())
-        self.assertIn("must be A, B, C, or D", result.stdout + result.stderr)
+        self.assertIn("must be A, B, C, D, or V11", result.stdout + result.stderr)
 
     def test_v9a_weights_and_training_protocol_are_preserved(self):
         result, exp_dir, calls = self._run("A")
@@ -1984,10 +2131,40 @@ class LDMZ64V10ColumnExperimentTest(unittest.TestCase):
             MINI_TARGET_SIZE="1,2,3", MINI_SOURCE_PC_RANGE="bad",
             MINI_MODEL_PC_RANGE="bad", MINI_SPLIT_SEED="999",
             TRAIN_SCENES_OVERRIDE="loop3",
+            MINI_LDM_COLUMN_CURRICULUM_ENABLED="true",
+            MINI_LDM_COLUMN_POSITIVE_START_WEIGHT="9.0",
+            MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT="9.0",
         )
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
         values = calls[0].split("|")
         self.assertEqual(values[16:21], ["500", "3", "64,128,128", "42", "garden"])
+        self.assertEqual(values[25:28], ["false", "0.02", "0.01"])
+
+    def test_v11_fixed_protocol_ignores_hostile_curriculum_and_data_overrides(self):
+        result, _, calls = self._run(
+            "V11",
+            SAMPLES_PER_SCENE="1",
+            MINI_LDM_EPOCHS="99",
+            MINI_TARGET_SIZE="1,2,3",
+            MINI_SOURCE_PC_RANGE="bad-source",
+            MINI_MODEL_PC_RANGE="bad-model",
+            MINI_SPLIT_SEED="999",
+            TRAIN_SCENES_OVERRIDE="loop3",
+            MINI_LDM_COLUMN_CURRICULUM_ENABLED="false",
+            MINI_LDM_COLUMN_POSITIVE_START_WEIGHT="9.0",
+            MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT="9.0",
+            MINI_LDM_COLUMN_POSITIVE_WEIGHT="9.0",
+            MINI_LDM_COLUMN_NEGATIVE_WEIGHT="9.0",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        values = calls[0].split("|")
+        self.assertEqual(values[1:4], ["0.02", "0.01", "1.0"])
+        self.assertEqual(values[16:21], ["500", "3", "64,128,128", "42", "garden"])
+        self.assertEqual(values[25:28], ["true", "0.03", "0.0"])
+        self.assertEqual(
+            values[28:30],
+            ["0,-20,-6,120,20,10", "0,-20,-6,40,20,10"],
+        )
 
     def test_reproducibility_protocol_is_explicitly_fixed(self):
         script = Z64_LDM_V10_RUNNER.read_text(encoding="utf-8")
@@ -2016,7 +2193,10 @@ class LDMZ64V10ColumnExperimentTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("run_ldm_vertical_experiment.sh", calls[0])
         script = Z64_LDM_V10_RUNNER.read_text(encoding="utf-8")
-        for forbidden in ("inference_minimal", "diagnose_ir_condition_ablation", "evaluate_ldm", "cd_train"):
+        for forbidden in (
+            "inference_minimal", "diagnose_ir_condition_ablation", "evaluate_ldm",
+            "visualization", "cd_train", "--mode cd",
+        ):
             self.assertNotIn(forbidden, script.lower())
 
     def test_rejects_unsafe_symlink_nonempty_and_active_lock(self):

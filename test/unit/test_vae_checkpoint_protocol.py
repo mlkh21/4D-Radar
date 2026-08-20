@@ -9,6 +9,7 @@ import random
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 import numpy as np
@@ -25,18 +26,51 @@ from diffusion_consistency_radar.cm.vae_3d import (
     resolve_checkpoint_grid_config,
 )
 from diffusion_consistency_radar.scripts.unified_train import (
+    LDM_VALIDATION_PROTOCOL,
+    LDM_VALIDATION_SELECTOR,
     OptimizedVAETrainer,
     OptimizedLDMTrainer,
     atomic_copy_file,
     atomic_torch_save,
     decoded_occupancy_auxiliary_loss,
-    deterministic_split_indices,
+    temporal_block_split_indices,
     seed_training_run,
     micro_occupancy_metrics,
 )
 
 
 class VAECheckpointProtocolTest(unittest.TestCase):
+    @staticmethod
+    def _radar_normalization_spec():
+        return {
+            "protocol": "radar_normalization_v1",
+            "formal": True,
+            "training_scenes": ["garden"],
+            "frame_count": 2,
+            "target_size": [4, 8, 8],
+            "source_pc_range": [0, -4, -2, 16, 4, 2],
+            "model_pc_range": [0, -2, -1, 8, 2, 1],
+            "intensity": {
+                "transform": "log1p_robust_zscore",
+                "log_median": 1.0,
+                "log_iqr": 2.0,
+                "clip": [-5.0, 5.0],
+            },
+            "doppler": {
+                "transform": "symmetric_physical_scale",
+                "scale_mps": 4.0,
+                "clip": [-1.0, 1.0],
+            },
+            "variance": {
+                "transform": "identity",
+                "unit": "m2_s2",
+                "aggregation": "occupied_voxel_equal_weight_total_variance",
+            },
+            "input_provenance": {
+                "dataset_manifest_sha256": {"garden": "d" * 64},
+            },
+        }
+
     def test_training_seed_reproduces_python_numpy_torch_and_loader_generator(self):
         first_generator = seed_training_run(123)
         first = (
@@ -210,22 +244,32 @@ class VAECheckpointProtocolTest(unittest.TestCase):
                 fallback_config_type="ultra_lightweight",
             )
 
-    def test_deterministic_split_has_non_empty_disjoint_partitions(self):
-        first = deterministic_split_indices(10, train_split=0.8, split_seed=42)
-        second = deterministic_split_indices(10, train_split=0.8, split_seed=42)
+    def test_temporal_block_split_returns_ordered_prefix_and_suffix(self):
+        train_indices, val_indices = temporal_block_split_indices(10, train_split=0.8)
+
+        self.assertEqual(train_indices, list(range(8)))
+        self.assertEqual(val_indices, [8, 9])
+
+    def test_temporal_block_split_is_disjoint_complete_and_rng_independent(self):
+        seed_training_run(7)
+        first = temporal_block_split_indices(10, train_split=0.6)
+        seed_training_run(99)
+        second = temporal_block_split_indices(10, train_split=0.6)
 
         self.assertEqual(first, second)
         train_indices, val_indices = first
-        self.assertEqual(len(train_indices), 8)
-        self.assertEqual(len(val_indices), 2)
         self.assertFalse(set(train_indices) & set(val_indices))
         self.assertEqual(set(train_indices) | set(val_indices), set(range(10)))
+        self.assertEqual(train_indices, list(range(6)))
+        self.assertEqual(val_indices, list(range(6, 10)))
 
-    def test_split_rejects_zero_length_partition(self):
+    def test_temporal_block_split_rejects_invalid_or_empty_partitions(self):
         with self.assertRaisesRegex(ValueError, "至少需要 2"):
-            deterministic_split_indices(1, train_split=0.8, split_seed=42)
+            temporal_block_split_indices(1, train_split=0.8)
         with self.assertRaisesRegex(ValueError, "train_split"):
-            deterministic_split_indices(10, train_split=1.0, split_seed=42)
+            temporal_block_split_indices(10, train_split=1.0)
+        with self.assertRaisesRegex(ValueError, "空划分"):
+            temporal_block_split_indices(2, train_split=0.1)
 
     def test_micro_metrics_accumulate_counts_before_division(self):
         target = torch.tensor([[[[[1.0, 1.0, 0.0, 0.0]]]]])
@@ -271,10 +315,112 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             "occupancy_activation",
             "best_loss",
             "best_iou",
+            "checkpoint_protocol",
+            "stage",
         }
         self.assertTrue(required.issubset(payload))
         self.assertEqual(payload["vae_config"], config)
         self.assertEqual(payload["best_iou"], 0.6)
+        self.assertEqual(payload["checkpoint_protocol"], "formal_chain_v1")
+        self.assertEqual(payload["stage"], "vae")
+        self.assertNotIn("radar_normalization", payload)
+        self.assertNotIn("radar_normalization_sha256", payload)
+
+        trainer.checkpoint_protocol = "formal_mini_chain_v1"
+        mini_payload = trainer._checkpoint_payload(3, 0.4, 0.3, 0.6)
+        self.assertEqual(
+            mini_payload["checkpoint_protocol"],
+            "formal_mini_chain_v1",
+        )
+
+    def test_ldm_checkpoint_payload_contains_chain_metadata(self):
+        trainer = OptimizedLDMTrainer.__new__(OptimizedLDMTrainer)
+        trainer.model = torch.nn.Linear(2, 2)
+        trainer.optimizer = torch.optim.AdamW(trainer.model.parameters())
+        trainer.model_config = {
+            "latent_dim": 4,
+            "in_channels": 16,
+            "out_channels": 4,
+            "fusion_voxel_shape": [4, 8, 8],
+            "fusion_latent_shape": [2, 4, 4],
+            "fusion_pc_range": [0, -2, -1, 8, 2, 1],
+        }
+        trainer.data_grid_config = {
+            "target_size": [4, 8, 8],
+            "source_pc_range": [0, -4, -2, 16, 4, 2],
+            "model_pc_range": [0, -2, -1, 8, 2, 1],
+        }
+        trainer.vae_checkpoint_sha256 = "a" * 64
+        trainer.latent_dim = 4
+        trainer.global_step = 2
+        trainer._ldm_loss_config = lambda epoch: {"epoch": epoch}
+        trainer.radar_normalization = self._radar_normalization_spec()
+        trainer.radar_normalization_sha256 = "e" * 64
+        trainer.allow_legacy_radar_units = False
+        trainer.validation_config = {
+            "protocol": LDM_VALIDATION_PROTOCOL,
+            "split": "temporal_block_validation_suffix",
+            "seed": 42,
+            "sigma": 0.5,
+            "occupancy_threshold": 0.5,
+        }
+        trainer.validation_selector = LDM_VALIDATION_SELECTOR
+        trainer.best_val_iou = 0.6
+        trainer.best_val_loss = 0.3
+        trainer.last_validation_metrics = {
+            "denoising_latent_loss": 0.35,
+            "denoising_occupancy_iou": 0.55,
+        }
+
+        payload = trainer._checkpoint_payload(epoch=1, loss=0.2, best_loss=0.2)
+
+        self.assertEqual(payload["checkpoint_protocol"], "formal_chain_v1")
+        self.assertEqual(payload["stage"], "ldm")
+        self.assertEqual(payload["vae_checkpoint_sha256"], "a" * 64)
+        self.assertEqual(payload["model_config"]["fusion_voxel_shape"], [4, 8, 8])
+        self.assertEqual(payload["radar_normalization"], self._radar_normalization_spec())
+        self.assertEqual(payload["radar_normalization_sha256"], "e" * 64)
+        self.assertEqual(
+            payload["ldm_validation"]["selector"], LDM_VALIDATION_SELECTOR
+        )
+
+        trainer.checkpoint_protocol = "formal_mini_chain_v1"
+        mini_payload = trainer._checkpoint_payload(epoch=1, loss=0.2, best_loss=0.2)
+        self.assertEqual(
+            mini_payload["checkpoint_protocol"],
+            "formal_mini_chain_v1",
+        )
+
+    def test_ldm_resume_rejects_normalization_before_loading_model_state(self):
+        from diffusion_consistency_radar.radar_normalization import (
+            RadarNormalizationError,
+        )
+
+        trainer = OptimizedLDMTrainer.__new__(OptimizedLDMTrainer)
+        trainer.device = torch.device("cpu")
+        trainer.data_grid_config = {
+            "target_size": [4, 8, 8],
+            "source_pc_range": [0, -4, -2, 16, 4, 2],
+            "model_pc_range": [0, -2, -1, 8, 2, 1],
+        }
+        trainer.radar_normalization = self._radar_normalization_spec()
+        trainer.radar_normalization_sha256 = "e" * 64
+        trainer.allow_legacy_radar_units = False
+        trainer.model = mock.Mock()
+        trainer.optimizer = mock.Mock()
+        changed = self._radar_normalization_spec()
+        changed["frame_count"] = 3
+        checkpoint = {
+            "radar_normalization": changed,
+            "radar_normalization_sha256": "e" * 64,
+        }
+        with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+            torch.save(checkpoint, handle.name)
+            with self.assertRaises(RadarNormalizationError):
+                trainer._resume_from_checkpoint(handle.name)
+
+        trainer.model.load_state_dict.assert_not_called()
+
 
     def test_epoch_best_state_is_updated_before_payload_is_built(self):
         config = create_ultra_lightweight_vae_config()

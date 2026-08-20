@@ -28,6 +28,7 @@ conda run -n Radar-Diffusion python test/ablation/diagnose_ir_condition_ablation
   --output_dir "${OUTPUT_DIR}" \
   --split validation \
   --model_type ldm \
+  --allow_legacy_radar_units \
   --max_samples "${ABLATION_MAX_SAMPLES}" \
   --steps "${ABLATION_STEPS}" \
   --sampler euler \

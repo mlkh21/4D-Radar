@@ -3,6 +3,9 @@
 import os
 import json
 import argparse
+import csv
+import sys
+import traceback
 from typing import Tuple, Optional, Sequence
 import numpy as np
 import cv2
@@ -11,6 +14,41 @@ from scipy.spatial import cKDTree
 import scipy.ndimage as ndimage
 import pypatchworkpp
 from multiprocessing import Pool, cpu_count
+
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from diffusion_consistency_radar.dataset_manifest import write_scene_manifest_atomic
+
+try:
+    # 作为包导入时使用完整模块路径。
+    from NTU4DRadLM_pre_processing.motion_protocol import (
+        VELOCITY_MODES,
+        VELOCITY_FRAMES,
+        load_recorded_velocity_table,
+        resolve_frame_velocity,
+        sha256_file,
+        transform_velocity,
+    )
+except ModuleNotFoundError as exc:
+    # 直接执行本文件时，脚本文件会遮蔽同名目录，回退到同目录模块。
+    if exc.name != "NTU4DRadLM_pre_processing.motion_protocol":
+        raise
+    from motion_protocol import (  # type: ignore[no-redef]
+        VELOCITY_MODES,
+        VELOCITY_FRAMES,
+        load_recorded_velocity_table,
+        resolve_frame_velocity,
+        sha256_file,
+        transform_velocity,
+    )
+
+if __package__:
+    from .timestamp_alignment import nearest_timestamp_match
+else:
+    from timestamp_alignment import nearest_timestamp_match  # type: ignore[no-redef]
 
 # ==============================================================================
 # 全局参数配置与常驻内存声明
@@ -115,6 +153,107 @@ def invert_r_t(r_mat, t_vec):
 def ensure_dir(path):
     if not os.path.exists(path): os.makedirs(path)
 
+
+def _timestamped_files(directory: str, suffix: str):
+    """按文件名时间戳排序并验证严格递增，保证索引文件与原始帧一致。"""
+    names = [name for name in os.listdir(directory) if name.endswith(suffix)]
+    try:
+        names.sort(key=lambda name: float(os.path.splitext(name)[0]))
+    except ValueError as exc:
+        raise ValueError(f"目录 {directory} 中存在无法解析时间戳的文件") from exc
+    timestamps = np.asarray(
+        [float(os.path.splitext(name)[0]) for name in names], dtype=np.float64
+    )
+    if timestamps.size and (
+        not np.all(np.isfinite(timestamps))
+        or np.any(np.diff(timestamps) <= 0.0)
+    ):
+        raise ValueError(f"目录 {directory} 的文件名时间戳必须严格递增且为有限数")
+    return names, timestamps
+
+
+def _load_radar_lidar_sync(
+    path: str,
+    radar_indices,
+    lidar_indices,
+    radar_timestamps: np.ndarray,
+    lidar_timestamps: np.ndarray,
+    max_delta: float,
+):
+    """校验 Step 1 的 Radar/LiDAR 配对及其实际 delta，拒绝旧无阈值索引。"""
+    try:
+        max_delta = float(max_delta)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Radar-LiDAR 时间容差必须是有限非负数") from exc
+    if not np.isfinite(max_delta) or max_delta < 0.0:
+        raise ValueError("Radar-LiDAR 时间容差必须是有限非负数")
+    if os.path.islink(path):
+        raise ValueError(f"Radar-LiDAR 同步记录不允许使用符号链接: {path}")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Radar-LiDAR 同步记录不存在: {path}；请先重新运行 NTU4DRadLM_timestamp_index.py"
+        )
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if len(rows) != len(radar_indices) or len(rows) != len(lidar_indices):
+        raise ValueError(
+            f"Radar-LiDAR 同步记录行数与索引文件不一致: "
+            f"sync={len(rows)}, radar={len(radar_indices)}, lidar={len(lidar_indices)}"
+        )
+
+    for position, row in enumerate(rows):
+        try:
+            radar_index = int(row["radar_index"])
+            lidar_index = int(row["lidar_index"])
+            recorded_delta = float(row["delta_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行格式错误") from exc
+        if radar_index != radar_indices[position] or lidar_index != lidar_indices[position]:
+            raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行与索引文件不匹配")
+        if not np.isfinite(recorded_delta) or recorded_delta < 0.0:
+            raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行 delta 非法")
+        if radar_index < 0 or radar_index >= len(radar_timestamps):
+            raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行 Radar 索引越界")
+        if lidar_index < 0 or lidar_index >= len(lidar_timestamps):
+            raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行 LiDAR 索引越界")
+        measured_delta = abs(float(radar_timestamps[radar_index]) - float(lidar_timestamps[lidar_index]))
+        if abs(recorded_delta - measured_delta) > 1e-6:
+            raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行 delta 与文件名时间戳不一致")
+        if recorded_delta > max_delta:
+            raise ValueError(
+                f"Radar-LiDAR 第 {position} 对时间差 {recorded_delta:.9f}s "
+                f"超过时间容差 {max_delta:.9f}s"
+            )
+    return rows
+
+
+def _ensure_motion_args(args):
+    """为旧的 Namespace 调用补齐安全默认值，避免隐式恢复固定 50m/s。"""
+    defaults = {
+        "velocity_mode": "none",
+        "velocity_frame": "radar",
+        "velocity_file": "",
+        "velocity_max_delta": 0.02,
+        "radar_lidar_max_delta": 0.045,
+        "radar_ir_max_delta": 0.025,
+    }
+    for name, default in defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
+    return args
+
+def ensure_fresh_scene_output(scene_out_path):
+    """仅允许向不存在或为空的普通场景目录写入，避免覆盖旧批次。"""
+    if os.path.lexists(scene_out_path):
+        if os.path.islink(scene_out_path):
+            raise RuntimeError(f"输出场景目录不允许使用符号链接: {scene_out_path}")
+        if not os.path.isdir(scene_out_path):
+            raise RuntimeError(f"输出场景路径不是目录: {scene_out_path}")
+        if os.listdir(scene_out_path):
+            raise RuntimeError(f"输出场景目录必须为空: {scene_out_path}")
+        return
+    os.makedirs(scene_out_path)
+
 def load_calib(calib_file):
     R, T = np.eye(3), np.zeros(3)
     if not os.path.exists(calib_file): raise FileNotFoundError(f"Calibration file not found: {calib_file}.")
@@ -159,6 +298,14 @@ def voxelize_pcl_airborne_optimized(pcl, voxel_size, pc_range, v_drone=None, dt_
     v_drone: array_like [3] -> 无人机当前的瞬时速度绝对值向量 [vx, vy, vz], 单位: m/s
     dt_sync: float -> 红外图像快门或激光与4D雷达帧之间的绝对硬件时钟残差, 单位: 秒
     """
+    dt_sync = float(dt_sync)
+    if not np.isfinite(dt_sync):
+        raise ValueError("dt_sync 必须是有限数")
+    if v_drone is not None:
+        v_drone = np.asarray(v_drone, dtype=np.float32)
+        if v_drone.shape != (3,) or not np.all(np.isfinite(v_drone)):
+            raise ValueError("v_drone 必须是三个有限数")
+
     # 1.机载高动态时空位置微秒级畸变修正
     # 在 70m/s 下，修正因传感器异步产生的帧内空间拉伸模糊
     if abs(dt_sync) > 1e-6 and v_drone is not None:
@@ -238,8 +385,9 @@ def _parallel_frame_worker(task_args):
     global _process_patchwork
 
     (i, r_file, l_file, current_ts, scene_raw_path, scene_out_path,
-     r_radar_to_lidar, t_radar_to_lidar, v_drone, dt_sync,
-     thermal_timestamps, thermal_files, thermal_dir, args_dict) = task_args
+     r_radar_to_lidar, t_radar_to_lidar, frame_velocity, dt_sync,
+     thermal_timestamps, thermal_files, thermal_dir, args_dict,
+     thermal_index, thermal_delta) = task_args
 
     radar_pcl = np.load(os.path.join(scene_raw_path, "radar_pcl", r_file))
     lidar_pcl = np.load(os.path.join(scene_raw_path, "livox_lidar", l_file))
@@ -257,9 +405,30 @@ def _parallel_frame_worker(task_args):
 
     if args_dict["align_to"] == "lidar":
         radar_pcl = transform_pcl(radar_pcl, r_radar_to_lidar, t_radar_to_lidar)
+    elif args_dict["align_to"] == "radar":
+        lidar_pcl = transform_pcl(
+            lidar_pcl,
+            r_radar_to_lidar.T,
+            -np.dot(r_radar_to_lidar.T, t_radar_to_lidar),
+        )
+    else:
+        raise ValueError(f"align_to 必须是 radar 或 lidar，当前为 {args_dict['align_to']!r}")
 
-    r_voxel = voxelize_pcl_airborne_optimized(radar_pcl, VOXEL_SIZE, args_dict["pc_range"], v_drone=v_drone, dt_sync=dt_sync)
-    l_voxel = voxelize_pcl_airborne_optimized(lidar_pcl, VOXEL_SIZE, args_dict["pc_range"], v_drone=v_drone, dt_sync=dt_sync)
+    target_velocity = None
+    if frame_velocity is not None:
+        target_velocity = transform_velocity(
+            frame_velocity,
+            source_frame=args_dict["velocity_frame"],
+            target_frame=args_dict["align_to"],
+            radar_to_lidar_rotation=r_radar_to_lidar,
+        )
+
+    r_voxel = voxelize_pcl_airborne_optimized(
+        radar_pcl, VOXEL_SIZE, args_dict["pc_range"], v_drone=target_velocity, dt_sync=dt_sync
+    )
+    l_voxel = voxelize_pcl_airborne_optimized(
+        lidar_pcl, VOXEL_SIZE, args_dict["pc_range"], v_drone=target_velocity, dt_sync=dt_sync
+    )
 
     target_voxel = build_sensor_aware_target_vectorized(
         lidar_voxel=l_voxel, radar_voxel=r_voxel, pc_range=args_dict["pc_range"],
@@ -270,12 +439,23 @@ def _parallel_frame_worker(task_args):
         visibility_mode=args_dict["visibility_mode"],
     )
 
-    if len(thermal_timestamps) > 0:
-        ir_idx = np.argmin(np.abs(thermal_timestamps - current_ts))
-        img = cv2.imread(os.path.join(thermal_dir, thermal_files[ir_idx]), cv2.IMREAD_GRAYSCALE)
-        if img is not None:
-            img_3ch = np.stack([cv2.resize(img, (640, 480)).astype(np.float32) / 255.0] * 3, axis=0)
-            np.save(os.path.join(scene_out_path, "ir_image", f"{i:06d}_ir.npy"), img_3ch)
+    # 红外帧索引和实际 delta 在主进程中预先计算并通过任务传入，
+    # 避免 worker 各自静默选择超出容差的最近帧。
+    if thermal_index is not None:
+        img = cv2.imread(
+            os.path.join(thermal_dir, thermal_files[thermal_index]),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if img is None:
+            raise RuntimeError(
+                f"无法读取 IR 帧 {thermal_files[thermal_index]} "
+                f"(Radar timestamp={current_ts:.9f})"
+            )
+        img_3ch = np.stack(
+            [cv2.resize(img, (640, 480)).astype(np.float32) / 255.0] * 3,
+            axis=0,
+        )
+        np.save(os.path.join(scene_out_path, "ir_image", f"{i:06d}_ir.npy"), img_3ch)
 
     ext = ".npz" if SAVE_SPARSE else ".npy"
     save_voxel(os.path.join(scene_out_path, "radar_voxel", f"{i:06d}{ext}"), r_voxel)
@@ -287,7 +467,8 @@ def _parallel_frame_worker(task_args):
 # 场景总控制中心
 # ==============================================================================
 
-def process_scene_task(scene_name, args, v_drone, dt_sync):
+def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
+    _ensure_motion_args(args)
     print(f"\n⚡ 正在初始化多进程并行流水线，目标场景: {scene_name}")
     scene_raw_path = os.path.join(args.raw_data_path, scene_name)
     scene_index_path = os.path.join(args.index_path, scene_name)
@@ -297,44 +478,109 @@ def process_scene_task(scene_name, args, v_drone, dt_sync):
     if args.invert_calib: r_radar_to_lidar, t_radar_to_lidar = invert_r_t(r_radar_to_lidar, t_radar_to_lidar)
     if abs(args.radar_z_shift) > 1e-8: t_radar_to_lidar[2] += float(args.radar_z_shift)
 
-    ensure_dir(os.path.join(scene_out_path, "radar_voxel"))
-    ensure_dir(os.path.join(scene_out_path, "lidar_voxel"))
-    ensure_dir(os.path.join(scene_out_path, "target_voxel"))
-    ensure_dir(os.path.join(scene_out_path, "ir_image"))
+    if args.velocity_mode not in VELOCITY_MODES:
+        raise ValueError(f"velocity_mode 必须是 {VELOCITY_MODES} 之一")
+    if args.velocity_frame not in VELOCITY_FRAMES:
+        raise ValueError(f"velocity_frame 必须是 {VELOCITY_FRAMES} 之一")
+    fixed_velocity = None
+    recorded_table = None
+    velocity_file_sha256 = None
+    if args.velocity_mode == "fixed":
+        fixed_velocity = (
+            args.vx if v_drone is None else v_drone[0],
+            args.vy if v_drone is None else v_drone[1],
+            args.vz if v_drone is None else v_drone[2],
+        )
+    elif args.velocity_mode == "recorded":
+        recorded_table = load_recorded_velocity_table(args.velocity_file)
+        velocity_file_sha256 = sha256_file(args.velocity_file)
 
     thermal_dir = os.path.join(scene_raw_path, "thermal_cam_thermal_image_compressed")
-    thermal_files = sorted([f for f in os.listdir(thermal_dir) if f.endswith('.png')]) if os.path.exists(thermal_dir) else []
-    thermal_timestamps = np.array([float(os.path.splitext(f)[0]) for f in thermal_files])
+    if not os.path.isdir(thermal_dir):
+        raise FileNotFoundError(f"IR 数据目录不存在，拒绝无提示地跳过 IR: {thermal_dir}")
+    thermal_files, thermal_timestamps = _timestamped_files(thermal_dir, ".png")
+    if thermal_timestamps.size == 0:
+        raise ValueError(f"IR 数据目录为空，拒绝无提示地跳过 IR: {thermal_dir}")
 
+    radar_index_path = os.path.join(scene_index_path, "radar_index_sequence.txt")
+    lidar_index_path = os.path.join(scene_index_path, "lidar_index_sequence.txt")
     try:
-        with open(os.path.join(scene_index_path, "radar_index_sequence.txt"), 'r') as f:
+        with open(radar_index_path, 'r') as f:
             radar_indices = [int(line.strip()) for line in f.readlines()]
-        with open(os.path.join(scene_index_path, "lidar_index_sequence.txt"), 'r') as f:
+        with open(lidar_index_path, 'r') as f:
             lidar_indices = [int(line.strip()) for line in f.readlines()]
-    except FileNotFoundError:
-        print(f"Index files not found for {scene_name}, skipping.")
-        return
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Index files not found for {scene_name}"
+        ) from exc
 
-    radar_files = sorted([f for f in os.listdir(os.path.join(scene_raw_path, "radar_pcl")) if f.endswith('.npy')])
-    lidar_files = sorted([f for f in os.listdir(os.path.join(scene_raw_path, "livox_lidar")) if f.endswith('.npy')])
+    radar_files, radar_timestamps = _timestamped_files(
+        os.path.join(scene_raw_path, "radar_pcl"), ".npy"
+    )
+    lidar_files, lidar_timestamps = _timestamped_files(
+        os.path.join(scene_raw_path, "livox_lidar"), ".npy"
+    )
+    radar_lidar_sync_path = os.path.join(scene_index_path, "radar_lidar_sync.csv")
+    _load_radar_lidar_sync(
+        radar_lidar_sync_path,
+        radar_indices,
+        lidar_indices,
+        radar_timestamps,
+        lidar_timestamps,
+        args.radar_lidar_max_delta,
+    )
 
     min_len = min(len(radar_indices), len(lidar_indices))
     if args.max_frames > 0: min_len = min(min_len, int(args.max_frames))
 
     args_dict = vars(args)
     worker_tasks = []
+    ir_sync_records = []
     for i in range(min_len):
         r_idx, l_idx = radar_indices[i], lidar_indices[i]
         if r_idx >= len(radar_files) or l_idx >= len(lidar_files): continue
-        current_ts = float(os.path.splitext(radar_files[r_idx])[0])
+        current_ts = float(radar_timestamps[r_idx])
+        thermal_index, thermal_delta = nearest_timestamp_match(
+            thermal_timestamps,
+            current_ts,
+            max_delta=args.radar_ir_max_delta,
+        )
+        frame_velocity = resolve_frame_velocity(
+            mode=args.velocity_mode,
+            fixed_velocity=fixed_velocity,
+            frame_timestamp=current_ts,
+            recorded_table=recorded_table,
+            max_delta=args.velocity_max_delta,
+        )
 
         worker_tasks.append((
             i, radar_files[r_idx], lidar_files[l_idx], current_ts,
             scene_raw_path, scene_out_path, r_radar_to_lidar, t_radar_to_lidar,
-            v_drone, dt_sync, thermal_timestamps, thermal_files, thermal_dir, args_dict
+            frame_velocity, dt_sync, thermal_timestamps, thermal_files, thermal_dir, args_dict,
+            thermal_index, thermal_delta,
         ))
+        ir_sync_records.append(
+            {
+                "frame_index": i,
+                "radar_timestamp": f"{current_ts:.9f}",
+                "ir_timestamp": f"{thermal_timestamps[thermal_index]:.9f}",
+                "delta_seconds": f"{thermal_delta:.9f}",
+            }
+        )
 
     num_workers = min(cpu_count(), len(worker_tasks), 16)
+    if num_workers <= 0:
+        raise RuntimeError(
+            f"场景 {scene_name} 没有可处理的 Radar/LiDAR 配对帧，拒绝启动零进程流水线"
+        )
+
+    # 只有所有索引和 IR 时间容差检查通过后才创建输出目录，避免失败场景
+    # 留下无法再次运行的半成品目录。
+    ensure_fresh_scene_output(scene_out_path)
+    ensure_dir(os.path.join(scene_out_path, "radar_voxel"))
+    ensure_dir(os.path.join(scene_out_path, "lidar_voxel"))
+    ensure_dir(os.path.join(scene_out_path, "target_voxel"))
+    ensure_dir(os.path.join(scene_out_path, "ir_image"))
 
     # 使用 initializer 绑定进程启动钩子，每个进程终生只打印一次初始化日志！
     print(f"🔥 正在拉起 {num_workers} 个并行的常驻感知 Worker...")
@@ -343,13 +589,29 @@ def process_scene_task(scene_name, args, v_drone, dt_sync):
         for _ in tqdm(pool.imap_unordered(_parallel_frame_worker, worker_tasks), total=len(worker_tasks), desc=f"Parallel {scene_name}"):
             written += 1
 
+    # 将每个实际使用的 Radar-IR 最近邻和 delta 持久化，供审计和复现实验使用。
+    ir_sync_path = os.path.join(scene_out_path, "radar_ir_sync.csv")
+    with open(ir_sync_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("frame_index", "radar_timestamp", "ir_timestamp", "delta_seconds"),
+        )
+        writer.writeheader()
+        writer.writerows(ir_sync_records)
+
     metadata = {
         "source_scene": scene_name, "frames_written": written,
         "policy": {
             "z_min": args.z_min, "x_max": args.x_max,
             "visibility_mode": args.visibility_mode,
             "require_radar_visibility": args.require_radar_visibility,
-            "radar_visibility_radius": args.radar_visibility_radius, "doppler_radius": args.doppler_radius
+            "radar_visibility_radius": args.radar_visibility_radius, "doppler_radius": args.doppler_radius,
+            "velocity_mode": args.velocity_mode,
+            "velocity_frame": args.velocity_frame,
+            "velocity_max_delta": args.velocity_max_delta,
+            "velocity_file_sha256": velocity_file_sha256,
+            "radar_lidar_max_delta": args.radar_lidar_max_delta,
+            "radar_ir_max_delta": args.radar_ir_max_delta,
         }
     }
     with open(os.path.join(scene_out_path, "target_policy.json"), "w", encoding="utf-8") as h:
@@ -362,8 +624,28 @@ def process_scene_task(scene_name, args, v_drone, dt_sync):
         "align_to": args.align_to,
         "invert_calib": bool(args.invert_calib),
         "radar_z_shift": float(args.radar_z_shift),
-        "v_drone": [float(v_drone[0]), float(v_drone[1]), float(v_drone[2])],
+        "velocity_mode": args.velocity_mode,
+        "velocity_frame": args.velocity_frame,
+        "velocity_max_delta": float(args.velocity_max_delta),
+        "v_drone": (
+            [float(value) for value in fixed_velocity]
+            if fixed_velocity is not None
+            else None
+        ),
+        "velocity_file": (
+            os.path.basename(args.velocity_file)
+            if args.velocity_mode == "recorded"
+            else None
+        ),
+        "velocity_file_sha256": velocity_file_sha256,
+        "velocity_record_count": (
+            int(recorded_table.shape[0]) if recorded_table is not None else None
+        ),
         "dt_sync": float(dt_sync),
+        "radar_lidar_max_delta": float(args.radar_lidar_max_delta),
+        "radar_lidar_sync_filename": os.path.basename(radar_lidar_sync_path),
+        "radar_ir_max_delta": float(args.radar_ir_max_delta),
+        "radar_ir_sync_filename": os.path.basename(ir_sync_path),
         "z_min": args.z_min,
         "x_max": args.x_max,
         "visibility_mode": args.visibility_mode,
@@ -379,6 +661,17 @@ def process_scene_task(scene_name, args, v_drone, dt_sync):
     }
     with open(os.path.join(scene_out_path, "preprocess_policy.json"), "w", encoding="utf-8") as h:
         json.dump(preprocess_policy, h, indent=2)
+    write_scene_manifest_atomic(
+        scene_out_path,
+        scene_name,
+        written,
+        {
+            "preprocess_script": os.path.abspath(__file__),
+            "calibration": args.calib_path,
+            "radar_index": radar_index_path,
+            "lidar_index": lidar_index_path,
+        },
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Integrated High-Speed Sensor-Aware Preprocessing")
@@ -390,10 +683,51 @@ if __name__ == "__main__":
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--invert_calib", action="store_true")
     parser.add_argument("--radar_z_shift", type=float, default=0.0)
-    parser.add_argument("--align_to", type=str, default="lidar")
+    parser.add_argument(
+        "--align_to",
+        choices=VELOCITY_FRAMES,
+        default="lidar",
+        help="将 Radar/LiDAR 都转换到哪个共享坐标系",
+    )
     parser.add_argument("--vx", type=float, default=50.0)
     parser.add_argument("--vy", type=float, default=0.0)
     parser.add_argument("--vz", type=float, default=0.0)
+    parser.add_argument(
+        "--velocity_mode",
+        choices=VELOCITY_MODES,
+        default="none",
+        help="运动补偿模式：none 不补偿，fixed 使用显式速度，recorded 按时间戳读取速度表",
+    )
+    parser.add_argument(
+        "--velocity_frame",
+        choices=VELOCITY_FRAMES,
+        default="radar",
+        help="--vx/速度表所在坐标系；只使用旋转转换到 align_to 坐标系",
+    )
+    parser.add_argument(
+        "--velocity_file",
+        type=str,
+        default="",
+        help="recorded 模式的 CSV/空白分隔速度表：timestamp,vx,vy,vz",
+    )
+    parser.add_argument(
+        "--velocity_max_delta",
+        type=float,
+        default=0.02,
+        help="recorded 速度与 Radar 帧时间戳允许的最大差值（秒）",
+    )
+    parser.add_argument(
+        "--radar_lidar_max_delta",
+        type=float,
+        default=0.045,
+        help="Radar-LiDAR 索引允许的最大时间差（秒；由 Step 1 写入记录）",
+    )
+    parser.add_argument(
+        "--radar_ir_max_delta",
+        type=float,
+        default=0.025,
+        help="Radar-IR 最近邻允许的最大时间差（秒），超限直接失败",
+    )
     parser.add_argument("--dt_sync", type=float, default=0.002)
 
     parser.add_argument("--pc_range", type=float, nargs=6, default=(0, -20, -6, 120, 20, 10))
@@ -420,8 +754,18 @@ if __name__ == "__main__":
         scenes = [d for d in os.listdir(args.raw_data_path) if os.path.isdir(os.path.join(args.raw_data_path, d))]
     print(f"Target integrated preprocessing activated. Scenes: {scenes}")
 
+    failures = []
     for scene in scenes:
-        try: process_scene_task(scene, args, [args.vx, args.vy, args.vz], args.dt_sync)
+        try:
+            process_scene_task(
+                scene,
+                args,
+                [args.vx, args.vy, args.vz] if args.velocity_mode == "fixed" else None,
+                args.dt_sync,
+            )
         except Exception as e:
+            failures.append((scene, e))
             print(f"Failed to process {scene}: {e}")
-            import traceback; traceback.print_exc()
+            traceback.print_exc()
+    if failures:
+        raise SystemExit(1)

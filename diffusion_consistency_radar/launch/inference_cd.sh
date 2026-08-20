@@ -1,5 +1,5 @@
 #!/bin/bash
-# CD 推理脚本 - 固定为逐文件推理模式（1 个输入文件 -> 1 个生成点云文件）
+# CD 正式部署生成脚本：只读取 sensor-aware Radar+IR，不读取离线真值
 
 set -euo pipefail
 
@@ -8,13 +8,17 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
-VAE_CKPT="${ROOT_DIR}/Result/train_results/vae/vae_best.pt"
-CD_CKPT="${ROOT_DIR}/Result/train_results/cd/cd_best.pt"
+MANIFEST_SCRIPT="${PROJECT_DIR}/scripts/dataset_manifest.py"
+CHECKPOINT_CHAIN_SCRIPT="${PROJECT_DIR}/scripts/diagnose_checkpoint_chain.py"
+PROTOCOL_TAG="formal_p1_04_full120_86p8_v1"
+RESULTS_DIR="${ROOT_DIR}/Result/train_results/${PROTOCOL_TAG}"
+VAE_CKPT="${RESULTS_DIR}/vae/vae_best.pt"
+LDM_CKPT="${RESULTS_DIR}/ldm/ldm_best.pt"
+CD_CKPT="${RESULTS_DIR}/cd/cd_best.pt"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
-PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre"
-RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
+PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
 TRAIN_DURATION_SECONDS="${TRAIN_DURATION_SECONDS:--1}"
-USE_MULTIMODAL_META="${USE_MULTIMODAL_META:-0}"
+OCC_THRESHOLD="${OCC_THRESHOLD:-0.05}"
 
 if [ ! -f "${VAE_CKPT}" ]; then
   echo "错误: VAE 模型不存在: ${VAE_CKPT}"
@@ -25,6 +29,12 @@ if [ ! -f "${CD_CKPT}" ]; then
   echo "错误: CD 模型不存在: ${CD_CKPT}"
   exit 1
 fi
+
+echo "校验正式 VAE/LDM/CD checkpoint 链"
+python "${CHECKPOINT_CHAIN_SCRIPT}" validate \
+  --vae_ckpt "${VAE_CKPT}" \
+  --ldm_ckpt "${LDM_CKPT}" \
+  --cd_ckpt "${CD_CKPT}"
 
 if [ ! -f "${DATA_LOADING_CONFIG}" ]; then
   echo "错误: 配置文件不存在: ${DATA_LOADING_CONFIG}"
@@ -54,39 +64,24 @@ if [ ${#TEST_SCENES[@]} -eq 0 ]; then
   exit 1
 fi
 
+# 所有场景先通过内容校验，再允许产生任一正式推理结果。
+for SCENE in "${TEST_SCENES[@]}"; do
+  SCENE_DIR="${PREPROCESSED_ROOT}/${SCENE}"
+  python "${MANIFEST_SCRIPT}" validate \
+    --scene_dir "${SCENE_DIR}" \
+    --expected_scene "${SCENE}"
+done
+
 for SCENE in "${TEST_SCENES[@]}"; do
   RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
-  TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
-  RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
-  LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-  OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_cd_eval"
+  OUTPUT_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_${PROTOCOL_TAG}_cd_1step_deploy"
 
   if [ ! -d "${RADAR_VOXEL_DIR}" ]; then
     echo "错误: radar_voxel 目录不存在: ${RADAR_VOXEL_DIR}"
     exit 1
   fi
 
-  if [ ! -d "${TARGET_VOXEL_DIR}" ]; then
-    echo "Error: target_voxel directory not found: ${TARGET_VOXEL_DIR}"
-    exit 1
-  fi
-
-  if [ ! -d "${RAW_LIVOX_DIR}" ]; then
-    echo "错误: livox_lidar 目录不存在: ${RAW_LIVOX_DIR}"
-    exit 1
-  fi
-
-  if [ ! -f "${LIDAR_INDEX_FILE}" ]; then
-    echo "错误: lidar 索引文件不存在: ${LIDAR_INDEX_FILE}"
-    exit 1
-  fi
-
-  EXTRA_META_ARGS=()
-  if [ "${USE_MULTIMODAL_META}" = "1" ]; then
-    EXTRA_META_ARGS+=(--use_multimodal_meta)
-  fi
-
-  echo "开始 CD 推理场景: ${SCENE}"
+  echo "开始 CD 正式部署生成场景: ${SCENE}"
   python "${INFER_SCRIPT}" \
     --vae_ckpt "${VAE_CKPT}" \
     --model_ckpt "${CD_CKPT}" \
@@ -94,18 +89,14 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --steps 1 \
     --sampler euler \
     --train_duration_seconds "${TRAIN_DURATION_SECONDS}" \
+    --occ_threshold "${OCC_THRESHOLD}" \
     --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
-    --target_voxel_dir "${TARGET_VOXEL_DIR}" \
-    --compare_with_target \
-    --report_task_metrics \
+    --require_real_ir \
     --save_voxel \
     --save_pointcloud \
-    --compare_with_lidar \
-    --raw_livox_dir "${RAW_LIVOX_DIR}" \
-    --lidar_index_file "${LIDAR_INDEX_FILE}" \
+    --save_uncertainty \
     --output_dir "${OUTPUT_DIR}" \
-    --device cuda \
-    "${EXTRA_META_ARGS[@]}"
+    --device cuda
 
   echo "完成: ${OUTPUT_DIR}"
 done

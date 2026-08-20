@@ -149,6 +149,77 @@ class VAESparseOccupancyLossTest(unittest.TestCase):
 
         self.assertLess(correct_loss.item(), all_empty_loss.item())
 
+    def test_sparse_loss_ignores_unobserved_empty_voxels(self):
+        model = self._make_model()
+        target = torch.zeros(1, 4, 1, 1, 4)
+        target[:, 0, 0, 0, 0] = 1.0
+        observed_mask = torch.tensor([[[[[1.0, 1.0, 0.0, 0.0]]]]])
+
+        visible_logits = torch.full_like(target, -8.0)
+        visible_logits[:, 0, 0, 0, 0] = 8.0
+        unknown_logits = visible_logits.clone()
+        unknown_logits[:, 0, 0, 0, 2:] = 8.0
+
+        masked_visible = model.compute_loss(
+            target,
+            visible_logits,
+            self._zero_posterior(),
+            observed_mask=observed_mask,
+        )[1]
+        masked_unknown = model.compute_loss(
+            target,
+            unknown_logits,
+            self._zero_posterior(),
+            observed_mask=observed_mask,
+        )[1]
+
+        torch.testing.assert_close(masked_visible, masked_unknown)
+
+    def test_sparse_loss_with_no_observed_empty_voxels_is_zero_and_finite(self):
+        model = self._make_model()
+        target = torch.zeros(1, 4, 1, 1, 4)
+        reconstruction = torch.full_like(target, 8.0)
+        observed_mask = torch.zeros(1, 1, 1, 1, 4)
+
+        total_loss, recon_loss, _ = model.compute_loss(
+            target,
+            reconstruction,
+            self._zero_posterior(),
+            observed_mask=observed_mask,
+        )
+
+        self.assertTrue(torch.isfinite(total_loss))
+        torch.testing.assert_close(recon_loss, torch.zeros_like(recon_loss))
+
+    def test_voxel_augmentation_keeps_observed_mask_aligned(self):
+        from diffusion_consistency_radar.cm.augmentation import VoxelAugmentation
+
+        target = torch.zeros(4, 2, 3, 4)
+        target[0, 0, 0, 1] = 1.0
+        condition = torch.zeros_like(target)
+        observed_mask = torch.zeros(1, 2, 3, 4)
+        observed_mask[0, 0, 0, 1] = 1.0
+        augmentation = VoxelAugmentation(
+            enable_flip=True,
+            flip_prob=1.0,
+            enable_rotate=False,
+            enable_noise=False,
+            enable_dropout=False,
+            enable_intensity_jitter=False,
+            enable_doppler_jitter=False,
+        )
+
+        augmented_target, _augmented_condition, augmented_mask = augmentation(
+            target,
+            condition,
+            observed_mask,
+        )
+
+        torch.testing.assert_close(
+            augmented_target[0:1] > 0.5,
+            augmented_mask > 0.5,
+        )
+
     def test_single_positive_voxel_has_nonzero_gradient_toward_positive_logit(self):
         model = self._make_model()
         target = torch.zeros(1, 4, 1, 1, 32)

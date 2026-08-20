@@ -3,6 +3,7 @@
 """测试 LDM 解码结果的可微垂直结构损失。"""
 
 import os
+import csv
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from diffusion_consistency_radar.scripts.unified_train import (
     LDM_METRICS_HEADER,
     LDM_LOSS_COMPONENT_NAMES,
     OptimizedLDMTrainer,
+    column_curriculum_weights,
     compute_ldm_loss_components,
     decoded_column_balanced_losses,
     decoded_density_precision_loss,
@@ -58,6 +60,134 @@ class TrainerVAE(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+    def get_latent(self, tensor):
+        """为 trainer 单批测试提供恒等潜空间编码。"""
+        return tensor
+
+
+class ColumnCurriculumWeightsTest(unittest.TestCase):
+    """验证列级正负损失 epoch 课程的数学契约。"""
+
+    def test_three_epoch_curve_matches_v11_contract(self):
+        actual = [
+            column_curriculum_weights(
+                epoch,
+                3,
+                enabled=True,
+                positive_start=0.03,
+                positive_final=0.02,
+                negative_start=0.0,
+                negative_final=0.01,
+            )
+            for epoch in (1, 2, 3)
+        ]
+
+        self.assertEqual(actual, [(0.03, 0.0), (0.025, 0.005), (0.02, 0.01)])
+
+    def test_disabled_curriculum_returns_fixed_final_weights(self):
+        self.assertEqual(
+            column_curriculum_weights(
+                1,
+                3,
+                enabled=False,
+                positive_start=99.0,
+                positive_final=0.2,
+                negative_start=99.0,
+                negative_final=0.4,
+            ),
+            (0.2, 0.4),
+        )
+
+    def test_single_epoch_uses_start_weights_when_enabled(self):
+        self.assertEqual(
+            column_curriculum_weights(
+                1,
+                1,
+                enabled=True,
+                positive_start=0.03,
+                positive_final=0.02,
+                negative_start=0.0,
+                negative_final=0.01,
+            ),
+            (0.03, 0.0),
+        )
+
+    def test_rejects_invalid_epoch_types_and_ranges(self):
+        invalid_cases = (
+            (0, 3, ValueError),
+            (4, 3, ValueError),
+            (1, 0, ValueError),
+            (1.0, 3, TypeError),
+            (1, 3.0, TypeError),
+            (True, 3, TypeError),
+            (1, False, TypeError),
+        )
+        for epoch, total_epochs, error_type in invalid_cases:
+            with self.subTest(epoch=epoch, total_epochs=total_epochs):
+                with self.assertRaises(error_type):
+                    column_curriculum_weights(
+                        epoch,
+                        total_epochs,
+                        enabled=True,
+                        positive_start=0.03,
+                        positive_final=0.02,
+                        negative_start=0.0,
+                        negative_final=0.01,
+                    )
+
+    def test_enabled_must_be_bool(self):
+        for enabled in (0, 1, None, "true"):
+            with self.subTest(enabled=enabled), self.assertRaises(TypeError):
+                column_curriculum_weights(
+                    1,
+                    3,
+                    enabled=enabled,
+                    positive_start=0.03,
+                    positive_final=0.02,
+                    negative_start=0.0,
+                    negative_final=0.01,
+                )
+
+    def test_rejects_negative_or_non_finite_weights(self):
+        valid_weights = {
+            "positive_start": 0.03,
+            "positive_final": 0.02,
+            "negative_start": 0.0,
+            "negative_final": 0.01,
+        }
+        for name in valid_weights:
+            for invalid_value in (-0.1, float("nan"), float("inf"), float("-inf")):
+                weights = dict(valid_weights)
+                weights[name] = invalid_value
+                with self.subTest(name=name, invalid_value=invalid_value):
+                    with self.assertRaises(ValueError):
+                        column_curriculum_weights(
+                            1,
+                            3,
+                            enabled=True,
+                            **weights,
+                        )
+
+    def test_rejects_bool_weights_before_float_conversion(self):
+        valid_weights = {
+            "positive_start": 0.03,
+            "positive_final": 0.02,
+            "negative_start": 0.0,
+            "negative_final": 0.01,
+        }
+        for name in valid_weights:
+            for invalid_value in (True, False):
+                weights = dict(valid_weights)
+                weights[name] = invalid_value
+                with self.subTest(name=name, invalid_value=invalid_value):
+                    with self.assertRaises(TypeError):
+                        column_curriculum_weights(
+                            1,
+                            3,
+                            enabled=True,
+                            **weights,
+                        )
 
 
 class DecodedColumnBalancedLossTest(unittest.TestCase):
@@ -1404,7 +1534,7 @@ class LDMDecodedStructureIntegrationTest(unittest.TestCase):
 
 
 class LDMTrainerUtilityTest(unittest.TestCase):
-    def _make_trainer(self, temp_dir, ldm_overrides=None):
+    def _make_trainer(self, temp_dir, ldm_overrides=None, resume_path=None):
         ldm_config = {
             "save_dir": temp_dir,
             "fusion_voxel_shape": [1, 1, 1],
@@ -1414,7 +1544,12 @@ class LDMTrainerUtilityTest(unittest.TestCase):
         ldm_config.update(ldm_overrides or {})
         config = mock.Mock()
         config.get.side_effect = lambda key, default=None: ldm_config if key == "ldm" else default
-        memory_opt = mock.Mock(device=torch.device("cpu"), use_amp=False)
+        memory_opt = mock.Mock(
+            device=torch.device("cpu"),
+            use_amp=False,
+            grad_accum_steps=1,
+            scaler=None,
+        )
 
         class TinyModel(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -1428,7 +1563,40 @@ class LDMTrainerUtilityTest(unittest.TestCase):
             "diffusion_consistency_radar.scripts.unified_train.CompleteDualModalityPerceptionNet",
             TinyModel,
         ):
-            return OptimizedLDMTrainer(TrainerVAE(), config, memory_opt)
+            return OptimizedLDMTrainer(
+                TrainerVAE(),
+                config,
+                memory_opt,
+                resume_path=resume_path,
+                allow_legacy_radar_units=True,
+            )
+
+    @staticmethod
+    def _write_minimal_ldm_checkpoint(
+        trainer,
+        checkpoint_path,
+        epoch,
+        *,
+        include_curriculum_total_epochs=True,
+        loss_config_overrides=None,
+        omit_ldm_loss_config=False,
+    ):
+        """写入可由真实恢复路径消费的最小 LDM checkpoint。"""
+        loss_config = trainer._ldm_loss_config(epoch=epoch)
+        loss_config.update(loss_config_overrides or {})
+        if not include_curriculum_total_epochs:
+            loss_config.pop("curriculum_total_epochs", None)
+        checkpoint = {
+            "epoch": epoch,
+            "step": 11,
+            "model_state_dict": trainer.model.state_dict(),
+            "optimizer_state_dict": trainer.optimizer.state_dict(),
+            "loss": 0.5,
+            "best_loss": 0.4,
+        }
+        if not omit_ldm_loss_config:
+            checkpoint["ldm_loss_config"] = loss_config
+        torch.save(checkpoint, checkpoint_path)
 
     def test_column_config_defaults_and_checkpoint_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1436,11 +1604,176 @@ class LDMTrainerUtilityTest(unittest.TestCase):
             self.assertEqual(trainer.decoded_column_positive_weight, 0.0)
             self.assertEqual(trainer.decoded_column_negative_weight, 0.0)
             self.assertEqual(trainer.decoded_column_temperature, 1.0)
+            self.assertFalse(trainer.decoded_column_curriculum_enabled)
+            self.assertEqual(trainer.decoded_column_positive_start_weight, 0.0)
+            self.assertEqual(trainer.decoded_column_negative_start_weight, 0.0)
+            self.assertEqual(trainer._column_weights_for_epoch(1), (0.0, 0.0))
 
             metadata = trainer._ldm_loss_config()
             self.assertEqual(metadata["decoded_column_positive_weight"], 0.0)
             self.assertEqual(metadata["decoded_column_negative_weight"], 0.0)
             self.assertEqual(metadata["decoded_column_temperature"], 1.0)
+            self.assertFalse(metadata["decoded_column_curriculum_enabled"])
+            self.assertEqual(metadata["curriculum_total_epochs"], 200)
+            self.assertNotIn("effective_column_positive_weight", metadata)
+            self.assertNotIn("effective_column_negative_weight", metadata)
+
+    def test_v11_curriculum_is_epoch_deterministic_and_self_describing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trainer = self._make_trainer(
+                temp_dir,
+                {
+                    "epochs": 3,
+                    "decoded_column_curriculum_enabled": True,
+                    "decoded_column_positive_start_weight": 0.03,
+                    "decoded_column_positive_weight": 0.02,
+                    "decoded_column_negative_start_weight": 0.0,
+                    "decoded_column_negative_weight": 0.01,
+                },
+            )
+
+            self.assertEqual(trainer._column_weights_for_epoch(2), (0.025, 0.005))
+            metadata = trainer._ldm_loss_config(epoch=2)
+            self.assertTrue(metadata["decoded_column_curriculum_enabled"])
+            self.assertEqual(metadata["decoded_column_positive_start_weight"], 0.03)
+            self.assertEqual(metadata["decoded_column_positive_weight"], 0.02)
+            self.assertEqual(metadata["decoded_column_negative_start_weight"], 0.0)
+            self.assertEqual(metadata["decoded_column_negative_weight"], 0.01)
+            self.assertEqual(metadata["curriculum_total_epochs"], 3)
+            self.assertEqual(metadata["effective_column_positive_weight"], 0.025)
+            self.assertEqual(metadata["effective_column_negative_weight"], 0.005)
+
+    def test_curriculum_total_epochs_must_be_a_strict_positive_integer(self):
+        invalid_configs = (
+            ({"epochs": 0}, ValueError),
+            ({"epochs": -1}, ValueError),
+            ({"epochs": True}, TypeError),
+            ({"epochs": 3.0}, TypeError),
+        )
+        for overrides, error_type in invalid_configs:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as temp_dir:
+                with self.assertRaisesRegex(error_type, "epochs"):
+                    self._make_trainer(temp_dir, overrides)
+
+    def test_resume_uses_saved_epoch_mapping_for_next_curriculum_epoch(self):
+        curriculum = {
+            "epochs": 3,
+            "decoded_column_curriculum_enabled": True,
+            "decoded_column_positive_start_weight": 0.03,
+            "decoded_column_positive_weight": 0.02,
+            "decoded_column_negative_start_weight": 0.0,
+            "decoded_column_negative_weight": 0.01,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = os.path.join(temp_dir, "resume.pt")
+            source = self._make_trainer(temp_dir, curriculum)
+            self._write_minimal_ldm_checkpoint(source, checkpoint_path, epoch=1)
+
+            resumed = self._make_trainer(
+                temp_dir, curriculum, resume_path=checkpoint_path
+            )
+
+            self.assertEqual(resumed.start_epoch, 2)
+            self.assertEqual(resumed._column_weights_for_epoch(2), (0.025, 0.005))
+
+    def test_resume_rejects_each_complete_curriculum_metadata_mismatch_before_loading(self):
+        curriculum = {
+            "epochs": 3,
+            "decoded_column_curriculum_enabled": True,
+            "decoded_column_positive_start_weight": 0.03,
+            "decoded_column_positive_weight": 0.02,
+            "decoded_column_negative_start_weight": 0.0,
+            "decoded_column_negative_weight": 0.01,
+        }
+        mismatches = {
+            "decoded_column_curriculum_enabled": False,
+            "curriculum_total_epochs": 4,
+            "decoded_column_positive_start_weight": 0.031,
+            "decoded_column_positive_weight": 0.021,
+            "decoded_column_negative_start_weight": 0.001,
+            "decoded_column_negative_weight": 0.011,
+        }
+        for field_name, saved_value in mismatches.items():
+            with self.subTest(field_name=field_name), tempfile.TemporaryDirectory() as temp_dir:
+                checkpoint_path = os.path.join(temp_dir, "resume_mismatch.pt")
+                source = self._make_trainer(temp_dir, curriculum)
+                self._write_minimal_ldm_checkpoint(
+                    source,
+                    checkpoint_path,
+                    epoch=1,
+                    loss_config_overrides={field_name: saved_value},
+                )
+
+                with mock.patch.object(
+                    torch.nn.Module, "load_state_dict", autospec=True
+                ) as model_load, mock.patch.object(
+                    torch.optim.AdamW, "load_state_dict", autospec=True
+                ) as optimizer_load:
+                    with self.assertRaisesRegex(ValueError, field_name):
+                        self._make_trainer(
+                            temp_dir, curriculum, resume_path=checkpoint_path
+                        )
+
+                model_load.assert_not_called()
+                optimizer_load.assert_not_called()
+
+    def test_resume_accepts_legacy_checkpoint_without_curriculum_total_epochs(self):
+        saved_curriculum = {
+            "epochs": 3,
+            "decoded_column_curriculum_enabled": True,
+            "decoded_column_positive_start_weight": 0.03,
+            "decoded_column_positive_weight": 0.02,
+            "decoded_column_negative_start_weight": 0.0,
+            "decoded_column_negative_weight": 0.01,
+        }
+        current_curriculum = dict(saved_curriculum, epochs=4)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = os.path.join(temp_dir, "resume_legacy.pt")
+            source = self._make_trainer(temp_dir, saved_curriculum)
+            self._write_minimal_ldm_checkpoint(
+                source,
+                checkpoint_path,
+                epoch=1,
+                include_curriculum_total_epochs=False,
+                loss_config_overrides={
+                    "decoded_column_positive_start_weight": 9.0,
+                },
+            )
+
+            resumed = self._make_trainer(
+                temp_dir, current_curriculum, resume_path=checkpoint_path
+            )
+
+            self.assertEqual(resumed.start_epoch, 2)
+            positive, negative = resumed._column_weights_for_epoch(2)
+            self.assertAlmostEqual(positive, 0.03 - 0.01 / 3.0)
+            self.assertAlmostEqual(negative, 0.01 / 3.0)
+
+    def test_resume_accepts_legacy_checkpoint_without_ldm_loss_config(self):
+        curriculum = {
+            "epochs": 3,
+            "decoded_column_curriculum_enabled": True,
+            "decoded_column_positive_start_weight": 0.03,
+            "decoded_column_positive_weight": 0.02,
+            "decoded_column_negative_start_weight": 0.0,
+            "decoded_column_negative_weight": 0.01,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = os.path.join(temp_dir, "resume_no_loss_config.pt")
+            source = self._make_trainer(temp_dir, curriculum)
+            self._write_minimal_ldm_checkpoint(
+                source,
+                checkpoint_path,
+                epoch=1,
+                omit_ldm_loss_config=True,
+            )
+
+            resumed = self._make_trainer(
+                temp_dir, curriculum, resume_path=checkpoint_path
+            )
+
+            self.assertEqual(resumed.start_epoch, 2)
+            self.assertEqual(resumed._column_weights_for_epoch(2), (0.025, 0.005))
 
     def test_column_config_reads_explicit_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1462,15 +1795,126 @@ class LDMTrainerUtilityTest(unittest.TestCase):
 
     def test_column_config_rejects_invalid_weights_and_temperature(self):
         invalid_configs = (
-            ({"decoded_column_positive_weight": -0.1}, "positive"),
-            ({"decoded_column_negative_weight": float("nan")}, "negative"),
-            ({"decoded_column_temperature": 0.0}, "temperature"),
-            ({"decoded_column_temperature": float("nan")}, "temperature"),
+            ({"decoded_column_positive_weight": -0.1}, ValueError, "positive"),
+            ({"decoded_column_negative_weight": float("nan")}, ValueError, "negative"),
+            ({"decoded_column_curriculum_enabled": "true"}, TypeError, "curriculum_enabled"),
+            ({"decoded_column_positive_start_weight": True}, TypeError, "positive_start"),
+            ({"decoded_column_negative_start_weight": float("inf")}, ValueError, "negative_start"),
+            ({"decoded_column_positive_weight": False}, TypeError, "positive"),
+            ({"decoded_column_temperature": 0.0}, ValueError, "temperature"),
+            ({"decoded_column_temperature": float("nan")}, ValueError, "temperature"),
         )
-        for overrides, message in invalid_configs:
+        for overrides, error_type, message in invalid_configs:
             with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as temp_dir:
-                with self.assertRaisesRegex(ValueError, message):
+                with self.assertRaisesRegex(error_type, message):
                     self._make_trainer(temp_dir, overrides)
+
+    def test_train_epoch_passes_effective_curriculum_weights_to_loss(self):
+        class TinyDenoiser(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, model_input, _sigmas):
+                return model_input[:, :1] * 0.0 + self.anchor
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trainer = self._make_trainer(
+                temp_dir,
+                {
+                    "epochs": 3,
+                    "decoded_column_curriculum_enabled": True,
+                    "decoded_column_positive_start_weight": 0.03,
+                    "decoded_column_positive_weight": 0.02,
+                    "decoded_column_negative_start_weight": 0.0,
+                    "decoded_column_negative_weight": 0.01,
+                },
+            )
+            trainer.model.unet_3d = TinyDenoiser()
+            target = torch.zeros(1, 1, 1, 1, 1)
+            loss_components = {
+                name: torch.zeros((), requires_grad=True)
+                for name in LDM_LOSS_COMPONENT_NAMES
+            }
+
+            with mock.patch(
+                "diffusion_consistency_radar.scripts.unified_train.compute_ldm_loss_components",
+                return_value=(trainer.model.unet_3d.anchor.square(), loss_components),
+            ) as compute_loss:
+                trainer.train_epoch(1, [(target, target.clone())])
+
+            self.assertEqual(trainer.last_effective_column_weights, (0.03, 0.0))
+            self.assertEqual(compute_loss.call_count, 1)
+            call_kwargs = compute_loss.call_args.kwargs
+            self.assertEqual(call_kwargs["decoded_column_positive_weight"], 0.03)
+            self.assertEqual(call_kwargs["decoded_column_negative_weight"], 0.0)
+
+    def test_metrics_header_and_row_include_effective_column_weights_before_lr(self):
+        positive_name = "effective_column_positive_weight"
+        negative_name = "effective_column_negative_weight"
+        self.assertLess(LDM_METRICS_HEADER.index(positive_name), LDM_METRICS_HEADER.index("lr"))
+        self.assertLess(LDM_METRICS_HEADER.index(negative_name), LDM_METRICS_HEADER.index("lr"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trainer = self._make_trainer(temp_dir)
+            trainer.last_effective_column_weights = (0.025, 0.005)
+            trainer.last_epoch_loss_components = {}
+            trainer.last_epoch_meta_components = {}
+            trainer._log_metrics(
+                2,
+                7,
+                0.5,
+                {
+                    "denoising_latent_loss": 0.4,
+                    "denoising_occupancy_iou": 0.6,
+                },
+                1.25,
+            )
+
+            with open(trainer.csv_file, newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row[positive_name], "0.025000")
+            self.assertEqual(row[negative_name], "0.005000")
+
+    def test_both_checkpoint_payloads_include_epoch_effective_weights(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trainer = self._make_trainer(
+                temp_dir,
+                {
+                    "epochs": 1,
+                    "save_every": 1,
+                    "decoded_column_curriculum_enabled": True,
+                    "decoded_column_positive_start_weight": 0.03,
+                    "decoded_column_positive_weight": 0.02,
+                    "decoded_column_negative_start_weight": 0.0,
+                    "decoded_column_negative_weight": 0.01,
+                },
+            )
+            train_loader = mock.Mock(batch_size=1)
+            train_loader.__len__ = mock.Mock(return_value=1)
+            val_loader = mock.Mock(batch_size=1)
+            val_loader.__len__ = mock.Mock(return_value=1)
+
+            with mock.patch.object(trainer, "train_epoch", return_value=0.5), mock.patch.object(
+                trainer,
+                "validate",
+                return_value={
+                    "denoising_latent_loss": 0.4,
+                    "denoising_occupancy_iou": 0.6,
+                },
+            ), mock.patch.object(
+                trainer, "_log_metrics"
+            ), mock.patch(
+                "diffusion_consistency_radar.scripts.unified_train.atomic_torch_save"
+            ) as save_checkpoint:
+                trainer.train(train_loader, val_loader)
+
+            self.assertEqual(save_checkpoint.call_count, 2)
+            for checkpoint_call in save_checkpoint.call_args_list:
+                loss_config = checkpoint_call.args[0]["ldm_loss_config"]
+                self.assertEqual(loss_config["curriculum_total_epochs"], 1)
+                self.assertEqual(loss_config["effective_column_positive_weight"], 0.03)
+                self.assertEqual(loss_config["effective_column_negative_weight"], 0.0)
 
     def test_prepare_metrics_csv_archives_legacy_resume_header(self):
         with tempfile.TemporaryDirectory() as temp_dir:

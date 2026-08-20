@@ -78,7 +78,8 @@ class VoxelAugmentation:
         self,
         target: torch.Tensor,
         condition: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        observed_mask: Optional[torch.Tensor] = None,
+    ):
         """
         对目标和条件同时应用增强 (保持一致性)
         
@@ -90,18 +91,30 @@ class VoxelAugmentation:
             augmented_target, augmented_condition
         """
         # NOTE: 确保有 batch 维度
+        has_observed_mask = observed_mask is not None
         squeeze_batch = False
+        if observed_mask is not None and target.ndim == 5 and observed_mask.ndim == 4:
+            observed_mask = observed_mask.unsqueeze(0)
         if target.ndim == 4:
             target = target.unsqueeze(0)
             condition = condition.unsqueeze(0)
+            if observed_mask is not None:
+                observed_mask = observed_mask.unsqueeze(0)
             squeeze_batch = True
         
         # NOTE: 1. 几何变换 (同时应用于 target 和 condition)
         if self.enable_flip and random.random() < self.flip_prob:
-            target, condition = self._random_flip(target, condition)
+            flip_dim = -1 if random.random() < 0.5 else -2
+            target, condition = self._random_flip(target, condition, flip_dim)
+            if observed_mask is not None:
+                observed_mask = torch.flip(observed_mask, dims=[flip_dim])
         
         if self.enable_rotate and random.random() < self.rotate_prob:
-            target, condition = self._random_rotate(target, condition)
+            k = random.randint(1, 3)
+            target = torch.rot90(target, k, dims=[-2, -1])
+            condition = torch.rot90(condition, k, dims=[-2, -1])
+            if observed_mask is not None:
+                observed_mask = torch.rot90(observed_mask, k, dims=[-2, -1])
         
         # NOTE: 2. 噪声注入 (只对 condition 应用，模拟雷达噪声)
         if self.enable_noise and random.random() < self.noise_prob:
@@ -122,24 +135,25 @@ class VoxelAugmentation:
         if squeeze_batch:
             target = target.squeeze(0)
             condition = condition.squeeze(0)
+            if observed_mask is not None:
+                observed_mask = observed_mask.squeeze(0)
         
+        if has_observed_mask:
+            return target, condition, observed_mask
         return target, condition
     
     def _random_flip(
         self,
         target: torch.Tensor,
         condition: torch.Tensor,
+        flip_dim: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """随机翻转 (水平/前后)"""
         # NOTE: 随机选择翻转轴
-        if random.random() < 0.5:
-            # NOTE: 水平翻转 (沿 W 轴)
-            target = torch.flip(target, dims=[-1])
-            condition = torch.flip(condition, dims=[-1])
-        else:
-            # NOTE: 前后翻转 (沿 H 轴)
-            target = torch.flip(target, dims=[-2])
-            condition = torch.flip(condition, dims=[-2])
+        if flip_dim is None:
+            flip_dim = -1 if random.random() < 0.5 else -2
+        target = torch.flip(target, dims=[flip_dim])
+        condition = torch.flip(condition, dims=[flip_dim])
         
         return target, condition
     
@@ -164,9 +178,13 @@ class VoxelAugmentation:
         
         # NOTE: 生成噪声
         noise = torch.randn_like(voxel) * self.noise_std
+        # occupancy 是几何存在性，不参与连续特征高斯噪声。
+        noise[:, 0:1] = 0.0
         
         # NOTE: 只在占用区域添加噪声
         voxel = voxel + noise * occupancy_mask
+        # Doppler variance 保持物理非负；空体素因 occupancy mask 仍为零。
+        voxel[:, 3:4] = voxel[:, 3:4].clamp_min(0.0)
         
         return voxel
     
@@ -278,9 +296,12 @@ class CutoutAugmentation:
         self,
         target: torch.Tensor,
         condition: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        observed_mask: Optional[torch.Tensor] = None,
+    ):
         """应用 Cutout"""
         if random.random() > self.prob:
+            if observed_mask is not None:
+                return target, condition, observed_mask
             return target, condition
         
         # NOTE: 只对 condition 应用 cutout (模拟部分遮挡)
@@ -301,6 +322,8 @@ class CutoutAugmentation:
             # NOTE: 遮挡
             condition[:, :, d_start:d_start+cut_d, h_start:h_start+cut_h, w_start:w_start+cut_w] = 0
         
+        if observed_mask is not None:
+            return target, condition, observed_mask
         return target, condition
 
 
@@ -326,14 +349,26 @@ class ComposedAugmentation:
         self,
         target: torch.Tensor,
         condition: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        observed_mask: Optional[torch.Tensor] = None,
+    ):
         """依次应用所有增强"""
         if not self.training:
+            if observed_mask is not None:
+                return target, condition, observed_mask
             return target, condition
         
         for aug in self.augmentations:
-            target, condition = aug(target, condition)
-        
+            if observed_mask is None:
+                target, condition = aug(target, condition)
+            else:
+                target, condition, observed_mask = aug(
+                    target,
+                    condition,
+                    observed_mask,
+                )
+
+        if observed_mask is not None:
+            return target, condition, observed_mask
         return target, condition
 
 

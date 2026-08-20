@@ -71,6 +71,8 @@ python NTU4DRadLM_pre_processing/NTU4DRadLM_pre_processing.py
 
 - 预处理默认会做 Radar -> LiDAR 坐标变换
 - LiDAR 会经过地面滤除
+- 运动补偿默认是 `none`，不会静默使用固定 `50 m/s`；如确有可靠的机体系速度，可显式设置 `VELOCITY_MODE=fixed`，或使用 `VELOCITY_MODE=recorded` 加载 `timestamp,vx,vy,vz` 速度表
+- 速度表必须与 Radar 文件名时间戳使用相同秒单位，默认最近邻时间差不得超过 `0.02s`；速度向量默认在 Radar 坐标系，预处理只用标定旋转转换到最终共享坐标系，不会把平移量加入速度
 - 若标定文件缺失，脚本会直接报错；只有显式设置 `ALLOW_IDENTITY_CALIB=1` 才允许回退单位矩阵
 
 ### 2. 训练
@@ -103,9 +105,21 @@ bash diffusion_consistency_radar/launch/train_unified.sh all
 
 默认输出目录：
 
-- `Result/train_results/vae/`
-- `Result/train_results/ldm/`
-- `Result/train_results/cd/`
+- `Result/train_results/formal_p1_04_full120_86p8_v1/vae/`
+- `Result/train_results/formal_p1_04_full120_86p8_v1/ldm/`
+- `Result/train_results/formal_p1_04_full120_86p8_v1/cd/`
+
+正式入口固定使用：
+
+- 数据：`Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/`
+- Radar normalization：`radar_normalization_garden_32x128x128_full120_86p8_v1.json`
+- Doppler 物理量程：`86.8 m/s`
+
+已有结果目录默认拒绝隐式续训。确认恢复的是同一正式协议后，显式执行：
+
+```bash
+ALLOW_RESUME=1 bash diffusion_consistency_radar/launch/train_unified.sh <vae|ldm|cd|all>
+```
 
 训练配置文件：
 
@@ -126,27 +140,35 @@ CD 推理：
 bash diffusion_consistency_radar/launch/inference_cd.sh
 ```
 
-这两个脚本会按 `data_loading_config.yml` 里的 `data.test` 场景逐文件推理，并输出：
+这两个脚本会先校验正式 VAE/LDM/CD checkpoint 链与 candidate manifest，再按
+`data_loading_config.yml` 里的 `data.test` 场景逐文件推理，并输出：
 
-- 生成点云：`Result/inference_results/<scene>_ldm_eval/` 或 `..._cd_eval/`
-- 指标文件：`inference_metrics.csv`
-- 运行日志：`inference_runtime.log`
+- LDM：`Result/inference_results/<scene>_formal_p1_04_full120_86p8_v1_ldm_deploy/`
+- CD：`Result/inference_results/<scene>_formal_p1_04_full120_86p8_v1_cd_1step_deploy/`
+- 运行协议：`inference_run.json`、`inference_runtime.csv`
+- 预测产物：`*_voxel.npy`、`*_pcl.npy` 和可用的 `*_uncertainty.npy`
 
 如果你想直接调用 Python 入口：
 
 ```bash
 python diffusion_consistency_radar/scripts/inference.py \
-  --vae_ckpt Result/train_results/vae/vae_best.pt \
-  --model_ckpt Result/train_results/ldm/ldm_best.pt \
+  --vae_ckpt Result/train_results/formal_p1_04_full120_86p8_v1/vae/vae_best.pt \
+  --model_ckpt Result/train_results/formal_p1_04_full120_86p8_v1/ldm/ldm_best.pt \
   --model_type ldm \
   --steps 40 \
   --sampler heun \
-  --radar_voxel_dir Data/NTU4DRadLM_Pre/loop3/radar_voxel \
+  --radar_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/loop3/radar_voxel \
+  --require_real_ir \
+  --save_voxel \
   --save_pointcloud \
-  --compare_with_lidar \
-  --raw_livox_dir Data/NTU4DRadLM_Raw/loop3/livox_lidar \
-  --lidar_index_file Data/NTU4DRadLM_Raw/loop3/lidar_index_sequence.txt \
-  --output_dir Result/inference_results/loop3_ldm_eval
+  --save_uncertainty \
+  --output_dir Result/inference_results/loop3_formal_p1_04_full120_86p8_v1_ldm_deploy
+```
+
+正式指标评价与生成解耦，在预测保存完成后执行：
+
+```bash
+bash diffusion_consistency_radar/launch/evaluate_inference.sh ldm
 ```
 
 ### 4. 诊断与对比
@@ -161,10 +183,10 @@ bash diffusion_consistency_radar/launch/diagnose.sh
 
 ```bash
 python diffusion_consistency_radar/scripts/diagnose_generation_quality.py \
-  --radar_voxel_dir Data/NTU4DRadLM_Pre/loop3/radar_voxel \
-  --target_voxel_dir Data/NTU4DRadLM_Pre/loop3/target_voxel \
-  --pred_dir Result/inference_results/loop3_ldm_eval \
-  --output_dir Result/diagnosis_results/loop3_ldm_eval \
+  --radar_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/loop3/radar_voxel \
+  --target_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/loop3/target_voxel \
+  --pred_dir Result/inference_results/loop3_formal_p1_04_full120_86p8_v1_ldm_deploy \
+  --output_dir Result/diagnosis_results/loop3_formal_p1_04_full120_86p8_v1_ldm_deploy \
   --max_files 20 \
   --pred_kind pcl \
   --occ_threshold 0.1
@@ -209,6 +231,13 @@ python diffusion_consistency_radar/scripts/evaluate.py \
 常用命令：
 
 ```bash
+# 先只读预检，不启动训练
+MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae
+
+# 8 GB 笔记本：正式数据协议、分阶段、带温度/显存/时长门禁
+bash test/mini-test/run_formal_mini_8gb.sh vae
+
+# 历史 legacy mini
 bash test/mini-test/train_minimal.sh all
 bash test/mini-test/inference_minimal.sh ldm
 bash test/mini-test/diagnose_minimal.sh
@@ -216,6 +245,7 @@ bash test/mini-test/diagnose_minimal.sh
 
 默认输出位置：
 
+- `test/result/formal_mini_p1_04_8gb_v1/`（8 GB formal mini）
 - `test/mini-test/train_results_mini/`
 - `test/mini-test/inference_results_mini/`
 - `test/mini-test/diagnostics/`
@@ -232,6 +262,8 @@ bash test/mini-test/diagnose_minimal.sh
 6. 需要更快的推理时再考虑 `cd`
 
 如果你只是想验证逻辑是否跑通，推荐直接走 `test/mini-test/`。
+
+8 GB formal mini 保持正式体素数量与 Radar 单位，只减少帧数、epoch 和 batch；它的 `formal_mini_chain_v1` checkpoint 不可替代正式全量训练结果。具体温度门禁和逐阶段命令见 [test/mini-test/README.md](./test/mini-test/README.md)。
 
 ## 已知说明
 

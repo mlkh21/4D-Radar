@@ -32,9 +32,16 @@ import csv
 import logging
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 直接执行本文件时同时暴露仓库根和包目录：前者支持
+# diffusion_consistency_radar.*，后者兼容既有 cm.* / scripts.* 导入。
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PACKAGE_ROOT = os.path.dirname(_SCRIPT_DIR)
+_PROJECT_ROOT = os.path.dirname(_PACKAGE_ROOT)
+for _import_root in (_PACKAGE_ROOT, _PROJECT_ROOT):
+    if _import_root not in sys.path:
+        sys.path.insert(0, _import_root)
 
-from cm.vae_3d import (
+from diffusion_consistency_radar.cm.vae_3d import (
     VAE3D, 
     build_vae_from_checkpoint,
     create_vae_config,
@@ -42,15 +49,79 @@ from cm.vae_3d import (
     create_ultra_lightweight_vae_config,
     create_standard_vae_config,
 )
-from cm.unet_optimized import OptimizedUNetModel, create_lightweight_unet_config
-from cm.dataset_loader import NTU4DRadLM_VoxelDataset
-from cm.karras_diffusion import KarrasDenoiser
-from cm.multimodal_fusion import (
+from diffusion_consistency_radar.cm.unet_optimized import (
+    OptimizedUNetModel,
+    create_lightweight_unet_config,
+)
+from diffusion_consistency_radar.cm.dataset_loader import (
+    NTU4DRadLM_VoxelDataset,
+    collate_voxel_samples,
+)
+from diffusion_consistency_radar.cm.karras_diffusion import KarrasDenoiser
+from diffusion_consistency_radar.cm.multimodal_fusion import (
     CompleteDualModalityPerceptionNet,
     heteroscedastic_gaussian_nll,
     migrate_ir_gate_state_dict,
 )
-from scripts.cd_train_optimized import ConsistencyDistillationTrainer
+from diffusion_consistency_radar.scripts.cd_train_optimized import (
+    ConsistencyDistillationTrainer,
+)
+from diffusion_consistency_radar.checkpoint_chain import (
+    FORMAL_CHECKPOINT_PROTOCOL,
+    resolve_training_checkpoint_protocol,
+    sha256_file,
+)
+from diffusion_consistency_radar.radar_normalization import (
+    LEGACY_RADAR_NORMALIZATION_PROTOCOL,
+    RadarNormalizationError,
+    assert_checkpoint_radar_normalization,
+    assert_same_radar_normalization,
+    load_radar_normalization_artifact,
+    radar_normalization_from_checkpoint,
+    validate_radar_normalization_sha256,
+    validate_radar_normalization_spec,
+)
+
+
+def resolve_training_radar_normalization(
+    data_config,
+    *,
+    target_size,
+    source_pc_range,
+    model_pc_range,
+    allow_legacy_radar_units=False,
+):
+    """在创建 Dataset/训练输出前解析唯一的 Radar 输入量纲协议。"""
+    if not isinstance(data_config, dict):
+        raise RadarNormalizationError("data 配置必须是字典")
+    if type(allow_legacy_radar_units) is not bool:
+        raise RadarNormalizationError("allow_legacy_radar_units 必须是 bool")
+    artifact_path = data_config.get("radar_normalization_path")
+    scale_mps = data_config.get("doppler_scale_mps")
+    path_configured = isinstance(artifact_path, str) and bool(artifact_path.strip())
+    scale_configured = scale_mps not in (None, "")
+    if allow_legacy_radar_units:
+        if path_configured or scale_configured:
+            raise RadarNormalizationError(
+                "legacy Radar 单位与正式 normalization 配置不能同时启用"
+            )
+        return None, ""
+    if not path_configured:
+        raise RadarNormalizationError(
+            "正式训练必须配置 data.radar_normalization_path artifact"
+        )
+    if not scale_configured:
+        raise RadarNormalizationError(
+            "正式训练必须显式配置 data.doppler_scale_mps"
+        )
+    return load_radar_normalization_artifact(
+        artifact_path.strip(),
+        target_size=target_size,
+        source_pc_range=source_pc_range,
+        model_pc_range=model_pc_range,
+        doppler_scale_mps=scale_mps,
+        require_formal=True,
+    )
 
 
 def atomic_torch_save(payload: Any, path: str):
@@ -117,6 +188,15 @@ def has_multimodal_meta(meta: Dict[str, Any]) -> bool:
     return all(torch.is_tensor((meta or {}).get(key)) for key in required)
 
 
+def encode_ldm_training_latents(vae, target, condition, meta_dict):
+    """正式多模态只编码 target；legacy batch 才构造 condition latent。"""
+    z_target = vae.get_latent(target)
+    z_cond = None
+    if not has_multimodal_meta(meta_dict):
+        z_cond = vae.get_latent(condition)
+    return z_target, z_cond
+
+
 def resolve_cd_teacher_checkpoint(args_ldm_ckpt: str, config: "ConfigManager") -> str:
     """Resolve the CD teacher checkpoint from CLI first, then YAML config."""
     return args_ldm_ckpt or config.get('cd.teacher_model_path', '')
@@ -163,12 +243,11 @@ def apply_vae_config_overrides(vae_config: Dict[str, Any], config: "ConfigManage
     return merged
 
 
-def deterministic_split_indices(
+def temporal_block_split_indices(
     dataset_size: int,
     train_split: float = 0.8,
-    split_seed: int = 42,
 ) -> Tuple[List[int], List[int]]:
-    """按固定随机种子划分非空训练集和验证集。"""
+    """按样本时间顺序划分连续的训练前缀和验证后缀。"""
     if dataset_size < 2:
         raise ValueError("训练/验证划分至少需要 2 个样本")
     if not 0.0 < train_split < 1.0:
@@ -179,9 +258,7 @@ def deterministic_split_indices(
             f"train_split={train_split} 导致空划分："
             f"dataset_size={dataset_size}, train_size={train_size}"
         )
-    generator = torch.Generator().manual_seed(int(split_seed))
-    indices = torch.randperm(dataset_size, generator=generator).tolist()
-    return indices[:train_size], indices[train_size:]
+    return list(range(train_size)), list(range(train_size, dataset_size))
 
 
 def seed_training_run(training_seed: int) -> torch.Generator:
@@ -593,6 +670,51 @@ def decoded_ir_frustum_negative_occupancy_loss(
     return negative_loss[negative_mask].mean()
 
 
+def column_curriculum_weights(
+    epoch: int,
+    total_epochs: int,
+    *,
+    enabled: bool,
+    positive_start: float,
+    positive_final: float,
+    negative_start: float,
+    negative_final: float,
+) -> tuple:
+    """计算当前 epoch 的列级正负损失权重。"""
+    if not isinstance(enabled, bool):
+        raise TypeError("enabled 必须是 bool")
+    # bool 是 int 的子类，这里显式排除以避免 True 被当作第 1 轮。
+    if type(epoch) is not int or type(total_epochs) is not int:
+        raise TypeError("epoch 和 total_epochs 必须是整数")
+    if total_epochs < 1 or not 1 <= epoch <= total_epochs:
+        raise ValueError("epoch 必须在 [1,total_epochs] 内")
+
+    raw_weights = {
+        "positive_start": positive_start,
+        "positive_final": positive_final,
+        "negative_start": negative_start,
+        "negative_final": negative_final,
+    }
+    for name, value in raw_weights.items():
+        if isinstance(value, bool):
+            raise TypeError(f"{name} 不能是 bool")
+    weights = {name: float(value) for name, value in raw_weights.items()}
+    for name, value in weights.items():
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} 必须是有限非负数，实际为 {value!r}")
+    if not enabled:
+        return weights["positive_final"], weights["negative_final"]
+
+    progress = (epoch - 1) / max(total_epochs - 1, 1)
+    positive = weights["positive_start"] + progress * (
+        weights["positive_final"] - weights["positive_start"]
+    )
+    negative = weights["negative_start"] + progress * (
+        weights["negative_final"] - weights["negative_start"]
+    )
+    return positive, negative
+
+
 LDM_LOSS_COMPONENT_NAMES = (
     "latent_loss",
     "decoded_occupancy_loss",
@@ -613,15 +735,113 @@ LDM_META_COMPONENT_NAMES = (
     "mock_calib_ratio",
     "ir_frustum_voxel_ratio",
 )
+LDM_VALIDATION_PROTOCOL = "ldm_denoising_validation_v1"
+LDM_VALIDATION_SELECTOR = (
+    "max_val_denoising_occupancy_iou_then_min_val_denoising_latent_loss_v1"
+)
+LDM_VALIDATION_SPLIT = "temporal_block_validation_suffix"
 LDM_METRICS_HEADER = (
     "epoch",
     "step",
     "loss",
     *LDM_LOSS_COMPONENT_NAMES,
     *LDM_META_COMPONENT_NAMES,
+    "effective_column_positive_weight",
+    "effective_column_negative_weight",
+    "val_denoising_latent_loss",
+    "val_denoising_occupancy_iou",
     "lr",
     "time_seconds",
 )
+
+
+def resolve_ldm_validation_config(ldm_config: Dict[str, Any]) -> Dict[str, Any]:
+    """解析固定训练期 denoising 验证协议，拒绝隐式随机配置。"""
+    seed = ldm_config.get("validation_seed", 42)
+    if type(seed) is not int or seed < 0:
+        raise ValueError("ldm.validation_seed 必须是非负整数")
+    numeric = {
+        "sigma": ldm_config.get("validation_sigma", 0.5),
+        "occupancy_threshold": ldm_config.get(
+            "validation_occupancy_threshold",
+            0.5,
+        ),
+    }
+    resolved = {}
+    for name, raw in numeric.items():
+        if isinstance(raw, bool):
+            raise ValueError(f"ldm.validation_{name} 必须是有限数")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"ldm.validation_{name} 必须是有限数") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"ldm.validation_{name} 必须是有限数")
+        resolved[name] = value
+    sigma_min = float(ldm_config.get("sigma_min", 0.002))
+    sigma_max = float(ldm_config.get("sigma_max", 80.0))
+    if not sigma_min <= resolved["sigma"] <= sigma_max:
+        raise ValueError(
+            "ldm.validation_sigma 必须位于训练 sigma 范围内: "
+            f"[{sigma_min},{sigma_max}]"
+        )
+    if not 0.0 < resolved["occupancy_threshold"] < 1.0:
+        raise ValueError("ldm.validation_occupancy_threshold 必须严格位于 (0,1)")
+    return {
+        "protocol": LDM_VALIDATION_PROTOCOL,
+        "split": LDM_VALIDATION_SPLIT,
+        "seed": seed,
+        **resolved,
+    }
+
+
+def _validated_ldm_validation_metrics(
+    metrics: Dict[str, Any],
+) -> Dict[str, float]:
+    """严格验证训练期 LDM validation 指标。"""
+    required = {
+        "denoising_latent_loss",
+        "denoising_occupancy_iou",
+    }
+    if not isinstance(metrics, dict) or set(metrics) != required:
+        raise ValueError(
+            "LDM validation metrics 必须精确包含 "
+            "denoising_latent_loss/denoising_occupancy_iou"
+        )
+    validated = {}
+    for name in sorted(required):
+        raw = metrics[name]
+        if isinstance(raw, bool):
+            raise ValueError(f"LDM validation {name} 必须是有限数")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"LDM validation {name} 必须是有限数") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"LDM validation {name} 必须是有限数")
+        validated[name] = value
+    if validated["denoising_latent_loss"] < 0.0:
+        raise ValueError("LDM validation denoising_latent_loss 必须非负")
+    if not 0.0 <= validated["denoising_occupancy_iou"] <= 1.0:
+        raise ValueError("LDM validation denoising_occupancy_iou 必须位于 [0,1]")
+    return validated
+
+
+def ldm_validation_is_improved(
+    current: Dict[str, Any],
+    best: Dict[str, Any],
+) -> bool:
+    """按 occupancy IoU 优先、latent loss 次优先比较验证状态。"""
+    current_metrics = _validated_ldm_validation_metrics(current)
+    best_metrics = _validated_ldm_validation_metrics(best)
+    current_iou = current_metrics["denoising_occupancy_iou"]
+    best_iou = best_metrics["denoising_occupancy_iou"]
+    if current_iou != best_iou:
+        return current_iou > best_iou
+    return (
+        current_metrics["denoising_latent_loss"]
+        < best_metrics["denoising_latent_loss"]
+    )
 
 
 def archive_legacy_metrics_csv(csv_file: str):
@@ -958,6 +1178,9 @@ class OptimizedVAETrainer:
         self.vae_config_type = vae_config_type or self.vae_config.get(
             "config_type", "custom"
         )
+        self.checkpoint_protocol = resolve_training_checkpoint_protocol(
+            config.get("data.checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+        )
         target_size, source_range, model_range = resolve_data_grid_config(
             config.get("data", {}) or {}
         )
@@ -1145,9 +1368,26 @@ class OptimizedVAETrainer:
             # NOTE: 前向阶段使用 autocast，配合梯度累积降低显存峰值。
             with autocast('cuda', enabled=self.memory_opt.use_amp):
                 recon, (mean, logvar) = self.model(target)
-                loss, recon_loss, kl_loss = self.model.compute_loss(
-                    target, recon, (mean, logvar)
-                )
+                observed_mask = meta_dict.get("occupancy_observed_mask")
+                if torch.is_tensor(observed_mask):
+                    observed_mask = observed_mask.to(
+                        self.device,
+                        non_blocking=True,
+                    )
+                if observed_mask is None:
+                    # 兼容旧模型/旧 batch 的三参数 compute_loss 接口。
+                    loss, recon_loss, kl_loss = self.model.compute_loss(
+                        target,
+                        recon,
+                        (mean, logvar),
+                    )
+                else:
+                    loss, recon_loss, kl_loss = self.model.compute_loss(
+                        target,
+                        recon,
+                        (mean, logvar),
+                        observed_mask=observed_mask,
+                    )
 
             losses = (loss, recon_loss, kl_loss)
             if not all(torch.isfinite(value).all() for value in losses):
@@ -1298,6 +1538,12 @@ class OptimizedVAETrainer:
             "vae_config_type": self.vae_config_type,
             "data_grid_config": dict(self.data_grid_config),
             "occupancy_activation": self.occupancy_activation,
+            "checkpoint_protocol": getattr(
+                self,
+                "checkpoint_protocol",
+                FORMAL_CHECKPOINT_PROTOCOL,
+            ),
+            "stage": "vae",
         }
 
     def _update_best_metrics(self, loss: float, val_iou: float):
@@ -1411,6 +1657,10 @@ class OptimizedLDMTrainer:
         config: ConfigManager,
         memory_opt: MemoryOptimizer,
         resume_path: Optional[str] = None,
+        vae_checkpoint_sha256: str = "",
+        radar_normalization=None,
+        radar_normalization_sha256: str = "",
+        allow_legacy_radar_units: bool = False,
     ):
         self.vae = vae.to(memory_opt.device)
         self.vae.eval()
@@ -1423,6 +1673,24 @@ class OptimizedLDMTrainer:
         
         ldm_config: Dict[str, Any] = config.get('ldm', {}) or {}
         self.ldm_config = ldm_config
+        self.validation_config = resolve_ldm_validation_config(ldm_config)
+        self.validation_selector = LDM_VALIDATION_SELECTOR
+        self.checkpoint_protocol = resolve_training_checkpoint_protocol(
+            config.get("data.checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+        )
+        self.vae_checkpoint_sha256 = str(vae_checkpoint_sha256 or "")
+        curriculum_total_epochs = ldm_config.get('epochs', 200)
+        if type(curriculum_total_epochs) is not int:
+            raise TypeError(
+                "ldm.epochs 必须是严格正整数，"
+                f"实际为 {curriculum_total_epochs!r}"
+            )
+        if curriculum_total_epochs < 1:
+            raise ValueError(
+                "ldm.epochs 必须是严格正整数，"
+                f"实际为 {curriculum_total_epochs!r}"
+            )
+        self.curriculum_total_epochs = curriculum_total_epochs
         self.latent_dim = int(self.vae.latent_dim)
         self.model_config = {
             "latent_dim": self.latent_dim,
@@ -1434,7 +1702,6 @@ class OptimizedLDMTrainer:
             "channel_mult": list(ldm_config.get('channel_mult', [1, 2, 3])),
         }
         self.save_dir = ldm_config.get('save_dir', './Result/train_results/ldm')
-        os.makedirs(self.save_dir, exist_ok=True)
         
         # 创建潜空间去噪骨干，再挂到雷达-红外多模态入口。
         base_unet = OptimizedUNetModel(
@@ -1451,6 +1718,67 @@ class OptimizedLDMTrainer:
         fusion_voxel_shape = tuple(int(v) for v in ldm_config.get('fusion_voxel_shape', [32, 128, 128]))
         fusion_latent_shape = tuple(int(v) for v in ldm_config.get('fusion_latent_shape', fusion_voxel_shape))
         fusion_pc_range = tuple(float(v) for v in ldm_config.get('fusion_pc_range', [0, -20, -6, 120, 20, 10]))
+        self.model_config.update({
+            "fusion_voxel_shape": list(fusion_voxel_shape),
+            "fusion_latent_shape": list(fusion_latent_shape),
+            "fusion_pc_range": list(fusion_pc_range),
+        })
+        source_pc_range = tuple(float(v) for v in (config.get("data", {}) or {}).get(
+            "source_pc_range", [0, -20, -6, 120, 20, 10]
+        ))
+        self.data_grid_config = {
+            "target_size": list(fusion_voxel_shape),
+            "source_pc_range": list(source_pc_range),
+            "model_pc_range": list(fusion_pc_range),
+        }
+        if type(allow_legacy_radar_units) is not bool:
+            raise RadarNormalizationError("allow_legacy_radar_units 必须是 bool")
+        self.allow_legacy_radar_units = allow_legacy_radar_units
+        if radar_normalization is None:
+            if not allow_legacy_radar_units:
+                raise RadarNormalizationError(
+                    "LDM trainer 缺少正式 Radar normalization"
+                )
+            self.radar_normalization = None
+            self.radar_normalization_sha256 = ""
+            self.radar_normalization_protocol = LEGACY_RADAR_NORMALIZATION_PROTOCOL
+        else:
+            if allow_legacy_radar_units:
+                raise RadarNormalizationError(
+                    "LDM Radar normalization 与 legacy 开关不能同时启用"
+                )
+            doppler = (
+                radar_normalization.get("doppler", {})
+                if isinstance(radar_normalization, dict)
+                else {}
+            )
+            self.radar_normalization = validate_radar_normalization_spec(
+                radar_normalization,
+                target_size=fusion_voxel_shape,
+                source_pc_range=source_pc_range,
+                model_pc_range=fusion_pc_range,
+                doppler_scale_mps=doppler.get("scale_mps"),
+                require_formal=True,
+            )
+            self.radar_normalization_sha256 = validate_radar_normalization_sha256(
+                radar_normalization_sha256,
+                context="LDM trainer Radar normalization",
+            )
+            self.radar_normalization_protocol = self.radar_normalization["protocol"]
+        if resume_path and os.path.exists(resume_path):
+            resume_checkpoint = safe_torch_load(resume_path, map_location="cpu")
+            assert_checkpoint_radar_normalization(
+                resume_checkpoint,
+                self.radar_normalization,
+                self.radar_normalization_sha256,
+                target_size=self.data_grid_config["target_size"],
+                source_pc_range=self.data_grid_config["source_pc_range"],
+                model_pc_range=self.data_grid_config["model_pc_range"],
+                allow_legacy_radar_units=self.allow_legacy_radar_units,
+                context="LDM resume preflight",
+            )
+            self._preloaded_resume_checkpoint = resume_checkpoint
+        os.makedirs(self.save_dir, exist_ok=True)
         self.model = CompleteDualModalityPerceptionNet(
             base_unet,
             voxel_shape=fusion_voxel_shape,
@@ -1484,15 +1812,41 @@ class OptimizedLDMTrainer:
         self.decoded_ir_frustum_occupancy_weight = float(ldm_config.get('decoded_ir_frustum_occupancy_weight', 0.0))
         self.decoded_ir_frustum_negative_weight = float(ldm_config.get('decoded_ir_frustum_negative_weight', 0.0))
         self.decoded_ir_frustum_top_weight = float(ldm_config.get('decoded_ir_frustum_top_weight', 0.0))
-        self.decoded_column_positive_weight = float(ldm_config.get('decoded_column_positive_weight', 0.0))
-        self.decoded_column_negative_weight = float(ldm_config.get('decoded_column_negative_weight', 0.0))
+        decoded_column_positive_weight = ldm_config.get('decoded_column_positive_weight', 0.0)
+        decoded_column_negative_weight = ldm_config.get('decoded_column_negative_weight', 0.0)
+        self.decoded_column_curriculum_enabled = ldm_config.get(
+            'decoded_column_curriculum_enabled', False
+        )
+        if type(self.decoded_column_curriculum_enabled) is not bool:
+            raise TypeError(
+                "decoded_column_curriculum_enabled 必须是 bool，"
+                f"实际为 {self.decoded_column_curriculum_enabled!r}"
+            )
+        decoded_column_positive_start_weight = ldm_config.get(
+            'decoded_column_positive_start_weight', decoded_column_positive_weight
+        )
+        decoded_column_negative_start_weight = ldm_config.get(
+            'decoded_column_negative_start_weight', decoded_column_negative_weight
+        )
+        # 统一复用纯函数校验 start/final，避免 bool 被 float 静默转换。
+        column_curriculum_weights(
+            1,
+            1,
+            enabled=True,
+            positive_start=decoded_column_positive_start_weight,
+            positive_final=decoded_column_positive_weight,
+            negative_start=decoded_column_negative_start_weight,
+            negative_final=decoded_column_negative_weight,
+        )
+        self.decoded_column_positive_weight = float(decoded_column_positive_weight)
+        self.decoded_column_negative_weight = float(decoded_column_negative_weight)
+        self.decoded_column_positive_start_weight = float(
+            decoded_column_positive_start_weight
+        )
+        self.decoded_column_negative_start_weight = float(
+            decoded_column_negative_start_weight
+        )
         self.decoded_column_temperature = float(ldm_config.get('decoded_column_temperature', 1.0))
-        for name, weight in (
-            ("decoded_column_positive_weight", self.decoded_column_positive_weight),
-            ("decoded_column_negative_weight", self.decoded_column_negative_weight),
-        ):
-            if not math.isfinite(weight) or weight < 0.0:
-                raise ValueError(f"{name} 必须是有限非负数，实际为 {weight!r}")
         if (
             not math.isfinite(self.decoded_column_temperature)
             or not 1e-3 <= self.decoded_column_temperature <= 100.0
@@ -1516,7 +1870,14 @@ class OptimizedLDMTrainer:
         self.start_epoch = 1
         self.global_step = 0
         self.best_loss = float('inf')
+        self.best_val_iou = float('-inf')
+        self.best_val_loss = float('inf')
+        self.last_validation_metrics = None
         self.is_resumed = False
+        self.last_effective_column_weights = (
+            self.decoded_column_positive_weight,
+            self.decoded_column_negative_weight,
+        )
         
         # 检查是否恢复训练
         if resume_path and os.path.exists(resume_path):
@@ -1531,9 +1892,21 @@ class OptimizedLDMTrainer:
         if self.is_resumed:
             self._resume_from_checkpoint(resume_path)
 
-    def _ldm_loss_config(self) -> Dict[str, float]:
+    def _column_weights_for_epoch(self, epoch: int) -> tuple:
+        """根据配置和 epoch 计算本轮实际列级正负损失权重。"""
+        return column_curriculum_weights(
+            epoch,
+            self.curriculum_total_epochs,
+            enabled=self.decoded_column_curriculum_enabled,
+            positive_start=self.decoded_column_positive_start_weight,
+            positive_final=self.decoded_column_positive_weight,
+            negative_start=self.decoded_column_negative_start_weight,
+            negative_final=self.decoded_column_negative_weight,
+        )
+
+    def _ldm_loss_config(self, epoch: Optional[int] = None) -> Dict[str, Any]:
         """返回当前生效的 LDM 损失权重，便于 checkpoint 自描述。"""
-        return {
+        loss_config = {
             "decoded_loss_weight": self.decoded_loss_weight,
             "decoded_false_positive_weight": self.decoded_false_positive_weight,
             "decoded_mass_weight": self.decoded_mass_weight,
@@ -1545,11 +1918,20 @@ class OptimizedLDMTrainer:
             "decoded_ir_frustum_occupancy_weight": self.decoded_ir_frustum_occupancy_weight,
             "decoded_ir_frustum_negative_weight": self.decoded_ir_frustum_negative_weight,
             "decoded_ir_frustum_top_weight": self.decoded_ir_frustum_top_weight,
+            "decoded_column_curriculum_enabled": self.decoded_column_curriculum_enabled,
+            "curriculum_total_epochs": self.curriculum_total_epochs,
+            "decoded_column_positive_start_weight": self.decoded_column_positive_start_weight,
             "decoded_column_positive_weight": self.decoded_column_positive_weight,
+            "decoded_column_negative_start_weight": self.decoded_column_negative_start_weight,
             "decoded_column_negative_weight": self.decoded_column_negative_weight,
             "decoded_column_temperature": self.decoded_column_temperature,
             "uncertainty_loss_weight": self.uncertainty_loss_weight,
         }
+        if epoch is not None:
+            effective_positive, effective_negative = self._column_weights_for_epoch(epoch)
+            loss_config["effective_column_positive_weight"] = effective_positive
+            loss_config["effective_column_negative_weight"] = effective_negative
+        return loss_config
     
     def _setup_logging(self):
         """设置日志系统"""
@@ -1580,8 +1962,87 @@ class OptimizedLDMTrainer:
     def _resume_from_checkpoint(self, ckpt_path: str):
         """从检查点恢复训练"""
         print(f"Resuming LDM from checkpoint: {ckpt_path}")
-        ckpt = safe_torch_load(ckpt_path, map_location=self.device)
+        ckpt = getattr(self, "_preloaded_resume_checkpoint", None)
+        if ckpt is None:
+            ckpt = safe_torch_load(ckpt_path, map_location=self.device)
+        assert_checkpoint_radar_normalization(
+            ckpt,
+            self.radar_normalization,
+            self.radar_normalization_sha256,
+            target_size=self.data_grid_config["target_size"],
+            source_pc_range=self.data_grid_config["source_pc_range"],
+            model_pc_range=self.data_grid_config["model_pc_range"],
+            allow_legacy_radar_units=self.allow_legacy_radar_units,
+            context="LDM resume checkpoint",
+        )
+        saved_loss_config = ckpt.get('ldm_loss_config', {})
+        curriculum_fields = (
+            "decoded_column_curriculum_enabled",
+            "curriculum_total_epochs",
+            "decoded_column_positive_start_weight",
+            "decoded_column_positive_weight",
+            "decoded_column_negative_start_weight",
+            "decoded_column_negative_weight",
+        )
+        # 只有完整的新协议才做严格比较；字段缺失视为旧 checkpoint，保持兼容。
+        if isinstance(saved_loss_config, dict) and all(
+            field in saved_loss_config for field in curriculum_fields
+        ):
+            current_values = {
+                "decoded_column_curriculum_enabled": self.decoded_column_curriculum_enabled,
+                "curriculum_total_epochs": self.curriculum_total_epochs,
+                "decoded_column_positive_start_weight": self.decoded_column_positive_start_weight,
+                "decoded_column_positive_weight": self.decoded_column_positive_weight,
+                "decoded_column_negative_start_weight": self.decoded_column_negative_start_weight,
+                "decoded_column_negative_weight": self.decoded_column_negative_weight,
+            }
+            saved_enabled = saved_loss_config["decoded_column_curriculum_enabled"]
+            if type(saved_enabled) is not bool or saved_enabled != current_values[
+                "decoded_column_curriculum_enabled"
+            ]:
+                raise ValueError(
+                    "checkpoint decoded_column_curriculum_enabled 与当前配置不一致："
+                    f"checkpoint={saved_enabled!r}, "
+                    f"current={current_values['decoded_column_curriculum_enabled']!r}"
+                )
+
+            saved_total_epochs = saved_loss_config["curriculum_total_epochs"]
+            if (
+                type(saved_total_epochs) is not int
+                or saved_total_epochs < 1
+                or saved_total_epochs != current_values["curriculum_total_epochs"]
+            ):
+                raise ValueError(
+                    "checkpoint curriculum_total_epochs 与当前配置不一致："
+                    f"checkpoint={saved_total_epochs!r}, "
+                    f"current={current_values['curriculum_total_epochs']!r}"
+                )
+
+            # 配置权重以 Python float 写入 checkpoint；绝对容差仅吸收序列化尾差。
+            for field in curriculum_fields[2:]:
+                saved_value = saved_loss_config[field]
+                if isinstance(saved_value, bool):
+                    raise ValueError(f"checkpoint {field} 必须是有限数，实际为 {saved_value!r}")
+                try:
+                    saved_float = float(saved_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"checkpoint {field} 必须是有限数，实际为 {saved_value!r}"
+                    ) from exc
+                current_float = float(current_values[field])
+                if not math.isfinite(saved_float) or not math.isclose(
+                    saved_float,
+                    current_float,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise ValueError(
+                        f"checkpoint {field} 与当前配置不一致："
+                        f"checkpoint={saved_value!r}, current={current_float!r}"
+                    )
         
+        # 验证协议属于恢复前置条件，必须在模型/优化器状态发生任何修改前校验。
+        self._restore_ldm_validation_state(ckpt)
         self.model.load_state_dict(migrate_ir_gate_state_dict(self.model, ckpt['model_state_dict']))
         if 'optimizer_state_dict' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -1589,13 +2050,88 @@ class OptimizedLDMTrainer:
         self.start_epoch = ckpt.get('epoch', 0) + 1
         self.global_step = ckpt.get('step', 0)
         self.best_loss = ckpt.get('best_loss', ckpt.get('loss', float('inf')))
-        
-        print(f"Resumed from epoch {self.start_epoch - 1}, step {self.global_step}, best loss: {self.best_loss:.4f}")
+
+        resume_message = (
+            f"Resumed from epoch {self.start_epoch - 1}, step {self.global_step}, "
+            f"best train loss: {self.best_loss:.4f}"
+        )
+        if self.last_validation_metrics is not None:
+            resume_message += (
+                f", best val IoU: {self.best_val_iou:.4f}, "
+                f"best val latent loss: {self.best_val_loss:.4f}"
+            )
+        print(resume_message)
+
+    def _restore_ldm_validation_state(self, checkpoint: Dict[str, Any]):
+        """恢复并严格校验新协议验证状态；旧 checkpoint 由首轮验证升级。"""
+        saved = checkpoint.get("ldm_validation")
+        if saved is None:
+            return
+        if not isinstance(saved, dict):
+            raise ValueError("checkpoint ldm_validation 必须是字典")
+
+        expected_text = {
+            "protocol": self.validation_config["protocol"],
+            "split": self.validation_config["split"],
+            "selector": self.validation_selector,
+        }
+        for field, expected in expected_text.items():
+            if saved.get(field) != expected:
+                raise ValueError(
+                    f"checkpoint LDM validation {field} 与当前协议不一致："
+                    f"checkpoint={saved.get(field)!r}, current={expected!r}"
+                )
+
+        saved_seed = saved.get("seed")
+        if type(saved_seed) is not int or saved_seed != self.validation_config["seed"]:
+            raise ValueError(
+                "checkpoint LDM validation seed 与当前配置不一致："
+                f"checkpoint={saved_seed!r}, "
+                f"current={self.validation_config['seed']!r}"
+            )
+        for field in ("sigma", "occupancy_threshold"):
+            raw = saved.get(field)
+            if isinstance(raw, bool):
+                raise ValueError(f"checkpoint LDM validation {field} 必须是有限数")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"checkpoint LDM validation {field} 必须是有限数"
+                ) from exc
+            if not math.isfinite(value) or not math.isclose(
+                value,
+                float(self.validation_config[field]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    f"checkpoint LDM validation {field} 与当前配置不一致："
+                    f"checkpoint={raw!r}, current={self.validation_config[field]!r}"
+                )
+
+        current_metrics = _validated_ldm_validation_metrics(saved.get("current"))
+        best_metrics = _validated_ldm_validation_metrics(saved.get("best"))
+        if ldm_validation_is_improved(current_metrics, best_metrics):
+            raise ValueError(
+                "checkpoint LDM validation best 状态劣于 current，无法安全恢复"
+            )
+        self.last_validation_metrics = current_metrics
+        self.best_val_iou = best_metrics["denoising_occupancy_iou"]
+        self.best_val_loss = best_metrics["denoising_latent_loss"]
     
-    def _log_metrics(self, epoch: int, step: int, loss: float, epoch_time: float):
+    def _log_metrics(
+        self,
+        epoch: int,
+        step: int,
+        loss: float,
+        validation_metrics: Dict[str, Any],
+        epoch_time: float,
+    ):
         """记录指标到 CSV 文件"""
         components = getattr(self, "last_epoch_loss_components", {})
         meta_components = getattr(self, "last_epoch_meta_components", {})
+        validation = _validated_ldm_validation_metrics(validation_metrics)
         with open(self.csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -1610,12 +2146,23 @@ class OptimizedLDMTrainer:
                     f'{float(meta_components.get(name, 0.0)):.6f}'
                     for name in LDM_META_COMPONENT_NAMES
                 ],
+                f'{self.last_effective_column_weights[0]:.6f}',
+                f'{self.last_effective_column_weights[1]:.6f}',
+                f'{validation["denoising_latent_loss"]:.6f}',
+                f'{validation["denoising_occupancy_iou"]:.6f}',
                 f'{self.optimizer.param_groups[0]["lr"]:.8f}',
                 f'{epoch_time:.2f}'
             ])
     
     def train_epoch(self, epoch: int, train_loader: DataLoader) -> float:
         """训练一个 epoch"""
+        effective_positive_weight, effective_negative_weight = (
+            self._column_weights_for_epoch(epoch)
+        )
+        self.last_effective_column_weights = (
+            effective_positive_weight,
+            effective_negative_weight,
+        )
         self.model.train()
         total_loss = 0
         total_components = {name: 0.0 for name in LDM_LOSS_COMPONENT_NAMES}
@@ -1637,8 +2184,12 @@ class OptimizedLDMTrainer:
             
             # 编码到潜空间
             with torch.no_grad():
-                z_target = self.vae.get_latent(target)
-                z_cond = self.vae.get_latent(cond)
+                z_target, z_cond = encode_ldm_training_latents(
+                    self.vae,
+                    target,
+                    cond,
+                    meta_dict,
+                )
             
             # NOTE: 按 Karras 噪声范围采样 sigma，覆盖高噪和低噪训练区间。
             batch_size = z_target.shape[0]
@@ -1679,6 +2230,8 @@ class OptimizedLDMTrainer:
                         total_meta["ir_frustum_voxel_ratio"] += float(ir_frustum_mask.float().mean().item())
                 else:
                     # Legacy batches without IR metadata still train the same 16-channel UNet backbone.
+                    if z_cond is None:
+                        raise RuntimeError("legacy LDM batch 缺少 condition latent")
                     model_input = pad_ldm_input_to_sixteen_channels(torch.cat([noised_z, z_cond], dim=1))
                     denoised = self.model.unet_3d(model_input, sigmas)
                     ir_frustum_mask = None
@@ -1702,8 +2255,8 @@ class OptimizedLDMTrainer:
                     ir_frustum_mask=ir_frustum_mask,
                     uncertainty_loss_weight=self.uncertainty_loss_weight,
                     uncertainty=uncertainty,
-                    decoded_column_positive_weight=self.decoded_column_positive_weight,
-                    decoded_column_negative_weight=self.decoded_column_negative_weight,
+                    decoded_column_positive_weight=effective_positive_weight,
+                    decoded_column_negative_weight=effective_negative_weight,
                     decoded_column_temperature=self.decoded_column_temperature,
                 )
                 scaled_loss = loss / self.memory_opt.grad_accum_steps
@@ -1787,9 +2340,187 @@ class OptimizedLDMTrainer:
                 self.last_epoch_meta_components["mock_calib_ratio"],
             )
         return total_loss / len(train_loader)
+
+    @torch.no_grad()
+    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
+        """在独立时间块上用固定噪声计算单步去噪代理指标。"""
+        if len(val_loader) == 0:
+            raise RuntimeError("LDM 验证 DataLoader 为空")
+
+        was_training = self.model.training
+        self.model.eval()
+        latent_squared_error = 0.0
+        latent_element_count = 0
+        occupancy_counts = {
+            "intersection": 0,
+            "union": 0,
+            "target_positive": 0,
+            "predicted_positive": 0,
+        }
+        generator = None
+        try:
+            for batch in val_loader:
+                target, cond, meta_dict = unpack_training_batch(batch)
+                target = target.to(self.device, non_blocking=True)
+                cond = cond.to(self.device, non_blocking=True)
+                meta_dict = move_meta_to_device(meta_dict, self.device)
+                z_target, z_cond = encode_ldm_training_latents(
+                    self.vae,
+                    target,
+                    cond,
+                    meta_dict,
+                )
+
+                if generator is None:
+                    generator = torch.Generator(device=z_target.device)
+                    generator.manual_seed(self.validation_config["seed"])
+                sigmas = torch.full(
+                    (z_target.shape[0],),
+                    self.validation_config["sigma"],
+                    device=z_target.device,
+                    dtype=z_target.dtype,
+                )
+                noise = torch.randn(
+                    z_target.shape,
+                    generator=generator,
+                    device=z_target.device,
+                    dtype=z_target.dtype,
+                )
+                noised_z = z_target + noise * sigmas.view(-1, 1, 1, 1, 1)
+
+                with autocast('cuda', enabled=self.memory_opt.use_amp):
+                    if has_multimodal_meta(meta_dict):
+                        model_out = self.model(
+                            cond,
+                            meta_dict["ir_img"],
+                            meta_dict["r_mat"],
+                            meta_dict["t_vec"],
+                            meta_dict["k_mat"],
+                            sigmas,
+                            noised_latent=noised_z,
+                            odom_cov_trace=meta_dict.get("odom_cov_trace"),
+                            is_mock_ir=meta_dict.get("is_mock_ir"),
+                            is_mock_calib=meta_dict.get("is_mock_calib"),
+                            return_uncertainty=False,
+                        )
+                        denoised = model_out[0] if isinstance(model_out, tuple) else model_out
+                    else:
+                        if z_cond is None:
+                            raise RuntimeError("legacy LDM validation batch 缺少 condition latent")
+                        model_input = pad_ldm_input_to_sixteen_channels(
+                            torch.cat([noised_z, z_cond], dim=1)
+                        )
+                        denoised = self.model.unet_3d(model_input, sigmas)
+
+                    decoded = self.vae.decode(denoised)
+
+                latent_squared_error += float(
+                    torch.square(denoised.float() - z_target.float()).sum().item()
+                )
+                latent_element_count += z_target.numel()
+                decoded_occupancy = decoded[:, 0:1]
+                if self.occupancy_activation == "sigmoid":
+                    decoded_occupancy = torch.sigmoid(decoded_occupancy)
+                batch_counts = micro_occupancy_metrics(
+                    decoded_occupancy,
+                    target[:, 0:1],
+                    threshold=self.validation_config["occupancy_threshold"],
+                )
+                for name, value in batch_counts.items():
+                    occupancy_counts[name] += value
+        finally:
+            self.model.train(was_training)
+
+        if latent_element_count == 0:
+            raise RuntimeError("LDM 验证集没有可计算的 latent 元素")
+        return _validated_ldm_validation_metrics({
+            "denoising_latent_loss": (
+                latent_squared_error / latent_element_count
+            ),
+            "denoising_occupancy_iou": (
+                occupancy_counts["intersection"]
+                / max(occupancy_counts["union"], 1)
+            ),
+        })
+
+    def _update_best_validation(self, metrics: Dict[str, Any]) -> bool:
+        """记录当前验证结果，并返回其是否刷新验证最优。"""
+        current = _validated_ldm_validation_metrics(metrics)
+        if self.best_val_iou == float('-inf'):
+            improved = True
+        else:
+            improved = ldm_validation_is_improved(
+                current,
+                {
+                    "denoising_latent_loss": self.best_val_loss,
+                    "denoising_occupancy_iou": self.best_val_iou,
+                },
+            )
+        self.last_validation_metrics = current
+        if improved:
+            self.best_val_loss = current["denoising_latent_loss"]
+            self.best_val_iou = current["denoising_occupancy_iou"]
+        return improved
+
+    def _checkpoint_payload(self, epoch: int, loss: float, best_loss: float) -> Dict[str, Any]:
+        """构造带完整网格和父 VAE hash 的正式 LDM checkpoint。"""
+        if self.radar_normalization is not None and self.last_validation_metrics is None:
+            raise RuntimeError("正式 LDM checkpoint 保存前必须完成独立验证")
+        payload = {
+            "epoch": epoch,
+            "step": self.global_step,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "loss": loss,
+            "best_loss": best_loss,
+            "best_train_loss": best_loss,
+            "latent_dim": self.latent_dim,
+            "model_config": dict(self.model_config),
+            "ldm_loss_config": self._ldm_loss_config(epoch=epoch),
+            "checkpoint_protocol": (
+                getattr(
+                    self,
+                    "checkpoint_protocol",
+                    FORMAL_CHECKPOINT_PROTOCOL,
+                )
+                if self.radar_normalization is not None
+                else "legacy_ldm_v0"
+            ),
+            "stage": "ldm",
+            "data_grid_config": dict(self.data_grid_config),
+            "vae_checkpoint_sha256": self.vae_checkpoint_sha256,
+            "model_family": "multimodal",
+        }
+        if self.last_validation_metrics is not None:
+            payload["ldm_validation"] = {
+                **dict(self.validation_config),
+                "selector": self.validation_selector,
+                "current": _validated_ldm_validation_metrics(
+                    self.last_validation_metrics
+                ),
+                "best": {
+                    "denoising_latent_loss": float(self.best_val_loss),
+                    "denoising_occupancy_iou": float(self.best_val_iou),
+                },
+            }
+        if self.radar_normalization is not None:
+            payload["radar_normalization"] = dict(self.radar_normalization)
+            payload["radar_normalization_sha256"] = self.radar_normalization_sha256
+        return payload
     
-    def train(self, train_loader: DataLoader):
-        """完整训练流程"""
+    def train(self, train_loader: DataLoader, val_loader: DataLoader):
+        """使用独立训练/验证 DataLoader 完成 LDM 训练。"""
+        if len(train_loader) == 0:
+            raise RuntimeError("LDM 训练 DataLoader 为空")
+        if len(val_loader) == 0:
+            raise RuntimeError("LDM 验证 DataLoader 为空")
+        if train_loader is val_loader:
+            raise ValueError("LDM 训练与验证不能复用同一个 DataLoader")
+        train_dataset = getattr(train_loader, "dataset", None)
+        val_dataset = getattr(val_loader, "dataset", None)
+        if train_dataset is not None and train_dataset is val_dataset:
+            raise ValueError("LDM 训练与验证不能复用同一个 Dataset")
+
         epochs = self.ldm_config.get('epochs', 200)
         save_every = self.ldm_config.get('save_every', 5000)
         
@@ -1800,6 +2531,9 @@ class OptimizedLDMTrainer:
         msg += f"Starting LDM Training\n"
         msg += f"  Total epochs: {epochs}\n"
         msg += f"  Batches per epoch: {len(train_loader)}\n"
+        msg += f"  Validation batches per epoch: {len(val_loader)}\n"
+        msg += f"  Validation protocol: {self.validation_config['protocol']}\n"
+        msg += f"  Best selector: {self.validation_selector}\n"
         msg += f"  Estimated total steps: {estimated_total_steps:,}\n"
         msg += f"  Start epoch: {self.start_epoch}\n"
         msg += f"  Batch size: {train_loader.batch_size}\n"
@@ -1817,50 +2551,55 @@ class OptimizedLDMTrainer:
         for epoch in range(self.start_epoch, epochs + 1):
             epoch_start = time.time()
             loss = self.train_epoch(epoch, train_loader)
-            epoch_time = time.time() - epoch_start
             self.global_step += len(train_loader)
+            validation_metrics = self.validate(val_loader)
+            validation_improved = self._update_best_validation(validation_metrics)
+            self.best_loss = min(self.best_loss, loss)
+            epoch_time = time.time() - epoch_start
             
             # 记录到 CSV
-            self._log_metrics(epoch, self.global_step, loss, epoch_time)
+            self._log_metrics(
+                epoch,
+                self.global_step,
+                loss,
+                validation_metrics,
+                epoch_time,
+            )
             
-            summary = f"\n[Epoch {epoch}/{epochs}] Loss: {loss:.4f} | Step: {self.global_step} | Time: {epoch_time:.1f}s"
+            summary = (
+                f"\n[Epoch {epoch}/{epochs}] Train loss: {loss:.4f} | "
+                f"Val latent loss: "
+                f"{validation_metrics['denoising_latent_loss']:.4f} | "
+                f"Val occupancy IoU: "
+                f"{validation_metrics['denoising_occupancy_iou']:.4f} | "
+                f"Step: {self.global_step} | Time: {epoch_time:.1f}s"
+            )
             print(summary)
             self.logger.info(summary)
             self.memory_opt.print_stats(prefix="  ")
             
-            # 保存最佳模型
-            if loss < self.best_loss:
-                self.best_loss = loss
+            # best 只由独立验证集决定，训练损失仅保留为审计字段。
+            if validation_improved:
                 best_ckpt = os.path.join(self.save_dir, "ldm_best.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'step': self.global_step,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'loss': loss,
-                    'best_loss': self.best_loss,
-                    'latent_dim': self.latent_dim,
-                    'model_config': dict(self.model_config),
-                    'ldm_loss_config': self._ldm_loss_config(),
-                }, best_ckpt)
-                msg = f"  ✓ Saved best model (loss: {loss:.4f})"
+                atomic_torch_save(
+                    self._checkpoint_payload(epoch, loss, self.best_loss),
+                    best_ckpt,
+                )
+                msg = (
+                    "  ✓ Saved best validation model "
+                    f"(IoU: {self.best_val_iou:.4f}, "
+                    f"latent loss: {self.best_val_loss:.4f})"
+                )
                 print(msg)
                 self.logger.info(msg)
             
             # 定期按epoch保存
             if epoch % save_every == 0:
                 ckpt_path = os.path.join(self.save_dir, f"ldm_epoch{epoch:04d}.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'step': self.global_step,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'loss': loss,
-                    'best_loss': self.best_loss,
-                    'latent_dim': self.latent_dim,
-                    'model_config': dict(self.model_config),
-                    'ldm_loss_config': self._ldm_loss_config(),
-                }, ckpt_path)
+                atomic_torch_save(
+                    self._checkpoint_payload(epoch, loss, self.best_loss),
+                    ckpt_path,
+                )
                 msg = f"  ✓ Saved checkpoint: {ckpt_path}"
                 print(msg)
                 self.logger.info(msg)
@@ -1868,7 +2607,9 @@ class OptimizedLDMTrainer:
         total_time = time.time() - start_time
         final_msg = "\n" + "=" * 70 + "\n"
         final_msg += f"Training completed in {total_time/3600:.2f} hours\n"
-        final_msg += f"Best loss: {self.best_loss:.4f}\n"
+        final_msg += f"Best train loss: {self.best_loss:.4f}\n"
+        final_msg += f"Best validation occupancy IoU: {self.best_val_iou:.4f}\n"
+        final_msg += f"Best validation latent loss: {self.best_val_loss:.4f}\n"
         final_msg += "=" * 70
         print(final_msg)
         self.logger.info(final_msg)
@@ -1887,6 +2628,11 @@ def main():
                         help="LDM checkpoint path (for CD training)")
     parser.add_argument("--resume", type=str, default="",
                         help="Resume training from checkpoint")
+    parser.add_argument(
+        "--allow_legacy_radar_units",
+        action="store_true",
+        help="仅供 mini-test/旧诊断显式保留未归一化 Radar；正式训练禁止使用",
+    )
     
     args = parser.parse_args()
     
@@ -1900,6 +2646,15 @@ def main():
     # 创建数据加载器
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
     align_ldm_grid_config(config, target_size, model_pc_range)
+    radar_normalization, radar_normalization_sha256 = (
+        resolve_training_radar_normalization(
+            data_config,
+            target_size=target_size,
+            source_pc_range=source_pc_range,
+            model_pc_range=model_pc_range,
+            allow_legacy_radar_units=args.allow_legacy_radar_units,
+        )
+    )
     train_dataset_base = NTU4DRadLM_VoxelDataset(
         root_dir=data_config.get('dataset_dir'),
         split='train',
@@ -1907,6 +2662,9 @@ def main():
         target_size=target_size,
         source_pc_range=source_pc_range,
         model_pc_range=model_pc_range,
+        radar_normalization=radar_normalization,
+        radar_normalization_sha256=radar_normalization_sha256,
+        allow_legacy_radar_units=args.allow_legacy_radar_units,
     )
     val_dataset_base = NTU4DRadLM_VoxelDataset(
         root_dir=data_config.get('dataset_dir'),
@@ -1915,13 +2673,15 @@ def main():
         target_size=target_size,
         source_pc_range=source_pc_range,
         model_pc_range=model_pc_range,
+        radar_normalization=radar_normalization,
+        radar_normalization_sha256=radar_normalization_sha256,
+        allow_legacy_radar_units=args.allow_legacy_radar_units,
     )
     if len(train_dataset_base) != len(val_dataset_base):
         raise RuntimeError("训练/验证 dataset 样本索引不一致，无法安全划分")
-    train_indices, val_indices = deterministic_split_indices(
+    train_indices, val_indices = temporal_block_split_indices(
         len(train_dataset_base),
         train_split=float(data_config.get("train_split", 0.8)),
-        split_seed=int(data_config.get("split_seed", 42)),
     )
     train_dataset = Subset(train_dataset_base, train_indices)
     val_dataset = Subset(val_dataset_base, val_indices)
@@ -1932,6 +2692,7 @@ def main():
         num_workers=data_config.get('num_workers', 4),
         pin_memory=False,
         generator=train_loader_generator,
+        collate_fn=collate_voxel_samples,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -1939,6 +2700,7 @@ def main():
         shuffle=False,
         num_workers=data_config.get('num_workers', 4),
         pin_memory=False,
+        collate_fn=collate_voxel_samples,
     )
     
     # VAE 训练
@@ -1977,8 +2739,17 @@ def main():
             ckpt, fallback_config_type=vae_type
         )
         
-        trainer = OptimizedLDMTrainer(vae, config, memory_opt, resume_path=args.resume)
-        trainer.train(train_loader)
+        trainer = OptimizedLDMTrainer(
+            vae,
+            config,
+            memory_opt,
+            resume_path=args.resume,
+            vae_checkpoint_sha256=sha256_file(args.vae_ckpt),
+            radar_normalization=radar_normalization,
+            radar_normalization_sha256=radar_normalization_sha256,
+            allow_legacy_radar_units=args.allow_legacy_radar_units,
+        )
+        trainer.train(train_loader, val_loader)
 
     # CD 训练
     elif args.mode == "cd":
@@ -2005,6 +2776,19 @@ def main():
                 'save_dir': cd_cfg.get('save_dir', './Result/train_results/cd'),
                 'resume_path': args.resume or None,
                 'ldm': config.get('ldm', {}) or {},
+                'data_grid_config': {
+                    'target_size': list(target_size),
+                    'source_pc_range': list(source_pc_range),
+                    'model_pc_range': list(model_pc_range),
+                },
+                'vae_checkpoint_sha256': sha256_file(args.vae_ckpt),
+                'ldm_checkpoint_sha256': sha256_file(ldm_ckpt),
+                'radar_normalization': radar_normalization,
+                'radar_normalization_sha256': radar_normalization_sha256,
+                'allow_legacy_radar_units': args.allow_legacy_radar_units,
+                'checkpoint_protocol': data_config.get(
+                    'checkpoint_protocol', FORMAL_CHECKPOINT_PROTOCOL
+                ),
             },
         )
         trainer.train(
