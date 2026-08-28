@@ -1720,3 +1720,128 @@ test/unit/test_interactive_inference_compare.py` passed.
 - 完成文档更新，给出预检、VAE/LDM/CD 分阶段运行、阶段间冷却、1 帧推理烟测和失败现场保留方法。
 - 最终真实预检通过：RTX 4070 Laptop GPU 8188 MiB、空闲 7186 MiB、37°C，未启动训练且未创建预检输出目录。
 - 聚焦验证通过：mini 协议 11、mini 配置/安全 103、checkpoint chain 10、VAE checkpoint 23，CD 入口测试通过；shell 语法和 Python 编译通过。没有删除或覆盖数据、checkpoint、训练日志和实验结果。
+
+## 2026-08-21 外部审查第一批修复完成
+
+- 实施 0--2 已完成：formal checkpoint/data v2、manifest profile、显式场景/标定、真实 IR 门禁、LiDAR 投影 frame 和 signed 时间补偿均已接线。
+- 代码审查补齐两项接口缺口：训练 preflight 交叉检查 manifest 内 target policy/Radar--IR sync/calibration provenance；推理进程交叉绑定 VAE/LDM/CD data identity 与当前 deployment manifest/calibration。
+- 正式训练不再创建 `.tmp_train_dataset`，正式预处理/训练/推理默认路径统一改为 `formal_v2_range_pending`；缺少范围决定、observed/split/data artifact 时明确失败，不会误用 v1 candidate 或结果根。
+- 已输出 `test/result/comparison/far_range_supervision_audit_v2/far_range_audit.json` 和逐帧 CSV。v1 宽口径结果保留不覆盖，但后续决策只使用限制完整 XYZ 体素盒的 v2。
+- v2 关键结果：garden 4013 帧中 3934 帧存在 80--120 m LiDAR occupied，总计 365069；当前 target 远距为 0，保留率 0；远距 raw/near raw 为 0.404%，远距/近距 occupied 为 1.488%。
+- 当前推荐 0--80 m formal v2，保持张量 `32×128×128`，把 80--120 m 留给地图 unknown；等待用户确认后才实现 observed/split/normalization 和 smoke。
+- 最终逐文件轻量回归通过：checkpoint 13、VAE 24、Dataset 15、manifest 12、thermal 6、motion 9、multimodal inference 33、formal inference 11、normalization 12、far audit 4，CD 两份直接接口通过；相关 Python 编译、6 份 shell 语法和 `git diff --check` 通过。
+- 完整 airborne 多模态测试中的既有完整 3D CPU forward 两次超过 90 秒无输出后仅终止本轮测试进程；直接相关几何 5 项通过，因此不把完整文件报告为通过。
+- 未运行数据重建、mini/full training、GPU 推理或正式评价；未删除、覆盖、移动数据、checkpoint、日志和实验结果。
+
+## 2026-08-21 formal v2 0--80 m 分支完成
+
+- 完成持久 observed mask、五模态 training manifest、基于真实 Radar 时间的 split/purge、train-only normalization 和可重建 formal data protocol。
+- 完成正式配置/launcher 的 0--80 m fresh v2 路径切换；旧 full120 路径未删除或覆盖，正式训练仍因全量新 artifact 尚不存在而 fail-closed。
+- 完成 evidence 0--80 m / map 0--120 m 双范围接口，新增远距地图单元保持 unknown 的反例测试，mapping 37/37 通过。
+- 完成 garden 4 帧 fresh smoke：五模态 manifest `frame_count=4`，正式 Dataset 加载 4 个样本，真实 IR/标定和 persisted observed 均通过。
+- 聚焦回归通过：observed 4、temporal/data protocol 4、manifest 12、Dataset 15、normalization builder 4、normalization protocol 12、mapping 37、formal inference 11、mini launcher 11、VAE checkpoint 24、checkpoint chain 13，以及 CD 两组入口测试；相关 Python/Shell 静态检查通过。
+- 代码审查补齐独立 CD 与 unified 的 formal 数据门禁不对称；未发现正式 launcher 残留 `range_pending`、旧 full120 数据根或 `.tmp_train_dataset`。
+- 尚未执行全量 v2 重建、8 GB mini、正式训练、GPU 推理或正式评价；deployment-profile 数据视图生产是下一项明确工作。
+
+## 2026-08-21 严格 deployment-profile 生成链完成
+
+- 新增 `deployment_view.py` 和 `build_deployment_view.py`，实现 fresh 输出、training v2 → deployment v3、根/场景双收据、hardlink/copy 和自包含父身份验证。
+- manifest 正式 deployment 入口只接受 schema v3；旧 v2 deployment 仅可作为非正式历史诊断，不能通过正式推理门禁。
+- 三个正式推理 launcher 已改为完整 deployment dataset validator；推理 Python 身份门禁同步接入父 manifest/receipt/current calibration/checkpoint 交叉校验。
+- `preprocess-v2.sh` 已扩展为 8 步，最后从 loop3 training root 生成与 launcher 路径一致的 deployment root。
+- 第一次 4 帧 smoke 因错误假设同步 CSV 位于 Raw 根而在输出创建前失败；实查后移除 Raw 隐形依赖，改为读取并复制 training scene 的 `radar_ir_sync.csv`，最终 v2 smoke 通过。
+- 最终回归 82 项通过：deployment 6、manifest 12、formal inference 11、多模态 inference 33、mini launcher 11、motion 9；相关 Python 编译、四份 shell 语法和 `git diff --check` 全部成功。
+- 未运行全量预处理、训练或 GPU 推理；正式 deployment root 仍需等待全量 0--80 m training 数据生成后由第 8 步发布。
+
+## 2026-08-26 Deployment observed/frame/risk 运行时安全链完成
+
+- 新增轻量 `geometry_protocol.py`，统一严格 R/T 外参解析，使地图 CLI `--help` 无需导入 Torch/OpenMPI。
+- 正式 inference 自动发布逐帧 Radar endpoint-ray observed mask 及内容收据，增加遮挡保护、LiDAR frame 声明、fresh 目录和原子文件写入。
+- formal streaming map 已接入 run/mask/pose/LiDAR→body 四项门禁、`T_local_body@T_body_voxel` 坐标组合、三态风险和动态安全距离；未绑定 frame/provenance 的可选 evidence 在 formal 模式失败关闭。
+- 真实 garden 4 帧只读 smoke 通过：endpoint `983/964/952/994`，observed `11727/11263/11208/11384`，所有 endpoint 都被 mask 覆盖；Radar→LiDAR SHA-256 为 `e50426da...be08d`。
+- 最终聚焦回归 103 项通过：multimodal inference 36、probabilistic mapping 45、formal inference 11、mini launcher 11。相关 Python 编译、streaming CLI `--help`、三份 inference shell 语法和 `git diff --check` 全部通过。
+- 未运行训练、模型前向、GPU 推理、全量数据生成或正式地图回放；未删除或覆盖数据、checkpoint、日志和实验结果。
+- 已知外部依赖：仓库暂无可信 LiDAR→body 标定和真实 body→local pose 文件，因此 formal map 实数据运行保持 fail-closed。
+
+## 2026-08-26 Mapping pose candidate 诊断启动
+
+- 用户授权新增独立候选生成/审计脚本，不改 formal 标定目录、deployment receipt 或地图入口。
+- 新增 3 项合成 RED：外参组合+双 pose-frame 假设 SLERP、超界/gap 无外推、非空/符号链接输出拒绝。首次运行因 `build_mapping_pose_candidates.py` 尚不存在而在收集阶段失败，符合预期且无输出副作用。
+
+## 2026-08-26 Mapping pose candidate 诊断完成
+
+- 已实现独立 alignment 诊断脚本和 4 项合成测试；新增第 4 项锁定正式外参/pose loader 必须拒绝诊断候选，RED 复现旧入口接受候选，GREEN 后 4/4 通过。
+- 已生成 fresh 结果 `test/result/comparison/alignment_check/mapping_pose_contract_loop3_candidate_v1`：6432 帧中覆盖 6162 帧，4 帧早于 GT，266 帧因相邻 GT gap 超过 0.2 s 保守拒绝。
+- 两套候选 CSV 的行数、时间递增、四元数归一化、`formal=false` 标记和输出哈希均通过只读自检；未修改 Data/config、deployment receipt、数据集、checkpoint、日志或旧结果。
+- 最终验证通过候选协议 4/4、概率地图 45/45，相关 4 个 Python 文件编译、诊断 CLI `--help` 与 `git diff --check` 均成功；未执行模型前向、训练或 GPU 任务。
+
+## 2026-08-26 Mapping frame 语义确认启动
+
+- 用户授权继续确认 Radar→IMU 方向和 GT pose frame；本阶段优先只读查找原始定义，缺失时才新增独立多窗口 LiDAR 反证诊断。
+- formal 硬门禁保持不变：指标胜出不能替代 TF、导出代码、标定报告或 CAD/实测轴定义，所有新结果继续标记 `formal=false`。
+
+## 2026-08-26 Mapping frame 语义确认与多窗口反证完成
+
+- 原始 bag 只读审计未找到 GT Odometry/static TF；官方 NTU4DRadLM 命名约定支持 `calib_radar_to_imu.txt` 为 Radar→VectorNav IMU，不应取逆，但 VectorNav IMU→airborne body 轴约定仍缺权威证据。
+- 新增 `evaluate_mapping_pose_overlap.py` 与 4 项合成测试，验证 candidate/sync/manifest/所选 voxel hash、`T_local_body@T_body_lidar` 组合、fresh 输出及 `formal=false` 不可辨识边界。
+- 代码审查发现并修复 v1 pose 使用 Radar timestamp、LiDAR-aligned voxel 使用 LiDAR timestamp 的接口不匹配；candidate v2 显式读取并封存 6432 行 Radar--LiDAR sync snapshot。
+- loop3 LiDAR-time v2 覆盖 6165/6432，1.0 s 高转角窗口从 1244 eligible pair 均匀取 48 对；GT-as-LiDAR 48/48 残差更低，pair-median NN 中位数为 `0.4123 m`，GT-as-IMU 为 `2.3012 m`。
+- 临时敏感性检查中 0.5 s 为 32/32、2.0 s 为 30/32 支持同一汇总结论。所有结果仍为 diagnostic；没有修改 formal 标定、数据、checkpoint、日志或模型，也未运行训练/GPU。
+- 最终回归通过 candidate 6、overlap 5、概率地图 45，共 56 项；相关 Python 编译、两份 CLI `--help` 与 `git diff --check` 全部成功。地图回归首次被沙箱 OpenMPI socket 限制中止，随后按既有批准在沙箱外原样 45/45 通过。
+
+## 2026-08-27 经验 LiDAR pose 离线地图合同完成
+
+- 新增 `empirical_pose_contract.py` 与独立 builder，生成自包含直接 LiDAR→local 合同；真实结果位于 `test/result/comparison/alignment_check/empirical_lidar_pose_loop3_v1`，6432 available、6165 selected、267 uncovered。
+- receipt SHA-256 为 `13977fe498acca71c64a7d2deec44467b84d327d0ae3e5b5bd659325628cb432`，直接 pose CSV SHA-256 为 `46719ffc6f94a4b55f56c0b5069cce18c3bda328850f5dde4f91e13d88917d46`；运行时只读复核通过。
+- `streaming_map_update.py` 增加离线经验模式，和 airborne formal 模式互斥；地图核心支持直接 `T_local_voxel`，metadata 明确 `airborne_formal=false`、`avoidance_formal=false`、LiDAR 查询原点与 pose coverage。
+- 代码审查补齐 prediction voxel provenance 隐形依赖：inference 发布逐帧内容收据，strict map 对实际消费文件执行 hash/shape/dtype/frame 预检；旧无收据推理结果保留但失败关闭。
+- 共享协议重构后静态编译通过；推理接口 37/37、概率地图 46/46、经验姿态 6/6 全部通过。没有运行训练、模型 forward、GPU 推理、全量预处理或正式地图回放，也未删除或覆盖历史数据与结果。
+
+## 2026-08-27 Radar point-count / Doppler-validity 数据合同完成
+
+- 新增共享 Radar statistics 严格存储/加载协议，预处理对每个 occupied voxel 统计原始点数与有限 Doppler 样本数，和四通道 Radar 一起写入稀疏 NPZ。
+- formal Dataset/统一训练/CD 入口要求该协议；审计摘要保留在 metadata，但明确对应增强前持久化体素且不进入模型。
+- 正式 launcher 支持 `CUDA_DEVICES` 和 `PREFLIGHT_ONLY=1`，预检遍历 manifest 中全部 Radar NPZ 并重建 formal data protocol；修复了默认 `0,1` 的单卡接口不匹配。
+- 4 帧 garden fresh CPU smoke 已通过 manifest、严格 Dataset、真实 IR/标定、persisted observed 与统计加载；Radar tensor 仍为 `[4,32,128,128]`。
+- RED 分别复现 launcher 缺单卡/预检接口和 metadata 缺引用边界；GREEN 后 launcher 协议 11/11、Radar statistics 5/5 通过。后者首次在沙箱内受 Open MPI socket 禁止中断，沙箱外同一 Conda Python 重跑通过。
+- 最终聚焦回归另通过 Dataset metadata 15/15、manifest 12/12、temporal/formal data 4/4、VAE checkpoint 24/24，以及 CD 两份直接接口脚本；相关 Python 编译、两份 shell 语法和 `git diff --check` 通过。
+- 未运行全量预处理、模型 forward、GPU 或训练；未写正式训练配置，未删除或覆盖任何数据、checkpoint、日志和结果。下一步是全量 `preprocess-v2.sh`、记录 artifact SHA、服务器只读预检和正式 VAE。
+
+## 2026-08-27 Formal v2 8 GB mini 训练入口完成
+
+- 将 `run_formal_mini_8gb.sh` 和 formal `train_minimal.sh` 切换到当前 0--80 m v2 数据、split、data protocol、normalization 与 `formal_mini_chain_v2`，默认 8/4 帧、单阶段 1 epoch。
+- checkpoint/data protocol 新增严格 mini selection 收据；统一训练和独立 CD 均按正式 split 限制实际 Dataset frame IDs，full/mini、不同样本数之间不能隐式续训或串链。
+- 补齐 formal mini deployment smoke：只读取 deployment Radar/IR 与当前标定，不读取 target/LiDAR 真值；mini 权重需显式授权，运行 metadata 不冒充正式部署协议。
+- 修复正式 LDM/CD launcher 的未定义 scene 目录变量，并修正 formal mini 日志中误导性的 legacy sample 数显示。
+- 真实 GPU/data preflight 通过且未创建输出；最终回归通过 temporal 5/5、checkpoint 14/14、VAE 26/26、multimodal inference 38/38、mini config/safety 103/103、mini shell/protocol 13/13 及两份 CD 直接接口套件，相关 shell/Python 静态检查和 `git diff --check` 通过。
+- 未启动实际 VAE/LDM/CD 训练或模型推理，未删除、覆盖或移动数据、checkpoint、日志及历史结果。
+
+## 2026-08-27 VAE smoke 验收与 short profile
+
+- 用户已完成默认 1 epoch VAE smoke；只读验收通过 checkpoint 协议、8/4 数据选择、0--80 m 网格、有限指标和错误日志检查，原结果继续保留在 `test/result/formal_mini_v2_80m_8gb_v1/`。
+- 已在 `test/result/INDEX.md` 登记为“已验证、非推荐”的工程 smoke；没有为尚未运行的 short profile 创建结果记录。
+- RED/GREEN 新增 `short_train`：只允许 VAE，固定 3 epoch、fresh 独立结果根和更严格的 60/75°C 温度门禁；未知 profile、多余参数、非 VAE short 和放宽温度均在训练启动前拒绝。
+- 完整轻量回归通过：mini shell/protocol 16/16、mini config/safety 103/103，以及 shell 语法、Python 编译和 `git diff --check`。
+- 真实 short 无训练 preflight 在 RTX 4070 Laptop 上通过：8188 MiB、空闲 6967 MiB、42°C；artifact 与 train/validation=8/4 协议校验通过，未创建 short 结果根，原 smoke checkpoint SHA-256 保持 `1ae08bf8...c61f50`。未自动启动 short training。
+- 用户已完成 fresh 3 epoch short VAE；验收确认 3 个 epoch/checkpoint 完整、loss 与 validation IoU 持续改善、协议和模型 state 匹配，错误扫描无 OOM/NaN/异常，训练后 GPU 41°C。
+- 已将 short VAE 登记为“已验证、非推荐”的工程结果；下一步仅允许在同一 short 结果根先执行 1 epoch LDM 的无训练 preflight，不把 mini 指标当作质量门槛。
+- 首次 LDM preflight 虽通过，但审查确认其父 checkpoint 仅做存在性检查；已完成聚焦 RED/GREEN，把 stage/protocol/data identity、非空 state 和 CD 父哈希校验前移到零输出 preflight，等待完整回归和真实复验。
+- 最终回归通过 mini shell/protocol 17/17、mini config/safety 103/103、checkpoint chain 14/14，以及两份 shell 语法、Python 编译和 `git diff --check`。
+- 修复后的真实 LDM preflight 通过并打印 VAE SHA-256 `a55c0bb0...03510`；GPU 42°C、空闲 7004 MiB，`ldm/` 仍为空且 `mini_ldm_config.yaml` 不存在，未启动训练。
+- 已只读评估 500 帧 × 20 epoch 请求：split 容量充足，但数据口径与长时运行设备尚需确认；未修改现有 smoke/short 参数，也未启动训练。
+
+## 2026-08-28 500 帧 medium_train 与服务器 full 20 epoch 完成
+
+- RED/GREEN 新增 `medium_train`：固定 400 train / 100 validation、VAE/LDM/CD 各 20 epoch、独立结果根，并拒绝帧数、epoch、温度、时长和空闲显存门槛漂移；原 `smoke`/`short_train` 行为不变。
+- 收尾审查补齐 RTX 4070 Laptop 设备名门禁；伪 RTX 4090 在训练启动前被拒绝，避免把 laptop mini profile 误当服务器正式入口。
+- 正式 launcher 固定 full-split `20/20/20`，生成配置时删除 mini frame 字段；`FORMAL_EPOCHS=19` 负向测试在数据读取前拒绝，20 epoch 只读预检验证 garden 4013 帧 manifest/Radar statistics 后退出，未生成配置或启动训练。
+- 回归通过 mini shell/protocol 19/19、mini config/safety 103/103、checkpoint chain 14/14、两份 shell 语法和 `git diff --check`。
+- 最终 laptop 真实预检通过：RTX 4070 Laptop、8188/6619 MiB、42°C、400/100、20/20/20、72°C 和 180 分钟门禁均正确；没有创建 medium 结果根，既有 smoke/short checkpoint 哈希不变。
+- README、test README、mini README 和持久计划已更新。没有启动模型训练、forward/backward 或推理，也没有删除、覆盖、移动数据、checkpoint、日志和历史结果。
+
+## 2026-08-28 medium VAE allocator 失败修复
+
+- 用户实际 medium VAE 在 epoch 1 batch 50 的 backward 触发 CUDA expandable-segment 内部断言并退出；失败 `v1` 没有 checkpoint，目录和日志完整保留。
+- 已沿 runner、训练脚本、Python 入口和 memory helper 核对真实依赖；移除 `expandable_segments`，固定 `max_split_size_mb:128`，并把 allocator 打印且记录到生成 YAML。默认 medium 结果根升级为 fresh `v2`。
+- 新增 hostile 环境覆盖、fresh 结果根和正式 launcher 配置审计测试；修复过程中暴露并修正两个 heredoc import 边界问题。最终配置/安全 103/103、脚本协议 20/20、shell/Python 静态检查与 `git diff --check` 通过。
+- 真实无训练 preflight 在 RTX 4070 Laptop 上因空闲显存 6375 MiB 小于 6500 MiB 安全门槛而拒绝；GPU 43°C、无计算进程，未放宽门禁、未运行 backward、未创建 `v2` 结果。

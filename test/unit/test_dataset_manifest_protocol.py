@@ -33,7 +33,7 @@ def write_bytes(path, payload):
 
 
 def create_scene(root, scene="garden", frame_count=2):
-    """创建严格四模态临时场景及四项 provenance。"""
+    """创建含正式 observed mask 的临时场景及 legacy provenance。"""
     scene_dir = os.path.join(root, scene)
     os.makedirs(scene_dir)
     with open(
@@ -42,7 +42,11 @@ def create_scene(root, scene="garden", frame_count=2):
         encoding="utf-8",
     ) as handle:
         json.dump(
-            {"source_scene": scene, "frames_written": frame_count},
+            {
+                "source_scene": scene,
+                "frames_written": frame_count,
+                "voxel_coordinate_frame": "lidar",
+            },
             handle,
         )
 
@@ -59,6 +63,10 @@ def create_scene(root, scene="garden", frame_count=2):
         write_bytes(
             os.path.join(scene_dir, "target_voxel", f"{frame_id}.npz"),
             b"target" + bytes([index]),
+        )
+        write_bytes(
+            os.path.join(scene_dir, "observed_mask", f"{frame_id}.npz"),
+            b"observed" + bytes([index]),
         )
         write_bytes(
             os.path.join(scene_dir, "ir_image", f"{frame_id}_ir.npy"),
@@ -78,7 +86,116 @@ def create_scene(root, scene="garden", frame_count=2):
     return scene_dir, provenance
 
 
+def create_v2_provenance(root, profile):
+    """创建与 training v2 / deployment v3 精确匹配的 provenance。"""
+    keys = [
+        "preprocess_script",
+        "radar_to_lidar",
+        "radar_to_thermal",
+        "lidar_to_thermal",
+        "thermal_intrinsics",
+        "radar_ir_sync",
+    ]
+    if profile == "training":
+        keys.extend(("radar_lidar_sync", "target_policy"))
+    provenance = {}
+    for key in keys:
+        path = os.path.join(root, f"v2_{key}.txt")
+        write_bytes(path, key.encode("utf-8"))
+        provenance[key] = path
+    if profile == "deployment":
+        scene_sync_path = os.path.join(root, "garden", "radar_ir_sync.csv")
+        write_bytes(scene_sync_path, b"radar_ir_sync")
+        provenance["radar_ir_sync"] = scene_sync_path
+        special_paths = {
+            "source_training_manifest": os.path.join(
+                root, "garden", "source_training_manifest.json"
+            ),
+            "deployment_view_receipt": os.path.join(
+                root, "garden", "deployment_view.json"
+            ),
+        }
+        for key, path in special_paths.items():
+            write_bytes(path, key.encode("utf-8"))
+            provenance[key] = path
+    return provenance
+
+
 class DatasetManifestProtocolTest(unittest.TestCase):
+    def test_training_v2_and_deployment_v3_enforce_exact_modalities(self):
+        module = load_manifest_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            training_dir, _legacy = create_scene(
+                os.path.join(temp_dir, "training")
+            )
+            training_provenance = create_v2_provenance(
+                os.path.join(temp_dir, "training"),
+                "training",
+            )
+            module.write_scene_manifest_atomic(
+                training_dir,
+                "garden",
+                2,
+                training_provenance,
+                profile="training",
+            )
+            training = module.validate_scene_manifest(
+                training_dir,
+                "garden",
+                expected_profile="training",
+            )
+            self.assertEqual(training["schema_version"], 2)
+            self.assertEqual(training["voxel_coordinate_frame"], "lidar")
+            self.assertIn("observed_mask", training["modalities"])
+
+            deployment_dir, _legacy = create_scene(
+                os.path.join(temp_dir, "deployment")
+            )
+            shutil.rmtree(os.path.join(deployment_dir, "lidar_voxel"))
+            shutil.rmtree(os.path.join(deployment_dir, "target_voxel"))
+            shutil.rmtree(os.path.join(deployment_dir, "observed_mask"))
+            deployment_provenance = create_v2_provenance(
+                os.path.join(temp_dir, "deployment"),
+                "deployment",
+            )
+            module.write_scene_manifest_atomic(
+                deployment_dir,
+                "garden",
+                2,
+                deployment_provenance,
+                profile="deployment",
+            )
+            deployment = module.validate_scene_manifest(
+                deployment_dir,
+                "garden",
+                expected_profile="deployment",
+            )
+            self.assertEqual(deployment["schema_version"], 3)
+            self.assertEqual(set(deployment["modalities"]), {"radar_voxel", "ir_image"})
+            with self.assertRaisesRegex(module.DatasetManifestError, "profile"):
+                module.validate_scene_manifest(
+                    deployment_dir,
+                    "garden",
+                    expected_profile="training",
+                )
+
+    def test_formal_profile_rejects_legacy_v1_manifest(self):
+        module = load_manifest_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scene_dir, provenance = create_scene(temp_dir)
+            module.write_scene_manifest_atomic(
+                scene_dir,
+                "garden",
+                2,
+                provenance,
+            )
+            with self.assertRaisesRegex(module.DatasetManifestError, "legacy v1"):
+                module.validate_scene_manifest(
+                    scene_dir,
+                    "garden",
+                    expected_profile="training",
+                )
+
     def test_valid_manifest_round_trip_is_portable_and_content_addressed(self):
         module = load_manifest_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -358,7 +475,8 @@ class DatasetManifestProtocolTest(unittest.TestCase):
 
     def test_cli_create_and_validate_round_trip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            scene_dir, provenance = create_scene(temp_dir)
+            scene_dir, _legacy = create_scene(temp_dir)
+            provenance = create_v2_provenance(temp_dir, "training")
             script = os.path.join(
                 PROJECT_ROOT,
                 "diffusion_consistency_radar",
@@ -376,14 +494,24 @@ class DatasetManifestProtocolTest(unittest.TestCase):
                     "garden",
                     "--expected_frame_count",
                     "2",
+                    "--profile",
+                    "training",
                     "--preprocess_script",
                     provenance["preprocess_script"],
-                    "--calibration",
-                    provenance["calibration"],
-                    "--radar_index",
-                    provenance["radar_index"],
-                    "--lidar_index",
-                    provenance["lidar_index"],
+                    "--radar_to_lidar",
+                    provenance["radar_to_lidar"],
+                    "--radar_to_thermal",
+                    provenance["radar_to_thermal"],
+                    "--lidar_to_thermal",
+                    provenance["lidar_to_thermal"],
+                    "--thermal_intrinsics",
+                    provenance["thermal_intrinsics"],
+                    "--radar_ir_sync",
+                    provenance["radar_ir_sync"],
+                    "--radar_lidar_sync",
+                    provenance["radar_lidar_sync"],
+                    "--target_policy",
+                    provenance["target_policy"],
                 ],
                 text=True,
                 capture_output=True,
@@ -398,6 +526,8 @@ class DatasetManifestProtocolTest(unittest.TestCase):
                     scene_dir,
                     "--expected_scene",
                     "garden",
+                    "--expected_profile",
+                    "training",
                 ],
                 text=True,
                 capture_output=True,
@@ -447,21 +577,24 @@ class DatasetManifestProtocolTest(unittest.TestCase):
                     encoding="utf-8",
                 ) as handle:
                     script = handle.read()
-                self.assertIn(
-                    'MANIFEST_SCRIPT="${PROJECT_DIR}/scripts/dataset_manifest.py"',
-                    script,
-                )
-                self.assertIn('"${MANIFEST_SCRIPT}" validate', script)
                 self.assertNotIn("SKIP_MANIFEST", script)
-                validation_index = script.index(
-                    '"${MANIFEST_SCRIPT}" validate'
-                )
                 if relative_path.endswith("train_unified.sh"):
-                    self.assertLess(
-                        validation_index,
-                        script.index('rm -rf "${TRAIN_DATASET_DIR}"'),
+                    self.assertIn(
+                        'MANIFEST_SCRIPT="${PROJECT_DIR}/scripts/dataset_manifest.py"',
+                        script,
                     )
+                    self.assertIn('"${MANIFEST_SCRIPT}" validate', script)
+                    self.assertIn("--expected_profile training", script)
+                    self.assertNotIn(".tmp_train_dataset", script)
+                    self.assertNotIn('rm -rf "${TRAIN_DATASET_DIR}"', script)
                 else:
+                    self.assertIn(
+                        'DEPLOYMENT_VIEW_SCRIPT="${PROJECT_DIR}/scripts/build_deployment_view.py"',
+                        script,
+                    )
+                    self.assertIn('"${DEPLOYMENT_VIEW_SCRIPT}"', script)
+                    self.assertIn("validate --dataset_dir", script)
+                    validation_index = script.index('"${DEPLOYMENT_VIEW_SCRIPT}"')
                     self.assertLess(
                         validation_index,
                         script.index('python "${INFER_SCRIPT}"'),

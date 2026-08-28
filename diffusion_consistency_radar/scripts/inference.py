@@ -6,9 +6,11 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 import random
 from datetime import datetime
@@ -31,15 +33,13 @@ try:
         CalibrationProvider,
         NTU4DRadLM_VoxelDataset,
         _resize_or_pad_ir_tensor,
-        apply_legacy_sync_compensation,
-        LEGACY_SYNC_DISPLACEMENT_X_M,
         DEFAULT_THERMAL_K,
         crop_voxel_channels_to_pc_range,
         collate_voxel_samples,
         resize_radar_voxel_channels,
         resize_voxel_channels,
     )
-except Exception:
+except ImportError:
     from cm.vae_3d import VAE3D, build_vae_from_checkpoint, resolve_checkpoint_grid_config
     from cm.unet_optimized import OptimizedUNetModel
     from cm.multimodal_fusion import CompleteDualModalityPerceptionNet, migrate_ir_gate_state_dict
@@ -48,8 +48,6 @@ except Exception:
         CalibrationProvider,
         NTU4DRadLM_VoxelDataset,
         _resize_or_pad_ir_tensor,
-        apply_legacy_sync_compensation,
-        LEGACY_SYNC_DISPLACEMENT_X_M,
         DEFAULT_THERMAL_K,
         crop_voxel_channels_to_pc_range,
         collate_voxel_samples,
@@ -83,7 +81,7 @@ try:
         parse_range_bins,
         uncertainty_calibration_metrics,
     )
-except Exception:
+except ImportError:
     from cm.evaluation_metrics import (
         bev_iou as task_bev_iou,
         filter_points_by_band,
@@ -95,8 +93,46 @@ except Exception:
 from torch.utils.data import DataLoader
 
 try:
+    from diffusion_consistency_radar.checkpoint_chain import (
+        CheckpointChainError,
+        FORMAL_CHECKPOINT_PROTOCOL,
+        FORMAL_MINI_CHECKPOINT_PROTOCOL,
+        safe_torch_load as safe_checkpoint_load,
+        validate_checkpoint_data_protocol,
+    )
+except ImportError:
+    from checkpoint_chain import (
+        CheckpointChainError,
+        FORMAL_CHECKPOINT_PROTOCOL,
+        FORMAL_MINI_CHECKPOINT_PROTOCOL,
+        safe_torch_load as safe_checkpoint_load,
+        validate_checkpoint_data_protocol,
+    )
+
+try:
+    from diffusion_consistency_radar.dataset_manifest import (
+        sha256_file,
+    )
+    from diffusion_consistency_radar.deployment_view import validate_deployment_view
+except ImportError:
+    from dataset_manifest import sha256_file
+    from deployment_view import validate_deployment_view
+
+try:
+    from diffusion_consistency_radar.geometry_protocol import load_extrinsic_transform
+except ImportError:
+    from geometry_protocol import load_extrinsic_transform
+
+try:
+    from diffusion_consistency_radar.prediction_artifact_protocol import (
+        build_prediction_voxel_metadata,
+    )
+except ImportError:
+    from prediction_artifact_protocol import build_prediction_voxel_metadata
+
+try:
     from scipy.spatial import cKDTree
-except Exception:
+except ImportError:
     cKDTree = None
 
 
@@ -133,6 +169,8 @@ RUNTIME_FIELDS = [
     "empty_frame_rate",
 ]
 
+RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL = "radar_endpoint_ray_visibility_v1"
+
 
 def _uses_legacy_evaluation(args) -> bool:
     """判断是否显式启用了兼容的生成时真值评价分支。"""
@@ -164,8 +202,119 @@ def resolve_effective_voxel_size(voxel_size, pc_range, target_size):
     ]
 
 
-def build_inference_run_metadata(args, generator, frame_count: int):
+def _observed_mask_records_digest(records) -> str:
+    """按帧顺序绑定 deployment observed mask 的内容身份。"""
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(str(record["frame_id"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(record["file"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(record["sha256"]).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(int(record["observed_voxels"])).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def build_observed_mask_metadata(records, identity=None):
+    """构造可由地图入口逐帧重算的 Radar 射线 observed 合同。"""
+    normalized = []
+    seen = set()
+    for record in records:
+        frame_id = str(record.get("frame_id", ""))
+        file_name = str(record.get("file", ""))
+        file_sha256 = str(record.get("sha256", ""))
+        observed_voxels = int(record.get("observed_voxels", -1))
+        if (
+            not frame_id
+            or frame_id in seen
+            or os.path.basename(file_name) != file_name
+            or not file_name.endswith("_observed_mask.npy")
+            or len(file_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in file_sha256)
+            or observed_voxels < 0
+        ):
+            raise ValueError("observed mask 记录格式无效或 frame 重复")
+        seen.add(frame_id)
+        normalized.append(
+            {
+                "frame_id": frame_id,
+                "file": file_name,
+                "sha256": file_sha256,
+                "observed_voxels": observed_voxels,
+            }
+        )
+    metadata = {
+        "protocol": RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL,
+        "coordinate_frame": "lidar",
+        "source": "radar_endpoint_rays",
+        "ir_frustum_marks_free_space": False,
+        "frame_count": len(normalized),
+        "observed_voxels": sum(record["observed_voxels"] for record in normalized),
+        "files_sha256": _observed_mask_records_digest(normalized),
+        "records": normalized,
+    }
+    if identity is not None:
+        origin = np.asarray(identity.get("radar_origin_lidar_m"), dtype=np.float64)
+        calibration_sha256 = str(identity.get("radar_to_lidar_sha256", ""))
+        if (
+            origin.shape != (3,)
+            or not np.all(np.isfinite(origin))
+            or len(calibration_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in calibration_sha256
+            )
+        ):
+            raise ValueError("Radar observed identity 的原点或标定 SHA-256 无效")
+        metadata["radar_origin_lidar_m"] = origin.astype(float).tolist()
+        metadata["radar_to_lidar_sha256"] = calibration_sha256
+    return metadata
+
+
+def build_inference_run_metadata(
+    args,
+    generator,
+    frame_count: int,
+    observed_mask_records=None,
+    prediction_voxel_records=None,
+):
     """记录离线 evaluator 复现坐标和阈值协议所需的实际参数。"""
+    observed_metadata = None
+    if observed_mask_records is not None:
+        observed_metadata = build_observed_mask_metadata(
+            observed_mask_records,
+            identity=getattr(generator, "radar_observed_identity", None),
+        )
+        if observed_metadata["frame_count"] != int(frame_count):
+            raise ValueError("observed mask frame_count 与推理 frame_count 不一致")
+    if bool(args.require_real_ir) and observed_metadata is None:
+        raise ValueError("正式 deployment inference 必须发布 observed mask 合同")
+    prediction_metadata = None
+    if prediction_voxel_records is not None:
+        prediction_metadata = build_prediction_voxel_metadata(
+            prediction_voxel_records
+        )
+        if prediction_metadata["frame_count"] != int(frame_count):
+            raise ValueError("prediction voxel frame_count 与推理 frame_count 不一致")
+    if bool(args.require_real_ir) and prediction_metadata is None:
+        raise ValueError("正式 deployment inference 必须发布 prediction voxel 合同")
+    if bool(args.require_real_ir):
+        deployment_identity = getattr(generator, "deployment_identity", None)
+        deployment_calibration = (
+            deployment_identity.get("calibration_sha256")
+            if isinstance(deployment_identity, dict)
+            else None
+        )
+        if (
+            not isinstance(deployment_calibration, dict)
+            or observed_metadata.get("radar_to_lidar_sha256")
+            != deployment_calibration.get("radar_to_lidar")
+        ):
+            raise ValueError(
+                "正式 observed mask 的 Radar→LiDAR 标定必须与 deployment identity 一致"
+            )
     return {
         "stage": "deployment_generation",
         "target_size": [int(value) for value in args.target_size],
@@ -192,14 +341,21 @@ def build_inference_run_metadata(args, generator, frame_count: int):
         "radar_normalization": generator.radar_normalization,
         "radar_normalization_sha256": generator.radar_normalization_sha256,
         "allow_legacy_radar_units": bool(generator.allow_legacy_radar_units),
-        "formal_protocol": bool(
-            generator.radar_normalization is not None
-            and generator.radar_normalization.get("formal") is True
+        "checkpoint_protocol": getattr(generator, "checkpoint_protocol", None),
+        "formal_protocol": (
+            getattr(generator, "checkpoint_protocol", None)
+            == FORMAL_CHECKPOINT_PROTOCOL
+        ),
+        "formal_mini_smoke": (
+            getattr(generator, "checkpoint_protocol", None)
+            == FORMAL_MINI_CHECKPOINT_PROTOCOL
         ),
         "frame_count": int(frame_count),
-        "legacy_sync_displacement_x_m": (
-            LEGACY_SYNC_DISPLACEMENT_X_M if args.require_real_ir else None
-        ),
+        "voxel_coordinate_frame": "lidar",
+        "observed_mask": observed_metadata,
+        "prediction_voxel": prediction_metadata,
+        "time_alignment_compensation": "preprocessing_signed_delta_only",
+        "deployment_identity": getattr(generator, "deployment_identity", None),
     }
 
 
@@ -210,6 +366,42 @@ def _write_json_atomic(path: str, payload) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
     os.replace(temp_path, path)
+
+
+def _save_npy_atomic(path: str, array: np.ndarray) -> None:
+    """同目录临时写入 NPY 后原子发布，避免暴露半文件。"""
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+        dir=os.path.dirname(path),
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.save(handle, array, allow_pickle=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def prepare_fresh_output_dir(path: str) -> str:
+    """创建或接受空输出目录，拒绝符号链接及任何历史内容。"""
+    output_dir = os.path.abspath(os.fspath(path))
+    if os.path.islink(output_dir):
+        raise ValueError(f"输出目录不得是符号链接: {output_dir}")
+    if os.path.exists(output_dir):
+        if not os.path.isdir(output_dir):
+            raise ValueError(f"输出路径必须是目录: {output_dir}")
+        if os.listdir(output_dir):
+            raise ValueError(f"输出目录必须为空，拒绝覆盖非空目录: {output_dir}")
+    else:
+        os.makedirs(output_dir, exist_ok=False)
+    return output_dir
 
 
 def reject_removed_oracle_arguments(argv) -> None:
@@ -227,19 +419,122 @@ def reject_removed_oracle_arguments(argv) -> None:
             )
 
 
-def safe_torch_load(path, map_location):
-    """兼容不同 PyTorch 版本的 checkpoint 加载逻辑。"""
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    except TypeError:
-        # HACK: 低版本 PyTorch 不支持 weights_only 参数，回退到兼容加载路径。
-        return torch.load(path, map_location=map_location)
-    except Exception as exc:
-        # NOTE: 部分历史权重含有 weights_only=True 不接受的对象，按错误信息回退。
-        msg = str(exc)
-        if "Weights only load failed" in msg or "Unsupported global" in msg:
-            return torch.load(path, map_location=map_location)
-        raise
+def resolve_formal_inference_data_protocol(
+    vae_checkpoint,
+    model_checkpoint,
+    *,
+    model_type: str,
+    allow_formal_mini_checkpoint: bool = False,
+):
+    """验证正式数据身份；mini-v2 仅可经显式授权用于离线 smoke。"""
+    vae_protocol = (
+        vae_checkpoint.get("checkpoint_protocol")
+        if isinstance(vae_checkpoint, dict)
+        else None
+    )
+    model_protocol = (
+        model_checkpoint.get("checkpoint_protocol")
+        if isinstance(model_checkpoint, dict)
+        else None
+    )
+    formal_protocols = {
+        FORMAL_CHECKPOINT_PROTOCOL,
+        FORMAL_MINI_CHECKPOINT_PROTOCOL,
+    }
+    if not formal_protocols.intersection({vae_protocol, model_protocol}):
+        return None
+
+    errors = []
+    if vae_protocol != model_protocol:
+        errors.append("VAE 与生成模型 checkpoint protocol 不一致")
+    if vae_protocol not in formal_protocols:
+        errors.append("正式生成模型不能搭配 legacy VAE checkpoint")
+    if model_protocol not in formal_protocols:
+        errors.append("正式 VAE 不能搭配 legacy 生成模型 checkpoint")
+    if (
+        FORMAL_MINI_CHECKPOINT_PROTOCOL in (vae_protocol, model_protocol)
+        and not allow_formal_mini_checkpoint
+    ):
+        errors.append(
+            "formal mini checkpoint 仅允许通过显式开关执行 test smoke"
+        )
+    if isinstance(vae_checkpoint, dict) and vae_checkpoint.get("stage") != "vae":
+        errors.append("VAE checkpoint stage 必须为 'vae'")
+    if isinstance(model_checkpoint, dict) and model_checkpoint.get("stage") != model_type:
+        errors.append(f"生成模型 checkpoint stage 必须为 {model_type!r}")
+
+    vae_data = validate_checkpoint_data_protocol(
+        vae_checkpoint.get("data_protocol") if isinstance(vae_checkpoint, dict) else None,
+        stage="vae",
+        errors=errors,
+    )
+    model_data = validate_checkpoint_data_protocol(
+        model_checkpoint.get("data_protocol")
+        if isinstance(model_checkpoint, dict)
+        else None,
+        stage=model_type,
+        errors=errors,
+    )
+    if vae_data is not None and model_data is not None and vae_data != model_data:
+        errors.append("VAE 与生成模型 data_protocol 不一致")
+    if errors:
+        raise CheckpointChainError(errors)
+    return dict(model_data)
+
+
+def assert_formal_deployment_identity(
+    *,
+    scene_dir: str,
+    radar_voxel_dir: str,
+    calibration_dir: str,
+    data_protocol,
+):
+    """绑定严格 deployment view、输入目录与 checkpoint 训练标定。"""
+    scene_dir = os.path.abspath(os.fspath(scene_dir))
+    scene = os.path.basename(scene_dir)
+    if not scene or scene in (".", ".."):
+        raise ValueError("正式 deployment scene 目录名非法")
+    view_identity = validate_deployment_view(scene_dir, scene)
+
+    expected_radar_dir = os.path.join(scene_dir, "radar_voxel")
+    if os.path.abspath(os.fspath(radar_voxel_dir)) != expected_radar_dir:
+        raise ValueError("--radar_voxel_dir 必须属于 --deployment_scene_dir/radar_voxel")
+    if view_identity.get("voxel_coordinate_frame") != "lidar":
+        raise ValueError("正式 Radar+IR checkpoint 只接受 LiDAR frame deployment 数据")
+
+    calibration_dir = os.path.abspath(os.fspath(calibration_dir))
+    calibration_files = {
+        "lidar_to_thermal": os.path.join(
+            calibration_dir, "calib_livox_to_thermal.txt"
+        ),
+        "thermal_intrinsics": os.path.join(
+            calibration_dir, "calib_cam_thermal.txt"
+        ),
+    }
+    actual_calibration = {}
+    for key, path in calibration_files.items():
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise ValueError(f"正式部署标定缺失或不是普通文件: {path}")
+        actual_calibration[key] = sha256_file(path)
+
+    checkpoint_calibration = (data_protocol or {}).get("calibration_sha256")
+    if actual_calibration != checkpoint_calibration:
+        raise ValueError("当前 deployment 标定 SHA-256 与 checkpoint data_protocol 不一致")
+    if view_identity.get("calibration_sha256") != actual_calibration:
+        raise ValueError("deployment view 标定 SHA-256 与当前 calibration_dir 不一致")
+
+    identity = dict(view_identity)
+    identity["calibration_sha256"] = actual_calibration
+    return identity
+
+
+def safe_torch_load(path, map_location, *, allow_legacy_pickle=False):
+    """推理默认只加载 weights-only；历史 pickle 需显式授权。"""
+    return safe_checkpoint_load(
+        path,
+        map_location=map_location,
+        allow_legacy_pickle=allow_legacy_pickle,
+    )
 
 
 def is_multimodal_state_dict(state_dict) -> bool:
@@ -457,6 +752,7 @@ def load_multimodal_meta_for_radar(
     radar_path: str,
     device,
     require_real_ir: bool = False,
+    calibration_dir: str = "",
 ):
     """加载逐帧 IR/标定元数据，并可启用正式 fail-closed 协议。"""
     scene_dir = os.path.dirname(os.path.dirname(radar_path))
@@ -465,14 +761,19 @@ def load_multimodal_meta_for_radar(
     ir_path = os.path.join(scene_dir, "ir_image", f"{frame_id}_ir.npy")
     meta = {}
 
-    provider = CalibrationProvider(dataset_root)
+    provider = CalibrationProvider(
+        dataset_root,
+        calibration_dir=calibration_dir or None,
+        require_real=require_real_ir,
+        voxel_coordinate_frame="lidar",
+    )
     r_mat, t_vec, k_mat, calib_meta = provider.load_with_metadata()
     is_mock = bool(calib_meta["is_mock_calib"])
     if require_real_ir and (
         is_mock or not bool(calib_meta["calib_is_thermal"])
     ):
         raise RuntimeError(
-            "严格真实 IR 模式需要 calib_radar_to_thermal.txt: "
+            "严格真实 IR 模式需要 calib_livox_to_thermal.txt: "
             f"scene={scene_dir}, source={calib_meta['calib_source']}, "
             f"reason={calib_meta['calib_fallback_reason']}"
         )
@@ -495,14 +796,12 @@ def load_multimodal_meta_for_radar(
     else:
         meta["is_mock_ir"] = torch.ones(1, device=device)
 
-    # NOTE: 真实和 fallback 外参都执行与训练 Dataset 相同的 legacy 位移。
-    t_vec = apply_legacy_sync_compensation(t_vec)
     meta["r_mat"] = r_mat.to(device)
     meta["t_vec"] = t_vec.to(device)
     meta["k_mat"] = k_mat.to(device)
     meta["is_mock_calib"] = torch.ones(1, device=device) if is_mock else torch.zeros(1, device=device)
     meta["odom_cov_trace"] = torch.zeros(1, device=device)
-    meta["legacy_sync_displacement_x_m"] = LEGACY_SYNC_DISPLACEMENT_X_M
+    meta["time_alignment_compensation"] = "preprocessing_signed_delta_only"
     meta["calib_source"] = calib_meta["calib_source"]
     meta["thermal_intrinsics_source"] = calib_meta["thermal_intrinsics_source"]
     meta["thermal_intrinsics_path"] = calib_meta["thermal_intrinsics_path"]
@@ -513,7 +812,7 @@ def load_multimodal_meta_for_radar(
     return meta
 
 
-def preflight_real_ir_inputs(model, radar_paths):
+def preflight_real_ir_inputs(model, radar_paths, calibration_dir: str):
     """在创建输出目录前验证全部正式帧，禁止留下部分正式结果。"""
     validate_real_ir_model(model)
     for radar_path in radar_paths:
@@ -521,6 +820,7 @@ def preflight_real_ir_inputs(model, radar_paths):
             radar_path,
             torch.device("cpu"),
             require_real_ir=True,
+            calibration_dir=calibration_dir,
         )
         if (
             float(meta["is_mock_ir"].item()) != 0.0
@@ -589,6 +889,8 @@ class RadarGenerator:
         source_pc_range=None,
         vae_fallback_config_type=None,
         allow_legacy_radar_units=False,
+        allow_legacy_checkpoint_pickle=False,
+        allow_formal_mini_checkpoint=False,
     ):
         """
         Args:
@@ -601,6 +903,11 @@ class RadarGenerator:
         self.model_type = model_type
         self.vae_fallback_config_type = vae_fallback_config_type
         self.allow_legacy_radar_units = allow_legacy_radar_units
+        self.allow_legacy_checkpoint_pickle = bool(allow_legacy_checkpoint_pickle)
+        self.allow_formal_mini_checkpoint = bool(allow_formal_mini_checkpoint)
+        self.data_protocol = None
+        self.deployment_identity = None
+        self.radar_observed_identity = None
         
         # NOTE: 变分自编码器（VAE）负责体素空间与潜空间之间的编码/解码。
         print(f"Loading VAE from {vae_path}...")
@@ -635,18 +942,42 @@ class RadarGenerator:
 
     def _load_vae(self, ckpt_path):
         """加载 VAE 模型"""
-        ckpt = safe_torch_load(ckpt_path, map_location=self.device)
+        ckpt = safe_torch_load(
+            ckpt_path,
+            map_location=self.device,
+            allow_legacy_pickle=getattr(
+                self, "allow_legacy_checkpoint_pickle", False
+            ),
+        )
         vae, metadata = build_vae_from_checkpoint(
             ckpt,
             fallback_config_type=self.vae_fallback_config_type,
         )
+        self.vae_checkpoint_payload = ckpt if isinstance(ckpt, dict) else {}
         self.vae_checkpoint_metadata = metadata
         return vae.to(self.device)
     
     def _load_model(self, ckpt_path):
         """加载 LDM 或 CD 模型"""
-        ckpt = safe_torch_load(ckpt_path, map_location=self.device)
+        ckpt = safe_torch_load(
+            ckpt_path,
+            map_location=self.device,
+            allow_legacy_pickle=getattr(
+                self, "allow_legacy_checkpoint_pickle", False
+            ),
+        )
         self.model_checkpoint_metadata = ckpt if isinstance(ckpt, dict) else {}
+        self.data_protocol = resolve_formal_inference_data_protocol(
+            getattr(self, "vae_checkpoint_payload", {}),
+            self.model_checkpoint_metadata,
+            model_type=getattr(self, "model_type", "ldm"),
+            allow_formal_mini_checkpoint=getattr(
+                self, "allow_formal_mini_checkpoint", False
+            ),
+        )
+        self.checkpoint_protocol = (
+            ckpt.get("checkpoint_protocol") if isinstance(ckpt, dict) else None
+        )
         (
             self.radar_normalization,
             self.radar_normalization_sha256,
@@ -876,6 +1207,149 @@ def load_sparse_voxel(filename):
     return voxel_grid
 
 
+def load_radar_endpoint_mask(
+    path,
+    target_size=(32, 128, 128),
+    source_pc_range=(0, -20, -6, 120, 20, 10),
+    model_pc_range=None,
+):
+    """按模型物理范围加载 Radar endpoint occupancy 为 ``(Z,X,Y)``。"""
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise ValueError(f"Radar voxel 必须是普通文件: {path}")
+    radar_voxel = (
+        load_sparse_voxel(path)
+        if path.endswith(".npz")
+        else np.load(path, allow_pickle=False).astype(np.float32)
+    )
+    if radar_voxel.ndim != 4 or radar_voxel.shape[-1] != 4:
+        raise ValueError(f"Radar voxel 必须是 (X,Y,Z,4): {path} -> {radar_voxel.shape}")
+    if not np.isfinite(radar_voxel).all():
+        raise ValueError(f"Radar voxel 含非有限数: {path}")
+    tensor = torch.from_numpy(radar_voxel).permute(3, 2, 0, 1)
+    effective_model_range = (
+        source_pc_range if model_pc_range is None else model_pc_range
+    )
+    tensor = crop_voxel_channels_to_pc_range(
+        tensor,
+        source_pc_range,
+        effective_model_range,
+    )
+    occupancy = F.adaptive_max_pool3d(
+        tensor[0:1].unsqueeze(0),
+        tuple(int(value) for value in target_size),
+    ).squeeze(0).squeeze(0)
+    return (occupancy.detach().cpu().numpy() > 0).astype(np.uint8)
+
+
+def build_radar_ray_observed_mask(
+    endpoint_mask_zxy,
+    *,
+    pc_range,
+    radar_origin_lidar_m,
+):
+    """从 Radar endpoint 到传感器原点离散射线，构造 LiDAR-frame 可见域。
+
+    IR 只参与条件特征，不参与 free-space 标记；无 Radar endpoint 时返回全零，
+    从而保持整帧 unknown。
+    """
+    endpoints = np.asarray(endpoint_mask_zxy)
+    if endpoints.ndim != 3 or not np.all(np.isfinite(endpoints)):
+        raise ValueError("endpoint_mask_zxy 必须是有限的 (Z,X,Y) 数组")
+    bounds = np.asarray(pc_range, dtype=np.float64)
+    origin = np.asarray(radar_origin_lidar_m, dtype=np.float64)
+    if (
+        bounds.shape != (6,)
+        or origin.shape != (3,)
+        or not np.all(np.isfinite(bounds))
+        or not np.all(np.isfinite(origin))
+        or not np.all(bounds[3:] > bounds[:3])
+    ):
+        raise ValueError("pc_range 与 radar_origin_lidar_m 必须是有效有限坐标")
+
+    z_size, x_size, y_size = endpoints.shape
+    xyz_size = np.asarray([x_size, y_size, z_size], dtype=np.float64)
+    xyz_resolution = (bounds[3:] - bounds[:3]) / xyz_size
+    origin_xyz_index = (origin - bounds[:3]) / xyz_resolution - 0.5
+    observed = np.zeros_like(endpoints, dtype=np.uint8)
+    endpoint_indices_zxy = np.argwhere(endpoints > 0)
+    if endpoint_indices_zxy.size == 0:
+        return observed
+    observed[tuple(endpoint_indices_zxy.T)] = 1
+    endpoint_indices_xyz = endpoint_indices_zxy[:, [1, 2, 0]].astype(np.int64)
+    origin_cell_xyz = np.floor(
+        (origin - bounds[:3]) / xyz_resolution
+    ).astype(np.int64)
+    directions = endpoint_indices_xyz - origin_cell_xyz[np.newaxis, :]
+    gcd = np.gcd.reduce(np.abs(directions), axis=1)
+    gcd[gcd == 0] = 1
+    normalized_directions = directions // gcd[:, np.newaxis]
+    endpoint_centers_xyz = (
+        bounds[:3]
+        + (endpoint_indices_xyz.astype(np.float64) + 0.5) * xyz_resolution
+    )
+    distances = np.linalg.norm(endpoint_centers_xyz - origin[np.newaxis, :], axis=1)
+    order = np.argsort(distances, kind="stable")
+    _, nearest_positions = np.unique(
+        normalized_directions[order],
+        axis=0,
+        return_index=True,
+    )
+    selected_endpoint_indices = order[nearest_positions]
+    for endpoint_xyz_index in endpoint_indices_xyz[selected_endpoint_indices]:
+        endpoint_xyz_index = endpoint_xyz_index.astype(np.float64)
+        step_count = int(
+            np.ceil(np.max(np.abs(endpoint_xyz_index - origin_xyz_index)))
+        ) + 1
+        samples_xyz = np.linspace(
+            origin_xyz_index,
+            endpoint_xyz_index,
+            num=max(step_count, 1),
+        )
+        samples_xyz = np.rint(samples_xyz).astype(np.int64)
+        valid = (
+            (samples_xyz[:, 0] >= 0)
+            & (samples_xyz[:, 0] < x_size)
+            & (samples_xyz[:, 1] >= 0)
+            & (samples_xyz[:, 1] < y_size)
+            & (samples_xyz[:, 2] >= 0)
+            & (samples_xyz[:, 2] < z_size)
+        )
+        samples_xyz = samples_xyz[valid]
+        observed[
+            samples_xyz[:, 2],
+            samples_xyz[:, 0],
+            samples_xyz[:, 1],
+        ] = 1
+    return observed
+
+
+def preflight_radar_observed_inputs(
+    radar_paths,
+    *,
+    calibration_dir,
+    target_size,
+    source_pc_range,
+    model_pc_range,
+):
+    """在创建输出前验证全部 Radar 文件和 Radar→LiDAR 射线原点。"""
+    calibration_path = os.path.join(
+        os.path.abspath(os.fspath(calibration_dir)),
+        "calib_radar_to_livox.txt",
+    )
+    T_lidar_radar = load_extrinsic_transform(calibration_path)
+    for radar_path in radar_paths:
+        load_radar_endpoint_mask(
+            radar_path,
+            target_size=target_size,
+            source_pc_range=source_pc_range,
+            model_pc_range=model_pc_range,
+        )
+    return {
+        "radar_origin_lidar_m": T_lidar_radar[:3, 3].astype(float).tolist(),
+        "radar_to_lidar_sha256": sha256_file(calibration_path),
+    }
+
+
 def load_radar_voxel_as_tensor(
     path,
     device,
@@ -1048,6 +1522,18 @@ def main():
     parser.add_argument("--model_type", type=str, default="ldm", choices=["ldm", "cd"], help="Model type")
     parser.add_argument("--dataset_dir", type=str, default="./Data/NTU4DRadLM_Pre", 
                         help="Dataset directory for condition data")
+    parser.add_argument(
+        "--calibration_dir",
+        type=str,
+        default="",
+        help="正式 LiDAR-to-Thermal 外参和 thermal 内参目录",
+    )
+    parser.add_argument(
+        "--deployment_scene_dir",
+        type=str,
+        default="",
+        help="正式部署场景目录；用于把输入、manifest 与 checkpoint 标定身份交叉绑定",
+    )
     parser.add_argument("--radar_voxel_dir", type=str, default="",
                         help="If set, load radar_voxel files from this directory and run per-sample inference")
     parser.add_argument("--max_files", type=int, default=0,
@@ -1108,6 +1594,16 @@ def main():
         action="store_true",
         help="仅用于历史 checkpoint/诊断；正式入口不得启用",
     )
+    parser.add_argument(
+        "--allow_legacy_checkpoint_pickle",
+        action="store_true",
+        help="仅用于可信历史 checkpoint 诊断；正式入口不得启用",
+    )
+    parser.add_argument(
+        "--allow_formal_mini_checkpoint",
+        action="store_true",
+        help="仅供 test/mini-test 离线 smoke；正式部署入口不得启用",
+    )
     parser.add_argument("--report_task_metrics", action="store_true",
                         help="Report shared-visible obstacle metrics in inference_metrics.csv")
     parser.add_argument("--task_range_bins", type=str, default="0-20,20-40,40-80,80-120",
@@ -1122,6 +1618,16 @@ def main():
     args = parser.parse_args()
     if args.require_real_ir and not args.radar_voxel_dir:
         parser.error("--require_real_ir requires --radar_voxel_dir")
+    if args.require_real_ir and not args.calibration_dir:
+        parser.error("--require_real_ir requires explicit --calibration_dir")
+    if args.require_real_ir and not args.deployment_scene_dir:
+        parser.error("--require_real_ir requires explicit --deployment_scene_dir")
+    if args.require_real_ir and not args.save_voxel:
+        parser.error("--require_real_ir formal deployment requires --save_voxel")
+    if args.allow_formal_mini_checkpoint and not args.require_real_ir:
+        parser.error(
+            "--allow_formal_mini_checkpoint requires --require_real_ir strict inputs"
+        )
     if args.seed >= 0:
         set_random_seed(args.seed)
     
@@ -1136,6 +1642,8 @@ def main():
         source_pc_range=args.source_pc_range,
         vae_fallback_config_type=args.vae_config_type,
         allow_legacy_radar_units=args.allow_legacy_radar_units,
+        allow_legacy_checkpoint_pickle=args.allow_legacy_checkpoint_pickle,
+        allow_formal_mini_checkpoint=args.allow_formal_mini_checkpoint,
     )
     args.target_size = generator.target_size
     args.source_pc_range = generator.source_pc_range
@@ -1182,12 +1690,30 @@ def main():
                     lidar_indices = [int(line.strip()) for line in f.readlines()]
 
         if args.require_real_ir:
+            if generator.data_protocol is None:
+                raise RuntimeError(
+                    "--require_real_ir 正式部署要求 formal_chain_v2 checkpoint data_protocol"
+                )
+            generator.deployment_identity = assert_formal_deployment_identity(
+                scene_dir=args.deployment_scene_dir,
+                radar_voxel_dir=args.radar_voxel_dir,
+                calibration_dir=args.calibration_dir,
+                data_protocol=generator.data_protocol,
+            )
             preflight_real_ir_inputs(
                 generator.model,
                 [os.path.join(args.radar_voxel_dir, name) for name in radar_files],
+                args.calibration_dir,
+            )
+            generator.radar_observed_identity = preflight_radar_observed_inputs(
+                [os.path.join(args.radar_voxel_dir, name) for name in radar_files],
+                calibration_dir=args.calibration_dir,
+                target_size=args.target_size,
+                source_pc_range=args.source_pc_range,
+                model_pc_range=args.pc_range,
             )
 
-        os.makedirs(args.output_dir, exist_ok=True)
+        args.output_dir = prepare_fresh_output_dir(args.output_dir)
 
         legacy_evaluation = _uses_legacy_evaluation(args)
         merged_csv_path = os.path.join(args.output_dir, inference_csv_name(args))
@@ -1264,6 +1790,8 @@ def main():
         raw_lidar_chamfer_values = []
         task_acc = {field: [] for field in TASK_METRIC_FIELDS}
         task_range_bins = parse_range_bins(args.task_range_bins)
+        observed_mask_records = []
+        prediction_voxel_records = []
 
         file_pbar = tqdm(
             enumerate(radar_files),
@@ -1274,6 +1802,21 @@ def main():
 
         for i, fname in file_pbar:
             radar_path = os.path.join(args.radar_voxel_dir, fname)
+            deployment_observed_mask = None
+            if args.require_real_ir:
+                endpoint_mask = load_radar_endpoint_mask(
+                    radar_path,
+                    target_size=args.target_size,
+                    source_pc_range=args.source_pc_range,
+                    model_pc_range=args.pc_range,
+                )
+                deployment_observed_mask = build_radar_ray_observed_mask(
+                    endpoint_mask,
+                    pc_range=args.pc_range,
+                    radar_origin_lidar_m=generator.radar_observed_identity[
+                        "radar_origin_lidar_m"
+                    ],
+                )
             radar_point_count = ""
             if raw_radar_files:
                 radar_raw_file = None
@@ -1307,6 +1850,7 @@ def main():
                     radar_path,
                     generator.device,
                     require_real_ir=args.require_real_ir,
+                    calibration_dir=args.calibration_dir,
                 )
                 if args.use_multimodal_meta or args.require_real_ir
                 else None
@@ -1335,8 +1879,34 @@ def main():
             task_values = {}
 
             if args.save_voxel:
-                out_voxel = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_voxel.npy")
-                np.save(out_voxel, sample)
+                frame_id = os.path.splitext(fname)[0].replace("_voxel", "")
+                voxel_file = f"{frame_id}_voxel.npy"
+                out_voxel = os.path.join(args.output_dir, voxel_file)
+                _save_npy_atomic(out_voxel, sample)
+                prediction_voxel_records.append(
+                    {
+                        "frame_id": frame_id,
+                        "file": voxel_file,
+                        "sha256": sha256_file(out_voxel),
+                        "shape_czxy": [int(value) for value in sample.shape],
+                        "dtype": str(sample.dtype),
+                    }
+                )
+            if deployment_observed_mask is not None:
+                frame_id = os.path.splitext(fname)[0].replace("_voxel", "")
+                mask_file = f"{frame_id}_observed_mask.npy"
+                mask_path = os.path.join(args.output_dir, mask_file)
+                _save_npy_atomic(mask_path, deployment_observed_mask)
+                observed_mask_records.append(
+                    {
+                        "frame_id": frame_id,
+                        "file": mask_file,
+                        "sha256": sha256_file(mask_path),
+                        "observed_voxels": int(
+                            np.count_nonzero(deployment_observed_mask)
+                        ),
+                    }
+                )
             if (args.save_voxel or args.save_uncertainty) and generator.last_uncertainty is not None:
                 unc = generator.last_uncertainty.get(
                     "variance",
@@ -1345,7 +1915,7 @@ def main():
                 if torch.is_tensor(unc):
                     unc_np = unc[0].detach().cpu().numpy()
                     out_unc = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_uncertainty.npy")
-                    np.save(out_unc, unc_np)
+                    _save_npy_atomic(out_unc, unc_np)
 
             if args.save_pointcloud or args.compare_with_lidar or args.compare_with_target:
                 pcl, used_topk_fallback = voxel_to_pointcloud(
@@ -1359,7 +1929,7 @@ def main():
                     fallback_count += 1
                 if args.save_pointcloud:
                     out_pcl = os.path.join(args.output_dir, f"{os.path.splitext(fname)[0]}_pcl.npy")
-                    np.save(out_pcl, pcl)
+                    _save_npy_atomic(out_pcl, pcl)
 
             pred_point_count = int(pcl.shape[0])
             total_pred_points += pred_point_count
@@ -1590,7 +2160,17 @@ def main():
 
         _write_json_atomic(
             os.path.join(args.output_dir, "inference_run.json"),
-            build_inference_run_metadata(args, generator, len(radar_files)),
+            build_inference_run_metadata(
+                args,
+                generator,
+                len(radar_files),
+                observed_mask_records=(
+                    observed_mask_records if args.require_real_ir else None
+                ),
+                prediction_voxel_records=(
+                    prediction_voxel_records if args.save_voxel else None
+                ),
+            ),
         )
 
         log_file.write("\n")
@@ -1623,7 +2203,7 @@ def main():
         print(f"Saved runtime log to {log_path}")
 
     else:
-        os.makedirs(args.output_dir, exist_ok=True)
+        args.output_dir = prepare_fresh_output_dir(args.output_dir)
         # NOTE: 简单模式下可从验证集抽取一个条件样本。
         if args.use_condition:
             print(f"Loading dataset from {args.dataset_dir}...")
@@ -1661,7 +2241,7 @@ def main():
         )
 
         output_path = os.path.join(args.output_dir, f"{args.model_type}_samples_{args.steps}steps.npy")
-        np.save(output_path, generated.cpu().numpy())
+        _save_npy_atomic(output_path, generated.cpu().numpy())
         print(f"\nSaved {args.num_samples} samples to {output_path}")
         print(f"Shape: {generated.shape}")
         print(f"Range: [{generated.min():.3f}, {generated.max():.3f}]")

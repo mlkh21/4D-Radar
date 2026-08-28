@@ -7,28 +7,96 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SELF_DIR}/../.." && pwd)"
 TRAIN_SCRIPT="${SELF_DIR}/train_minimal.sh"
 
+if [[ "$#" -gt 2 ]]; then
+  echo "Usage: $0 [vae|ldm|cd] [smoke|short_train|medium_train]"
+  echo "Error: 受保护入口最多接受阶段和 profile 两个位置参数"
+  exit 2
+fi
+
 MODE="${1:-vae}"
+PROFILE="${2:-smoke}"
 case "${MODE}" in
   vae|ldm|cd) ;;
   *)
-    echo "Usage: $0 [vae|ldm|cd]"
+    echo "Usage: $0 [vae|ldm|cd] [smoke|short_train|medium_train]"
     echo "为避免笔记本持续满载，本入口只允许逐阶段运行。"
     exit 2
     ;;
 esac
 
-SAMPLES_PER_SCENE="${SAMPLES_PER_SCENE:-16}"
-MINI_VAE_EPOCHS="${MINI_VAE_EPOCHS:-1}"
-MINI_LDM_EPOCHS="${MINI_LDM_EPOCHS:-1}"
-MINI_CD_EPOCHS="${MINI_CD_EPOCHS:-1}"
+case "${PROFILE}" in
+  smoke)
+    PROFILE_TRAIN_FRAMES_PER_SCENE=8
+    PROFILE_VALIDATION_FRAMES_PER_SCENE=4
+    PROFILE_REQUIRE_EXACT_FRAMES=0
+    PROFILE_MAX_TRAIN_FRAMES_PER_SCENE=32
+    PROFILE_MAX_VALIDATION_FRAMES_PER_SCENE=16
+    PROFILE_VAE_EPOCHS=1
+    PROFILE_LDM_EPOCHS=1
+    PROFILE_CD_EPOCHS=1
+    PROFILE_MAX_GPU_TEMP_C=80
+    PROFILE_MAX_START_TEMP_C=65
+    PROFILE_MAX_STAGE_MINUTES=20
+    PROFILE_MIN_FREE_GPU_MEMORY_MIB=6000
+    PROFILE_REQUIRED_GPU_NAME=""
+    DEFAULT_MINI_RESULTS_DIR="${ROOT_DIR}/test/result/formal_mini_v2_80m_8gb_v1"
+    ;;
+  short_train)
+    if [[ "${MODE}" != "vae" ]]; then
+      echo "Error: short_train 目前只允许 VAE；LDM/CD 继续使用 smoke 档逐阶段验证"
+      exit 2
+    fi
+    PROFILE_TRAIN_FRAMES_PER_SCENE=8
+    PROFILE_VALIDATION_FRAMES_PER_SCENE=4
+    PROFILE_REQUIRE_EXACT_FRAMES=0
+    PROFILE_MAX_TRAIN_FRAMES_PER_SCENE=32
+    PROFILE_MAX_VALIDATION_FRAMES_PER_SCENE=16
+    PROFILE_VAE_EPOCHS=3
+    PROFILE_LDM_EPOCHS=1
+    PROFILE_CD_EPOCHS=1
+    PROFILE_MAX_GPU_TEMP_C=75
+    PROFILE_MAX_START_TEMP_C=60
+    PROFILE_MAX_STAGE_MINUTES=20
+    PROFILE_MIN_FREE_GPU_MEMORY_MIB=6000
+    PROFILE_REQUIRED_GPU_NAME=""
+    DEFAULT_MINI_RESULTS_DIR="${ROOT_DIR}/test/result/formal_mini_v2_80m_8gb_short_v1"
+    ;;
+  medium_train)
+    # 500 帧由正式时间切分中的 400 train + 100 validation 组成，三阶段各训练 20 epoch。
+    PROFILE_TRAIN_FRAMES_PER_SCENE=400
+    PROFILE_VALIDATION_FRAMES_PER_SCENE=100
+    PROFILE_REQUIRE_EXACT_FRAMES=1
+    PROFILE_MAX_TRAIN_FRAMES_PER_SCENE=400
+    PROFILE_MAX_VALIDATION_FRAMES_PER_SCENE=100
+    PROFILE_VAE_EPOCHS=20
+    PROFILE_LDM_EPOCHS=20
+    PROFILE_CD_EPOCHS=20
+    PROFILE_MAX_GPU_TEMP_C=72
+    PROFILE_MAX_START_TEMP_C=55
+    PROFILE_MAX_STAGE_MINUTES=180
+    PROFILE_MIN_FREE_GPU_MEMORY_MIB=6500
+    PROFILE_REQUIRED_GPU_NAME="NVIDIA GeForce RTX 4070 Laptop GPU"
+    DEFAULT_MINI_RESULTS_DIR="${ROOT_DIR}/test/result/formal_medium_v2_80m_laptop_500f_20ep_v2"
+    ;;
+  *)
+    echo "Error: profile 必须为 smoke、short_train 或 medium_train，实际为 ${PROFILE}"
+    exit 2
+    ;;
+esac
+
+MINI_TRAIN_FRAMES_PER_SCENE="${MINI_TRAIN_FRAMES_PER_SCENE:-${PROFILE_TRAIN_FRAMES_PER_SCENE}}"
+MINI_VALIDATION_FRAMES_PER_SCENE="${MINI_VALIDATION_FRAMES_PER_SCENE:-${PROFILE_VALIDATION_FRAMES_PER_SCENE}}"
+MINI_VAE_EPOCHS="${MINI_VAE_EPOCHS:-${PROFILE_VAE_EPOCHS}}"
+MINI_LDM_EPOCHS="${MINI_LDM_EPOCHS:-${PROFILE_LDM_EPOCHS}}"
+MINI_CD_EPOCHS="${MINI_CD_EPOCHS:-${PROFILE_CD_EPOCHS}}"
 MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-1}"
 MINI_NUM_WORKERS="${MINI_NUM_WORKERS:-0}"
 MINI_GRAD_ACCUM="${MINI_GRAD_ACCUM:-1}"
-MINI_MAX_GPU_TEMP_C="${MINI_MAX_GPU_TEMP_C:-80}"
-MINI_MAX_START_TEMP_C="${MINI_MAX_START_TEMP_C:-65}"
-MINI_MAX_STAGE_MINUTES="${MINI_MAX_STAGE_MINUTES:-20}"
+MINI_MAX_GPU_TEMP_C="${MINI_MAX_GPU_TEMP_C:-${PROFILE_MAX_GPU_TEMP_C}}"
+MINI_MAX_START_TEMP_C="${MINI_MAX_START_TEMP_C:-${PROFILE_MAX_START_TEMP_C}}"
+MINI_MAX_STAGE_MINUTES="${MINI_MAX_STAGE_MINUTES:-${PROFILE_MAX_STAGE_MINUTES}}"
 MINI_MIN_GPU_MEMORY_MIB="${MINI_MIN_GPU_MEMORY_MIB:-7500}"
-MINI_MIN_FREE_GPU_MEMORY_MIB="${MINI_MIN_FREE_GPU_MEMORY_MIB:-6000}"
+MINI_MIN_FREE_GPU_MEMORY_MIB="${MINI_MIN_FREE_GPU_MEMORY_MIB:-${PROFILE_MIN_FREE_GPU_MEMORY_MIB}}"
 MINI_THERMAL_POLL_SECONDS="${MINI_THERMAL_POLL_SECONDS:-5}"
 MINI_STOP_GRACE_SECONDS="${MINI_STOP_GRACE_SECONDS:-5}"
 MINI_PREFLIGHT_ONLY="${MINI_PREFLIGHT_ONLY:-0}"
@@ -42,7 +110,8 @@ export CUDA_DEVICES
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 
 for setting in \
-  SAMPLES_PER_SCENE MINI_VAE_EPOCHS MINI_LDM_EPOCHS MINI_CD_EPOCHS \
+  MINI_TRAIN_FRAMES_PER_SCENE MINI_VALIDATION_FRAMES_PER_SCENE \
+  MINI_VAE_EPOCHS MINI_LDM_EPOCHS MINI_CD_EPOCHS \
   MINI_BATCH_SIZE MINI_GRAD_ACCUM MINI_MAX_GPU_TEMP_C MINI_MAX_START_TEMP_C \
   MINI_MAX_STAGE_MINUTES MINI_MIN_GPU_MEMORY_MIB \
   MINI_MIN_FREE_GPU_MEMORY_MIB MINI_THERMAL_POLL_SECONDS \
@@ -57,12 +126,12 @@ if [[ ! "${MINI_NUM_WORKERS}" =~ ^[0-9]+$ ]]; then
   echo "Error: MINI_NUM_WORKERS 必须为非负整数，实际为 ${MINI_NUM_WORKERS}"
   exit 2
 fi
-for fixed_epoch in MINI_VAE_EPOCHS MINI_LDM_EPOCHS MINI_CD_EPOCHS; do
-  if [[ "${!fixed_epoch}" -ne 1 ]]; then
-    echo "Error: 8 GB formal mini 固定 ${fixed_epoch}=1"
-    exit 2
-  fi
-done
+if [[ "${MINI_VAE_EPOCHS}" -ne "${PROFILE_VAE_EPOCHS}" ]] ||
+  [[ "${MINI_LDM_EPOCHS}" -ne "${PROFILE_LDM_EPOCHS}" ]] ||
+  [[ "${MINI_CD_EPOCHS}" -ne "${PROFILE_CD_EPOCHS}" ]]; then
+  echo "Error: ${PROFILE} 固定 VAE/LDM/CD epochs=${PROFILE_VAE_EPOCHS}/${PROFILE_LDM_EPOCHS}/${PROFILE_CD_EPOCHS}"
+  exit 2
+fi
 if [[ "${MINI_BATCH_SIZE}" -ne 1 || "${MINI_GRAD_ACCUM}" -ne 1 ]]; then
   echo "Error: 8 GB formal mini 固定 MINI_BATCH_SIZE=1 且 MINI_GRAD_ACCUM=1"
   exit 2
@@ -71,20 +140,29 @@ if [[ "${MINI_NUM_WORKERS}" -ne 0 ]]; then
   echo "Error: 8 GB formal mini 固定 MINI_NUM_WORKERS=0，以降低 CPU 持续负载"
   exit 2
 fi
-if [[ "${SAMPLES_PER_SCENE}" -gt 32 ]]; then
-  echo "Error: 8 GB formal mini 的 SAMPLES_PER_SCENE 不得高于 32"
+if [[ "${PROFILE_REQUIRE_EXACT_FRAMES}" -eq 1 ]]; then
+  if [[ "${MINI_TRAIN_FRAMES_PER_SCENE}" -ne "${PROFILE_TRAIN_FRAMES_PER_SCENE}" ]] ||
+    [[ "${MINI_VALIDATION_FRAMES_PER_SCENE}" -ne "${PROFILE_VALIDATION_FRAMES_PER_SCENE}" ]]; then
+    echo "Error: ${PROFILE} 固定 train/validation frames per scene=${PROFILE_TRAIN_FRAMES_PER_SCENE}/${PROFILE_VALIDATION_FRAMES_PER_SCENE}"
+    exit 2
+  fi
+elif [[ "${MINI_TRAIN_FRAMES_PER_SCENE}" -gt "${PROFILE_MAX_TRAIN_FRAMES_PER_SCENE}" ]] ||
+  [[ "${MINI_VALIDATION_FRAMES_PER_SCENE}" -gt "${PROFILE_MAX_VALIDATION_FRAMES_PER_SCENE}" ]]; then
+  echo "Error: ${PROFILE} 的 train/validation frames per scene 不得高于 ${PROFILE_MAX_TRAIN_FRAMES_PER_SCENE}/${PROFILE_MAX_VALIDATION_FRAMES_PER_SCENE}"
   exit 2
 fi
-if [[ "${MINI_MAX_GPU_TEMP_C}" -gt 80 || "${MINI_MAX_START_TEMP_C}" -gt 65 ]]; then
-  echo "Error: 受保护入口不得提高 80 C 运行温度或 65 C 启动温度上限"
+if [[ "${MINI_MAX_GPU_TEMP_C}" -gt "${PROFILE_MAX_GPU_TEMP_C}" ||
+  "${MINI_MAX_START_TEMP_C}" -gt "${PROFILE_MAX_START_TEMP_C}" ]]; then
+  echo "Error: ${PROFILE} 受保护入口不得提高 ${PROFILE_MAX_GPU_TEMP_C} C 运行温度或 ${PROFILE_MAX_START_TEMP_C} C 启动温度上限"
   exit 2
 fi
-if [[ "${MINI_MAX_STAGE_MINUTES}" -gt 20 ]]; then
-  echo "Error: 8 GB formal mini 的单阶段时长不得高于 20 分钟"
+if [[ "${MINI_MAX_STAGE_MINUTES}" -gt "${PROFILE_MAX_STAGE_MINUTES}" ]]; then
+  echo "Error: ${PROFILE} 的单阶段时长不得高于 ${PROFILE_MAX_STAGE_MINUTES} 分钟"
   exit 2
 fi
-if [[ "${MINI_MIN_GPU_MEMORY_MIB}" -lt 7500 || "${MINI_MIN_FREE_GPU_MEMORY_MIB}" -lt 6000 ]]; then
-  echo "Error: 受保护入口不得降低总显存 7500 MiB 或可用显存 6000 MiB 门槛"
+if [[ "${MINI_MIN_GPU_MEMORY_MIB}" -lt 7500 ||
+  "${MINI_MIN_FREE_GPU_MEMORY_MIB}" -lt "${PROFILE_MIN_FREE_GPU_MEMORY_MIB}" ]]; then
+  echo "Error: ${PROFILE} 受保护入口不得降低总显存 7500 MiB 或可用显存 ${PROFILE_MIN_FREE_GPU_MEMORY_MIB} MiB 门槛"
   exit 2
 fi
 if [[ "${MINI_THERMAL_POLL_SECONDS}" -gt 10 || "${MINI_STOP_GRACE_SECONDS}" -gt 15 ]]; then
@@ -121,6 +199,7 @@ GPU_STATE="$(query_gpu_state)" || {
 }
 IFS=',' read -r GPU_NAME GPU_TOTAL_MIB GPU_FREE_MIB GPU_TEMP_C <<< "${GPU_STATE}"
 GPU_NAME="${GPU_NAME#${GPU_NAME%%[![:space:]]*}}"
+GPU_NAME="${GPU_NAME%${GPU_NAME##*[![:space:]]}}"
 GPU_TOTAL_MIB="${GPU_TOTAL_MIB//[[:space:]]/}"
 GPU_FREE_MIB="${GPU_FREE_MIB//[[:space:]]/}"
 GPU_TEMP_C="${GPU_TEMP_C//[[:space:]]/}"
@@ -130,6 +209,11 @@ for value in "${GPU_TOTAL_MIB}" "${GPU_FREE_MIB}" "${GPU_TEMP_C}"; do
     exit 1
   fi
 done
+if [[ -n "${PROFILE_REQUIRED_GPU_NAME}" &&
+  "${GPU_NAME}" != "${PROFILE_REQUIRED_GPU_NAME}" ]]; then
+  echo "Error: ${PROFILE} 仅允许 ${PROFILE_REQUIRED_GPU_NAME}，实际为 ${GPU_NAME}"
+  exit 1
+fi
 if [[ "${GPU_TOTAL_MIB}" -lt "${MINI_MIN_GPU_MEMORY_MIB}" ]]; then
   echo "Error: GPU 总显存 ${GPU_TOTAL_MIB} MiB 低于门槛 ${MINI_MIN_GPU_MEMORY_MIB} MiB"
   exit 1
@@ -143,7 +227,7 @@ if [[ "${GPU_TEMP_C}" -gt "${MINI_MAX_START_TEMP_C}" ]]; then
   exit 1
 fi
 
-MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${ROOT_DIR}/test/result/formal_mini_p1_04_8gb_v1}"
+MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${DEFAULT_MINI_RESULTS_DIR}}"
 MINI_RESULTS_DIR="$(realpath -m -- "${MINI_RESULTS_DIR}")"
 RESULT_ROOT="$(realpath -m -- "${ROOT_DIR}/test/result")"
 case "${MINI_RESULTS_DIR}" in
@@ -181,39 +265,53 @@ fi
 
 export MINI_RESULTS_DIR
 export MINI_PREFLIGHT_ONLY
-export MINI_DATASET_DIR="${MINI_RESULTS_DIR}/.tmp_${MODE}_train_dataset"
 export MINI_CONFIG_PATH="${MINI_RESULTS_DIR}/mini_${MODE}_config.yaml"
 export MINI_RADAR_PROTOCOL="formal"
-export MINI_CHECKPOINT_PROTOCOL="formal_mini_chain_v1"
-export PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
+export MINI_CHECKPOINT_PROTOCOL="formal_mini_chain_v2"
+export PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1"
+export MINI_DATASET_DIR="${PREPROCESSED_ROOT}"
 export CALIB_CONFIG_DIR="${ROOT_DIR}/Data/config"
 export TRAIN_SCENES_OVERRIDE="garden"
-export MINI_RADAR_NORMALIZATION_PATH="${ROOT_DIR}/diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_full120_86p8_v1.json"
-export EXPECTED_FORMAL_ARTIFACT_SHA256="2c9c92650b98ec686d621b53eccb5e7f376cb6b8ea1047d4fb594349af90c4d5"
+export MINI_RADAR_NORMALIZATION_PATH="${ROOT_DIR}/diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json"
+export EXPECTED_FORMAL_ARTIFACT_SHA256="11f59d84cc186c39256c112154faf458ec9ead5fec9b08b997abd5058b68e97c"
+export MINI_TEMPORAL_SPLIT_ARTIFACT="${PREPROCESSED_ROOT}/temporal_split_garden_train80_purge3s_v1.json"
+export MINI_DATA_PROTOCOL_PATH="${PREPROCESSED_ROOT}/formal_data_protocol_garden_train80_purge3s_v1.json"
 export MINI_DOPPLER_SCALE_MPS="86.8"
 export MINI_TARGET_SIZE="32,128,128"
-export MINI_SOURCE_PC_RANGE="0,-20,-6,120,20,10"
-export MINI_MODEL_PC_RANGE="0,-20,-6,120,20,10"
+export MINI_SOURCE_PC_RANGE="0,-20,-6,80,20,10"
+export MINI_MODEL_PC_RANGE="0,-20,-6,80,20,10"
 export MINI_VAE_CONFIG_TYPE="ultra_lightweight"
 export MINI_VAE_LATENT_DIM=""
 export MINI_VAE_OCC_LOSS="bce_dice"
 export MINI_TRAIN_SPLIT="0.8"
 export MINI_SPLIT_SEED="42"
 export MINI_USE_AUG="false"
-export MINI_REQUIRE_FRESH_SCRATCH="1"
+export MINI_REQUIRE_FRESH_SCRATCH="0"
 export MINI_REQUIRE_FRESH_CONFIG="1"
-export SAMPLES_PER_SCENE MINI_VAE_EPOCHS MINI_LDM_EPOCHS MINI_CD_EPOCHS
+export MINI_TRAIN_FRAMES_PER_SCENE MINI_VALIDATION_FRAMES_PER_SCENE
+export MINI_VAE_EPOCHS MINI_LDM_EPOCHS MINI_CD_EPOCHS
 export MINI_BATCH_SIZE MINI_NUM_WORKERS MINI_GRAD_ACCUM
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
+# PyTorch 2.4.1 在本机 expandable segment 路径触发过 allocator 内部断言；固定使用 native allocator 分块策略。
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+
+case "${MODE}" in
+  vae) ACTIVE_STAGE_EPOCHS="${MINI_VAE_EPOCHS}" ;;
+  ldm) ACTIVE_STAGE_EPOCHS="${MINI_LDM_EPOCHS}" ;;
+  cd) ACTIVE_STAGE_EPOCHS="${MINI_CD_EPOCHS}" ;;
+esac
 
 echo "=========================================="
 echo "Formal mini 8 GB guarded run"
 echo "stage: ${MODE}"
+echo "profile: ${PROFILE}"
 echo "GPU: ${GPU_NAME}"
 echo "GPU memory total/free: ${GPU_TOTAL_MIB}/${GPU_FREE_MIB} MiB"
 echo "GPU start/max temperature: ${GPU_TEMP_C}/${MINI_MAX_GPU_TEMP_C} C"
-echo "samples/epochs/batch: ${SAMPLES_PER_SCENE}/1/${MINI_BATCH_SIZE}"
+echo "train/validation frames per scene: ${MINI_TRAIN_FRAMES_PER_SCENE}/${MINI_VALIDATION_FRAMES_PER_SCENE}"
+echo "selected frames per scene: $((MINI_TRAIN_FRAMES_PER_SCENE + MINI_VALIDATION_FRAMES_PER_SCENE))"
+echo "epochs/batch: ${ACTIVE_STAGE_EPOCHS}/${MINI_BATCH_SIZE}"
 echo "max stage runtime: ${MINI_MAX_STAGE_MINUTES} min"
+echo "CUDA allocator: ${PYTORCH_CUDA_ALLOC_CONF}"
 echo "results: ${MINI_RESULTS_DIR}"
 echo "=========================================="
 

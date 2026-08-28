@@ -124,6 +124,7 @@ def validate_radar_normalization_spec(
     model_pc_range: Sequence[float],
     doppler_scale_mps: Optional[float] = None,
     require_formal: bool = True,
+    expected_split_artifact_sha256: Optional[str] = None,
 ) -> dict:
     """严格验证 normalization v1，并返回不共享可变对象的副本。"""
     mapping = _require_exact_keys(spec, _TOP_LEVEL_KEYS, "radar_normalization")
@@ -242,11 +243,18 @@ def validate_radar_normalization_spec(
     if variance.get("aggregation") != "occupied_voxel_equal_weight_total_variance":
         raise RadarNormalizationError("variance aggregation 不符合协议")
 
-    provenance = _require_exact_keys(
+    provenance = _require_mapping(
         mapping.get("input_provenance"),
-        {"dataset_manifest_sha256"},
         "input_provenance",
     )
+    allowed_provenance_keys = {
+        frozenset({"dataset_manifest_sha256"}),
+        frozenset({"dataset_manifest_sha256", "split_artifact_sha256"}),
+    }
+    if frozenset(provenance) not in allowed_provenance_keys:
+        raise RadarNormalizationError(
+            "input_provenance 字段必须包含 dataset manifest，且只可选配 split artifact"
+        )
     manifests = _require_mapping(
         provenance.get("dataset_manifest_sha256"),
         "input_provenance.dataset_manifest_sha256",
@@ -260,6 +268,21 @@ def validate_radar_normalization_spec(
             raise RadarNormalizationError(
                 f"场景 {scene!r} 的 dataset manifest SHA-256 无效"
             )
+    split_digest = provenance.get("split_artifact_sha256")
+    if split_digest is not None:
+        validate_radar_normalization_sha256(
+            split_digest,
+            context="normalization split artifact",
+        )
+    if expected_split_artifact_sha256 is not None:
+        expected_split = validate_radar_normalization_sha256(
+            expected_split_artifact_sha256,
+            context="expected split artifact",
+        )
+        if split_digest != expected_split:
+            raise RadarNormalizationError(
+                "normalization 未绑定当前 temporal split artifact SHA-256"
+            )
 
     return copy.deepcopy(dict(mapping))
 
@@ -272,6 +295,7 @@ def load_radar_normalization_artifact(
     model_pc_range: Sequence[float],
     doppler_scale_mps: float,
     require_formal: bool = True,
+    expected_split_artifact_sha256: Optional[str] = None,
 ) -> Tuple[dict, str]:
     """从非 symlink 普通文件读取、验证 spec，并返回真实文件 SHA-256。"""
     artifact_path = os.path.abspath(os.fspath(path))
@@ -299,6 +323,7 @@ def load_radar_normalization_artifact(
         model_pc_range=model_pc_range,
         doppler_scale_mps=doppler_scale_mps,
         require_formal=require_formal,
+        expected_split_artifact_sha256=expected_split_artifact_sha256,
     )
     return validated, _sha256_file(artifact_path)
 

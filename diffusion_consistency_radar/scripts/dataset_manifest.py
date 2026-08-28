@@ -37,10 +37,20 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
     )
+    create_parser.add_argument(
+        "--profile",
+        required=True,
+        choices=("training", "deployment"),
+        help="training 要求 Radar/LiDAR/target/observed/IR；deployment 只要求 Radar/IR",
+    )
     create_parser.add_argument("--preprocess_script", required=True)
-    create_parser.add_argument("--calibration", required=True)
-    create_parser.add_argument("--radar_index", required=True)
-    create_parser.add_argument("--lidar_index", required=True)
+    create_parser.add_argument("--radar_to_lidar", required=True)
+    create_parser.add_argument("--radar_to_thermal", required=True)
+    create_parser.add_argument("--lidar_to_thermal", required=True)
+    create_parser.add_argument("--thermal_intrinsics", required=True)
+    create_parser.add_argument("--radar_ir_sync", required=True)
+    create_parser.add_argument("--radar_lidar_sync")
+    create_parser.add_argument("--target_policy")
 
     validate_parser = subparsers.add_parser(
         "validate",
@@ -48,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.add_argument("--scene_dir", required=True)
     validate_parser.add_argument("--expected_scene", required=True)
+    validate_parser.add_argument(
+        "--expected_profile",
+        choices=("training", "deployment"),
+        help="指定后拒绝不带 profile 的 legacy v1 manifest",
+    )
     return parser
 
 
@@ -57,19 +72,43 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     try:
         if args.command == "create":
+            if args.profile == "deployment":
+                parser.error(
+                    "严格 deployment v3 必须使用 build_deployment_view.py create，"
+                    "禁止绕过父 training manifest 与 receipt"
+                )
             provenance_paths = {
                 "preprocess_script": args.preprocess_script,
-                "calibration": args.calibration,
-                "radar_index": args.radar_index,
-                "lidar_index": args.lidar_index,
+                "radar_to_lidar": args.radar_to_lidar,
+                "radar_to_thermal": args.radar_to_thermal,
+                "lidar_to_thermal": args.lidar_to_thermal,
+                "thermal_intrinsics": args.thermal_intrinsics,
+                "radar_ir_sync": args.radar_ir_sync,
             }
+            if args.profile == "training":
+                if not args.radar_lidar_sync or not args.target_policy:
+                    parser.error(
+                        "training profile 必须同时提供 --radar_lidar_sync "
+                        "和 --target_policy"
+                    )
+                provenance_paths.update(
+                    {
+                        "radar_lidar_sync": args.radar_lidar_sync,
+                        "target_policy": args.target_policy,
+                    }
+                )
             manifest_path = write_scene_manifest_atomic(
                 args.scene_dir,
                 args.scene,
                 args.expected_frame_count,
                 provenance_paths,
+                profile=args.profile,
             )
-            manifest = validate_scene_manifest(args.scene_dir, args.scene)
+            manifest = validate_scene_manifest(
+                args.scene_dir,
+                args.scene,
+                expected_profile=args.profile,
+            )
         else:
             manifest_path = os.path.join(
                 os.path.abspath(args.scene_dir),
@@ -78,6 +117,7 @@ def main(argv=None) -> None:
             manifest = validate_scene_manifest(
                 args.scene_dir,
                 args.expected_scene,
+                expected_profile=args.expected_profile,
             )
     except DatasetManifestError as exc:
         parser.error(str(exc))
@@ -88,6 +128,8 @@ def main(argv=None) -> None:
                 "manifest_path": manifest_path,
                 "scene": manifest["scene"],
                 "frame_count": manifest["frame_count"],
+                "schema_version": manifest["schema_version"],
+                "profile": manifest.get("profile", "legacy_v1"),
                 "content_sha256": manifest["content_sha256"],
             },
             ensure_ascii=False,

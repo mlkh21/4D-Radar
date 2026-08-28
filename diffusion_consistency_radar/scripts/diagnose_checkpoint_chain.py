@@ -42,8 +42,9 @@ def _construct_and_load_chain(
     cd_path: str,
     report: Dict[str, Any],
     device: str,
+    allow_legacy_protocol: bool,
 ) -> Dict[str, Any]:
-    """按 checkpoint 自描述配置在指定设备构建并严格加载三阶段模型。"""
+    """按目标 stage 自描述配置构建并严格加载，不执行 forward。"""
     from diffusion_consistency_radar.cm.vae_3d import build_vae_from_checkpoint
     from diffusion_consistency_radar.scripts.inference import (
         build_inference_model,
@@ -53,13 +54,23 @@ def _construct_and_load_chain(
     target_size = tuple(int(value) for value in report["grid"]["target_size"])
     model_range = tuple(float(value) for value in report["grid"]["model_pc_range"])
     torch_device = torch.device(device)
-    vae_checkpoint = safe_torch_load(vae_path)
+    vae_checkpoint = safe_torch_load(
+        vae_path,
+        allow_legacy_pickle=allow_legacy_protocol,
+    )
     vae, metadata = build_vae_from_checkpoint(vae_checkpoint)
     vae = vae.to(torch_device).eval()
     loaded = {"vae": {"latent_dim": int(vae.latent_dim)}}
 
-    for stage, path in (("ldm", ldm_path), ("cd", cd_path)):
-        checkpoint = safe_torch_load(path)
+    stage_paths = {"ldm": ldm_path, "cd": cd_path}
+    for stage in report["stages"]:
+        if stage == "vae":
+            continue
+        path = stage_paths[stage]
+        checkpoint = safe_torch_load(
+            path,
+            allow_legacy_pickle=allow_legacy_protocol,
+        )
         state_dict = checkpoint_state_dict(checkpoint)
         config = resolve_generation_model_config(
             checkpoint,
@@ -92,6 +103,8 @@ def diagnose_checkpoint_chain(
     report_dir: str = "",
     construct: bool = False,
     device: str = "cpu",
+    target_stage: str = "cd",
+    allow_legacy_protocol: bool = False,
 ) -> Dict[str, Any]:
     """执行协议诊断；成功时可选写入新的 JSON 报告。"""
     report = validate_formal_checkpoint_chain(
@@ -99,6 +112,8 @@ def diagnose_checkpoint_chain(
         ldm_ckpt,
         cd_ckpt,
         require_multimodal=True,
+        target_stage=target_stage,
+        allow_legacy_protocol=allow_legacy_protocol,
     )
     if construct:
         report = _construct_and_load_chain(
@@ -107,6 +122,7 @@ def diagnose_checkpoint_chain(
             cd_ckpt,
             report,
             device,
+            allow_legacy_protocol,
         )
     if report_dir:
         _ensure_empty_report_dir(report_dir)
@@ -135,8 +151,14 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate = subparsers.add_parser("validate", help="校验并可选保存协议报告")
     validate.add_argument("--vae_ckpt", required=True)
-    validate.add_argument("--ldm_ckpt", required=True)
-    validate.add_argument("--cd_ckpt", required=True)
+    validate.add_argument("--ldm_ckpt", default="")
+    validate.add_argument("--cd_ckpt", default="")
+    validate.add_argument(
+        "--target_stage",
+        default="cd",
+        choices=("vae", "ldm", "cd"),
+        help="只校验目标阶段及其父 checkpoint",
+    )
     validate.add_argument("--report_dir", default="")
     validate.add_argument(
         "--construct",
@@ -144,6 +166,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="在 CPU/指定设备构建并严格加载 VAE、LDM、CD，不执行 forward",
     )
     validate.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
+    validate.add_argument(
+        "--allow_legacy_protocol",
+        action="store_true",
+        help="仅诊断可信历史 v1 checkpoint；允许 legacy 协议和 pickle 回退",
+    )
     return parser
 
 
@@ -157,6 +184,8 @@ def main(argv=None) -> int:
             report_dir=args.report_dir,
             construct=args.construct,
             device=args.device,
+            target_stage=args.target_stage,
+            allow_legacy_protocol=args.allow_legacy_protocol,
         )
     except (CheckpointChainError, ValueError, RuntimeError, OSError) as exc:
         print(str(exc), file=sys.stderr)

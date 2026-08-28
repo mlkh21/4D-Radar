@@ -21,6 +21,15 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from diffusion_consistency_radar.dataset_manifest import write_scene_manifest_atomic
+from diffusion_consistency_radar.observed_mask import (
+    OBSERVED_MASK_PROTOCOL,
+    build_lidar_observed_mask,
+    save_observed_mask,
+)
+from diffusion_consistency_radar.radar_statistics import (
+    RADAR_STATISTICS_PROTOCOL,
+    save_sparse_radar_voxel,
+)
 
 try:
     # 作为包导入时使用完整模块路径。
@@ -29,6 +38,7 @@ try:
         VELOCITY_FRAMES,
         load_recorded_velocity_table,
         resolve_frame_velocity,
+        sensor_to_reference_motion_delta,
         sha256_file,
         transform_velocity,
     )
@@ -41,6 +51,7 @@ except ModuleNotFoundError as exc:
         VELOCITY_FRAMES,
         load_recorded_velocity_table,
         resolve_frame_velocity,
+        sensor_to_reference_motion_delta,
         sha256_file,
         transform_velocity,
     )
@@ -57,6 +68,9 @@ RAW_DATA_PATH = "./Data/NTU4DRadLM_Raw"
 INDEX_PATH = "./Data/NTU4DRadLM_Raw"
 OUTPUT_PATH = "./Data/NTU4DRadLM_Pre_sensor_aware"
 CALIB_PATH = "./Data/config/calib_radar_to_livox.txt"
+RADAR_TO_THERMAL_PATH = "./Data/config/calib_radar_to_thermal.txt"
+LIDAR_TO_THERMAL_PATH = "./Data/config/calib_livox_to_thermal.txt"
+THERMAL_INTRINSICS_PATH = "./Data/config/calib_cam_thermal.txt"
 
 VOXEL_SIZE = [0.2, 0.2, 0.2]
 PC_RANGE = [0, -20, -6, 120, 20, 10]
@@ -150,6 +164,30 @@ def build_sensor_aware_target_vectorized(
 def invert_r_t(r_mat, t_vec):
     return r_mat.T, -np.dot(r_mat.T, t_vec)
 
+
+def audit_calibration_closure(
+    r_radar_to_lidar,
+    t_radar_to_lidar,
+    radar_to_thermal_path,
+    lidar_to_thermal_path,
+):
+    """比较直接 Radar→Thermal 与经 LiDAR 组合的外参，只记录不擅自择真。"""
+    r_radar_to_thermal, t_radar_to_thermal = load_calib(radar_to_thermal_path)
+    r_lidar_to_thermal, t_lidar_to_thermal = load_calib(lidar_to_thermal_path)
+    composed_r = r_lidar_to_thermal @ r_radar_to_lidar
+    composed_t = r_lidar_to_thermal @ t_radar_to_lidar + t_lidar_to_thermal
+    return {
+        "composition": "radar_to_lidar_then_lidar_to_thermal",
+        "rotation_max_abs": float(
+            np.max(np.abs(composed_r - r_radar_to_thermal))
+        ),
+        "translation_l2_m": float(
+            np.linalg.norm(composed_t - t_radar_to_thermal)
+        ),
+        "authority_for_lidar_voxels": "direct_lidar_to_thermal",
+        "status": "audit_only_requires_reprojection_review",
+    }
+
 def ensure_dir(path):
     if not os.path.exists(path): os.makedirs(path)
 
@@ -206,6 +244,7 @@ def _load_radar_lidar_sync(
             radar_index = int(row["radar_index"])
             lidar_index = int(row["lidar_index"])
             recorded_delta = float(row["delta_seconds"])
+            recorded_signed_delta = float(row["signed_delta_seconds"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行格式错误") from exc
         if radar_index != radar_indices[position] or lidar_index != lidar_indices[position]:
@@ -217,8 +256,19 @@ def _load_radar_lidar_sync(
         if lidar_index < 0 or lidar_index >= len(lidar_timestamps):
             raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行 LiDAR 索引越界")
         measured_delta = abs(float(radar_timestamps[radar_index]) - float(lidar_timestamps[lidar_index]))
+        measured_signed_delta = (
+            float(lidar_timestamps[lidar_index])
+            - float(radar_timestamps[radar_index])
+        )
         if abs(recorded_delta - measured_delta) > 1e-6:
             raise ValueError(f"Radar-LiDAR 同步记录第 {position} 行 delta 与文件名时间戳不一致")
+        if (
+            not np.isfinite(recorded_signed_delta)
+            or abs(recorded_signed_delta - measured_signed_delta) > 1e-6
+        ):
+            raise ValueError(
+                f"Radar-LiDAR 同步记录第 {position} 行 signed delta 与文件名时间戳不一致"
+            )
         if recorded_delta > max_delta:
             raise ValueError(
                 f"Radar-LiDAR 第 {position} 对时间差 {recorded_delta:.9f}s "
@@ -236,6 +286,9 @@ def _ensure_motion_args(args):
         "velocity_max_delta": 0.02,
         "radar_lidar_max_delta": 0.045,
         "radar_ir_max_delta": 0.025,
+        "radar_to_thermal_path": RADAR_TO_THERMAL_PATH,
+        "lidar_to_thermal_path": LIDAR_TO_THERMAL_PATH,
+        "thermal_intrinsics_path": THERMAL_INTRINSICS_PATH,
     }
     for name, default in defaults.items():
         if not hasattr(args, name):
@@ -255,8 +308,10 @@ def ensure_fresh_scene_output(scene_out_path):
     os.makedirs(scene_out_path)
 
 def load_calib(calib_file):
-    R, T = np.eye(3), np.zeros(3)
-    if not os.path.exists(calib_file): raise FileNotFoundError(f"Calibration file not found: {calib_file}.")
+    """严格读取 source-to-target 外参，拒绝缺字段时静默使用单位阵。"""
+    R, T = None, None
+    if os.path.islink(calib_file) or not os.path.isfile(calib_file):
+        raise FileNotFoundError(f"Calibration file not found or not regular: {calib_file}.")
     with open(calib_file, 'r') as f:
         for line in f:
             if ':' not in line: continue
@@ -270,6 +325,15 @@ def load_calib(calib_file):
             if len(vals) == 0: continue
             if key == 'R' and len(vals) == 9: R = np.array(vals).reshape(3, 3)
             elif key == 'T' and len(vals) == 3: T = np.array(vals)
+    if R is None or T is None or not np.all(np.isfinite(R)) or not np.all(np.isfinite(T)):
+        raise ValueError(f"Calibration R/T missing or non-finite: {calib_file}")
+    if not np.allclose(R @ R.T, np.eye(3), atol=5e-3, rtol=0.0):
+        raise ValueError(f"Calibration R is not orthogonal: {calib_file}")
+    determinant = float(np.linalg.det(R))
+    if abs(determinant - 1.0) > 5e-3:
+        raise ValueError(
+            f"Calibration R determinant must be near 1, got {determinant}: {calib_file}"
+        )
     return R, T
 
 def transform_pcl(pcl, R, T):
@@ -278,16 +342,58 @@ def transform_pcl(pcl, R, T):
     pcl_trans[:, :3] = np.dot(pcl[:, :3], R.T) + T
     return pcl_trans
 
-def save_voxel(filename, voxel_grid):
+
+def compensate_radar_doppler(pcl, radar_velocity):
+    """在 Radar 原点坐标系内剔除平台径向速度，避免外参平移改变射线方向。"""
+    if radar_velocity is None or pcl.shape[0] == 0 or pcl.shape[1] <= 4:
+        return pcl
+    velocity = np.asarray(radar_velocity, dtype=np.float32)
+    if velocity.shape != (3,) or not np.all(np.isfinite(velocity)):
+        raise ValueError("radar_velocity 必须是三个有限数")
+    corrected = pcl.copy()
+    xyz = corrected[:, :3]
+    radius = np.maximum(np.linalg.norm(xyz, axis=1), 1e-6)
+    ego_radial = np.sum(xyz * velocity[None, :], axis=1) / radius
+    corrected[:, 4] = corrected[:, 4] - ego_radial
+    return corrected
+
+
+def move_pcl_to_reference_time(pcl, velocity, motion_delta_seconds):
+    """在共享坐标系内按有符号时间量移动一份非参考点云。"""
+    if velocity is None or pcl.shape[0] == 0:
+        return pcl
+    delta = float(motion_delta_seconds)
+    if not np.isfinite(delta):
+        raise ValueError("motion_delta_seconds 必须是有限数")
+    if abs(delta) <= 1e-12:
+        return pcl
+    moved = pcl.copy()
+    moved[:, :3] += np.asarray(velocity, dtype=np.float32) * delta
+    return moved
+
+def save_voxel(filename, voxel_grid, radar_statistics=None):
+    """保存普通稀疏体素；Radar 可把统计合同绑定在同一 NPZ 内。"""
     if SAVE_SPARSE:
+        if radar_statistics is not None:
+            save_sparse_radar_voxel(filename, voxel_grid, radar_statistics)
+            return
         occupied = voxel_grid[..., 0] > 0
         coords = np.column_stack(np.where(occupied))
         features = voxel_grid[occupied]
         np.savez(filename, coords=coords, features=features, shape=voxel_grid.shape)
     else:
+        if radar_statistics is not None:
+            raise ValueError("Radar statistics 只支持 SAVE_SPARSE=True")
         np.save(filename, voxel_grid.astype(np.float32))
 
-def voxelize_pcl_airborne_optimized(pcl, voxel_size, pc_range, v_drone=None, dt_sync=0.0):
+def voxelize_pcl_airborne_optimized(
+    pcl,
+    voxel_size,
+    pc_range,
+    v_drone=None,
+    dt_sync=0.0,
+    return_statistics=False,
+):
     """
     重构后的机载自适应点云体素化核心函数
 
@@ -296,7 +402,7 @@ def voxelize_pcl_airborne_optimized(pcl, voxel_size, pc_range, v_drone=None, dt_
     voxel_size: list [3] -> 体素网格的分辨率 [dx, dy, dz] 单位:米
     pc_range: list [6] -> 感知空间的边界 [x_min, y_min, z_min, x_max, y_max, z_max]
     v_drone: array_like [3] -> 无人机当前的瞬时速度绝对值向量 [vx, vy, vz], 单位: m/s
-    dt_sync: float -> 红外图像快门或激光与4D雷达帧之间的绝对硬件时钟残差, 单位: 秒
+    dt_sync: float -> 当前点云时间减参考时刻的有符号时间量, 单位: 秒
     """
     dt_sync = float(dt_sync)
     if not np.isfinite(dt_sync):
@@ -306,8 +412,7 @@ def voxelize_pcl_airborne_optimized(pcl, voxel_size, pc_range, v_drone=None, dt_
         if v_drone.shape != (3,) or not np.all(np.isfinite(v_drone)):
             raise ValueError("v_drone 必须是三个有限数")
 
-    # 1.机载高动态时空位置微秒级畸变修正
-    # 在 70m/s 下，修正因传感器异步产生的帧内空间拉伸模糊
+    # 1. 将非参考传感器点云移动到明确参考时刻；参考传感器的 dt 恒为 0。
     if abs(dt_sync) > 1e-6 and v_drone is not None:
         pcl = pcl.copy()
         pcl[:, :3] += np.array(v_drone, dtype=np.float32) * dt_sync
@@ -335,7 +440,16 @@ def voxelize_pcl_airborne_optimized(pcl, voxel_size, pc_range, v_drone=None, dt_
         int((pc_range[4] - pc_range[1]) / voxel_size[1]),
         int((pc_range[5] - pc_range[2]) / voxel_size[2])
     )
-    if pcl.shape[0] == 0: return np.zeros(grid_shape + (4,), dtype=np.float32)
+    if pcl.shape[0] == 0:
+        empty_voxel = np.zeros(grid_shape + (4,), dtype=np.float32)
+        if not return_statistics:
+            return empty_voxel
+        return empty_voxel, {
+            "protocol": RADAR_STATISTICS_PROTOCOL,
+            "coords": np.empty((0, 3), dtype=np.int32),
+            "point_count": np.empty((0,), dtype=np.uint32),
+            "doppler_valid_count": np.empty((0,), dtype=np.uint32),
+        }
 
     # 4. 展平 3D 矩阵，实现无 Python 循环的高性能散列填充 (Scatter Accumulate)
     x_idx = np.clip(((pcl[:, 0] - pc_range[0]) / voxel_size[0]).astype(np.int32), 0, grid_shape[0] - 1)
@@ -348,7 +462,13 @@ def voxelize_pcl_airborne_optimized(pcl, voxel_size, pc_range, v_drone=None, dt_
     sort_order = np.argsort(flat_indices)
     flat_indices = flat_indices[sort_order]
     features = pcl[sort_order, 3] if pcl.shape[1] > 3 else np.ones(pcl.shape[0])
-    doppler = pcl[sort_order, 4] if pcl.shape[1] > 4 else np.zeros(pcl.shape[0])
+    has_doppler = pcl.shape[1] > 4
+    doppler = pcl[sort_order, 4] if has_doppler else np.zeros(pcl.shape[0])
+    doppler_valid = (
+        np.isfinite(pcl[sort_order, 4])
+        if has_doppler
+        else np.zeros(pcl.shape[0], dtype=bool)
+    )
 
     unique_indices, unique_counts = np.unique(flat_indices, return_counts=True)
     uz_idx = unique_indices % grid_shape[2]
@@ -375,7 +495,27 @@ def voxelize_pcl_airborne_optimized(pcl, voxel_size, pc_range, v_drone=None, dt_
    # 截断保护，防止随机噪点方差过大导致神经网络训练时出现 NaN 异常
     voxel_grid[ux_idx, uy_idx, uz_idx, 3] = np.clip(var_doppler, 0.0, 50.0)
 
-    return voxel_grid
+    if not return_statistics:
+        return voxel_grid
+    doppler_valid_accumulator = np.zeros(np.prod(grid_shape), dtype=np.uint32)
+    np.add.at(
+        doppler_valid_accumulator,
+        flat_indices,
+        doppler_valid.astype(np.uint32, copy=False),
+    )
+    statistics = {
+        "protocol": RADAR_STATISTICS_PROTOCOL,
+        "coords": np.column_stack((ux_idx, uy_idx, uz_idx)).astype(
+            np.int32,
+            copy=False,
+        ),
+        "point_count": unique_counts.astype(np.uint32, copy=False),
+        "doppler_valid_count": doppler_valid_accumulator[unique_indices].astype(
+            np.uint32,
+            copy=False,
+        ),
+    }
+    return voxel_grid, statistics
 
 # ==============================================================================
 # 工作子进程单元
@@ -384,8 +524,9 @@ def voxelize_pcl_airborne_optimized(pcl, voxel_size, pc_range, v_drone=None, dt_
 def _parallel_frame_worker(task_args):
     global _process_patchwork
 
-    (i, r_file, l_file, current_ts, scene_raw_path, scene_out_path,
-     r_radar_to_lidar, t_radar_to_lidar, frame_velocity, dt_sync,
+    (i, r_file, l_file, radar_timestamp, lidar_timestamp,
+     scene_raw_path, scene_out_path,
+     r_radar_to_lidar, t_radar_to_lidar, frame_velocity,
      thermal_timestamps, thermal_files, thermal_dir, args_dict,
      thermal_index, thermal_delta) = task_args
 
@@ -402,6 +543,16 @@ def _parallel_frame_worker(task_args):
                 tree = cKDTree(lidar_pcl[:, :3])
                 _, idx = tree.query(nonground[:, :3], k=1)
                 lidar_pcl = lidar_pcl[idx]
+
+    radar_velocity = None
+    if frame_velocity is not None:
+        radar_velocity = transform_velocity(
+            frame_velocity,
+            source_frame=args_dict["velocity_frame"],
+            target_frame="radar",
+            radar_to_lidar_rotation=r_radar_to_lidar,
+        )
+        radar_pcl = compensate_radar_doppler(radar_pcl, radar_velocity)
 
     if args_dict["align_to"] == "lidar":
         radar_pcl = transform_pcl(radar_pcl, r_radar_to_lidar, t_radar_to_lidar)
@@ -423,11 +574,42 @@ def _parallel_frame_worker(task_args):
             radar_to_lidar_rotation=r_radar_to_lidar,
         )
 
-    r_voxel = voxelize_pcl_airborne_optimized(
-        radar_pcl, VOXEL_SIZE, args_dict["pc_range"], v_drone=target_velocity, dt_sync=dt_sync
+    reference_timestamp = (
+        lidar_timestamp if args_dict["align_to"] == "lidar" else radar_timestamp
+    )
+    radar_motion_delta = sensor_to_reference_motion_delta(
+        radar_timestamp,
+        reference_timestamp,
+    )
+    lidar_motion_delta = sensor_to_reference_motion_delta(
+        lidar_timestamp,
+        reference_timestamp,
+    )
+    radar_pcl = move_pcl_to_reference_time(
+        radar_pcl,
+        target_velocity,
+        radar_motion_delta,
+    )
+    lidar_pcl = move_pcl_to_reference_time(
+        lidar_pcl,
+        target_velocity,
+        lidar_motion_delta,
+    )
+
+    r_voxel, radar_statistics = voxelize_pcl_airborne_optimized(
+        radar_pcl,
+        VOXEL_SIZE,
+        args_dict["pc_range"],
+        v_drone=None,
+        dt_sync=0.0,
+        return_statistics=True,
     )
     l_voxel = voxelize_pcl_airborne_optimized(
-        lidar_pcl, VOXEL_SIZE, args_dict["pc_range"], v_drone=target_velocity, dt_sync=dt_sync
+        lidar_pcl,
+        VOXEL_SIZE,
+        args_dict["pc_range"],
+        v_drone=None,
+        dt_sync=0.0,
     )
 
     target_voxel = build_sensor_aware_target_vectorized(
@@ -437,6 +619,10 @@ def _parallel_frame_worker(task_args):
         radar_visibility_radius=args_dict["radar_visibility_radius"],
         doppler_radius=args_dict["doppler_radius"],
         visibility_mode=args_dict["visibility_mode"],
+    )
+    observed_mask = build_lidar_observed_mask(
+        l_voxel,
+        args_dict["pc_range"],
     )
 
     # 红外帧索引和实际 delta 在主进程中预先计算并通过任务传入，
@@ -449,7 +635,7 @@ def _parallel_frame_worker(task_args):
         if img is None:
             raise RuntimeError(
                 f"无法读取 IR 帧 {thermal_files[thermal_index]} "
-                f"(Radar timestamp={current_ts:.9f})"
+                f"(Radar timestamp={radar_timestamp:.9f})"
             )
         img_3ch = np.stack(
             [cv2.resize(img, (640, 480)).astype(np.float32) / 255.0] * 3,
@@ -458,16 +644,25 @@ def _parallel_frame_worker(task_args):
         np.save(os.path.join(scene_out_path, "ir_image", f"{i:06d}_ir.npy"), img_3ch)
 
     ext = ".npz" if SAVE_SPARSE else ".npy"
-    save_voxel(os.path.join(scene_out_path, "radar_voxel", f"{i:06d}{ext}"), r_voxel)
+    save_voxel(
+        os.path.join(scene_out_path, "radar_voxel", f"{i:06d}{ext}"),
+        r_voxel,
+        radar_statistics=radar_statistics,
+    )
     save_voxel(os.path.join(scene_out_path, "lidar_voxel", f"{i:06d}{ext}"), l_voxel)
     save_voxel(os.path.join(scene_out_path, "target_voxel", f"{i:06d}{ext}"), target_voxel)
+    save_observed_mask(
+        os.path.join(scene_out_path, "observed_mask", f"{i:06d}.npz"),
+        observed_mask,
+        args_dict["pc_range"],
+    )
     return True
 
 # ==============================================================================
 # 场景总控制中心
 # ==============================================================================
 
-def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
+def process_scene_task(scene_name, args, v_drone=None):
     _ensure_motion_args(args)
     print(f"\n⚡ 正在初始化多进程并行流水线，目标场景: {scene_name}")
     scene_raw_path = os.path.join(args.raw_data_path, scene_name)
@@ -477,6 +672,19 @@ def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
     r_radar_to_lidar, t_radar_to_lidar = load_calib(args.calib_path)
     if args.invert_calib: r_radar_to_lidar, t_radar_to_lidar = invert_r_t(r_radar_to_lidar, t_radar_to_lidar)
     if abs(args.radar_z_shift) > 1e-8: t_radar_to_lidar[2] += float(args.radar_z_shift)
+    calibration_closure = audit_calibration_closure(
+        r_radar_to_lidar,
+        t_radar_to_lidar,
+        args.radar_to_thermal_path,
+        args.lidar_to_thermal_path,
+    )
+    if os.path.islink(args.thermal_intrinsics_path) or not os.path.isfile(
+        args.thermal_intrinsics_path
+    ):
+        raise FileNotFoundError(
+            "Thermal intrinsics file not found or not regular: "
+            f"{args.thermal_intrinsics_path}"
+        )
 
     if args.velocity_mode not in VELOCITY_MODES:
         raise ValueError(f"velocity_mode 必须是 {VELOCITY_MODES} 之一")
@@ -521,7 +729,7 @@ def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
         os.path.join(scene_raw_path, "livox_lidar"), ".npy"
     )
     radar_lidar_sync_path = os.path.join(scene_index_path, "radar_lidar_sync.csv")
-    _load_radar_lidar_sync(
+    radar_lidar_sync_rows = _load_radar_lidar_sync(
         radar_lidar_sync_path,
         radar_indices,
         lidar_indices,
@@ -539,32 +747,39 @@ def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
     for i in range(min_len):
         r_idx, l_idx = radar_indices[i], lidar_indices[i]
         if r_idx >= len(radar_files) or l_idx >= len(lidar_files): continue
-        current_ts = float(radar_timestamps[r_idx])
+        radar_timestamp = float(radar_timestamps[r_idx])
+        lidar_timestamp = float(lidar_timestamps[l_idx])
         thermal_index, thermal_delta = nearest_timestamp_match(
             thermal_timestamps,
-            current_ts,
+            radar_timestamp,
             max_delta=args.radar_ir_max_delta,
         )
         frame_velocity = resolve_frame_velocity(
             mode=args.velocity_mode,
             fixed_velocity=fixed_velocity,
-            frame_timestamp=current_ts,
+            frame_timestamp=(
+                lidar_timestamp if args.align_to == "lidar" else radar_timestamp
+            ),
             recorded_table=recorded_table,
             max_delta=args.velocity_max_delta,
         )
 
         worker_tasks.append((
-            i, radar_files[r_idx], lidar_files[l_idx], current_ts,
+            i, radar_files[r_idx], lidar_files[l_idx], radar_timestamp,
+            lidar_timestamp,
             scene_raw_path, scene_out_path, r_radar_to_lidar, t_radar_to_lidar,
-            frame_velocity, dt_sync, thermal_timestamps, thermal_files, thermal_dir, args_dict,
+            frame_velocity, thermal_timestamps, thermal_files, thermal_dir, args_dict,
             thermal_index, thermal_delta,
         ))
         ir_sync_records.append(
             {
                 "frame_index": i,
-                "radar_timestamp": f"{current_ts:.9f}",
+                "radar_timestamp": f"{radar_timestamp:.9f}",
                 "ir_timestamp": f"{thermal_timestamps[thermal_index]:.9f}",
                 "delta_seconds": f"{thermal_delta:.9f}",
+                "signed_delta_seconds": (
+                    f"{float(thermal_timestamps[thermal_index]) - radar_timestamp:.9f}"
+                ),
             }
         )
 
@@ -580,6 +795,7 @@ def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
     ensure_dir(os.path.join(scene_out_path, "radar_voxel"))
     ensure_dir(os.path.join(scene_out_path, "lidar_voxel"))
     ensure_dir(os.path.join(scene_out_path, "target_voxel"))
+    ensure_dir(os.path.join(scene_out_path, "observed_mask"))
     ensure_dir(os.path.join(scene_out_path, "ir_image"))
 
     # 使用 initializer 绑定进程启动钩子，每个进程终生只打印一次初始化日志！
@@ -594,7 +810,13 @@ def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
     with open(ir_sync_path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("frame_index", "radar_timestamp", "ir_timestamp", "delta_seconds"),
+            fieldnames=(
+                "frame_index",
+                "radar_timestamp",
+                "ir_timestamp",
+                "delta_seconds",
+                "signed_delta_seconds",
+            ),
         )
         writer.writeheader()
         writer.writerows(ir_sync_records)
@@ -614,14 +836,25 @@ def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
             "radar_ir_max_delta": args.radar_ir_max_delta,
         }
     }
-    with open(os.path.join(scene_out_path, "target_policy.json"), "w", encoding="utf-8") as h:
+    target_policy_path = os.path.join(scene_out_path, "target_policy.json")
+    with open(target_policy_path, "w", encoding="utf-8") as h:
         json.dump(metadata, h, indent=2)
+    radar_lidar_signed_deltas = [
+        float(row["signed_delta_seconds"])
+        for row in radar_lidar_sync_rows[:min_len]
+    ]
+    radar_ir_signed_deltas = [
+        float(row["signed_delta_seconds"])
+        for row in ir_sync_records
+    ]
     preprocess_policy = {
         "source_scene": scene_name,
         "frames_written": written,
         "pc_range": list(args.pc_range),
         "voxel_size": list(VOXEL_SIZE),
         "align_to": args.align_to,
+        "voxel_coordinate_frame": args.align_to,
+        "time_reference_sensor": args.align_to,
         "invert_calib": bool(args.invert_calib),
         "radar_z_shift": float(args.radar_z_shift),
         "velocity_mode": args.velocity_mode,
@@ -641,21 +874,46 @@ def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
         "velocity_record_count": (
             int(recorded_table.shape[0]) if recorded_table is not None else None
         ),
-        "dt_sync": float(dt_sync),
         "radar_lidar_max_delta": float(args.radar_lidar_max_delta),
         "radar_lidar_sync_filename": os.path.basename(radar_lidar_sync_path),
+        "radar_lidar_signed_delta_semantics": "lidar_timestamp_minus_radar_timestamp",
+        "radar_lidar_signed_delta_min_seconds": min(radar_lidar_signed_deltas),
+        "radar_lidar_signed_delta_max_seconds": max(radar_lidar_signed_deltas),
         "radar_ir_max_delta": float(args.radar_ir_max_delta),
         "radar_ir_sync_filename": os.path.basename(ir_sync_path),
+        "radar_ir_signed_delta_semantics": "ir_timestamp_minus_radar_timestamp",
+        "radar_ir_signed_delta_min_seconds": min(radar_ir_signed_deltas),
+        "radar_ir_signed_delta_max_seconds": max(radar_ir_signed_deltas),
+        "spatial_time_compensation": (
+            "non_reference_sensor_only"
+            if args.velocity_mode != "none"
+            else "none_no_velocity"
+        ),
+        "calibration_closure_audit": calibration_closure,
         "z_min": args.z_min,
         "x_max": args.x_max,
         "visibility_mode": args.visibility_mode,
         "require_radar_visibility": bool(args.require_radar_visibility),
         "radar_visibility_radius": int(args.radar_visibility_radius),
         "doppler_radius": int(args.doppler_radius),
+        "observed_mask_protocol": OBSERVED_MASK_PROTOCOL,
+        "observed_mask_source": "lidar_ray_from_preprocessed_lidar_voxel",
+        "observed_mask_pc_range": list(args.pc_range),
+        "radar_statistics_protocol": RADAR_STATISTICS_PROTOCOL,
+        "radar_statistics_storage": "radar_npz_aligned_with_coords",
+        "radar_statistics_fields": {
+            "point_count": "uint32_points_per_occupied_voxel",
+            "doppler_valid_count": "uint32_finite_doppler_samples_per_occupied_voxel",
+        },
+        "radar_statistics_model_consumed": False,
         "channels": {
             "0": "occupancy",
             "1": "mean_intensity",
-            "2": "egomotion_compensated_mean_doppler",
+            "2": (
+                "raw_mean_doppler"
+                if args.velocity_mode == "none"
+                else "egomotion_compensated_mean_doppler"
+            ),
             "3": "clipped_doppler_variance_0_50",
         },
     }
@@ -667,10 +925,15 @@ def process_scene_task(scene_name, args, v_drone=None, dt_sync=0.0):
         written,
         {
             "preprocess_script": os.path.abspath(__file__),
-            "calibration": args.calib_path,
-            "radar_index": radar_index_path,
-            "lidar_index": lidar_index_path,
+            "radar_to_lidar": args.calib_path,
+            "radar_to_thermal": args.radar_to_thermal_path,
+            "lidar_to_thermal": args.lidar_to_thermal_path,
+            "thermal_intrinsics": args.thermal_intrinsics_path,
+            "radar_lidar_sync": radar_lidar_sync_path,
+            "radar_ir_sync": ir_sync_path,
+            "target_policy": target_policy_path,
         },
+        profile="training",
     )
 
 if __name__ == "__main__":
@@ -679,6 +942,21 @@ if __name__ == "__main__":
     parser.add_argument("--index_path", type=str, default=INDEX_PATH)
     parser.add_argument("--output_path", type=str, default=OUTPUT_PATH)
     parser.add_argument("--calib_path", type=str, default=CALIB_PATH)
+    parser.add_argument(
+        "--radar_to_thermal_path",
+        type=str,
+        default=RADAR_TO_THERMAL_PATH,
+    )
+    parser.add_argument(
+        "--lidar_to_thermal_path",
+        type=str,
+        default=LIDAR_TO_THERMAL_PATH,
+    )
+    parser.add_argument(
+        "--thermal_intrinsics_path",
+        type=str,
+        default=THERMAL_INTRINSICS_PATH,
+    )
     parser.add_argument("--scene", type=str, default="")
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--invert_calib", action="store_true")
@@ -728,8 +1006,6 @@ if __name__ == "__main__":
         default=0.025,
         help="Radar-IR 最近邻允许的最大时间差（秒），超限直接失败",
     )
-    parser.add_argument("--dt_sync", type=float, default=0.002)
-
     parser.add_argument("--pc_range", type=float, nargs=6, default=(0, -20, -6, 120, 20, 10))
     parser.add_argument("--z_min", type=float, default=-1.0)
     parser.add_argument("--x_max", type=float, default=80.0)
@@ -761,7 +1037,6 @@ if __name__ == "__main__":
                 scene,
                 args,
                 [args.vx, args.vy, args.vz] if args.velocity_mode == "fixed" else None,
-                args.dt_sync,
             )
         except Exception as e:
             failures.append((scene, e))

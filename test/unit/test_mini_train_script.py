@@ -76,6 +76,12 @@ CONFIG_ARGUMENT_CONTRACT = [
     ("MINI_RADAR_NORMALIZATION_PATH", "radar_normalization_path"),
     ("MINI_DOPPLER_SCALE_MPS", "doppler_scale_mps"),
     ("MINI_CHECKPOINT_PROTOCOL", "checkpoint_protocol"),
+    ("MINI_TEMPORAL_SPLIT_ARTIFACT", "temporal_split_artifact"),
+    ("MINI_DATA_PROTOCOL_PATH", "data_protocol_path"),
+    ("MINI_TRAIN_FRAMES_PER_SCENE", "mini_train_frames_per_scene"),
+    ("MINI_VALIDATION_FRAMES_PER_SCENE", "mini_validation_frames_per_scene"),
+    ("CALIB_CONFIG_DIR", "calibration_dir"),
+    ("TRAIN_SCENES_CSV", "scene_names_csv"),
     ("MINI_VAE_CONFIG_TYPE", "vae_config_type"),
     ("MINI_VAE_LATENT_DIM", "vae_latent_dim"),
     ("MINI_VAE_OCC_LOSS", "vae_occ_loss"),
@@ -199,7 +205,13 @@ class MiniTrainScriptTest(unittest.TestCase):
                 "MINI_RADAR_PROTOCOL": radar_protocol,
                 "MINI_RADAR_NORMALIZATION_PATH": str(temp_path / "artifact.json"),
                 "MINI_DOPPLER_SCALE_MPS": "86.8",
-                "MINI_CHECKPOINT_PROTOCOL": "formal_mini_chain_v1",
+                "MINI_CHECKPOINT_PROTOCOL": "formal_mini_chain_v2",
+                "MINI_TEMPORAL_SPLIT_ARTIFACT": str(temp_path / "split.json"),
+                "MINI_DATA_PROTOCOL_PATH": str(temp_path / "formal_data.json"),
+                "MINI_TRAIN_FRAMES_PER_SCENE": "8",
+                "MINI_VALIDATION_FRAMES_PER_SCENE": "4",
+                "CALIB_CONFIG_DIR": str(temp_path / "config"),
+                "TRAIN_SCENES_CSV": "garden",
                 "MINI_VAE_CONFIG_TYPE": "ultra_lightweight",
                 "MINI_VAE_LATENT_DIM": latent_dim,
                 "MINI_VAE_OCC_LOSS": "bce_dice",
@@ -385,8 +397,13 @@ class MiniTrainScriptTest(unittest.TestCase):
         self.assertEqual(generated["data"]["doppler_scale_mps"], 86.8)
         self.assertEqual(
             generated["data"]["checkpoint_protocol"],
-            "formal_mini_chain_v1",
+            "formal_mini_chain_v2",
         )
+        self.assertEqual(generated["data"]["scene_names"], ["garden"])
+        self.assertEqual(generated["data"]["mini_train_frames_per_scene"], 8)
+        self.assertEqual(generated["data"]["mini_validation_frames_per_scene"], 4)
+        self.assertTrue(generated["data"]["require_persisted_observed_mask"])
+        self.assertTrue(generated["data"]["require_radar_statistics"])
         self.assertEqual(generated["hardware"]["num_gpus"], 1)
         self.assertTrue(generated["optimization"]["use_checkpoint"])
         self.assertFalse(generated["optimization"]["use_amp"])
@@ -460,7 +477,13 @@ class MiniTrainScriptTest(unittest.TestCase):
                 "MINI_RADAR_PROTOCOL": "legacy",
                 "MINI_RADAR_NORMALIZATION_PATH": "",
                 "MINI_DOPPLER_SCALE_MPS": "",
-                "MINI_CHECKPOINT_PROTOCOL": "formal_mini_chain_v1",
+                "MINI_CHECKPOINT_PROTOCOL": "formal_mini_chain_v2",
+                "MINI_TEMPORAL_SPLIT_ARTIFACT": str(temp_path / "split.json"),
+                "MINI_DATA_PROTOCOL_PATH": str(temp_path / "formal_data.json"),
+                "MINI_TRAIN_FRAMES_PER_SCENE": "8",
+                "MINI_VALIDATION_FRAMES_PER_SCENE": "4",
+                "CALIB_CONFIG_DIR": str(temp_path / "config"),
+                "TRAIN_SCENES_CSV": "garden",
                 "MINI_VAE_CONFIG_TYPE": "ultra_lightweight",
                 "MINI_VAE_LATENT_DIM": "", "MINI_VAE_OCC_LOSS": "bce_dice",
                 "MINI_TRAIN_SPLIT": "0.8", "MINI_SPLIT_SEED": "42",

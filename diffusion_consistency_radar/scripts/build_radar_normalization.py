@@ -33,6 +33,10 @@ from diffusion_consistency_radar.radar_normalization import (  # noqa: E402
     RadarNormalizationError,
     validate_radar_normalization_spec,
 )
+from diffusion_consistency_radar.temporal_split import (  # noqa: E402
+    load_temporal_split_artifact,
+    split_frame_ids_by_scene,
+)
 
 
 def _positive_scale(value: float) -> float:
@@ -144,6 +148,7 @@ def build_and_write_artifact(
     model_pc_range: Sequence[float],
     doppler_scale_mps: float,
     max_frames: int = 0,
+    split_artifact_path: str = "",
 ) -> str:
     """验证显式训练场景，统计 occupied intensity 并原子发布 artifact。"""
     output_path = _preflight_output(output_path)
@@ -156,12 +161,30 @@ def build_and_write_artifact(
     if not os.path.isdir(dataset_root):
         raise RadarNormalizationError(f"dataset_dir 不存在或不是目录: {dataset_root}")
 
+    split_artifact_sha256 = ""
+    train_frame_ids_by_scene = None
+    if split_artifact_path:
+        split_artifact, split_artifact_sha256 = load_temporal_split_artifact(
+            split_artifact_path,
+            dataset_dir=dataset_root,
+            expected_scenes=selected_scenes,
+            require_formal=True,
+        )
+        train_frame_ids_by_scene = split_frame_ids_by_scene(
+            split_artifact,
+            "train",
+        )
+
     manifest_hashes = {}
     intensity_chunks = []
     total_frames = 0
     for scene in selected_scenes:
         scene_dir = os.path.join(dataset_root, scene)
-        manifest = validate_scene_manifest(scene_dir, scene)
+        manifest = validate_scene_manifest(
+            scene_dir,
+            scene,
+            expected_profile="training" if train_frame_ids_by_scene is not None else None,
+        )
         if not isinstance(manifest, dict):
             raise RadarNormalizationError(f"场景 {scene!r} manifest 返回值无效")
         manifest_hashes[scene] = manifest.get("content_sha256")
@@ -172,7 +195,22 @@ def build_and_write_artifact(
                 f"场景 {scene!r} Radar 帧数与 manifest 不一致: "
                 f"manifest={manifest_frame_count!r}, radar={len(frame_paths)}"
             )
-        selected_paths = frame_paths if max_frames == 0 else frame_paths[:max_frames]
+        if train_frame_ids_by_scene is not None:
+            paths_by_frame = {
+                os.path.splitext(os.path.basename(path))[0]: path
+                for path in frame_paths
+            }
+            requested_ids = train_frame_ids_by_scene[scene]
+            missing_ids = [frame_id for frame_id in requested_ids if frame_id not in paths_by_frame]
+            if missing_ids:
+                raise RadarNormalizationError(
+                    f"场景 {scene!r} split train frame 缺失: {missing_ids}"
+                )
+            selected_paths = [paths_by_frame[frame_id] for frame_id in requested_ids]
+        else:
+            selected_paths = frame_paths
+        if max_frames > 0:
+            selected_paths = selected_paths[:max_frames]
         for path in selected_paths:
             radar = _load_radar_tensor(path)
             radar = crop_voxel_channels_to_pc_range(
@@ -199,9 +237,15 @@ def build_and_write_artifact(
     if not math.isfinite(log_iqr) or log_iqr <= 0.0:
         raise RadarNormalizationError("occupied intensity 的 log IQR 必须为正有限数")
 
+    is_formal = bool(train_frame_ids_by_scene is not None and max_frames == 0)
+    input_provenance = {
+        "dataset_manifest_sha256": manifest_hashes,
+    }
+    if split_artifact_sha256:
+        input_provenance["split_artifact_sha256"] = split_artifact_sha256
     artifact = {
         "protocol": RADAR_NORMALIZATION_PROTOCOL,
-        "formal": max_frames == 0,
+        "formal": is_formal,
         "training_scenes": selected_scenes,
         "frame_count": total_frames,
         "target_size": [int(value) for value in target_size],
@@ -223,9 +267,7 @@ def build_and_write_artifact(
             "unit": "m2_s2",
             "aggregation": "occupied_voxel_equal_weight_total_variance",
         },
-        "input_provenance": {
-            "dataset_manifest_sha256": manifest_hashes,
-        },
+        "input_provenance": input_provenance,
     }
     artifact = validate_radar_normalization_spec(
         artifact,
@@ -233,7 +275,10 @@ def build_and_write_artifact(
         source_pc_range=source_pc_range,
         model_pc_range=model_pc_range,
         doppler_scale_mps=scale_mps,
-        require_formal=max_frames == 0,
+        require_formal=is_formal,
+        expected_split_artifact_sha256=(
+            split_artifact_sha256 if is_formal else None
+        ),
     )
     _write_json_atomic(output_path, artifact)
     return output_path
@@ -250,6 +295,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source_pc_range", nargs=6, type=float, required=True)
     parser.add_argument("--model_pc_range", nargs=6, type=float, required=True)
     parser.add_argument("--doppler_scale_mps", type=float, required=True)
+    parser.add_argument(
+        "--split_artifact",
+        default="",
+        help="正式 artifact 必须绑定的 temporal split；仅统计其 train frame",
+    )
     parser.add_argument(
         "--max_frames",
         type=int,
@@ -272,6 +322,7 @@ def main() -> None:
             model_pc_range=args.model_pc_range,
             doppler_scale_mps=args.doppler_scale_mps,
             max_frames=args.max_frames,
+            split_artifact_path=args.split_artifact,
         )
     except RadarNormalizationError as exc:
         parser.error(str(exc))

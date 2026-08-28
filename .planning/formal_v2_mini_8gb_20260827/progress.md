@@ -1,0 +1,53 @@
+<!-- 文件功能：持续记录 formal v2 8 GB mini 训练实施与测试进展。 -->
+# Progress
+
+## 2026-08-27
+
+- 用户确认按建议实施 current formal v2 受保护 mini 训练入口。
+- 已读取 planning-with-files 技能并完成 session catch-up；未发现未同步输出。
+- 已建立独立 scoped 计划；尚未修改生产代码或启动训练。
+- 完成首轮训练调用链审计：确认 `formal_mini_chain_v2` 尚未进入 formal multimodal 分支，现有 v1 mini 的临时软链接数据视图也不满足 v2 manifest/split/data-protocol 门禁。
+- 设计收敛为直接复用只读正式 v2 数据根与 split，训练入口在 mini-v2 协议下确定性限制 train/validation frame IDs，并持久化选择收据。
+- 阶段 1 完成：mini 选择将作为 `data_protocol.mini_selection` 进入既有 VAE/LDM/CD checkpoint 与 resume/父链校验；正式链行为保持不变。
+- 开始阶段 2 RED：准备覆盖 mini selection 结构/错配、formal multimodal 门禁、v2 runner 路径和无临时数据视图。
+- RED 完成：temporal helper 与 checkpoint selection builder 分别按预期 ImportError；mini script 协议 11 项中 10 项因旧 v1/full120 路径与缺 v2 字段失败，唯一无关 formal launcher 测试保持通过。
+- 完整 checkpoint 文件首轮在第二项被沙箱 OpenMPI socket 限制中止；改为具名运行新增用例后稳定命中预期缺失接口，未把未执行项计为结果。
+- 开始阶段 3：实现纯协议 helper、unified formal-mini 分支与 v2 保护脚本。
+- 首轮 GREEN：temporal 5/5、mini selection 具名 checkpoint 1/1、shell/Python 静态检查通过；mini scripts 10/11。
+- 唯一失败是 bad-artifact 负向预检在 15 秒超时：脚本先做了全量 manifest/split 重建，尚未到错误 SHA 比较。将校验顺序改为先比较 artifact 文件 SHA，保持任何输出创建前 fail-closed。
+- 修复后 mini scripts 11/11、完整 mini train 静态/行为测试 103/103 通过；新增 unified formal-mini 两项测试在沙箱外 2/2 通过。
+- 首次真实预检在沙箱内因无法读取 GPU 0 状态立即退出，未创建任何输出；下一次只在沙箱外重跑同一 `MINI_PREFLIGHT_ONLY=1` 命令。
+- 沙箱外真实预检通过：RTX 4070 Laptop 8188 MiB、空闲 6923 MiB、41 C；artifact SHA=`11f59d84...e97c`，formal v2 data protocol 选择 train=8、validation=4。
+- 预检明确在 scratch/config/output 创建前退出，没有启动 CUDA 训练；阶段 3 实现完成，进入代码审查与扩展回归。
+- 代码审查定位到两个后续阶段断点：独立 CD 主入口未识别 mini-v2 为正式多模态协议，mini inference formal 分支仍绑定旧 v1/full120；开始沿各自真实调用链补测试和最小修复。
+- 新增 CD、mini inference 和正式 launcher 断点测试；首次具名 RED 因 `test/unit` 非 package 的调用方式错误未触达断言，改用文件原生入口重跑。
+- RED 确认旧 mini inference 的 v1/full120 路径及两个正式 launcher 的未定义 `SCENE_DIR`；Torch 相关具名测试在沙箱内仍受 OpenMPI 限制。
+- 已修复独立 CD mini-v2 正式门禁、选择收据和 train ID 截断；推理仅在显式 smoke 开关下接受 mini-v2，输出协议不再把 mini 标成全量正式。
+- formal mini inference 已改读 0--80 m deployment view 和真实标定，且不自动读取 target/LiDAR 真值；LDM/CD 正式 launcher 绑定当前 scene 的实际目录。
+- GREEN：mini shell/protocol 13/13、formal-mini inference 具名 1/1、standalone CD 新增断言 2/2，shell/Python 静态检查通过；未启动训练或推理。
+- 最终回归通过：temporal 5/5、checkpoint 14/14、VAE 26/26、multimodal inference 38/38、mini config/safety 103/103、mini shell/protocol 13/13，以及 CD 两份直接接口套件。
+- 下游地图检查确认 formal/empirical strict loader 强制 `formal_protocol=true`，会拒绝 `formal_mini_smoke`；5 份 shell 语法、相关 Python 编译与 `git diff --check` 通过。
+- README、test README、mini README 和三份 TODO 已更新；实现与审查完成，实际训练仍等待用户显式执行。
+- 用户已显式完成 1 epoch VAE smoke；只读验收确认 checkpoint、日志、8/4 数据身份和 0--80 m 网格完整，GPU 40 C，未发现 OOM/NaN/过热或超时。
+- 按此前约定继续新增 `short_train`：保留 smoke 结果，VAE 3 epoch 写入 fresh short 结果根并收紧到 75 C；开始阶段 7 RED/GREEN，不自动训练。
+- 已审计 runner 参数解析、epoch 固定、结果门禁、fake-GPU harness 与 README 引用；确认只修改保护 runner、聚焦测试和文档即可，不改训练核心。
+- short profile RED 已命中旧行为：脚本无第二参数、仍显示 1 epoch/80 C，`ldm short_train` 错误进入父 checkpoint 检查，且 80 C 没有被 short 档拒绝；开始最小实现。
+- short profile GREEN 聚焦 5/5：默认 smoke 不变；short VAE 显示 3 epoch/75 C，非 VAE 和 80 C override 均在 `setsid` 前拒绝。阶段 7 完成，进入回归和文档。
+- 收尾修复多余参数静默忽略和跨阶段 epoch 日志问题；完整 mini shell/protocol 16/16、mini config/safety 103/103、shell/Python 静态检查及 `git diff --check` 通过。
+- 真实 `MINI_PREFLIGHT_ONLY=1 ... vae short_train` 通过，GPU 42 C、空闲 6967 MiB；没有创建 short 结果根或启动训练，原 smoke checkpoint 哈希保持不变。阶段 8 完成。
+- 已把完成的 1 epoch smoke 以“已验证、非推荐”写入结果索引；未给尚不存在的 short 输出登记结果。
+- 用户完成 3 epoch short VAE；只读验收 checkpoint、指标趋势、错误日志和 GPU 冷却状态通过，并以“已验证、非推荐”登记结果。下一步先做同结果根的 LDM 无训练 preflight。
+- 首次 LDM preflight 本身通过且未创建 config/output，但调用链复核发现它只验证父 checkpoint 存在；开始阶段 9 RED/GREEN，补齐与训练启动相同的身份校验后再交付 LDM 命令。
+- RED 明确失败于缺少 `assert_checkpoint_training_identity` 等接线；GREEN 后 formal heredoc 会构造同一 mini selection、safe-load 父权重、校验非空 state/stage/protocol/data identity，并在 CD 阶段核对 LDM→VAE 文件哈希。
+- 回归通过 17/17、103/103、14/14 和静态检查；修复后的真实 LDM preflight 打印正确 VAE 哈希并通过，配置不存在、LDM 目录为空。阶段 9 完成，实际 LDM 等待用户显式运行。
+- 用户要求所有阶段改为 500 帧、20 epoch。只读核对确认 split 容量足够，但 500 总帧与 500/500 两种合同不同；实测外推 VAE 已约 78--98 分钟，现等待确认口径和运行设备，不先削弱笔记本门禁。
+- 用户确认 400/100 共 500 帧在 RTX 4070 Laptop 分阶段执行，服务器 full split 各阶段 20 epoch；开始阶段 10 RED/GREEN，不自动启动任何训练。
+- 阶段 10 RED/GREEN 完成：新增独立 medium profile、硬件/数据/epoch fail-closed 门禁和服务器 full 20 epoch 覆盖；审查后补齐 RTX 4070 Laptop 设备名强制检查。
+- 最终回归为 19/19、103/103、14/14，shell 语法与 diff check 通过。真实 laptop 400/100 零训练 preflight 与服务器 full 20 epoch 只读 preflight 均通过，未创建结果或启动训练。
+- 用户显式启动 medium VAE；数据、normalization、400/100 选择和 20 epoch 配置均通过，但 epoch 1 batch 50 的 backward 触发 CUDA expandable-segment 内部断言并退出。失败 v1 目录与日志保留，阶段 11 开始；不直接重复原命令。
+- allocator RED 命中 runner 的 expandable 配置和 v1 默认根；GREEN 后 laptop/服务器统一 `max_split_size_mb:128`，运行期工具不再覆盖，生成配置记录实际值，medium 默认根升级为 v2。伪 GPU 协议回归 20/20 通过。
+- 首轮及第二轮配置回归均暴露 `import os` 因重复 heredoc 上下文而落在错误位置，导致同一批 26 个连带失败；shell/compile/diff 正常。现改为在唯一 allocator 读取点局部导入，并先执行单项测试，避免第三次盲跑全套回归。
+- 配置生成器定向测试与 103 项全量配置回归通过；20 项协议回归进一步发现正式数据预检 heredoc 的三个顶层 import 残留 tab，导致 bad-artifact 门禁在 SHA 比较前报 `IndentationError`。已局部去除缩进，按单项门禁优先复测。
+- 首次 bad-artifact 单项复测仍报相同错误；全量检查 heredoc 后确认更早执行的 scene 配置解析片段也有三行顶层 import 被缩进。现已修复该真实先行边界，继续同一单项复测，不启动训练。
+- bad-artifact 单项复测通过；最终 CPU 回归通过配置/安全 103/103、脚本协议 20/20 和全部静态检查。README、结果索引及三份 TODO 已更新，失败 v1 保留且 fresh v2 不存在。
+- 真实 medium 无训练 preflight 因当前空闲显存 6375 MiB 低于固定 6500 MiB 门槛而正确拒绝；无 compute process，未放宽保护或启动 backward。阶段 11 只剩用户释放少量图形显存后的 GPU 预检/短诊断。

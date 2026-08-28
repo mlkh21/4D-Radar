@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -13,6 +15,29 @@ if ROOT not in sys.path:
 
 
 class MultimodalInferenceInterfaceTest(unittest.TestCase):
+    def _formal_data_protocol(self, calibration_dir=None):
+        calibration = {
+            "lidar_to_thermal": "5" * 64,
+            "thermal_intrinsics": "6" * 64,
+        }
+        if calibration_dir is not None:
+            for key, name in (
+                ("lidar_to_thermal", "calib_livox_to_thermal.txt"),
+                ("thermal_intrinsics", "calib_cam_thermal.txt"),
+            ):
+                with open(os.path.join(calibration_dir, name), "rb") as handle:
+                    calibration[key] = hashlib.sha256(handle.read()).hexdigest()
+        return {
+            "protocol": "formal_data_v2",
+            "dataset_manifest_sha256": {"garden": "1" * 64},
+            "split_artifact_sha256": "2" * 64,
+            "target_policy_sha256": {"garden": "3" * 64},
+            "observed_mask_sha256": {"garden": "4" * 64},
+            "observed_mask_protocol": "observed_mask_v1",
+            "calibration_sha256": calibration,
+            "radar_ir_sync_sha256": {"garden": "7" * 64},
+        }
+
     def _radar_normalization(self, target_size=(2, 4, 5)):
         return {
             "protocol": "radar_normalization_v1",
@@ -63,7 +88,7 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
         )
         if write_calibration:
             with open(
-                os.path.join(config_dir, "calib_radar_to_thermal.txt"),
+                os.path.join(config_dir, "calib_livox_to_thermal.txt"),
                 "w",
                 encoding="utf-8",
             ) as handle:
@@ -79,6 +104,100 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                     "D_00: 0 0 0 0 0\n"
                 )
         return radar_path, ir_path
+
+    def _build_strict_deployment_fixture(self, root):
+        """先生成 training v2，再通过正式生产器派生 deployment v3。"""
+        from diffusion_consistency_radar.dataset_manifest import (
+            write_scene_manifest_atomic,
+        )
+        from diffusion_consistency_radar.deployment_view import (
+            build_deployment_dataset,
+        )
+
+        training_root = os.path.join(root, "training")
+        radar_path, _ir_path = self._write_real_ir_fixture(training_root)
+        scene_dir = os.path.dirname(os.path.dirname(radar_path))
+        calibration_dir = os.path.join(training_root, "config")
+        with open(
+            os.path.join(scene_dir, "preprocess_policy.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(
+                {
+                    "source_scene": "scene",
+                    "frames_written": 1,
+                    "voxel_coordinate_frame": "lidar",
+                },
+                handle,
+            )
+        for modality in ("lidar_voxel", "target_voxel", "observed_mask"):
+            os.makedirs(os.path.join(scene_dir, modality))
+        np.save(
+            os.path.join(scene_dir, "lidar_voxel", "000000.npy"),
+            np.zeros((1, 1, 1, 4), dtype=np.float32),
+        )
+        np.save(
+            os.path.join(scene_dir, "target_voxel", "000000.npy"),
+            np.zeros((1, 1, 1, 4), dtype=np.float32),
+        )
+        with open(
+            os.path.join(scene_dir, "observed_mask", "000000.npz"),
+            "wb",
+        ) as handle:
+            handle.write(b"observed")
+        target_policy = os.path.join(scene_dir, "target_policy.json")
+        with open(target_policy, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+
+        for name in (
+            "calib_radar_to_livox.txt",
+            "calib_radar_to_thermal.txt",
+        ):
+            with open(os.path.join(calibration_dir, name), "w", encoding="utf-8") as handle:
+                handle.write(name)
+        preprocess_script = os.path.join(root, "preprocess.py")
+        with open(preprocess_script, "w", encoding="utf-8") as handle:
+            handle.write("# fixture")
+        radar_lidar_sync = os.path.join(root, "radar_lidar_sync.csv")
+        radar_ir_sync = os.path.join(scene_dir, "radar_ir_sync.csv")
+        for path in (radar_lidar_sync, radar_ir_sync):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(os.path.basename(path))
+        provenance = {
+            "preprocess_script": preprocess_script,
+            "radar_to_lidar": os.path.join(
+                calibration_dir, "calib_radar_to_livox.txt"
+            ),
+            "radar_to_thermal": os.path.join(
+                calibration_dir, "calib_radar_to_thermal.txt"
+            ),
+            "lidar_to_thermal": os.path.join(
+                calibration_dir, "calib_livox_to_thermal.txt"
+            ),
+            "thermal_intrinsics": os.path.join(
+                calibration_dir, "calib_cam_thermal.txt"
+            ),
+            "radar_lidar_sync": radar_lidar_sync,
+            "radar_ir_sync": radar_ir_sync,
+            "target_policy": target_policy,
+        }
+        write_scene_manifest_atomic(
+            scene_dir,
+            "scene",
+            1,
+            provenance,
+            profile="training",
+        )
+        deployment_root = os.path.join(root, "deployment")
+        build_deployment_dataset(
+            training_dataset_dir=training_root,
+            output_dataset_dir=deployment_root,
+            scenes=["scene"],
+            calibration_dir=calibration_dir,
+            preprocess_script=preprocess_script,
+        )
+        return os.path.join(deployment_root, "scene"), calibration_dir
 
     def test_removed_oracle_arguments_report_diagnostic_migration(self):
         """旧 oracle 参数必须明确迁移到独立诊断脚本。"""
@@ -97,6 +216,113 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                     "diagnose_oracle_target_adaptation.py",
                 ):
                     reject(argv)
+
+    def test_formal_inference_rejects_checkpoint_data_identity_mismatch(self):
+        """正式推理不能只凭两个可加载权重就跳过 data protocol 链身份。"""
+        from diffusion_consistency_radar.scripts import inference
+
+        data_protocol = self._formal_data_protocol()
+        vae = {
+            "checkpoint_protocol": "formal_chain_v2",
+            "stage": "vae",
+            "data_protocol": data_protocol,
+        }
+        ldm = {
+            "checkpoint_protocol": "formal_chain_v2",
+            "stage": "ldm",
+            "data_protocol": dict(data_protocol),
+        }
+        resolved = inference.resolve_formal_inference_data_protocol(
+            vae,
+            ldm,
+            model_type="ldm",
+        )
+        self.assertEqual(resolved, data_protocol)
+
+        ldm["data_protocol"] = dict(data_protocol)
+        ldm["data_protocol"]["split_artifact_sha256"] = "8" * 64
+        with self.assertRaisesRegex(Exception, "data_protocol"):
+            inference.resolve_formal_inference_data_protocol(
+                vae,
+                ldm,
+                model_type="ldm",
+            )
+
+    def test_formal_mini_inference_requires_explicit_smoke_authorization(self):
+        """mini-v2 只可显式用于离线 smoke，不能冒充全量正式 checkpoint。"""
+        from diffusion_consistency_radar.scripts import inference
+
+        data_protocol = self._formal_data_protocol()
+        data_protocol["mini_selection"] = {
+            "protocol": "formal_mini_selection_v1",
+            "strategy": "ordered_prefix_per_scene",
+            "train_frames_per_scene": 8,
+            "validation_frames_per_scene": 4,
+        }
+        vae = {
+            "checkpoint_protocol": "formal_mini_chain_v2",
+            "stage": "vae",
+            "data_protocol": data_protocol,
+        }
+        ldm = {
+            "checkpoint_protocol": "formal_mini_chain_v2",
+            "stage": "ldm",
+            "data_protocol": dict(data_protocol),
+        }
+
+        with self.assertRaisesRegex(Exception, "mini.*smoke"):
+            inference.resolve_formal_inference_data_protocol(
+                vae,
+                ldm,
+                model_type="ldm",
+            )
+        resolved = inference.resolve_formal_inference_data_protocol(
+            vae,
+            ldm,
+            model_type="ldm",
+            allow_formal_mini_checkpoint=True,
+        )
+        self.assertEqual(resolved, data_protocol)
+
+        ldm["checkpoint_protocol"] = "formal_chain_v2"
+        with self.assertRaisesRegex(Exception, "checkpoint protocol"):
+            inference.resolve_formal_inference_data_protocol(
+                vae,
+                ldm,
+                model_type="ldm",
+                allow_formal_mini_checkpoint=True,
+            )
+
+    def test_formal_deployment_binds_manifest_and_current_calibration(self):
+        """部署 manifest、输入目录和当前标定必须与 checkpoint 交叉一致。"""
+        from diffusion_consistency_radar.scripts import inference
+
+        with tempfile.TemporaryDirectory() as root:
+            scene_dir, calibration_dir = self._build_strict_deployment_fixture(root)
+            data_protocol = self._formal_data_protocol(calibration_dir)
+
+            identity = inference.assert_formal_deployment_identity(
+                scene_dir=scene_dir,
+                radar_voxel_dir=os.path.join(scene_dir, "radar_voxel"),
+                calibration_dir=calibration_dir,
+                data_protocol=data_protocol,
+            )
+            self.assertEqual(identity["scene"], "scene")
+            self.assertEqual(identity["voxel_coordinate_frame"], "lidar")
+
+            with open(
+                os.path.join(calibration_dir, "calib_cam_thermal.txt"),
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("# changed\n")
+            with self.assertRaisesRegex(ValueError, "checkpoint data_protocol"):
+                inference.assert_formal_deployment_identity(
+                    scene_dir=scene_dir,
+                    radar_voxel_dir=os.path.join(scene_dir, "radar_voxel"),
+                    calibration_dir=calibration_dir,
+                    data_protocol=data_protocol,
+                )
 
     def test_fixed_threshold_arguments_do_not_trigger_oracle_migration(self):
         """固定阈值和正常 target 对比不应触发迁移错误。"""
@@ -533,8 +759,8 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                 model_config={"model_channels": 8, "channel_mult": [1]},
             )
 
-    def test_strict_real_ir_loads_real_meta_and_applies_training_sync_offset(self):
-        """严格模式必须使用真实 IR/thermal 外参并匹配训练同步位移。"""
+    def test_strict_real_ir_loads_lidar_frame_meta_without_fixed_offset(self):
+        """严格模式使用 LiDAR→Thermal，加载阶段不再伪造固定时间位移。"""
         from diffusion_consistency_radar.scripts import inference
 
         with tempfile.TemporaryDirectory() as root:
@@ -543,13 +769,15 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                 radar_path,
                 torch.device("cpu"),
                 require_real_ir=True,
+                calibration_dir=os.path.join(root, "config"),
             )
 
         self.assertEqual(float(meta["is_mock_ir"].item()), 0.0)
         self.assertEqual(float(meta["is_mock_calib"].item()), 0.0)
-        self.assertAlmostEqual(float(meta["t_vec"][0].item()), 1.01, places=6)
-        self.assertAlmostEqual(
-            float(meta["legacy_sync_displacement_x_m"]), 0.01, places=6
+        self.assertAlmostEqual(float(meta["t_vec"][0].item()), 1.0, places=6)
+        self.assertEqual(
+            meta["time_alignment_compensation"],
+            "preprocessing_signed_delta_only",
         )
 
     def test_strict_real_ir_rejects_missing_frame(self):
@@ -564,6 +792,7 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                     radar_path,
                     torch.device("cpu"),
                     require_real_ir=True,
+                    calibration_dir=os.path.join(root, "config"),
                 )
 
     def test_strict_real_ir_rejects_symlink(self):
@@ -581,6 +810,7 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                     radar_path,
                     torch.device("cpu"),
                     require_real_ir=True,
+                    calibration_dir=os.path.join(root, "config"),
                 )
 
     def test_strict_real_ir_rejects_invalid_shape_and_nonfinite_values(self):
@@ -600,6 +830,7 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                             radar_path,
                             torch.device("cpu"),
                             require_real_ir=True,
+                            calibration_dir=os.path.join(root, "config"),
                         )
 
     def test_strict_real_ir_rejects_missing_thermal_calibration(self):
@@ -611,11 +842,12 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                 root,
                 write_calibration=False,
             )
-            with self.assertRaisesRegex(RuntimeError, "thermal|calib_radar_to_thermal"):
+            with self.assertRaisesRegex(RuntimeError, "thermal|calib_livox_to_thermal"):
                 inference.load_multimodal_meta_for_radar(
                     radar_path,
                     torch.device("cpu"),
                     require_real_ir=True,
+                    calibration_dir=os.path.join(root, "config"),
                 )
 
     def test_strict_real_ir_rejects_missing_thermal_intrinsics(self):
@@ -630,6 +862,7 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
                     radar_path,
                     torch.device("cpu"),
                     require_real_ir=True,
+                    calibration_dir=os.path.join(root, "config"),
                 )
 
     def test_strict_real_ir_rejects_single_modality_model(self):
@@ -675,11 +908,49 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
         generator.radar_normalization = self._radar_normalization()
         generator.radar_normalization_sha256 = "b" * 64
         generator.allow_legacy_radar_units = False
+        generator.checkpoint_protocol = "formal_chain_v2"
+        generator.radar_observed_identity = {
+            "radar_origin_lidar_m": [0.0, 0.0, 0.0],
+            "radar_to_lidar_sha256": "e" * 64,
+        }
+        generator.deployment_identity = {
+            "calibration_sha256": {"radar_to_lidar": "e" * 64}
+        }
 
         metadata = inference.build_inference_run_metadata(
             args,
             generator,
             frame_count=2,
+            observed_mask_records=[
+                {
+                    "frame_id": "000000",
+                    "file": "000000_observed_mask.npy",
+                    "sha256": "c" * 64,
+                    "observed_voxels": 7,
+                },
+                {
+                    "frame_id": "000001",
+                    "file": "000001_observed_mask.npy",
+                    "sha256": "d" * 64,
+                    "observed_voxels": 9,
+                },
+            ],
+            prediction_voxel_records=[
+                {
+                    "frame_id": "000000",
+                    "file": "000000_voxel.npy",
+                    "sha256": "a" * 64,
+                    "shape_czxy": [4, 2, 4, 5],
+                    "dtype": "float32",
+                },
+                {
+                    "frame_id": "000001",
+                    "file": "000001_voxel.npy",
+                    "sha256": "b" * 64,
+                    "shape_czxy": [4, 2, 4, 5],
+                    "dtype": "float32",
+                },
+            ],
         )
 
         self.assertEqual(
@@ -708,7 +979,120 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
         self.assertEqual(metadata["radar_normalization"], self._radar_normalization())
         self.assertEqual(metadata["radar_normalization_sha256"], "b" * 64)
         self.assertEqual(metadata["radar_normalization_protocol"], "radar_normalization_v1")
+        self.assertEqual(metadata["checkpoint_protocol"], "formal_chain_v2")
         self.assertTrue(metadata["formal_protocol"])
+        self.assertFalse(metadata["formal_mini_smoke"])
+        self.assertEqual(metadata["voxel_coordinate_frame"], "lidar")
+        self.assertEqual(
+            metadata["observed_mask"]["protocol"],
+            "radar_endpoint_ray_visibility_v1",
+        )
+        self.assertEqual(metadata["observed_mask"]["frame_count"], 2)
+        self.assertEqual(metadata["observed_mask"]["observed_voxels"], 16)
+        self.assertEqual(
+            metadata["prediction_voxel"]["protocol"],
+            "generated_voxel_artifact_v1",
+        )
+        self.assertEqual(metadata["prediction_voxel"]["frame_count"], 2)
+        self.assertEqual(metadata["prediction_voxel"]["layout"], "czxy")
+
+    def test_formal_inference_metadata_requires_prediction_voxel_receipt(self):
+        """正式推理不能只绑定 observed mask 而遗漏实际 prediction 内容。"""
+        from diffusion_consistency_radar.scripts import inference
+
+        args = SimpleNamespace(
+            target_size=(2, 4, 5),
+            source_pc_range=(0, 0, 0, 40, 20, 16),
+            pc_range=(0, 0, 0, 40, 20, 16),
+            voxel_size=None,
+            occ_threshold=0.35,
+            model_type="ldm",
+            steps=40,
+            sampler="heun",
+            require_real_ir=True,
+        )
+        generator = SimpleNamespace(model=SimpleNamespace(is_multimodal=True))
+        generator.radar_normalization = self._radar_normalization()
+        generator.radar_normalization_sha256 = "b" * 64
+        generator.allow_legacy_radar_units = False
+        generator.radar_observed_identity = {
+            "radar_origin_lidar_m": [0.0, 0.0, 0.0],
+            "radar_to_lidar_sha256": "e" * 64,
+        }
+        generator.deployment_identity = {
+            "calibration_sha256": {"radar_to_lidar": "e" * 64}
+        }
+        observed = [
+            {
+                "frame_id": "000000",
+                "file": "000000_observed_mask.npy",
+                "sha256": "c" * 64,
+                "observed_voxels": 7,
+            }
+        ]
+
+        with self.assertRaisesRegex(ValueError, "prediction voxel"):
+            inference.build_inference_run_metadata(
+                args,
+                generator,
+                frame_count=1,
+                observed_mask_records=observed,
+            )
+
+    def test_radar_endpoint_rays_generate_lidar_frame_observed_mask(self):
+        """部署 mask 只能来自 Radar endpoint 射线，不能来自预测 sigmoid。"""
+        from diffusion_consistency_radar.scripts import inference
+
+        endpoints = np.zeros((3, 5, 5), dtype=np.uint8)  # (Z,X,Y)
+        endpoints[1, 4, 2] = 1
+        observed = inference.build_radar_ray_observed_mask(
+            endpoints,
+            pc_range=(0.0, -2.5, -1.5, 5.0, 2.5, 1.5),
+            radar_origin_lidar_m=(0.0, 0.0, 0.0),
+        )
+
+        self.assertEqual(observed.shape, endpoints.shape)
+        self.assertEqual(observed.dtype, np.uint8)
+        self.assertEqual(int(observed[1, 4, 2]), 1)
+        self.assertTrue(np.all(observed[1, :, 2] == 1))
+        self.assertEqual(int(np.count_nonzero(observed[:, :, 0])), 0)
+
+    def test_radar_ray_visibility_does_not_clear_behind_nearest_endpoint(self):
+        """同方向远端可保留为 endpoint，但近端后的间隔不能被射线标成 free。"""
+        from diffusion_consistency_radar.scripts import inference
+
+        endpoints = np.zeros((1, 6, 1), dtype=np.uint8)
+        endpoints[0, 2, 0] = 1
+        endpoints[0, 5, 0] = 1
+        observed = inference.build_radar_ray_observed_mask(
+            endpoints,
+            pc_range=(0.0, -0.5, -0.5, 6.0, 0.5, 0.5),
+            radar_origin_lidar_m=(0.0, 0.0, 0.0),
+        )
+
+        self.assertEqual(int(observed[0, 2, 0]), 1)
+        self.assertEqual(int(observed[0, 5, 0]), 1)
+        self.assertEqual(int(observed[0, 3, 0]), 0)
+        self.assertEqual(int(observed[0, 4, 0]), 0)
+
+    def test_fresh_output_directory_rejects_nonempty_and_symlink(self):
+        """推理不得覆盖旧结果，也不得把输出写入符号链接目录。"""
+        from diffusion_consistency_radar.scripts import inference
+
+        with tempfile.TemporaryDirectory() as root:
+            nonempty = os.path.join(root, "nonempty")
+            os.makedirs(nonempty)
+            with open(os.path.join(nonempty, "old.txt"), "w", encoding="utf-8") as handle:
+                handle.write("old")
+            with self.assertRaisesRegex(ValueError, "非空"):
+                inference.prepare_fresh_output_dir(nonempty)
+
+            real_dir = os.path.join(root, "real")
+            linked_dir = os.path.join(root, "linked")
+            os.makedirs(real_dir)
+            os.symlink(real_dir, linked_dir)
+            with self.assertRaisesRegex(ValueError, "符号链接"):
+                inference.prepare_fresh_output_dir(linked_dir)
 
     def test_legacy_inference_metadata_cannot_look_formal(self):
         from diffusion_consistency_radar.scripts import inference

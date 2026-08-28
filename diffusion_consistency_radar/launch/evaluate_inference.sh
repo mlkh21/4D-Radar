@@ -10,8 +10,8 @@ ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 EVALUATE_SCRIPT="${PROJECT_DIR}/scripts/evaluate_saved_predictions.py"
 MANIFEST_SCRIPT="${PROJECT_DIR}/scripts/dataset_manifest.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
-PROTOCOL_TAG="formal_p1_04_full120_86p8_v1"
-PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
+PROTOCOL_TAG="formal_v2_80m_86p8_v1"
+PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1"
 RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw_p1_01_candidate"
 TARGET_THRESHOLD="${TARGET_THRESHOLD:-0.5}"
 MAX_EVAL_FILES="${MAX_EVAL_FILES:-0}"
@@ -69,12 +69,13 @@ if [ ${#TEST_SCENES[@]} -eq 0 ]; then
   exit 1
 fi
 
-# 所有场景先通过四模态内容校验，再允许写任一评价目录。
+# 所有场景先通过含 observed mask 的 training manifest，再允许写评价目录。
 for SCENE in "${TEST_SCENES[@]}"; do
   SCENE_DIR="${PREPROCESSED_ROOT}/${SCENE}"
   python "${MANIFEST_SCRIPT}" validate \
     --scene_dir "${SCENE_DIR}" \
-    --expected_scene "${SCENE}"
+    --expected_scene "${SCENE}" \
+    --expected_profile training
 done
 
 for SCENE in "${TEST_SCENES[@]}"; do

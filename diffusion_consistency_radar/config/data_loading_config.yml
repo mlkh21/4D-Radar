@@ -1,4 +1,6 @@
 data:
   train: ["garden"]
-
   test: ["loop3"]
+  train_manifest_profile: "training"
+  test_manifest_profile: "deployment"
+  voxel_coordinate_frame: "lidar"

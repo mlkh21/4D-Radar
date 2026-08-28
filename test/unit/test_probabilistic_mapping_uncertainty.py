@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import sys
 import tempfile
@@ -11,8 +12,150 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from diffusion_consistency_radar.prediction_artifact_protocol import (
+    prediction_voxel_records_digest,
+)
+
 
 class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
+    @staticmethod
+    def _write_formal_mapping_fixture(root):
+        """写入一帧 LiDAR-frame prediction、mask、pose 与外参协议。"""
+        from diffusion_consistency_radar.scripts.streaming_map_update import (
+            _observed_mask_records_digest,
+        )
+
+        voxel_dir = os.path.join(root, "inference")
+        output_dir = os.path.join(root, "map")
+        os.makedirs(voxel_dir)
+        voxel = np.zeros((4, 1, 2, 1), dtype=np.float32)
+        voxel[0, 0, 0, 0] = 1.0
+        voxel_path = os.path.join(voxel_dir, "000001_voxel.npy")
+        np.save(voxel_path, voxel)
+        mask = np.ones((2, 1, 1), dtype=np.uint8)
+        mask_file = "000001_observed_mask.npy"
+        mask_path = os.path.join(voxel_dir, mask_file)
+        np.save(mask_path, mask)
+        with open(mask_path, "rb") as handle:
+            mask_sha256 = hashlib.sha256(handle.read()).hexdigest()
+        record = {
+            "frame_id": "000001",
+            "file": mask_file,
+            "sha256": mask_sha256,
+            "observed_voxels": 2,
+        }
+        with open(voxel_path, "rb") as handle:
+            voxel_sha256 = hashlib.sha256(handle.read()).hexdigest()
+        prediction_record = {
+            "frame_id": "000001",
+            "file": "000001_voxel.npy",
+            "sha256": voxel_sha256,
+            "shape_czxy": [4, 1, 2, 1],
+            "dtype": "float32",
+        }
+        run_path = os.path.join(root, "inference_run.json")
+        with open(run_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "stage": "deployment_generation",
+                    "formal_protocol": True,
+                    "require_real_ir": True,
+                    "model_is_multimodal": True,
+                    "voxel_coordinate_frame": "lidar",
+                    "frame_count": 1,
+                    "deployment_identity": {
+                        "calibration_sha256": {"radar_to_lidar": "a" * 64}
+                    },
+                    "observed_mask": {
+                        "protocol": "radar_endpoint_ray_visibility_v1",
+                        "coordinate_frame": "lidar",
+                        "source": "radar_endpoint_rays",
+                        "ir_frustum_marks_free_space": False,
+                        "frame_count": 1,
+                        "observed_voxels": 2,
+                        "radar_origin_lidar_m": [0.0, 0.0, 0.0],
+                        "radar_to_lidar_sha256": "a" * 64,
+                        "files_sha256": _observed_mask_records_digest([record]),
+                        "records": [record],
+                    },
+                    "prediction_voxel": {
+                        "protocol": "generated_voxel_artifact_v1",
+                        "coordinate_frame": "lidar",
+                        "layout": "czxy",
+                        "frame_count": 1,
+                        "records_sha256": prediction_voxel_records_digest(
+                            [prediction_record]
+                        ),
+                        "records": [prediction_record],
+                    },
+                },
+                handle,
+            )
+        pose_path = os.path.join(root, "poses.csv")
+        with open(pose_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("frame,timestamp,tx,ty,tz,qx,qy,qz,qw\n")
+            handle.write("000001,10.0,0,0,0,0,0,0,1\n")
+        extrinsic_path = os.path.join(root, "lidar_to_body.txt")
+        with open(extrinsic_path, "w", encoding="utf-8") as handle:
+            handle.write("R: 1 0 0 0 1 0 0 0 1\n")
+            handle.write("T: 1 0 0\n")
+        argv = [
+            "streaming_map_update.py",
+            "--radar_voxel_dir", voxel_dir,
+            "--radar_voxel_layout", "czxy",
+            "--formal_mapping",
+            "--inference_run", run_path,
+            "--observed_mask_dir", voxel_dir,
+            "--pose_file", pose_path,
+            "--lidar_to_body_calib", extrinsic_path,
+            "--output_dir", output_dir,
+            "--pc_range", "0", "0", "0", "2", "1", "1",
+            "--map_pc_range", "0", "0", "0", "20", "2", "2",
+            "--save_every", "1",
+        ]
+        return {
+            "voxel_dir": voxel_dir,
+            "output_dir": output_dir,
+            "mask_path": mask_path,
+            "voxel_path": voxel_path,
+            "argv": argv,
+        }
+
+    def test_map_cells_beyond_model_evidence_range_remain_unknown(self):
+        """0--80 m evidence 不得被拉伸到 120 m，地图远端必须保持 unknown。"""
+        from diffusion_consistency_radar.cm.probabilistic_mapping import (
+            GridMapConfig,
+            SlidingProbabilisticGridMap,
+        )
+
+        cfg = GridMapConfig(
+            x_min=0,
+            x_max=3,
+            y_min=0,
+            y_max=1,
+            x_resolution=1,
+            y_resolution=1,
+            z_min=0,
+            z_max=1,
+            z_resolution=1,
+            evidence_pc_range=(0, 0, 0, 2, 1, 1),
+        )
+        grid = SlidingProbabilisticGridMap(cfg)
+        voxel = np.zeros((2, 1, 1, 4), dtype=np.float32)
+        observed = np.ones((2, 1, 1), dtype=np.float32)
+        voxel[1, 0, 0, 0] = 1.0
+
+        grid.update_from_voxel(
+            voxel,
+            timestamp=1.0,
+            observed_mask=observed,
+        )
+        snapshot = grid.snapshot()
+
+        self.assertGreater(float(snapshot["occ_prob_layers"][1, 0, 0]), 0.5)
+        self.assertAlmostEqual(float(snapshot["occ_prob_layers"][2, 0, 0]), 0.5)
+        self.assertAlmostEqual(float(snapshot["unknown_mass_layers"][2, 0, 0]), 1.0)
+
     @staticmethod
     def _small_pose_map():
         from diffusion_consistency_radar.cm.probabilistic_mapping import (
@@ -53,6 +196,51 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
         self.assertAlmostEqual(float(snapshot["occ_prob_layers"][1, 0, 0]), 0.5, places=6)
         np.testing.assert_allclose(snapshot["last_T_local_body"], translated)
         self.assertEqual(float(snapshot["last_timestamp"]), 2.0)
+
+    def test_lidar_to_body_then_body_to_local_composes_for_evidence(self):
+        """LiDAR frame evidence 必须经 LiDAR→body→local 两段变换。"""
+        from diffusion_consistency_radar.cm.probabilistic_mapping import (
+            GridMapConfig,
+            SlidingProbabilisticGridMap,
+        )
+
+        cfg = GridMapConfig(
+            x_min=0,
+            x_max=20,
+            y_min=0,
+            y_max=2,
+            x_resolution=1,
+            y_resolution=1,
+            z_min=0,
+            z_max=1,
+            z_resolution=1,
+            evidence_pc_range=(0, 0, 0, 2, 1, 1),
+        )
+        grid = SlidingProbabilisticGridMap(cfg)
+        voxel = np.zeros((2, 1, 1, 4), dtype=np.float32)
+        voxel[0, 0, 0, 0] = 1.0
+        observed = np.ones((2, 1, 1), dtype=np.float32)
+        T_local_body = np.eye(4, dtype=np.float32)
+        T_local_body[0, 3] = 10.0
+        T_body_lidar = np.eye(4, dtype=np.float32)
+        T_body_lidar[0, 3] = 1.0
+
+        grid.update_from_voxel(
+            voxel,
+            timestamp=1.0,
+            observed_mask=observed,
+            T_local_body=T_local_body,
+            T_body_voxel=T_body_lidar,
+        )
+        snapshot = grid.snapshot()
+
+        self.assertGreater(float(snapshot["occ_prob_layers"][11, 0, 0]), 0.5)
+        np.testing.assert_allclose(snapshot["last_T_local_body"], T_local_body)
+        np.testing.assert_allclose(snapshot["last_T_body_voxel"], T_body_lidar)
+        np.testing.assert_allclose(
+            snapshot["last_T_local_voxel"],
+            T_local_body @ T_body_lidar,
+        )
 
     def test_pose_rotation_and_vertical_translation_keep_physical_height_layers(self):
         """刚体旋转和 Z 平移必须作用于三维层，不能只变换 BEV 索引。"""
@@ -288,6 +476,199 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
 
         self.assertLess(near["uncertainty"], 1.0)
         self.assertAlmostEqual(near["uncertainty"], 1.0 - float(grid.belief[1, 0]), places=5)
+
+    def test_safety_distance_is_monotonic_for_flight_speed(self):
+        from diffusion_consistency_radar.cm.probabilistic_mapping import (
+            compute_safety_distance_m,
+        )
+
+        distances = [
+            compute_safety_distance_m(
+                speed_m_s=speed,
+                reaction_time_s=0.5,
+                brake_deceleration_m_s2=8.0,
+                margin_m=5.0,
+            )
+            for speed in (35.0, 50.0, 70.0)
+        ]
+        self.assertLess(distances[0], distances[1])
+        self.assertLess(distances[1], distances[2])
+
+    def test_query_is_three_state_and_unknown_is_fail_closed(self):
+        from diffusion_consistency_radar.cm.probabilistic_mapping import (
+            GridMapConfig,
+            LazyLocalMapQuery,
+        )
+
+        cfg = GridMapConfig(
+            x_min=0,
+            x_max=100,
+            y_min=0,
+            y_max=100,
+            x_resolution=1,
+            y_resolution=1,
+            z_min=0,
+            z_max=10,
+            z_resolution=1,
+        )
+        query = LazyLocalMapQuery(cfg)
+        empty = query.query_proximity(50.0, 50.0, search_radius=25.0)
+        self.assertEqual(empty["state"], "unknown")
+        self.assertEqual(empty["reason"], "map_not_initialized")
+        self.assertEqual(empty["is_risky"], 1.0)
+
+        free_snapshot = {
+            "occ_prob": np.zeros(cfg.shape_xy, dtype=np.float32),
+            "belief": np.ones(cfg.shape_xy, dtype=np.float32),
+            "unknown_mass": np.zeros(cfg.shape_xy, dtype=np.float32),
+        }
+        query.refresh(free_snapshot)
+        insufficient = query.query_proximity(
+            50.0,
+            50.0,
+            search_radius=20.0,
+            speed_m_s=10.0,
+            reaction_time_s=1.0,
+            brake_deceleration_m_s2=5.0,
+            safety_margin_m=1.0,
+        )
+        self.assertEqual(insufficient["state"], "unknown")
+        self.assertEqual(insufficient["reason"], "search_radius_below_safety_distance")
+        self.assertEqual(insufficient["is_risky"], 1.0)
+
+        clear = query.query_proximity(
+            50.0,
+            50.0,
+            search_radius=25.0,
+            speed_m_s=10.0,
+            reaction_time_s=1.0,
+            brake_deceleration_m_s2=5.0,
+            safety_margin_m=1.0,
+        )
+        self.assertEqual(clear["state"], "clear")
+        self.assertEqual(clear["is_risky"], 0.0)
+
+        obstacle_snapshot = dict(free_snapshot)
+        obstacle_snapshot["occ_prob"] = free_snapshot["occ_prob"].copy()
+        obstacle_snapshot["belief"] = free_snapshot["belief"].copy()
+        obstacle_snapshot["unknown_mass"] = free_snapshot["unknown_mass"].copy()
+        obstacle_snapshot["occ_prob"][55, 50] = 0.9
+        obstacle_snapshot["belief"][55, 50] = 0.1
+        obstacle_snapshot["unknown_mass"][55, 50] = 0.9
+        query.refresh(obstacle_snapshot)
+        obstacle = query.query_proximity(
+            50.0,
+            50.0,
+            search_radius=25.0,
+            speed_m_s=10.0,
+            reaction_time_s=1.0,
+            brake_deceleration_m_s2=5.0,
+            safety_margin_m=1.0,
+        )
+        self.assertEqual(obstacle["state"], "obstacle")
+        self.assertGreater(obstacle["uncertainty"], 0.7)
+        self.assertEqual(obstacle["is_risky"], 1.0)
+
+    def test_formal_streaming_requires_all_frame_contracts_before_output(self):
+        """formal map 缺 mask、pose、run metadata 或外参时必须无副作用失败。"""
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            voxel_dir = os.path.join(tmp, "voxels")
+            output_dir = os.path.join(tmp, "map")
+            os.makedirs(voxel_dir)
+            np.save(
+                os.path.join(voxel_dir, "000001_voxel.npy"),
+                np.zeros((2, 1, 1, 4), dtype=np.float32),
+            )
+            argv = [
+                "streaming_map_update.py",
+                "--radar_voxel_dir", voxel_dir,
+                "--output_dir", output_dir,
+                "--formal_mapping",
+                "--pc_range", "0", "0", "0", "2", "1", "1",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                with self.assertRaisesRegex(ValueError, "formal.*observed_mask_dir"):
+                    main()
+            self.assertFalse(os.path.exists(output_dir))
+
+    def test_formal_streaming_binds_mask_pose_and_lidar_to_body(self):
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._write_formal_mapping_fixture(tmp)
+            with mock.patch.object(sys, "argv", fixture["argv"]):
+                main()
+
+            with np.load(os.path.join(fixture["output_dir"], "map_final.npz")) as result:
+                self.assertGreater(float(result["occ_prob_layers"][1, 0, 0]), 0.5)
+                np.testing.assert_allclose(result["last_T_local_body"], np.eye(4))
+                self.assertAlmostEqual(float(result["last_T_body_voxel"][0, 3]), 1.0)
+                self.assertAlmostEqual(float(result["last_T_local_voxel"][0, 3]), 1.0)
+            with open(
+                os.path.join(fixture["output_dir"], "map_run.json"),
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                metadata = json.load(handle)
+            self.assertEqual(metadata["protocol"], "pose_aware_layered_map_v3")
+            self.assertTrue(metadata["formal_mapping"])
+            self.assertEqual(metadata["voxel_coordinate_frame"], "lidar")
+            self.assertEqual(metadata["runtime_contract_status"], "formal_fail_closed")
+            self.assertTrue(metadata["unknown_is_risky"])
+
+    def test_formal_streaming_rejects_mask_tamper_before_output(self):
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._write_formal_mapping_fixture(tmp)
+            np.save(fixture["mask_path"], np.zeros((2, 1, 1), dtype=np.uint8))
+            with mock.patch.object(sys, "argv", fixture["argv"]):
+                with self.assertRaisesRegex(ValueError, "SHA-256"):
+                    main()
+            self.assertFalse(os.path.exists(fixture["output_dir"]))
+
+    def test_formal_streaming_rejects_prediction_voxel_tamper_before_output(self):
+        """正式地图必须绑定实际消费的 prediction voxel 内容。"""
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._write_formal_mapping_fixture(tmp)
+            tampered = np.zeros((4, 1, 2, 1), dtype=np.float32)
+            tampered[0, 0, 1, 0] = 1.0
+            np.save(fixture["voxel_path"], tampered)
+            with mock.patch.object(sys, "argv", fixture["argv"]):
+                with self.assertRaisesRegex(ValueError, "prediction voxel SHA-256"):
+                    main()
+            self.assertFalse(os.path.exists(fixture["output_dir"]))
+
+    def test_formal_streaming_rejects_observed_calibration_identity_mismatch(self):
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._write_formal_mapping_fixture(tmp)
+            run_path = fixture["argv"][fixture["argv"].index("--inference_run") + 1]
+            with open(run_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            payload["deployment_identity"]["calibration_sha256"]["radar_to_lidar"] = "b" * 64
+            with open(run_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            with mock.patch.object(sys, "argv", fixture["argv"]):
+                with self.assertRaisesRegex(ValueError, "frame/observed"):
+                    main()
+            self.assertFalse(os.path.exists(fixture["output_dir"]))
+
+    def test_formal_streaming_rejects_unbound_optional_evidence(self):
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._write_formal_mapping_fixture(tmp)
+            argv = fixture["argv"] + ["--uncertainty_dir", fixture["voxel_dir"]]
+            with mock.patch.object(sys, "argv", argv):
+                with self.assertRaisesRegex(ValueError, "未绑定收据.*uncertainty"):
+                    main()
+            self.assertFalse(os.path.exists(fixture["output_dir"]))
 
     def test_speed_band_adjusts_window_decay_and_far_reliability(self):
         from diffusion_consistency_radar.cm.probabilistic_mapping import GridMapConfig, SlidingProbabilisticGridMap

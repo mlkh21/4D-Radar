@@ -12,6 +12,33 @@ if ROOT not in sys.path:
 
 
 class AirborneVoxelizationTest(unittest.TestCase):
+    def test_doppler_is_compensated_in_radar_frame_before_extrinsic_translation(self):
+        from NTU4DRadLM_pre_processing.NTU4DRadLM_pre_processing import (
+            compensate_radar_doppler,
+            move_pcl_to_reference_time,
+            transform_pcl,
+        )
+
+        radar = np.asarray([[10.0, 0.0, 0.0, 1.0, 5.0]], dtype=np.float32)
+        corrected = compensate_radar_doppler(
+            radar,
+            np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        )
+        lidar_frame = transform_pcl(
+            corrected,
+            np.eye(3),
+            np.asarray([0.0, 10.0, 0.0]),
+        )
+        moved = move_pcl_to_reference_time(
+            lidar_frame,
+            np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            -0.04,
+        )
+
+        self.assertAlmostEqual(float(moved[0, 4]), 4.0, places=6)
+        self.assertAlmostEqual(float(moved[0, 0]), 9.96, places=5)
+        self.assertAlmostEqual(float(moved[0, 1]), 10.0, places=5)
+
     def test_compensates_sync_offset_and_egomotion_doppler_variance(self):
         from NTU4DRadLM_pre_processing.NTU4DRadLM_pre_processing import (
             voxelize_pcl_airborne_optimized,
@@ -52,7 +79,7 @@ class DatasetIRMetaTest(unittest.TestCase):
             shape=voxel.shape,
         )
 
-    def test_dataset_returns_ir_tensor_and_compensated_calibration_meta(self):
+    def test_dataset_returns_ir_tensor_without_fixed_sync_displacement(self):
         from diffusion_consistency_radar.cm.dataset_loader import NTU4DRadLM_VoxelDataset
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,7 +111,11 @@ class DatasetIRMetaTest(unittest.TestCase):
             self.assertGreater(float(meta["ir_img"].std()), 0.0)
             self.assertEqual(tuple(meta["r_mat"].shape), (3, 3))
             self.assertEqual(tuple(meta["t_vec"].shape), (3,))
-            self.assertAlmostEqual(float(meta["t_vec"][0]), 0.01, places=6)
+            self.assertAlmostEqual(float(meta["t_vec"][0]), 0.0, places=6)
+            self.assertEqual(
+                meta["time_alignment_compensation"],
+                "preprocessing_signed_delta_only",
+            )
             self.assertEqual(tuple(meta["k_mat"].shape), (3, 3))
             self.assertTrue(path.endswith("000000.npz"))
 

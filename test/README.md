@@ -72,6 +72,78 @@ conda run -n Radar-Diffusion python \
   test/diagnostics/alignment/shared_visibility_eval.py --help
 ```
 
+LiDAR→body 与逐帧 body→local 候选诊断：
+
+```bash
+conda run -n Radar-Diffusion python \
+  test/diagnostics/alignment/build_mapping_pose_candidates.py \
+  --radar_to_imu_matrix Data/config/calib_radar_to_imu.txt \
+  --radar_to_lidar_calib Data/config/calib_radar_to_livox.txt \
+  --ground_truth Data/NTU4DRadLM/loop3/gt_odom.txt \
+  --radar_sync_csv Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/loop3/radar_ir_sync.csv \
+  --radar_lidar_sync_csv Data/NTU4DRadLM_Raw_p1_01_candidate/loop3/radar_lidar_sync.csv \
+  --pose_reference_sensor lidar \
+  --output_dir <全新的诊断结果目录> \
+  --max_interpolation_gap_s 0.2
+```
+
+该入口只发布 `formal=false` 候选，同时保留 GT-as-IMU 与 GT-as-LiDAR
+两种未决假设。LiDAR 对齐数据必须显式选择 `lidar` 时间参考；v2 会把
+Radar--LiDAR sync 快照及哈希封存在候选目录。正式地图加载器会按文件内容
+拒绝这些候选，不得通过放宽插值间隔、复制首 pose 或修改文件名冒充部署合同。
+
+跨帧 LiDAR 重合反证：
+
+```bash
+conda run -n Radar-Diffusion python \
+  test/diagnostics/alignment/evaluate_mapping_pose_overlap.py \
+  --processed_scene_dir Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/loop3 \
+  --candidate_dir <candidate v2 目录> \
+  --output_dir <全新的 overlap 诊断目录> \
+  --pair_delta_s 1.0 \
+  --min_rotation_deg 3.0 \
+  --max_pairs 48
+```
+
+该入口验证 candidate、manifest 自哈希和所选 LiDAR 体素收据，并比较两种
+GT frame 假设的双向最近邻残差。结果始终为 `formal=false`；GT-as-LiDAR
+分支会使 LiDAR→body 外参代数消去，因此该指标不能确认 Radar→IMU 方向。
+
+经验 LiDAR→local 离线地图合同：
+
+```bash
+conda run -n Radar-Diffusion python \
+  diffusion_consistency_radar/scripts/build_empirical_lidar_pose_contract.py \
+  --candidate_dir test/result/comparison/alignment_check/mapping_pose_contract_loop3_candidate_v2_lidar_time \
+  --overlap_dir test/result/comparison/alignment_check/mapping_pose_frame_overlap_loop3_diagnostic_v2_lidar_time \
+  --output_dir <全新的经验位姿合同目录>
+```
+
+该入口只接受已经相互绑定的 LiDAR-time candidate 与 overlap 诊断，直接发布
+`T_local_lidar`，并把来源快照、逐帧 pose 与 SHA-256 封装成自包含 receipt。
+它只允许 `offline_empirical_mapping=true`，明确写入 `airborne_formal=false`、
+`avoidance_formal=false`；无位姿覆盖帧保持 uncovered，禁止外推。
+
+新正式推理完成后，可在 fresh 输出目录执行离线经验地图回放：
+
+```bash
+conda run -n Radar-Diffusion python \
+  diffusion_consistency_radar/scripts/streaming_map_update.py \
+  --radar_voxel_dir <新正式推理目录> \
+  --radar_voxel_layout czxy \
+  --offline_empirical_mapping \
+  --empirical_pose_receipt test/result/comparison/alignment_check/empirical_lidar_pose_loop3_v1/empirical_pose_receipt.json \
+  --inference_run <新正式推理目录>/inference_run.json \
+  --observed_mask_dir <新正式推理目录> \
+  --output_dir <全新的离线地图结果目录> \
+  --pc_range 0 -20 -6 80 20 10 \
+  --map_pc_range 0 -20 -6 120 20 10
+```
+
+严格地图会按 receipt 选择 6165 个有 pose 的帧，并重算实际消费的 prediction
+voxel 与 observed mask 哈希。旧推理目录缺少 `prediction_voxel` 内容收据，必须
+重新推理生成 metadata；不得手工补写 JSON 或删除 267 个 uncovered 文件绕过门禁。
+
 雷达轴约定诊断：
 
 ```bash
@@ -141,8 +213,21 @@ conda run -n Radar-Diffusion python \
 ## Mini-test 入口
 
 ```bash
-# RTX 4070 Laptop 8 GB：正式数据协议、单阶段保护运行
+# RTX 4070 Laptop 8 GB：先做不训练的 formal v2 只读预检
+MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae
+
+# 用户确认后才启动单阶段 VAE mini
 bash test/mini-test/run_formal_mini_8gb.sh vae
+
+# 已验收 1 epoch smoke 后，可先预检独立 3 epoch VAE short profile
+MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae short_train
+# 用户确认后才启动；不会覆盖上面的 smoke
+bash test/mini-test/run_formal_mini_8gb.sh vae short_train
+
+# RTX 4070 Laptop：500 个唯一帧（400 train + 100 validation）的 20 epoch 中型筛查
+MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae medium_train
+# 预检、散热和空闲显存确认后，才显式启动单阶段
+bash test/mini-test/run_formal_mini_8gb.sh vae medium_train
 
 # 历史 legacy mini
 bash test/mini-test/train_minimal.sh all
@@ -155,13 +240,34 @@ bash test/mini-test/diagnose_minimal.sh
 默认 mini 输出保留在：
 
 ```text
-test/result/formal_mini_p1_04_8gb_v1/
+test/result/formal_mini_v2_80m_8gb_v1/
+test/result/formal_mini_v2_80m_8gb_short_v1/
+test/result/formal_medium_v2_80m_laptop_500f_20ep_v2/
 test/mini-test/train_results_mini/
 test/mini-test/inference_results_mini/
 test/mini-test/.tmp_mini_train_dataset/
 ```
 
-`run_formal_mini_8gb.sh` 必须按 `vae → ldm → cd` 分阶段执行，并在阶段间冷却；它保持 full120 正式监督协议，但 checkpoint 标记为 `formal_mini_chain_v1`，不能送入正式 checkpoint 链。完整门禁与推理烟测命令见 `test/mini-test/README.md`。
+`formal_medium_v2_80m_laptop_500f_20ep_v1/` 是 epoch 1 第 50 个 batch
+触发 CUDA expandable-segment 内部断言的失败现场，没有 checkpoint；目录保留用于诊断，
+不得续训。修复后的 `medium_train` 固定写入 fresh `v2` 目录。
+
+`run_formal_mini_8gb.sh` 必须按 `vae → ldm → cd` 分阶段执行，并在阶段间冷却。
+它使用 formal v2 0--80 m 数据合同，默认从正式 split 读取 8 个 train 和 4 个
+validation 帧；checkpoint 标记为 `formal_mini_chain_v2`，只能用于工程 smoke，不能送入
+正式 checkpoint/deployment 链。完整门禁与 1 帧推理命令见 `test/mini-test/README.md`。
+`short_train` 仅用于 fresh 的 3 epoch VAE 趋势检查，使用独立结果根和 60/75°C
+启动/运行温度门禁，不代表正式训练。
+short VAE 后续 LDM 必须用 `MINI_RESULTS_DIR=test/result/formal_mini_v2_80m_8gb_short_v1`
+显式复用父权重，并先运行 `MINI_PREFLIGHT_ONLY=1`；预检会在零输出条件下校验父
+checkpoint 的 stage/protocol/data identity。完整命令见 `test/mini-test/README.md`。
+
+`medium_train` 固定 batch 1、worker 0、400/100 帧和 VAE/LDM/CD 各 20 epoch，不能通过
+环境变量放宽为其他样本数或 epoch。它在 RTX 4070 Laptop 上按阶段运行，启动/运行温度
+上限为 55/72°C、启动空闲显存至少 6500 MiB、单阶段最多 180 分钟。VAE/LDM 会消费
+100 帧 validation；CD 当前只用 400 帧训练，留出的 100 帧在 CD 完成后独立评价。
+该 profile 还会严格拒绝设备名不是 `NVIDIA GeForce RTX 4070 Laptop GPU` 的 GPU。
+该档用于较强的本地质量筛查，正式服务器仍使用 3210/774 full split、每阶段 20 epoch。
 
 ## 结果保存规则
 

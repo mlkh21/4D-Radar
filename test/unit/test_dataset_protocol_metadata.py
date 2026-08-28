@@ -340,7 +340,7 @@ class DatasetProtocolMetadataTest(unittest.TestCase):
         self.assertEqual(len(batch_meta["preprocess_policy"]), 2)
         self.assertIsNone(batch_meta["preprocess_policy"][0]["v_drone"])
 
-    def test_missing_ir_uses_mock_and_fallback_t_has_sync_compensation(self):
+    def test_missing_ir_uses_mock_without_inventing_sync_displacement(self):
         from diffusion_consistency_radar.cm.dataset_loader import NTU4DRadLM_VoxelDataset
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -365,7 +365,11 @@ class DatasetProtocolMetadataTest(unittest.TestCase):
 
             self.assertTrue(bool(meta["is_mock_ir"]))
             self.assertTrue(bool(meta["is_mock_calib"]))
-            self.assertAlmostEqual(float(meta["t_vec"][0]), 0.01, places=6)
+            self.assertAlmostEqual(float(meta["t_vec"][0]), 0.0, places=6)
+            self.assertEqual(
+                meta["time_alignment_compensation"],
+                "preprocessing_signed_delta_only",
+            )
             self.assertEqual(meta["calib_fallback_reason"], "thermal_missing")
 
     def test_livox_calibration_is_recorded_but_not_used_as_real_thermal_calib(self):
@@ -402,7 +406,7 @@ class DatasetProtocolMetadataTest(unittest.TestCase):
             self.assertFalse(bool(meta["has_thermal_calib"]))
             self.assertEqual(meta["calib_source"], "mock_default")
             self.assertEqual(meta["calib_fallback_reason"], "thermal_missing_livox_available_not_used_for_ir")
-            self.assertAlmostEqual(float(meta["t_vec"][0]), 0.01, places=6)
+            self.assertAlmostEqual(float(meta["t_vec"][0]), 0.0, places=6)
 
     def test_thermal_calibration_is_used_as_real_ir_calib(self):
         from diffusion_consistency_radar.cm.dataset_loader import NTU4DRadLM_VoxelDataset
@@ -416,7 +420,7 @@ class DatasetProtocolMetadataTest(unittest.TestCase):
             os.makedirs(radar)
             os.makedirs(target)
 
-            with open(os.path.join(config, "calib_radar_to_thermal.txt"), "w", encoding="utf-8") as f:
+            with open(os.path.join(config, "calib_livox_to_thermal.txt"), "w", encoding="utf-8") as f:
                 f.write("R: 1 0 0 0 1 0 0 0 1\n")
                 f.write("T: 1 2 3\n")
 
@@ -434,9 +438,35 @@ class DatasetProtocolMetadataTest(unittest.TestCase):
             _target, _radar, meta = ds[0]
 
             self.assertFalse(bool(meta["is_mock_calib"]))
-            self.assertEqual(meta["calib_source"], "calib_radar_to_thermal.txt")
+            self.assertEqual(meta["calib_source"], "calib_livox_to_thermal.txt")
             self.assertTrue(bool(meta["calib_is_thermal"]))
-            self.assertAlmostEqual(float(meta["t_vec"][0]), 1.01, places=6)
+            self.assertAlmostEqual(float(meta["t_vec"][0]), 1.0, places=6)
+
+    def test_explicit_scene_names_prevent_dataset_scene_guessing(self):
+        from diffusion_consistency_radar.cm.dataset_loader import NTU4DRadLM_VoxelDataset
+
+        with tempfile.TemporaryDirectory() as root:
+            for scene_name in ("garden", "loop3"):
+                scene = os.path.join(root, scene_name)
+                radar = os.path.join(scene, "radar_voxel")
+                target = os.path.join(scene, "target_voxel")
+                os.makedirs(radar)
+                os.makedirs(target)
+                voxel = np.zeros((2, 2, 2, 4), dtype=np.float32)
+                voxel[0, 0, 0, 0] = 1.0
+                write_sparse(os.path.join(radar, "000000.npz"), voxel)
+                write_sparse(os.path.join(target, "000000.npz"), voxel)
+
+            dataset = NTU4DRadLM_VoxelDataset(
+                root,
+                split="train",
+                scene_names=["loop3"],
+                use_augmentation=False,
+                allow_legacy_radar_units=True,
+            )
+
+        self.assertEqual(len(dataset), 1)
+        self.assertIn("/loop3/", dataset.samples[0][1])
 
     def test_dataset_audit_reports_ir_coverage_and_mock_calibration(self):
         from diffusion_consistency_radar.scripts.audit_dataset_protocol import audit_scene

@@ -47,8 +47,8 @@ class RadarNormalizationBuilderTest(unittest.TestCase):
         kwargs.update(overrides)
         return kwargs
 
-    def test_builder_uses_explicit_scenes_all_frames_and_actual_transform_order(self):
-        """只统计显式 train scene，并在 crop/resize 后计算 log1p 分位数。"""
+    def test_builder_uses_only_split_train_frames_and_actual_transform_order(self):
+        """只统计唯一 split 的 train frame，并在 crop/resize 后计算分位数。"""
         from diffusion_consistency_radar.scripts import build_radar_normalization
 
         with tempfile.TemporaryDirectory() as root:
@@ -64,20 +64,39 @@ class RadarNormalizationBuilderTest(unittest.TestCase):
             output = os.path.join(root, "artifacts", "radar_normalization.json")
             manifest = {"frame_count": 2, "content_sha256": "a" * 64}
 
+            split_artifact = {
+                "scenes": {
+                    "garden": {
+                        "train_frame_ids": ["000000", "000001"],
+                    }
+                }
+            }
             with mock.patch.object(
                 build_radar_normalization,
                 "validate_scene_manifest",
                 return_value=manifest,
-            ) as validate:
+            ) as validate, mock.patch.object(
+                build_radar_normalization,
+                "load_temporal_split_artifact",
+                return_value=(split_artifact, "d" * 64),
+            ):
                 result_path = build_radar_normalization.build_and_write_artifact(
-                    **self._kwargs(root, output)
+                    **self._kwargs(
+                        root,
+                        output,
+                        split_artifact_path=os.path.join(root, "split.json"),
+                    )
                 )
 
             with open(output, encoding="utf-8") as handle:
                 artifact = json.load(handle)
 
         self.assertEqual(result_path, output)
-        validate.assert_called_once_with(os.path.join(root, "garden"), "garden")
+        validate.assert_called_once_with(
+            os.path.join(root, "garden"),
+            "garden",
+            expected_profile="training",
+        )
         self.assertEqual(artifact["training_scenes"], ["garden"])
         self.assertEqual(artifact["frame_count"], 2)
         self.assertTrue(artifact["formal"])
@@ -86,6 +105,10 @@ class RadarNormalizationBuilderTest(unittest.TestCase):
         self.assertEqual(
             artifact["input_provenance"]["dataset_manifest_sha256"],
             {"garden": "a" * 64},
+        )
+        self.assertEqual(
+            artifact["input_provenance"]["split_artifact_sha256"],
+            "d" * 64,
         )
 
     def test_frame_cap_marks_artifact_nonformal(self):

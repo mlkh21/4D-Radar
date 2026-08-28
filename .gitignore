@@ -1,5 +1,7 @@
 *.log
 .vscode/
+.codex/
+./agents/
 pull-to-server.sh
 pull-from-server.sh
 

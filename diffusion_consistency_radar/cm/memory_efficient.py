@@ -427,9 +427,7 @@ def apply_memory_optimizations():
         # NOTE: 启用 cuDNN benchmark
         torch.backends.cudnn.benchmark = True
         
-        # NOTE: 设置显存分配策略
-        import os
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+        # NOTE: CUDA allocator 必须由 launcher 在导入 PyTorch 前固定；运行期不再修改隐藏环境依赖。
 
 
 # NOTE: 便捷函数

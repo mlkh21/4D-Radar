@@ -22,7 +22,12 @@ class MiniScriptsProtocolTest(unittest.TestCase):
         Path(path).write_text(content, encoding="utf-8")
         os.chmod(path, 0o755)
 
-    def _run_guarded_runner_with_fake_gpu(self, gpu_state, extra_env=None):
+    def _run_guarded_runner_with_fake_gpu(
+        self,
+        gpu_state,
+        extra_env=None,
+        runner_args=None,
+    ):
         with tempfile.TemporaryDirectory(prefix="formal_mini_guard_") as root:
             fake_bin = os.path.join(root, "bin")
             os.makedirs(fake_bin)
@@ -45,8 +50,13 @@ class MiniScriptsProtocolTest(unittest.TestCase):
                 }
             )
             env.update(extra_env or {})
+            command = [
+                "bash",
+                os.path.join(ROOT, "test/mini-test/run_formal_mini_8gb.sh"),
+                *(runner_args or ["vae"]),
+            ]
             result = subprocess.run(
-                ["bash", os.path.join(ROOT, "test/mini-test/run_formal_mini_8gb.sh"), "vae"],
+                command,
                 cwd=ROOT,
                 env=env,
                 text=True,
@@ -74,6 +84,24 @@ class MiniScriptsProtocolTest(unittest.TestCase):
         self.assertIn('MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-', script)
         self.assertIn('--save_uncertainty', script)
 
+    def test_formal_mini_inference_uses_v2_deployment_view_without_truth(self):
+        """formal mini smoke 必须读取 0--80 m deployment view 并显式授权 mini 权重。"""
+        script = self._read("test/mini-test/inference_minimal.sh")
+
+        for fragment in (
+            "NTU4DRadLM_Deploy_formal_v2_80m_86p8_v1",
+            'DEFAULT_SOURCE_PC_RANGE="0,-20,-6,80,20,10"',
+            'DEFAULT_MODEL_PC_RANGE="0,-20,-6,80,20,10"',
+            'CALIBRATION_DIR="${CALIBRATION_DIR:-${ROOT_DIR}/Data/config}"',
+            '--deployment_scene_dir',
+            '--calibration_dir',
+            '--allow_formal_mini_checkpoint',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+        self.assertNotIn("NTU4DRadLM_Pre_sensor_aware_p1_04_candidate", script)
+        self.assertNotIn('DEFAULT_MODEL_PC_RANGE="0,-20,-6,120,20,10"', script)
+
     def test_mini_scripts_explicitly_select_legacy_or_formal_radar_protocol(self):
         train_script = self._read("test/mini-test/train_minimal.sh")
         inference_script = self._read("test/mini-test/inference_minimal.sh")
@@ -92,7 +120,11 @@ class MiniScriptsProtocolTest(unittest.TestCase):
             "cfg['data']['doppler_scale_mps'] = float(doppler_scale_mps)",
             train_script,
         )
-        self.assertIn("formal_mini_chain_v1", train_script)
+        self.assertIn("formal_mini_chain_v2", train_script)
+        self.assertIn("temporal_split_artifact", train_script)
+        self.assertIn("data_protocol_path", train_script)
+        self.assertIn("mini_train_frames_per_scene", train_script)
+        self.assertIn("mini_validation_frames_per_scene", train_script)
         self.assertIn(
             "PYTHON_CMD=(conda run --no-capture-output -n Radar-Diffusion python)",
             train_script,
@@ -103,7 +135,7 @@ class MiniScriptsProtocolTest(unittest.TestCase):
         artifact_path = os.path.join(
             ROOT,
             "diffusion_consistency_radar/config/",
-            "radar_normalization_garden_32x128x128_full120_86p8_v1.json",
+            "radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json",
         )
         with tempfile.TemporaryDirectory(prefix="formal_bad_sha_") as results_dir:
             scratch = os.path.join(results_dir, ".tmp_vae_train_dataset")
@@ -116,11 +148,15 @@ class MiniScriptsProtocolTest(unittest.TestCase):
                     "MINI_RADAR_PROTOCOL": "formal",
                     "MINI_RADAR_NORMALIZATION_PATH": artifact_path,
                     "EXPECTED_FORMAL_ARTIFACT_SHA256": "0" * 64,
-                    "MINI_MODEL_PC_RANGE": "0,-20,-6,120,20,10",
+                    "PREPROCESSED_ROOT": os.path.join(
+                        ROOT, "Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1"
+                    ),
+                    "MINI_DATASET_DIR": os.path.join(
+                        ROOT, "Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1"
+                    ),
                     "MINI_RESULTS_DIR": results_dir,
-                    "MINI_DATASET_DIR": scratch,
                     "MINI_CONFIG_PATH": config_path,
-                    "MINI_REQUIRE_FRESH_SCRATCH": "1",
+                    "MINI_REQUIRE_FRESH_SCRATCH": "0",
                     "MINI_REQUIRE_FRESH_CONFIG": "1",
                 }
             )
@@ -140,41 +176,61 @@ class MiniScriptsProtocolTest(unittest.TestCase):
             self.assertFalse(os.path.exists(scratch))
             self.assertFalse(os.path.exists(config_path))
 
+    def test_formal_preflight_validates_parent_checkpoint_identity_before_exit(self):
+        """LDM/CD 预检必须在无输出退出前校验父 checkpoint，而非只检查文件存在。"""
+        script = self._read("test/mini-test/train_minimal.sh")
+
+        for fragment in (
+            "assert_checkpoint_training_identity",
+            "build_formal_mini_selection",
+            "checkpoint_state_dict",
+            "safe_torch_load",
+            'parent_checkpoints["ldm"].get("vae_checkpoint_sha256")',
+            "Formal mini parent checkpoint validated",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+        self.assertLess(
+            script.index("assert_checkpoint_training_identity"),
+            script.index("Mini training preflight passed; no scratch/config/output was created."),
+        )
+
     def test_formal_mini_8gb_runner_has_short_single_stage_hardware_guards(self):
         script = self._read("test/mini-test/run_formal_mini_8gb.sh")
 
         for fragment in (
             'MODE="${1:-vae}"',
-            'SAMPLES_PER_SCENE="${SAMPLES_PER_SCENE:-16}"',
-            'MINI_VAE_EPOCHS="${MINI_VAE_EPOCHS:-1}"',
-            'MINI_LDM_EPOCHS="${MINI_LDM_EPOCHS:-1}"',
-            'MINI_CD_EPOCHS="${MINI_CD_EPOCHS:-1}"',
+            'PROFILE="${2:-smoke}"',
+            'if [[ "$#" -gt 2 ]]; then',
+            'MINI_TRAIN_FRAMES_PER_SCENE="${MINI_TRAIN_FRAMES_PER_SCENE:-${PROFILE_TRAIN_FRAMES_PER_SCENE}}"',
+            'MINI_VALIDATION_FRAMES_PER_SCENE="${MINI_VALIDATION_FRAMES_PER_SCENE:-${PROFILE_VALIDATION_FRAMES_PER_SCENE}}"',
             'MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-1}"',
             'MINI_NUM_WORKERS="${MINI_NUM_WORKERS:-0}"',
-            'MINI_MAX_GPU_TEMP_C="${MINI_MAX_GPU_TEMP_C:-80}"',
-            'MINI_MAX_START_TEMP_C="${MINI_MAX_START_TEMP_C:-65}"',
-            'MINI_MAX_STAGE_MINUTES="${MINI_MAX_STAGE_MINUTES:-20}"',
-            'MINI_MIN_FREE_GPU_MEMORY_MIB="${MINI_MIN_FREE_GPU_MEMORY_MIB:-6000}"',
+            'MINI_MAX_STAGE_MINUTES="${MINI_MAX_STAGE_MINUTES:-${PROFILE_MAX_STAGE_MINUTES}}"',
+            'MINI_MIN_FREE_GPU_MEMORY_MIB="${MINI_MIN_FREE_GPU_MEMORY_MIB:-${PROFILE_MIN_FREE_GPU_MEMORY_MIB}}"',
             'nvidia-smi',
-            'formal_mini_chain_v1',
-            'NTU4DRadLM_Pre_sensor_aware_p1_04_candidate',
-            'radar_normalization_garden_32x128x128_full120_86p8_v1.json',
+            'formal_mini_chain_v2',
+            'NTU4DRadLM_Pre_formal_v2_80m_86p8_v1',
+            'radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json',
+            'temporal_split_garden_train80_purge3s_v1.json',
+            'formal_data_protocol_garden_train80_purge3s_v1.json',
             'MINI_RADAR_PROTOCOL="formal"',
-            'MINI_DATASET_DIR="${MINI_RESULTS_DIR}/.tmp_${MODE}_train_dataset"',
             'MINI_CONFIG_PATH="${MINI_RESULTS_DIR}/mini_${MODE}_config.yaml"',
-            'MINI_REQUIRE_FRESH_SCRATCH="1"',
             'MINI_REQUIRE_FRESH_CONFIG="1"',
             'MINI_PREFLIGHT_ONLY="${MINI_PREFLIGHT_ONLY:-0}"',
             'TRAIN_SCENES_OVERRIDE="garden"',
-            'EXPECTED_FORMAL_ARTIFACT_SHA256="2c9c92650b98ec686d621b53eccb5e7f376cb6b8ea1047d4fb594349af90c4d5"',
+            'EXPECTED_FORMAL_ARTIFACT_SHA256="11f59d84cc186c39256c112154faf458ec9ead5fec9b08b997abd5058b68e97c"',
             'MINI_VAE_LATENT_DIM=""',
             'Formal mini 8 GB preflight passed; training was not started.',
             'bash "${TRAIN_SCRIPT}" "${MODE}"',
+            'echo "epochs/batch: ${ACTIVE_STAGE_EPOCHS}/${MINI_BATCH_SIZE}"',
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, script)
         self.assertIn('vae|ldm|cd)', script)
         self.assertNotIn('all_with_cd)', script)
+        self.assertNotIn('NTU4DRadLM_Pre_sensor_aware_p1_04_candidate', script)
+        self.assertNotIn('formal_mini_chain_v1', script)
         self.assertLess(
             script.index('Formal mini 8 GB preflight passed; training was not started.'),
             script.index('setsid bash "${TRAIN_SCRIPT}" "${MODE}"'),
@@ -184,6 +240,162 @@ class MiniScriptsProtocolTest(unittest.TestCase):
             train_script.index("Mini training preflight passed; no scratch/config/output was created."),
             train_script.index('mkdir -- "${MINI_DATASET_DIR}"'),
         )
+
+    def test_short_train_profile_is_isolated_and_more_conservative(self):
+        """3 epoch short train 必须使用独立结果根，并收紧温度而非覆盖 smoke。"""
+        script = self._read("test/mini-test/run_formal_mini_8gb.sh")
+
+        for fragment in (
+            'PROFILE="${2:-smoke}"',
+            'short_train)',
+            'PROFILE_VAE_EPOCHS=3',
+            'PROFILE_MAX_GPU_TEMP_C=75',
+            'formal_mini_v2_80m_8gb_short_v1',
+            'short_train 目前只允许 VAE',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
+        result, launched = self._run_guarded_runner_with_fake_gpu(
+            "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 7000, 50",
+            runner_args=["vae", "short_train"],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("profile: short_train", result.stdout)
+        self.assertIn("GPU start/max temperature: 50/75 C", result.stdout)
+        self.assertIn("epochs/batch: 3/1", result.stdout)
+        self.assertIn("train_minimal.sh vae", launched)
+
+    def test_short_train_rejects_non_vae_and_weaker_temperature_limit(self):
+        """short profile 不得扩散到 LDM/CD，也不得把温度上限改回 80 C。"""
+        result, launched = self._run_guarded_runner_with_fake_gpu(
+            "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 7000, 50",
+            runner_args=["ldm", "short_train"],
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("short_train 目前只允许 VAE", result.stdout)
+        self.assertEqual(launched, "")
+
+        result, launched = self._run_guarded_runner_with_fake_gpu(
+            "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 7000, 50",
+            {"MINI_MAX_GPU_TEMP_C": "80"},
+            runner_args=["vae", "short_train"],
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不得提高 75 C", result.stdout)
+        self.assertEqual(launched, "")
+
+    def test_medium_train_profile_fixes_500_frames_and_20_epochs(self):
+        """笔记本 medium profile 必须固定 400/100 帧、20 epoch 和独立结果根。"""
+        script = self._read("test/mini-test/run_formal_mini_8gb.sh")
+
+        for fragment in (
+            "medium_train)",
+            "PROFILE_TRAIN_FRAMES_PER_SCENE=400",
+            "PROFILE_VALIDATION_FRAMES_PER_SCENE=100",
+            "PROFILE_VAE_EPOCHS=20",
+            "PROFILE_LDM_EPOCHS=20",
+            "PROFILE_CD_EPOCHS=20",
+            "PROFILE_MAX_GPU_TEMP_C=72",
+            "PROFILE_MAX_START_TEMP_C=55",
+            "PROFILE_MAX_STAGE_MINUTES=180",
+            "PROFILE_MIN_FREE_GPU_MEMORY_MIB=6500",
+            'PROFILE_REQUIRED_GPU_NAME="NVIDIA GeForce RTX 4070 Laptop GPU"',
+            "formal_medium_v2_80m_laptop_500f_20ep_v2",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
+        result, launched = self._run_guarded_runner_with_fake_gpu(
+            "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 7000, 50",
+            runner_args=["vae", "medium_train"],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("profile: medium_train", result.stdout)
+        self.assertIn("train/validation frames per scene: 400/100", result.stdout)
+        self.assertIn("selected frames per scene: 500", result.stdout)
+        self.assertIn("GPU start/max temperature: 50/72 C", result.stdout)
+        self.assertIn("epochs/batch: 20/1", result.stdout)
+        self.assertIn("max stage runtime: 180 min", result.stdout)
+        self.assertIn("train_minimal.sh vae", launched)
+
+    def test_guarded_runner_uses_stable_allocator_without_expandable_segments(self):
+        """PyTorch 2.4.1 的 laptop 入口不得再次启用已触发内部断言的 allocator。"""
+        runner = self._read("test/mini-test/run_formal_mini_8gb.sh")
+        memory_efficient = self._read(
+            "diffusion_consistency_radar/cm/memory_efficient.py"
+        )
+        train_script = self._read("test/mini-test/train_minimal.sh")
+
+        self.assertIn(
+            'export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"', runner
+        )
+        self.assertNotIn("expandable_segments", runner)
+        self.assertNotIn("expandable_segments", memory_efficient)
+        self.assertIn(
+            "cfg['hardware']['cuda_allocator_conf'] = allocator_conf",
+            train_script,
+        )
+
+        result, launched = self._run_guarded_runner_with_fake_gpu(
+            "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 7000, 50",
+            {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+            runner_args=["vae", "medium_train"],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("CUDA allocator: max_split_size_mb:128", result.stdout)
+        self.assertIn("train_minimal.sh vae", launched)
+
+    def test_medium_train_profile_rejects_data_or_guard_drift(self):
+        """500 帧档不得被环境变量改成其他帧数或放宽笔记本保护门槛。"""
+        cases = (
+            (
+                {"MINI_TRAIN_FRAMES_PER_SCENE": "399"},
+                "固定 train/validation frames per scene=400/100",
+            ),
+            ({"MINI_MAX_GPU_TEMP_C": "73"}, "不得提高 72 C"),
+            ({"MINI_MAX_STAGE_MINUTES": "181"}, "单阶段时长不得高于 180 分钟"),
+            (
+                {"MINI_MIN_FREE_GPU_MEMORY_MIB": "6000"},
+                "可用显存 6500 MiB 门槛",
+            ),
+        )
+        for extra_env, expected in cases:
+            with self.subTest(extra_env=extra_env):
+                result, launched = self._run_guarded_runner_with_fake_gpu(
+                    "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 7000, 50",
+                    extra_env,
+                    runner_args=["vae", "medium_train"],
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stdout)
+                self.assertEqual(launched, "")
+
+        result, launched = self._run_guarded_runner_with_fake_gpu(
+            "NVIDIA GeForce RTX 4090, 24564, 23000, 40",
+            runner_args=["vae", "medium_train"],
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("仅允许 NVIDIA GeForce RTX 4070 Laptop GPU", result.stdout)
+        self.assertEqual(launched, "")
+
+    def test_guarded_runner_rejects_unknown_profile_and_extra_arguments(self):
+        """未知 profile 和多余位置参数都必须在读取 GPU 或启动训练前拒绝。"""
+        result, launched = self._run_guarded_runner_with_fake_gpu(
+            "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 7000, 50",
+            runner_args=["vae", "unknown"],
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("profile 必须为 smoke、short_train 或 medium_train", result.stdout)
+        self.assertEqual(launched, "")
+
+        result, launched = self._run_guarded_runner_with_fake_gpu(
+            "NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 7000, 50",
+            runner_args=["vae", "smoke", "unexpected"],
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("最多接受阶段和 profile 两个位置参数", result.stdout)
+        self.assertEqual(launched, "")
 
     def test_formal_mini_8gb_runner_passes_safe_fake_gpu_without_real_training(self):
         result, launched = self._run_guarded_runner_with_fake_gpu(
@@ -233,30 +445,48 @@ class MiniScriptsProtocolTest(unittest.TestCase):
             "diffusion_consistency_radar/launch/train_unified.sh"
         )
 
-        self.assertIn("NTU4DRadLM_Pre_sensor_aware_p1_04_candidate", script)
+        self.assertIn("NTU4DRadLM_Pre_formal_v2_80m_86p8_v1", script)
         self.assertIn(
-            "radar_normalization_garden_32x128x128_full120_86p8_v1.json",
+            "radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json",
             script,
         )
-        self.assertIn("formal_p1_04_full120_86p8_v1", script)
+        self.assertIn("formal_v2_80m_86p8_v1", script)
         self.assertIn('ALLOW_RESUME="${ALLOW_RESUME:-0}"', script)
         self.assertIn('if [ "${ALLOW_RESUME}" != "1" ]; then', script)
         self.assertIn("拒绝隐式续训", script)
         self.assertIn("cfg['data']['radar_normalization_path']", script)
         self.assertIn("cfg['data']['doppler_scale_mps'] = 86.8", script)
         self.assertNotIn("Please train VAE first: sh ", script)
+        self.assertIn('EXPECTED_ARTIFACT_SHA256="${EXPECTED_ARTIFACT_SHA256:-}"', script)
+        self.assertIn("temporal_split_garden_train80_purge3s_v1.json", script)
+        self.assertIn("formal_data_protocol_garden_train80_purge3s_v1.json", script)
+        self.assertIn("cfg['data']['require_persisted_observed_mask'] = True", script)
+        self.assertIn("cfg['data']['require_radar_statistics'] = True", script)
         self.assertIn(
-            'EXPECTED_ARTIFACT_SHA256="2c9c92650b98ec686d621b53eccb5e7f376cb6b8ea1047d4fb594349af90c4d5"',
+            'CUDA_DEVICES="${CUDA_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"',
             script,
         )
+        self.assertIn('PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"', script)
+        self.assertIn('FORMAL_EPOCHS="${FORMAL_EPOCHS:-20}"', script)
+        self.assertIn("正式服务器训练固定 VAE/LDM/CD epochs=20/20/20", script)
+        self.assertIn('export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"', script)
+        self.assertIn('if [ "${PREFLIGHT_ONLY}" = "1" ]; then', script)
+        self.assertIn("Radar statistics 预检通过", script)
+        self.assertIn("cfg['data'].pop('mini_train_frames_per_scene', None)", script)
+        self.assertIn("cfg['data'].pop('mini_validation_frames_per_scene', None)", script)
+        self.assertIn("cfg[stage]['epochs'] = int(formal_epochs)", script)
+        self.assertIn(
+            "cfg['hardware']['cuda_allocator_conf'] = allocator_conf", script
+        )
+        self.assertIn('echo "CUDA allocator: ${PYTORCH_CUDA_ALLOC_CONF}"', script)
+        self.assertIn('echo "Formal epochs per stage: ${FORMAL_EPOCHS}"', script)
+        self.assertNotIn("CUDA_VISIBLE_DEVICES=0,1", script)
+        self.assertNotIn("CUDA_VISIBLE_DEVICES=0 python", script)
         self.assertLess(
             script.index("拒绝隐式续训"),
-            script.index("CUDA_VISIBLE_DEVICES"),
+            script.index("export CUDA_VISIBLE_DEVICES"),
         )
-        self.assertLess(
-            script.index("load_radar_normalization_artifact"),
-            script.index('rm -rf "${TRAIN_DATASET_DIR}"'),
-        )
+        self.assertNotIn('rm -rf "${TRAIN_DATASET_DIR}"', script)
 
     def test_inference_script_rejects_removed_oracle_environment(self):
         """旧 adaptive 环境变量必须在任何推理准备前给出迁移提示。"""
@@ -275,6 +505,20 @@ class MiniScriptsProtocolTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("diagnose_oracle_target_adaptation.py", result.stdout)
+
+    def test_formal_launchers_bind_each_deployment_scene_directory(self):
+        """单模型正式 launcher 不能引用未定义的 SCENE_DIR。"""
+        for relative_path in (
+            "diffusion_consistency_radar/launch/inference_ldm.sh",
+            "diffusion_consistency_radar/launch/inference_cd.sh",
+        ):
+            script = self._read(relative_path)
+            with self.subTest(relative_path=relative_path):
+                self.assertIn(
+                    '--deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}"',
+                    script,
+                )
+                self.assertNotIn('--deployment_scene_dir "${SCENE_DIR}"', script)
 
 
 if __name__ == "__main__":

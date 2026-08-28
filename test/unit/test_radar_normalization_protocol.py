@@ -405,47 +405,35 @@ class RadarNormalizationProtocolTest(unittest.TestCase):
         default_data = default_config["data"]
         self.assertEqual(
             default_data["dataset_dir"],
-            "./Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate",
+            "./Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1",
         )
         self.assertEqual(default_data["target_size"], [32, 128, 128])
         self.assertEqual(
             default_data["source_pc_range"],
-            [0, -20, -6, 120, 20, 10],
+            [0, -20, -6, 80, 20, 10],
         )
         self.assertEqual(
             default_data["model_pc_range"],
-            [0, -20, -6, 120, 20, 10],
+            [0, -20, -6, 80, 20, 10],
         )
         self.assertEqual(
             default_data["radar_normalization_path"],
             "./diffusion_consistency_radar/config/"
-            "radar_normalization_garden_32x128x128_full120_86p8_v1.json",
+            "radar_normalization_garden_32x128x128_80m_"
+            "train80_purge3s_86p8_v2.json",
         )
         self.assertEqual(default_data["doppler_scale_mps"], 86.8)
-
-        default_artifact = os.path.join(
-            ROOT,
-            default_data["radar_normalization_path"],
-        )
-        loaded_default, default_digest = resolve_training_radar_normalization(
-            {
-                "radar_normalization_path": default_artifact,
-                "doppler_scale_mps": default_data["doppler_scale_mps"],
-            },
-            target_size=tuple(default_data["target_size"]),
-            source_pc_range=tuple(default_data["source_pc_range"]),
-            model_pc_range=tuple(default_data["model_pc_range"]),
-        )
-        self.assertTrue(loaded_default["formal"])
-        self.assertEqual(loaded_default["training_scenes"], ["garden"])
-        self.assertEqual(
-            default_digest,
-            "2c9c92650b98ec686d621b53eccb5e7f376cb6b8ea1047d4fb594349af90c4d5",
-        )
+        self.assertEqual(default_data["checkpoint_protocol"], "formal_chain_v2")
+        self.assertIn("temporal_split_garden_train80_purge3s_v1.json", default_data["temporal_split_artifact"])
+        self.assertIn("formal_data_protocol_garden_train80_purge3s_v1.json", default_data["data_protocol_path"])
+        self.assertEqual(default_data["scene_names"], ["garden"])
+        self.assertTrue(default_data["require_real_ir"])
+        self.assertTrue(default_data["require_real_calibration"])
+        self.assertTrue(default_data["require_persisted_observed_mask"])
         for stage in ("vae", "ldm", "cd"):
             self.assertEqual(
                 default_config[stage]["save_dir"],
-                "./Result/train_results/formal_p1_04_full120_86p8_v1/"
+                "./Result/train_results/formal_v2_80m_86p8_v1/"
                 f"{stage}",
             )
 

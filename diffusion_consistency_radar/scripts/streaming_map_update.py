@@ -17,9 +17,12 @@ import numpy as np
 
 # 该离线入口只需要两个轻量模块；直接执行时不得加载 `cm/__init__.py`
 # 中完整的 Torch/分布式训练栈，否则 `--help` 也可能触发 OpenMPI 初始化。
-CM_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cm")
+PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CM_DIR = os.path.join(PACKAGE_DIR, "cm")
 if CM_DIR not in sys.path:
     sys.path.insert(0, CM_DIR)
+if PACKAGE_DIR not in sys.path:
+    sys.path.insert(0, PACKAGE_DIR)
 
 from probabilistic_mapping import (  # noqa: E402
     GridMapConfig,
@@ -28,9 +31,19 @@ from probabilistic_mapping import (  # noqa: E402
     load_sparse_voxel_npz,
 )
 from evaluation_metrics import occupancy_prf, voxel_to_points  # noqa: E402
+from geometry_protocol import load_extrinsic_transform  # noqa: E402
+from empirical_pose_contract import (  # noqa: E402
+    load_empirical_lidar_pose_contract,
+)
+from prediction_artifact_protocol import (  # noqa: E402
+    PREDICTION_VOXEL_PROTOCOL,
+    normalize_prediction_voxel_records,
+    prediction_voxel_records_digest,
+)
 
 
 DYNAMIC_EVIDENCE_PROTOCOL = "dynamic_occupancy_evidence_v1"
+RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL = "radar_endpoint_ray_visibility_v1"
 DYNAMIC_EVIDENCE_METADATA = "dynamic_evidence.json"
 DYNAMIC_EVIDENCE_KEYS = {
     "protocol",
@@ -213,7 +226,7 @@ def load_dynamic_evidence_protocol(
             "动态 evidence frame_count 与 Radar 帧数不一致: "
             f"metadata={frame_count!r}, radar={len(voxel_file_names)}"
         )
-    expected_shape = [int(value) for value in cfg.shape_xyz]
+    expected_shape = [int(value) for value in cfg.evidence_shape_xyz]
     actual_shape = metadata.get("shape_xyz")
     if (
         not isinstance(actual_shape, list)
@@ -222,17 +235,10 @@ def load_dynamic_evidence_protocol(
         or actual_shape != expected_shape
     ):
         raise ValueError(
-            "动态 evidence shape_xyz 与地图不一致: "
-            f"metadata={actual_shape!r}, map={expected_shape}"
+            "动态 evidence shape_xyz 与模型 evidence 不一致: "
+            f"metadata={actual_shape!r}, evidence={expected_shape}"
         )
-    expected_range = [
-        float(cfg.x_min),
-        float(cfg.y_min),
-        float(cfg.z_min),
-        float(cfg.x_max),
-        float(cfg.y_max),
-        float(cfg.z_max),
-    ]
+    expected_range = [float(value) for value in cfg.evidence_pc_range]
     range_payload = metadata.get("pc_range")
     if (
         not isinstance(range_payload, list)
@@ -246,8 +252,8 @@ def load_dynamic_evidence_protocol(
         or not np.allclose(actual_range, expected_range, atol=1e-9, rtol=0.0)
     ):
         raise ValueError(
-            "动态 evidence pc_range 与地图不一致: "
-            f"metadata={actual_range}, map={expected_range}"
+            "动态 evidence pc_range 与模型 evidence 不一致: "
+            f"metadata={actual_range}, evidence={expected_range}"
         )
 
     paths: Dict[str, str] = {}
@@ -419,6 +425,8 @@ def load_pose_table(
             raise ValueError(
                 "pose CSV 必须包含 frame,timestamp,tx,ty,tz,qx,qy,qz,qw"
             )
+        if "diagnostic_formal" in set(reader.fieldnames):
+            raise ValueError("正式入口拒绝 formal=false 的诊断候选 pose CSV")
         for row_number, row in enumerate(reader, start=2):
             frame = str(row.get("frame", "")).strip()
             if not frame:
@@ -453,6 +461,235 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _observed_mask_records_digest(records) -> str:
+    """复算 inference 端逐帧 mask 收据，拒绝只信任 JSON 声明。"""
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(str(record["frame_id"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(record["file"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(record["sha256"]).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(int(record["observed_voxels"])).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def load_formal_inference_contract(
+    path: str,
+    radar_file_names: List[str],
+    radar_voxel_dir: str,
+    observed_mask_dir: str,
+    allow_receipt_bound_subset: bool = False,
+) -> Dict[str, object]:
+    """验证 formal inference 身份；经验模式只允许 receipt 绑定的有序子集。"""
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise ValueError(f"formal inference_run 必须是普通 JSON 文件: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"formal inference_run 无法解析: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("formal inference_run 顶层必须是 JSON 对象")
+    expected_frames = [_voxel_frame_key(name) for name in radar_file_names]
+    observed = payload.get("observed_mask") if isinstance(payload, dict) else None
+    prediction = payload.get("prediction_voxel") if isinstance(payload, dict) else None
+    deployment_identity = (
+        payload.get("deployment_identity") if isinstance(payload, dict) else None
+    )
+    deployment_calibration = (
+        deployment_identity.get("calibration_sha256")
+        if isinstance(deployment_identity, dict)
+        else None
+    )
+    radar_origin = np.asarray(
+        observed.get("radar_origin_lidar_m") if isinstance(observed, dict) else None,
+        dtype=np.float64,
+    )
+    radar_to_lidar_sha256 = (
+        str(observed.get("radar_to_lidar_sha256", ""))
+        if isinstance(observed, dict)
+        else ""
+    )
+    if (
+        payload.get("stage") != "deployment_generation"
+        or payload.get("formal_protocol") is not True
+        or payload.get("require_real_ir") is not True
+        or payload.get("model_is_multimodal") is not True
+        or payload.get("voxel_coordinate_frame") != "lidar"
+        or type(payload.get("frame_count")) is not int
+        or (
+            payload.get("frame_count") != len(expected_frames)
+            if not allow_receipt_bound_subset
+            else payload.get("frame_count") < len(expected_frames)
+        )
+        or not isinstance(observed, dict)
+        or observed.get("protocol") != RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL
+        or observed.get("coordinate_frame") != "lidar"
+        or observed.get("source") != "radar_endpoint_rays"
+        or observed.get("ir_frustum_marks_free_space") is not False
+        or type(observed.get("frame_count")) is not int
+        or observed.get("frame_count") != payload.get("frame_count")
+        or radar_origin.shape != (3,)
+        or not np.all(np.isfinite(radar_origin))
+        or len(radar_to_lidar_sha256) != 64
+        or not isinstance(deployment_calibration, dict)
+        or deployment_calibration.get("radar_to_lidar")
+        != radar_to_lidar_sha256
+        or not isinstance(prediction, dict)
+        or prediction.get("protocol") != PREDICTION_VOXEL_PROTOCOL
+        or prediction.get("coordinate_frame") != "lidar"
+        or prediction.get("layout") != "czxy"
+        or prediction.get("frame_count") != payload.get("frame_count")
+    ):
+        raise ValueError("formal inference_run 的 frame/observed 协议不完整")
+    records = observed.get("records")
+    if not isinstance(records, list) or len(records) != payload.get("frame_count"):
+        raise ValueError("formal inference_run observed records 帧数不一致")
+    normalized_records = []
+    records_by_frame = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("formal inference_run observed record 必须是对象")
+        frame_id = str(record.get("frame_id", ""))
+        file_name = str(record.get("file", ""))
+        file_sha256 = str(record.get("sha256", ""))
+        observed_voxels = record.get("observed_voxels")
+        if (
+            not frame_id
+            or frame_id in records_by_frame
+            or file_name != f"{frame_id}_observed_mask.npy"
+            or os.path.basename(file_name) != file_name
+            or len(file_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in file_sha256
+            )
+            or type(observed_voxels) is not int
+            or observed_voxels < 0
+        ):
+            raise ValueError(f"formal observed record 与帧不匹配: {frame_id}")
+        normalized = {
+            "frame_id": frame_id,
+            "file": file_name,
+            "sha256": file_sha256,
+            "observed_voxels": observed_voxels,
+        }
+        normalized_records.append(normalized)
+        records_by_frame[frame_id] = normalized
+    if _observed_mask_records_digest(normalized_records) != observed.get("files_sha256"):
+        raise ValueError("formal observed mask 集合 SHA-256 不匹配")
+    if (
+        type(observed.get("observed_voxels")) is not int
+        or observed.get("observed_voxels")
+        != sum(record["observed_voxels"] for record in normalized_records)
+    ):
+        raise ValueError("formal observed mask 总体素计数不匹配")
+    declared_frames = [record["frame_id"] for record in normalized_records]
+
+    prediction_records = prediction.get("records")
+    if not isinstance(prediction_records, list) or len(prediction_records) != payload.get(
+        "frame_count"
+    ):
+        raise ValueError("formal prediction voxel records 帧数不一致")
+    try:
+        normalized_predictions = normalize_prediction_voxel_records(
+            prediction_records
+        )
+    except ValueError as exc:
+        raise ValueError(f"formal prediction voxel record 无效: {exc}") from exc
+    predictions_by_frame = {
+        record["frame_id"]: record for record in normalized_predictions
+    }
+    if prediction_voxel_records_digest(normalized_predictions) != prediction.get(
+        "records_sha256"
+    ):
+        raise ValueError("formal prediction voxel 集合 SHA-256 不匹配")
+    prediction_frames = [record["frame_id"] for record in normalized_predictions]
+    if prediction_frames != declared_frames:
+        raise ValueError("formal prediction voxel 与 observed records 帧顺序不一致")
+    if allow_receipt_bound_subset:
+        missing = [frame for frame in expected_frames if frame not in records_by_frame]
+        if missing:
+            raise ValueError(f"经验 receipt 帧不在 inference_run 中: {missing[:5]}")
+        declared_index = {
+            frame: index for index, frame in enumerate(declared_frames)
+        }
+        selected_indices = [declared_index[frame] for frame in expected_frames]
+        if selected_indices != sorted(selected_indices):
+            raise ValueError("经验 receipt 帧不是 inference_run 的有序子集")
+    elif declared_frames != expected_frames:
+        raise ValueError("formal inference_run observed records 帧顺序不一致")
+
+    selected_records = [records_by_frame[frame] for frame in expected_frames]
+    selected_predictions = [predictions_by_frame[frame] for frame in expected_frames]
+    if [record["file"] for record in selected_predictions] != list(radar_file_names):
+        raise ValueError("formal prediction voxel 文件名与地图输入不一致")
+    for record in selected_predictions:
+        frame_id = record["frame_id"]
+        voxel_path = os.path.join(radar_voxel_dir, record["file"])
+        if os.path.islink(voxel_path) or not os.path.isfile(voxel_path):
+            raise ValueError(f"formal prediction voxel 必须是普通文件: {voxel_path}")
+        if _sha256_file(voxel_path) != record["sha256"]:
+            raise ValueError(f"formal prediction voxel SHA-256 不匹配: {frame_id}")
+        array = np.load(voxel_path, allow_pickle=False)
+        if (
+            not isinstance(array, np.ndarray)
+            or list(array.shape) != record["shape_czxy"]
+            or str(array.dtype) != record["dtype"]
+            or not np.all(np.isfinite(array))
+        ):
+            raise ValueError(f"formal prediction voxel 内容合同无效: {frame_id}")
+    mask_paths = {}
+    for record in selected_records:
+        frame_id = record["frame_id"]
+        mask_path = os.path.join(observed_mask_dir, record["file"])
+        if os.path.islink(mask_path) or not os.path.isfile(mask_path):
+            raise ValueError(f"formal observed mask 必须是普通文件: {mask_path}")
+        if _sha256_file(mask_path) != record["sha256"]:
+            raise ValueError(f"formal observed mask SHA-256 不匹配: {frame_id}")
+        array = np.load(mask_path, allow_pickle=False)
+        if (
+            not isinstance(array, np.ndarray)
+            or not np.all(np.isfinite(array))
+            or not np.all((array == 0) | (array == 1))
+            or int(np.count_nonzero(array)) != record["observed_voxels"]
+        ):
+            raise ValueError(f"formal observed mask 内容合同无效: {frame_id}")
+        mask_paths[frame_id] = mask_path
+    return {
+        "metadata": payload,
+        "metadata_sha256": _sha256_file(path),
+        "observed": observed,
+        "prediction": prediction,
+        "mask_paths": mask_paths,
+        "selected_observed_files_sha256": _observed_mask_records_digest(
+            selected_records
+        ),
+        "declared_frame_count": int(payload["frame_count"]),
+        "selected_prediction_files_sha256": prediction_voxel_records_digest(
+            selected_predictions
+        ),
+    }
+
+
+def prepare_fresh_output_dir(path: str) -> str:
+    """地图结果只允许写入 fresh 普通目录，拒绝覆盖历史结果。"""
+    output_dir = os.path.abspath(os.fspath(path))
+    if os.path.islink(output_dir):
+        raise ValueError(f"输出目录不得是符号链接: {output_dir}")
+    if os.path.exists(output_dir):
+        if not os.path.isdir(output_dir):
+            raise ValueError(f"输出路径必须是目录: {output_dir}")
+        if os.listdir(output_dir):
+            raise ValueError(f"输出目录必须为空，拒绝覆盖非空目录: {output_dir}")
+    else:
+        os.makedirs(output_dir, exist_ok=False)
+    return output_dir
 
 
 def _write_json_atomic(path: str, payload: Dict[str, object]) -> None:
@@ -538,13 +775,21 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         "radar_reliability": args.radar_reliability,
         "infrared_reliability": args.infrared_reliability,
         "speed_m_s": args.speed_m_s,
+        "reaction_time_s": args.reaction_time_s,
+        "brake_deceleration_m_s2": args.brake_deceleration_m_s2,
+        "safety_margin_m": args.safety_margin_m,
+        "query_search_radius_m": args.query_search_radius_m,
+        "max_unknown_mass": args.max_unknown_mass,
         "odom_cov_trace": args.odom_cov_trace,
         "calib_confidence": args.calib_confidence,
     }
     for name, value in finite_values.items():
         if not np.isfinite(float(value)):
             raise ValueError(f"{name} 必须是有限数")
-    if not args.pose_file and float(args.dt) <= 0.0:
+    offline_empirical = bool(getattr(args, "offline_empirical_mapping", False))
+    if args.formal_mapping and offline_empirical:
+        raise ValueError("formal_mapping 与 offline_empirical_mapping 互斥")
+    if not args.pose_file and not offline_empirical and float(args.dt) <= 0.0:
         raise ValueError("identity_legacy 模式的 dt 必须大于 0")
     if int(args.window_size) <= 0 or int(args.frame_limit) < 0:
         raise ValueError("window_size 必须大于 0，frame_limit 必须非负")
@@ -552,6 +797,15 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("save_every 必须大于 0")
     if float(args.decay_rate) < 0.0 or float(args.speed_m_s) <= 0.0:
         raise ValueError("decay_rate 必须非负，speed_m_s 必须大于 0")
+    if (
+        float(args.reaction_time_s) < 0.0
+        or float(args.brake_deceleration_m_s2) <= 0.0
+        or float(args.safety_margin_m) < 0.0
+        or float(args.query_search_radius_m) <= 0.0
+        or float(args.max_unknown_mass) < 0.0
+        or float(args.max_unknown_mass) > 1.0
+    ):
+        raise ValueError("安全查询参数超出有效范围")
     if (
         args.dynamic_evidence_dir
         and float(args.dynamic_decay_rate) <= float(args.decay_rate)
@@ -573,23 +827,73 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("pc_range 必须包含 6 个有限数")
     if not np.all(pc_range[3:] > pc_range[:3]):
         raise ValueError("pc_range 的 max 必须逐轴大于 min")
+    map_pc_range = np.asarray(args.map_pc_range, dtype=np.float64)
+    if map_pc_range.shape != (6,) or not np.all(np.isfinite(map_pc_range)):
+        raise ValueError("map_pc_range 必须包含 6 个有限数")
+    if not np.all(map_pc_range[3:] > map_pc_range[:3]):
+        raise ValueError("map_pc_range 的 max 必须逐轴大于 min")
+    if (
+        not np.allclose(map_pc_range[:3], pc_range[:3], atol=1e-9, rtol=0.0)
+        or np.any(map_pc_range[3:] < pc_range[3:] - 1e-9)
+    ):
+        raise ValueError("pc_range 必须从相同最小边界完全位于 map_pc_range 内")
+    strict_mapping = bool(args.formal_mapping or offline_empirical)
+    if args.formal_mapping:
+        required = (
+            ("observed_mask_dir", args.observed_mask_dir),
+            ("pose_file", args.pose_file),
+            ("inference_run", args.inference_run),
+            ("lidar_to_body_calib", args.lidar_to_body_calib),
+        )
+        for name, value in required:
+            if not value:
+                raise ValueError(f"formal_mapping 要求显式 --{name}")
+    if offline_empirical:
+        required = (
+            ("observed_mask_dir", args.observed_mask_dir),
+            ("inference_run", args.inference_run),
+            ("empirical_pose_receipt", args.empirical_pose_receipt),
+        )
+        for name, value in required:
+            if not value:
+                raise ValueError(f"offline_empirical_mapping 要求显式 --{name}")
+        if args.pose_file or args.lidar_to_body_calib:
+            raise ValueError(
+                "offline_empirical_mapping 与 pose_file/lidar_to_body_calib 互斥"
+            )
+    if strict_mapping:
+        if int(args.frame_limit) != 0:
+            raise ValueError("严格地图模式禁止 frame_limit；帧集合必须由合同绑定")
+        if args.infrared_bev_dir:
+            raise ValueError("严格地图模式暂不接受缺少 frame 合同的 infrared_bev_dir")
+        if args.uncertainty_dir:
+            raise ValueError("严格地图模式暂不接受未绑定收据的 uncertainty_dir")
+        if args.dynamic_evidence_dir:
+            raise ValueError("严格地图模式暂不接受未绑定 frame 的 dynamic_evidence_dir")
+        if args.prior_dem:
+            raise ValueError("严格地图模式暂不接受缺少 local-frame provenance 的 prior_dem")
+        if args.target_voxel_dir:
+            raise ValueError("严格地图模式不得消费离线 target 真值目录")
 
 
 def build_config(args, first_voxel_xyzc: np.ndarray) -> GridMapConfig:
     nx, ny, nz = first_voxel_xyzc.shape[:3]
     x_min, y_min, z_min, x_max, y_max, z_max = args.pc_range
+    map_x_min, map_y_min, map_z_min, map_x_max, map_y_max, map_z_max = (
+        args.map_pc_range
+    )
     x_res = (x_max - x_min) / max(nx, 1)
     y_res = (y_max - y_min) / max(ny, 1)
     z_res = (z_max - z_min) / max(nz, 1)
     return GridMapConfig(
-        x_min=x_min,
-        y_min=y_min,
-        x_max=x_max,
-        y_max=y_max,
+        x_min=map_x_min,
+        y_min=map_y_min,
+        x_max=map_x_max,
+        y_max=map_y_max,
         x_resolution=float(x_res),
         y_resolution=float(y_res),
-        z_min=z_min,
-        z_max=z_max,
+        z_min=map_z_min,
+        z_max=map_z_max,
         z_resolution=float(z_res),
         window_size=args.window_size,
         decay_rate=args.decay_rate,
@@ -598,6 +902,7 @@ def build_config(args, first_voxel_xyzc: np.ndarray) -> GridMapConfig:
         radar_reliability=args.radar_reliability,
         infrared_reliability=args.infrared_reliability,
         speed_m_s=args.speed_m_s,
+        evidence_pc_range=tuple(float(value) for value in args.pc_range),
     )
 
 
@@ -609,6 +914,37 @@ def main() -> None:
         choices=("auto", "xyzc", "czxy"),
         default="auto",
         help="Radar/prediction voxel layout; auto only accepts unambiguous shapes",
+    )
+    parser.add_argument(
+        "--formal_mapping",
+        action="store_true",
+        help="启用 deployment fail-closed：要求 run/mask/pose/LiDAR→body 全部显式绑定",
+    )
+    parser.add_argument(
+        "--offline_empirical_mapping",
+        action="store_true",
+        help=(
+            "启用仅限离线的经验 LiDAR→local fail-closed 模式；"
+            "不得用于 airborne/avoidance formal"
+        ),
+    )
+    parser.add_argument(
+        "--empirical_pose_receipt",
+        type=str,
+        default="",
+        help="自包含 empirical_pose_receipt.json；只在离线经验模式使用",
+    )
+    parser.add_argument(
+        "--inference_run",
+        type=str,
+        default="",
+        help="formal inference_run.json；用于绑定 LiDAR frame 与 observed mask 收据",
+    )
+    parser.add_argument(
+        "--lidar_to_body_calib",
+        type=str,
+        default="",
+        help="严格 R:/T: 格式 LiDAR→body 外参文件",
     )
     parser.add_argument(
         "--pose_file",
@@ -625,7 +961,7 @@ def main() -> None:
         "--observed_mask_dir",
         type=str,
         default="",
-        help="Optional per-frame <frame>_observed_mask.npy/.npz; absent cells remain unknown",
+        help="逐帧 <frame>_observed_mask.npy/.npz；formal_mapping 时必需",
     )
     parser.add_argument(
         "--dynamic_evidence_dir",
@@ -654,6 +990,11 @@ def main() -> None:
     parser.add_argument("--radar_reliability", type=float, default=0.75)
     parser.add_argument("--infrared_reliability", type=float, default=0.65)
     parser.add_argument("--speed_m_s", type=float, default=50.0)
+    parser.add_argument("--reaction_time_s", type=float, default=0.5)
+    parser.add_argument("--brake_deceleration_m_s2", type=float, default=8.0)
+    parser.add_argument("--safety_margin_m", type=float, default=5.0)
+    parser.add_argument("--query_search_radius_m", type=float, default=30.0)
+    parser.add_argument("--max_unknown_mass", type=float, default=0.5)
     parser.add_argument("--odom_cov_trace", type=float, default=0.0)
     parser.add_argument("--calib_confidence", type=float, default=1.0)
     parser.add_argument("--frame_limit", type=int, default=0)
@@ -662,9 +1003,19 @@ def main() -> None:
         "--pc_range",
         type=float,
         nargs=6,
-        default=[0, -20, -6, 120, 20, 10],
+        default=[0, -20, -6, 80, 20, 10],
+        help="模型或 target evidence 的物理范围",
+    )
+    parser.add_argument(
+        "--map_pc_range",
+        type=float,
+        nargs=6,
+        default=None,
+        help="局部地图范围；省略时与 pc_range 相同",
     )
     args = parser.parse_args()
+    if args.map_pc_range is None:
+        args.map_pc_range = list(args.pc_range)
     validate_runtime_args(args)
 
     # 在创建输出目录前校验全部输入，避免协议错误留下不可重跑的半成品。
@@ -684,6 +1035,15 @@ def main() -> None:
         os.path.islink(args.prior_dem) or not os.path.isfile(args.prior_dem)
     ):
         raise ValueError(f"prior_dem 必须是普通文件: {args.prior_dem}")
+    for argument_name in (
+        "inference_run",
+        "lidar_to_body_calib",
+        "pose_file",
+        "empirical_pose_receipt",
+    ):
+        file_path = getattr(args, argument_name)
+        if file_path and (os.path.islink(file_path) or not os.path.isfile(file_path)):
+            raise ValueError(f"{argument_name} 必须是普通文件: {file_path}")
 
     all_radar_files = list_voxel_files(args.radar_voxel_dir)
     if not all_radar_files:
@@ -700,11 +1060,46 @@ def main() -> None:
             f"Radar voxel 映射到重复 frame 键: "
             f"{sorted(duplicate_frame_keys)[:5]}"
         )
+    empirical_contract = None
     radar_files = all_radar_files
+    pose_table: Dict[str, Dict[str, object]] = {}
+    if args.offline_empirical_mapping:
+        empirical_contract = load_empirical_lidar_pose_contract(
+            args.empirical_pose_receipt,
+            all_radar_files,
+        )
+        radar_files = list(empirical_contract["selected_voxel_file_names"])
+        pose_table = dict(empirical_contract["pose_table"])
     if args.frame_limit > 0:
         radar_files = radar_files[: args.frame_limit]
-    pose_table = load_pose_table(args.pose_file, radar_files) if args.pose_file else {}
-    pose_mode = "body_to_local_csv" if pose_table else "identity_legacy"
+    if args.pose_file:
+        pose_table = load_pose_table(args.pose_file, radar_files)
+    pose_mode = (
+        "empirical_lidar_to_local"
+        if args.offline_empirical_mapping
+        else ("body_to_local_csv" if pose_table else "identity_legacy")
+    )
+    formal_contract = None
+    observed_mask_paths: Dict[str, str] = {}
+    strict_mapping = bool(args.formal_mapping or args.offline_empirical_mapping)
+    if strict_mapping:
+        formal_contract = load_formal_inference_contract(
+            args.inference_run,
+            radar_files,
+            args.radar_voxel_dir,
+            args.observed_mask_dir,
+            allow_receipt_bound_subset=args.offline_empirical_mapping,
+        )
+        observed_mask_paths = dict(formal_contract["mask_paths"])
+    if args.formal_mapping:
+        T_body_voxel = load_extrinsic_transform(args.lidar_to_body_calib)
+        voxel_coordinate_frame = "lidar"
+    elif args.offline_empirical_mapping:
+        T_body_voxel = None
+        voxel_coordinate_frame = "lidar"
+    else:
+        T_body_voxel = np.eye(4, dtype=np.float32)
+        voxel_coordinate_frame = "body_legacy"
     target_paths: Dict[str, str] = {}
     if args.target_voxel_dir:
         target_paths = {
@@ -725,6 +1120,18 @@ def main() -> None:
         layout=args.radar_voxel_layout,
     )
     cfg = build_config(args, first_voxel)
+    if strict_mapping:
+        # 全帧 shape 与 mask 合同必须在创建输出目录前通过，避免半成品结果根。
+        for file_name in radar_files:
+            voxel_for_preflight = load_voxel(
+                os.path.join(args.radar_voxel_dir, file_name),
+                layout=args.radar_voxel_layout,
+            )
+            load_observed_mask(
+                observed_mask_paths[_voxel_frame_key(file_name)],
+                voxel_shape=voxel_for_preflight.shape[:3],
+                preserve_height=True,
+            )
     grid_map = SlidingProbabilisticGridMap(cfg)
     query = LazyLocalMapQuery(cfg)
     dynamic_protocol = (
@@ -756,11 +1163,12 @@ def main() -> None:
         if not np.all(np.isfinite(prior_dem) | np.isnan(prior_dem)):
             raise ValueError("prior DEM 只能包含有限值或 NaN")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    args.output_dir = prepare_fresh_output_dir(args.output_dir)
 
     metric_path = os.path.join(args.output_dir, "streaming_metrics.csv")
     with open(metric_path, "w", newline="") as f_csv:
         writer = csv.writer(f_csv)
+        pose_origin_frame = "lidar" if args.offline_empirical_mapping else "body"
         writer.writerow([
             "frame",
             "timestamp",
@@ -768,6 +1176,9 @@ def main() -> None:
             "nearest_dist",
             "nearest_uncertainty",
             "is_risky",
+            "risk_state",
+            "risk_reason",
+            "safety_distance_m",
             "speed_m_s",
             "odom_cov_trace",
             "obstacle_precision",
@@ -778,9 +1189,9 @@ def main() -> None:
             "observed_mask_cells",
             "unknown_fraction",
             "pose_used",
-            "body_local_x",
-            "body_local_y",
-            "body_local_z",
+            f"{pose_origin_frame}_local_x",
+            f"{pose_origin_frame}_local_y",
+            f"{pose_origin_frame}_local_z",
             "dynamic_evidence_used",
             "dynamic_observed_cells",
             "dynamic_probability_mean_observed",
@@ -793,13 +1204,25 @@ def main() -> None:
             if pose_table:
                 pose_record = pose_table[frame_key]
                 timestamp = float(pose_record["timestamp"])
-                T_local_body = np.asarray(
-                    pose_record["T_local_body"],
-                    dtype=np.float32,
-                )
+                if args.offline_empirical_mapping:
+                    T_local_voxel = np.asarray(
+                        pose_record["T_local_voxel"],
+                        dtype=np.float32,
+                    )
+                    T_local_body = None
+                    query_transform = T_local_voxel
+                else:
+                    T_local_body = np.asarray(
+                        pose_record["T_local_body"],
+                        dtype=np.float32,
+                    )
+                    T_local_voxel = None
+                    query_transform = T_local_body
             else:
                 timestamp = i * args.dt
                 T_local_body = np.eye(4, dtype=np.float32)
+                T_local_voxel = None
+                query_transform = T_local_body
 
             voxel = load_voxel(
                 os.path.join(args.radar_voxel_dir, file_name),
@@ -807,9 +1230,10 @@ def main() -> None:
             )
             unc_path = find_uncertainty_file(args.uncertainty_dir, file_name)
             model_uncertainty = load_model_uncertainty(unc_path) if unc_path else None
-            observed_mask_path = find_observed_mask_file(
-                args.observed_mask_dir,
-                file_name,
+            observed_mask_path = (
+                observed_mask_paths[frame_key]
+                if strict_mapping
+                else find_observed_mask_file(args.observed_mask_dir, file_name)
             )
             observed_mask = (
                 load_observed_mask(
@@ -834,6 +1258,14 @@ def main() -> None:
                         f"动态 evidence 在预检后发生变化: {frame_key}"
                     )
                 dynamic_hash_records.append((frame_key, evidence_hash))
+            update_pose_kwargs = (
+                {"T_local_voxel": T_local_voxel}
+                if args.offline_empirical_mapping
+                else {
+                    "T_local_body": T_local_body,
+                    "T_body_voxel": T_body_voxel,
+                }
+            )
             grid_map.update_from_voxel(
                 voxel_xyzc=voxel,
                 timestamp=timestamp,
@@ -842,9 +1274,9 @@ def main() -> None:
                 model_uncertainty=model_uncertainty,
                 calib_confidence=args.calib_confidence,
                 observed_mask=observed_mask,
-                T_local_body=T_local_body,
                 dynamic_probability=dynamic_probability,
                 dynamic_observed_mask=dynamic_observed,
+                **update_pose_kwargs,
             )
 
             if args.infrared_bev_dir:
@@ -862,12 +1294,17 @@ def main() -> None:
 
             snapshot = grid_map.snapshot()
             query.refresh(snapshot)
-            # 查询点是当前机体原点在 local 系中的位置，不再使用历史固定测试坐标。
+            # 查询点是当前合同 pose 原点：机载模式为 body，经验模式为 LiDAR。
             prox = query.query_proximity(
-                x_m=float(T_local_body[0, 3]),
-                y_m=float(T_local_body[1, 3]),
-                z_m=float(T_local_body[2, 3]),
-                search_radius=30.0,
+                x_m=float(query_transform[0, 3]),
+                y_m=float(query_transform[1, 3]),
+                z_m=float(query_transform[2, 3]),
+                search_radius=args.query_search_radius_m,
+                speed_m_s=args.speed_m_s,
+                reaction_time_s=args.reaction_time_s,
+                brake_deceleration_m_s2=args.brake_deceleration_m_s2,
+                safety_margin_m=args.safety_margin_m,
+                max_unknown_mass=args.max_unknown_mass,
             )
             obstacle_precision = ""
             obstacle_recall = ""
@@ -883,7 +1320,7 @@ def main() -> None:
                 )
                 target_points = transform_points(
                     target_points_body,
-                    T_local_body,
+                    T_local_body @ T_body_voxel,
                 )
                 map_points = map_occ_to_points(
                     snapshot["occ_prob_layers"],
@@ -912,6 +1349,9 @@ def main() -> None:
                 f"{prox['distance']:.3f}",
                 f"{prox['uncertainty']:.3f}",
                 int(prox["is_risky"] > 0.5),
+                prox["state"],
+                prox["reason"],
+                f"{prox['safety_distance_m']:.3f}",
                 f"{args.speed_m_s:.3f}",
                 f"{args.odom_cov_trace:.6f}",
                 obstacle_precision,
@@ -922,9 +1362,9 @@ def main() -> None:
                 int(np.count_nonzero(observed_mask)) if observed_mask is not None else "",
                 f"{float(np.mean(snapshot['unknown_mass'])):.6f}",
                 int(bool(pose_table)),
-                f"{float(T_local_body[0, 3]):.6f}",
-                f"{float(T_local_body[1, 3]):.6f}",
-                f"{float(T_local_body[2, 3]):.6f}",
+                f"{float(query_transform[0, 3]):.6f}",
+                f"{float(query_transform[1, 3]):.6f}",
+                f"{float(query_transform[2, 3]):.6f}",
                 int(dynamic_probability is not None),
                 (
                     int(np.count_nonzero(dynamic_observed))
@@ -971,25 +1411,147 @@ def main() -> None:
     _write_json_atomic(
         os.path.join(args.output_dir, "map_run.json"),
         {
-            "protocol": "pose_aware_layered_map_v2",
+            "protocol": (
+                "pose_aware_layered_map_offline_empirical_v1"
+                if args.offline_empirical_mapping
+                else "pose_aware_layered_map_v3"
+            ),
+            "formal_mapping": bool(args.formal_mapping),
+            "offline_empirical_mapping": bool(args.offline_empirical_mapping),
+            "airborne_formal": bool(args.formal_mapping),
+            "avoidance_formal": bool(args.formal_mapping),
+            "runtime_contract_status": (
+                "formal_fail_closed"
+                if args.formal_mapping
+                else (
+                    "offline_empirical_fail_closed"
+                    if args.offline_empirical_mapping
+                    else "legacy_degraded"
+                )
+            ),
             "map_frame": "local",
             "pose_mode": pose_mode,
-            "pose_direction": "body_to_local",
-            "pose_file": os.path.basename(args.pose_file) if args.pose_file else None,
-            "pose_file_sha256": _sha256_file(args.pose_file) if args.pose_file else None,
+            "pose_direction": (
+                "lidar_to_local"
+                if args.offline_empirical_mapping
+                else "body_to_local"
+            ),
+            "voxel_coordinate_frame": voxel_coordinate_frame,
+            "voxel_to_body_direction": (
+                "lidar_to_body"
+                if args.formal_mapping
+                else (None if args.offline_empirical_mapping else "identity_legacy")
+            ),
+            "T_body_voxel": (
+                T_body_voxel.astype(float).tolist()
+                if T_body_voxel is not None
+                else None
+            ),
+            "lidar_to_body_calib": (
+                os.path.basename(args.lidar_to_body_calib)
+                if args.formal_mapping
+                else None
+            ),
+            "lidar_to_body_calib_sha256": (
+                _sha256_file(args.lidar_to_body_calib)
+                if args.formal_mapping
+                else None
+            ),
+            "pose_file": (
+                os.path.basename(empirical_contract["pose_path"])
+                if empirical_contract is not None
+                else (os.path.basename(args.pose_file) if args.pose_file else None)
+            ),
+            "pose_file_sha256": (
+                empirical_contract["pose_sha256"]
+                if empirical_contract is not None
+                else (_sha256_file(args.pose_file) if args.pose_file else None)
+            ),
+            "empirical_pose_receipt": (
+                os.path.basename(args.empirical_pose_receipt)
+                if args.offline_empirical_mapping
+                else None
+            ),
+            "empirical_pose_receipt_sha256": (
+                empirical_contract["receipt_sha256"]
+                if empirical_contract is not None
+                else None
+            ),
+            "empirical_pose_evidence_level": (
+                empirical_contract["receipt"]["evidence_level"]
+                if empirical_contract is not None
+                else None
+            ),
+            "inference_run": (
+                os.path.basename(args.inference_run) if strict_mapping else None
+            ),
+            "inference_run_sha256": (
+                formal_contract["metadata_sha256"]
+                if formal_contract is not None
+                else None
+            ),
+            "observed_mask_protocol": (
+                formal_contract["observed"]["protocol"]
+                if formal_contract is not None
+                else ("legacy_optional" if args.observed_mask_dir else "missing_degraded")
+            ),
+            "observed_mask_files_sha256": (
+                formal_contract["observed"]["files_sha256"]
+                if formal_contract is not None
+                else None
+            ),
+            "consumed_observed_mask_files_sha256": (
+                formal_contract["selected_observed_files_sha256"]
+                if formal_contract is not None
+                else None
+            ),
+            "prediction_voxel_protocol": (
+                formal_contract["prediction"]["protocol"]
+                if formal_contract is not None
+                else None
+            ),
+            "prediction_voxel_records_sha256": (
+                formal_contract["prediction"]["records_sha256"]
+                if formal_contract is not None
+                else None
+            ),
+            "consumed_prediction_voxel_files_sha256": (
+                formal_contract["selected_prediction_files_sha256"]
+                if formal_contract is not None
+                else None
+            ),
+            "available_inference_frame_count": len(all_radar_files),
             "frame_count": len(radar_files),
+            "receipt_uncovered_frame_count": (
+                empirical_contract["uncovered_frame_count"]
+                if empirical_contract is not None
+                else 0
+            ),
             "radar_voxel_layout": args.radar_voxel_layout,
             "target_voxel_layout": (
                 args.target_voxel_layout if target_paths else None
             ),
-            "pc_range": [float(value) for value in args.pc_range],
+            "evidence_pc_range": [float(value) for value in args.pc_range],
+            "map_pc_range": [float(value) for value in args.map_pc_range],
             "map_shape_xyz": [int(value) for value in cfg.shape_xyz],
             "occupancy_probability": "pignistic_m_occ_plus_half_unknown",
             "map_occupancy_threshold": 0.55,
             "target_occupancy_threshold": 0.1 if target_paths else None,
             "metric_frame": "local",
             "obstacle_metric_space": "bev_xy",
-            "proximity_query": "body_origin_local_3d",
+            "proximity_query": (
+                "lidar_origin_local_3d_three_state_v1"
+                if args.offline_empirical_mapping
+                else "body_origin_local_3d_three_state_v1"
+            ),
+            "risk_states": ["clear", "obstacle", "unknown"],
+            "unknown_is_risky": True,
+            "speed_m_s": float(args.speed_m_s),
+            "reaction_time_s": float(args.reaction_time_s),
+            "brake_deceleration_m_s2": float(args.brake_deceleration_m_s2),
+            "safety_margin_m": float(args.safety_margin_m),
+            "query_search_radius_m": float(args.query_search_radius_m),
+            "max_unknown_mass": float(args.max_unknown_mass),
             "dynamic_evidence_enabled": dynamic_protocol is not None,
             "decay_rate_base": float(args.decay_rate),
             "decay_rate_effective": float(cfg.decay_rate),

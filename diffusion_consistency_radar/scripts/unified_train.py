@@ -68,8 +68,13 @@ from diffusion_consistency_radar.scripts.cd_train_optimized import (
 )
 from diffusion_consistency_radar.checkpoint_chain import (
     FORMAL_CHECKPOINT_PROTOCOL,
+    FORMAL_MINI_CHECKPOINT_PROTOCOL,
+    assert_checkpoint_training_identity,
+    build_formal_mini_selection,
     resolve_training_checkpoint_protocol,
+    safe_torch_load as safe_checkpoint_load,
     sha256_file,
+    validate_checkpoint_data_protocol,
 )
 from diffusion_consistency_radar.radar_normalization import (
     LEGACY_RADAR_NORMALIZATION_PROTOCOL,
@@ -81,6 +86,20 @@ from diffusion_consistency_radar.radar_normalization import (
     validate_radar_normalization_sha256,
     validate_radar_normalization_spec,
 )
+from diffusion_consistency_radar.temporal_split import (
+    limit_frame_ids_by_scene,
+    load_temporal_split_artifact,
+    split_frame_ids_by_scene,
+)
+from diffusion_consistency_radar.dataset_manifest import (
+    sha256_json_value,
+    validate_scene_manifest,
+)
+from diffusion_consistency_radar.formal_data_protocol import (
+    load_formal_data_protocol_artifact,
+)
+from diffusion_consistency_radar.observed_mask import OBSERVED_MASK_PROTOCOL
+from diffusion_consistency_radar.radar_statistics import RADAR_STATISTICS_PROTOCOL
 
 
 def resolve_training_radar_normalization(
@@ -90,6 +109,7 @@ def resolve_training_radar_normalization(
     source_pc_range,
     model_pc_range,
     allow_legacy_radar_units=False,
+    expected_split_artifact_sha256=None,
 ):
     """在创建 Dataset/训练输出前解析唯一的 Radar 输入量纲协议。"""
     if not isinstance(data_config, dict):
@@ -121,6 +141,7 @@ def resolve_training_radar_normalization(
         model_pc_range=model_pc_range,
         doppler_scale_mps=scale_mps,
         require_formal=True,
+        expected_split_artifact_sha256=expected_split_artifact_sha256,
     )
 
 
@@ -202,19 +223,164 @@ def resolve_cd_teacher_checkpoint(args_ldm_ckpt: str, config: "ConfigManager") -
     return args_ldm_ckpt or config.get('cd.teacher_model_path', '')
 
 
-def safe_torch_load(path, map_location):
-    """兼容不同 PyTorch 版本的 checkpoint 加载逻辑。"""
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    except TypeError:
-        # HACK: 低版本 PyTorch 不支持 weights_only，回退到兼容模式。
-        return torch.load(path, map_location=map_location)
-    except Exception as exc:
-        # NOTE: 某些历史权重包含自定义对象，weights_only=True 会拒绝加载。
-        msg = str(exc)
-        if "Weights only load failed" in msg or "Unsupported global" in msg:
-            return torch.load(path, map_location=map_location)
-        raise
+def safe_torch_load(path, map_location, *, allow_legacy_pickle=False):
+    """训练默认只加载 weights-only；历史 pickle 必须显式授权。"""
+    return safe_checkpoint_load(
+        path,
+        map_location=map_location,
+        allow_legacy_pickle=allow_legacy_pickle,
+    )
+
+
+def resolve_training_data_protocol(
+    data_config: Dict[str, Any],
+    stage: str,
+    *,
+    allow_legacy_data: bool = False,
+) -> Dict[str, Any]:
+    """从 YAML 读取并严格验证当前 stage 的训练数据身份。"""
+    value = (data_config or {}).get("data_protocol")
+    artifact_path = (data_config or {}).get("data_protocol_path")
+    if value is not None and artifact_path not in (None, ""):
+        raise ValueError("data_protocol 与 data_protocol_path 不能同时配置")
+    if artifact_path not in (None, ""):
+        split_path = (data_config or {}).get("temporal_split_artifact")
+        scene_names = (data_config or {}).get("scene_names")
+        protocol, _artifact_sha256 = load_formal_data_protocol_artifact(
+            artifact_path,
+            dataset_dir=(data_config or {}).get("dataset_dir"),
+            scenes=scene_names,
+            split_artifact_path=split_path,
+            stage=stage,
+        )
+    elif value is None and allow_legacy_data:
+        return {"protocol": "legacy_data_v0"}
+    else:
+        protocol = validate_checkpoint_data_protocol(
+            value,
+            stage=stage,
+        )
+
+    checkpoint_protocol = resolve_training_checkpoint_protocol(
+        (data_config or {}).get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+    )
+    train_limit = (data_config or {}).get("mini_train_frames_per_scene")
+    validation_limit = (data_config or {}).get(
+        "mini_validation_frames_per_scene"
+    )
+    if checkpoint_protocol == FORMAL_MINI_CHECKPOINT_PROTOCOL:
+        selection = build_formal_mini_selection(train_limit, validation_limit)
+        protocol = dict(protocol)
+        protocol["mini_selection"] = selection
+        return validate_checkpoint_data_protocol(protocol, stage=stage)
+    if train_limit is not None or validation_limit is not None:
+        raise ValueError(
+            "mini frame limits 只允许 formal_mini_chain_v2，正式全量链禁止隐式截断"
+        )
+    return protocol
+
+
+def is_formal_multimodal_training(
+    checkpoint_protocol: str,
+    *,
+    allow_legacy_radar_units: bool,
+) -> bool:
+    """正式全量与 formal mini v2 必须共享同一多模态数据门禁。"""
+    if type(allow_legacy_radar_units) is not bool:
+        raise ValueError("allow_legacy_radar_units 必须是 bool")
+    return (
+        checkpoint_protocol
+        in {FORMAL_CHECKPOINT_PROTOCOL, FORMAL_MINI_CHECKPOINT_PROTOCOL}
+        and not allow_legacy_radar_units
+    )
+
+
+def assert_formal_dataset_preflight(
+    dataset,
+    *,
+    dataset_root: str,
+    scene_names,
+    data_protocol: Dict[str, Any],
+) -> None:
+    """在模型构建前核对 manifest 身份并加载一帧真实 IR/标定样本。"""
+    manifest_hashes = data_protocol.get("dataset_manifest_sha256", {})
+    target_policy_hashes = data_protocol.get("target_policy_sha256", {})
+    observed_mask_hashes = data_protocol.get("observed_mask_sha256", {})
+    radar_ir_sync_hashes = data_protocol.get("radar_ir_sync_sha256", {})
+    expected_scenes = set(scene_names)
+    scene_mappings = {
+        "dataset_manifest_sha256": manifest_hashes,
+        "target_policy_sha256": target_policy_hashes,
+        "observed_mask_sha256": observed_mask_hashes,
+        "radar_ir_sync_sha256": radar_ir_sync_hashes,
+    }
+    mismatched_mappings = [
+        name for name, mapping in scene_mappings.items() if set(mapping) != expected_scenes
+    ]
+    if mismatched_mappings:
+        raise RuntimeError(
+            "formal data_protocol 场景集合与 data.scene_names 不一致: "
+            f"fields={mismatched_mappings}, config={sorted(scene_names)}"
+        )
+    expected_calibration = data_protocol.get("calibration_sha256")
+    for scene in scene_names:
+        manifest = validate_scene_manifest(
+            os.path.join(dataset_root, scene),
+            scene,
+            expected_profile="training",
+        )
+        if manifest["content_sha256"] != manifest_hashes[scene]:
+            raise RuntimeError(
+                f"场景 {scene} manifest hash 与 data_protocol 不一致"
+            )
+        provenance = manifest["preprocessing"]["provenance"]
+        if provenance["target_policy"]["sha256"] != target_policy_hashes[scene]:
+            raise RuntimeError(
+                f"场景 {scene} target policy 与 data_protocol 不一致"
+            )
+        if provenance["radar_ir_sync"]["sha256"] != radar_ir_sync_hashes[scene]:
+            raise RuntimeError(
+                f"场景 {scene} Radar-IR sync 与 data_protocol 不一致"
+            )
+        actual_observed_hash = sha256_json_value(
+            manifest["modalities"]["observed_mask"]
+        )
+        if actual_observed_hash != observed_mask_hashes[scene]:
+            raise RuntimeError(
+                f"场景 {scene} observed mask records 与 data_protocol 不一致"
+            )
+        manifest_calibration = {
+            "lidar_to_thermal": provenance["lidar_to_thermal"]["sha256"],
+            "thermal_intrinsics": provenance["thermal_intrinsics"]["sha256"],
+        }
+        if manifest_calibration != expected_calibration:
+            raise RuntimeError(
+                f"场景 {scene} calibration provenance 与 data_protocol 不一致"
+            )
+    if len(dataset) == 0:
+        raise RuntimeError("formal dataset 不包含可训练样本")
+    _target, _radar, metadata = dataset[0][:3]
+    if bool(metadata.get("is_mock_ir", True)):
+        raise RuntimeError("formal dataset preflight 检测到 mock IR")
+    if bool(metadata.get("is_mock_calib", True)):
+        raise RuntimeError("formal dataset preflight 检测到 mock calibration")
+    if metadata.get("extrinsic_source_frame") != "lidar":
+        raise RuntimeError("formal dataset IR 外参 source frame 必须为 lidar")
+    if metadata.get("occupancy_observed_mask_source") != "persisted_lidar_ray_v1":
+        raise RuntimeError("formal dataset 必须使用持久化 observed mask")
+    if data_protocol.get("observed_mask_protocol") != OBSERVED_MASK_PROTOCOL:
+        raise RuntimeError("formal data protocol 的 observed mask protocol 不匹配")
+    radar_statistics = metadata.get("radar_statistics")
+    if (
+        not isinstance(radar_statistics, list)
+        or not radar_statistics
+        or any(
+            not isinstance(summary, dict)
+            or summary.get("protocol") != RADAR_STATISTICS_PROTOCOL
+            for summary in radar_statistics
+        )
+    ):
+        raise RuntimeError("formal dataset 缺少 Radar statistics 审计摘要")
 
 
 def apply_vae_config_overrides(vae_config: Dict[str, Any], config: "ConfigManager") -> Dict[str, Any]:
@@ -1181,6 +1347,10 @@ class OptimizedVAETrainer:
         self.checkpoint_protocol = resolve_training_checkpoint_protocol(
             config.get("data.checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
         )
+        self.data_protocol = resolve_training_data_protocol(
+            config.get("data", {}) or {},
+            "vae",
+        )
         target_size, source_range, model_range = resolve_data_grid_config(
             config.get("data", {}) or {}
         )
@@ -1283,6 +1453,12 @@ class OptimizedVAETrainer:
         """从检查点恢复训练"""
         print(f"Resuming from checkpoint: {ckpt_path}")
         ckpt = safe_torch_load(ckpt_path, map_location=self.device)
+        assert_checkpoint_training_identity(
+            ckpt,
+            expected_stage="vae",
+            checkpoint_protocol=self.checkpoint_protocol,
+            data_protocol=self.data_protocol,
+        )
         
         # 加载模型
         if isinstance(self.model, nn.DataParallel):
@@ -1544,6 +1720,7 @@ class OptimizedVAETrainer:
                 FORMAL_CHECKPOINT_PROTOCOL,
             ),
             "stage": "vae",
+            "data_protocol": dict(self.data_protocol),
         }
 
     def _update_best_metrics(self, loss: float, val_iou: float):
@@ -1678,6 +1855,11 @@ class OptimizedLDMTrainer:
         self.checkpoint_protocol = resolve_training_checkpoint_protocol(
             config.get("data.checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
         )
+        self.data_protocol = resolve_training_data_protocol(
+            config.get("data", {}) or {},
+            "ldm",
+            allow_legacy_data=allow_legacy_radar_units,
+        )
         self.vae_checkpoint_sha256 = str(vae_checkpoint_sha256 or "")
         curriculum_total_epochs = ldm_config.get('epochs', 200)
         if type(curriculum_total_epochs) is not int:
@@ -1767,6 +1949,12 @@ class OptimizedLDMTrainer:
             self.radar_normalization_protocol = self.radar_normalization["protocol"]
         if resume_path and os.path.exists(resume_path):
             resume_checkpoint = safe_torch_load(resume_path, map_location="cpu")
+            assert_checkpoint_training_identity(
+                resume_checkpoint,
+                expected_stage="ldm",
+                checkpoint_protocol=self.checkpoint_protocol,
+                data_protocol=self.data_protocol,
+            )
             assert_checkpoint_radar_normalization(
                 resume_checkpoint,
                 self.radar_normalization,
@@ -2490,6 +2678,7 @@ class OptimizedLDMTrainer:
             "data_grid_config": dict(self.data_grid_config),
             "vae_checkpoint_sha256": self.vae_checkpoint_sha256,
             "model_family": "multimodal",
+            "data_protocol": dict(self.data_protocol),
         }
         if self.last_validation_metrics is not None:
             payload["ldm_validation"] = {
@@ -2639,9 +2828,87 @@ def main():
     # 加载配置
     config = ConfigManager(args.config)
     data_config = config.get('data', {})
+    data_protocol = resolve_training_data_protocol(
+        data_config,
+        args.mode,
+        allow_legacy_data=args.allow_legacy_radar_units,
+    )
     training_seed = int(data_config.get("training_seed", data_config.get("split_seed", 42)))
     train_loader_generator = seed_training_run(training_seed)
     memory_opt = MemoryOptimizer(config)
+    checkpoint_protocol = resolve_training_checkpoint_protocol(
+        data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+    )
+    formal_multimodal = is_formal_multimodal_training(
+        checkpoint_protocol,
+        allow_legacy_radar_units=args.allow_legacy_radar_units,
+    )
+    scene_names = data_config.get("scene_names")
+    if formal_multimodal:
+        if not isinstance(scene_names, list) or not scene_names:
+            raise RuntimeError("formal v2 必须显式配置非空 data.scene_names")
+        if data_config.get("require_real_ir") is not True:
+            raise RuntimeError("formal v2 必须设置 data.require_real_ir=true")
+        if data_config.get("require_real_calibration") is not True:
+            raise RuntimeError(
+                "formal v2 必须设置 data.require_real_calibration=true"
+            )
+        if data_config.get("voxel_coordinate_frame") != "lidar":
+            raise RuntimeError(
+                "当前 formal v2 只接受 voxel_coordinate_frame=lidar"
+            )
+        if data_config.get("require_persisted_observed_mask") is not True:
+            raise RuntimeError(
+                "formal v2 必须设置 data.require_persisted_observed_mask=true"
+            )
+        if data_config.get("require_radar_statistics") is not True:
+            raise RuntimeError(
+                "formal v2 必须设置 data.require_radar_statistics=true"
+            )
+
+    train_frame_ids_by_scene = None
+    val_frame_ids_by_scene = None
+    split_artifact_sha256 = None
+    if formal_multimodal:
+        split_artifact_path = data_config.get("temporal_split_artifact")
+        if not isinstance(split_artifact_path, str) or not split_artifact_path.strip():
+            raise RuntimeError("formal v2 必须显式配置 temporal_split_artifact")
+        split_artifact, split_artifact_sha256 = load_temporal_split_artifact(
+            split_artifact_path,
+            dataset_dir=data_config.get("dataset_dir"),
+            expected_scenes=scene_names,
+            require_formal=True,
+        )
+        if data_protocol.get("split_artifact_sha256") != split_artifact_sha256:
+            raise RuntimeError(
+                "temporal split 文件 SHA-256 与 formal data_protocol 不一致"
+            )
+        train_frame_ids_by_scene = split_frame_ids_by_scene(
+            split_artifact,
+            "train",
+        )
+        val_frame_ids_by_scene = split_frame_ids_by_scene(
+            split_artifact,
+            "validation",
+        )
+        if checkpoint_protocol == FORMAL_MINI_CHECKPOINT_PROTOCOL:
+            mini_selection = data_protocol.get("mini_selection") or {}
+            train_frame_ids_by_scene = limit_frame_ids_by_scene(
+                train_frame_ids_by_scene,
+                mini_selection.get("train_frames_per_scene"),
+                partition="train",
+            )
+            val_frame_ids_by_scene = limit_frame_ids_by_scene(
+                val_frame_ids_by_scene,
+                mini_selection.get("validation_frames_per_scene"),
+                partition="validation",
+            )
+            print(
+                "Formal mini v2 frame selection: "
+                f"train={sum(map(len, train_frame_ids_by_scene.values()))}, "
+                f"validation={sum(map(len, val_frame_ids_by_scene.values()))}, "
+                f"strategy={mini_selection.get('strategy')}"
+            )
 
     # 创建数据加载器
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
@@ -2653,6 +2920,7 @@ def main():
             source_pc_range=source_pc_range,
             model_pc_range=model_pc_range,
             allow_legacy_radar_units=args.allow_legacy_radar_units,
+            expected_split_artifact_sha256=split_artifact_sha256,
         )
     )
     train_dataset_base = NTU4DRadLM_VoxelDataset(
@@ -2665,6 +2933,22 @@ def main():
         radar_normalization=radar_normalization,
         radar_normalization_sha256=radar_normalization_sha256,
         allow_legacy_radar_units=args.allow_legacy_radar_units,
+        scene_names=scene_names,
+        calibration_dir=data_config.get("calibration_dir"),
+        require_real_ir=bool(data_config.get("require_real_ir", False)),
+        require_real_calibration=bool(
+            data_config.get("require_real_calibration", False)
+        ),
+        require_persisted_observed_mask=bool(
+            data_config.get("require_persisted_observed_mask", False)
+        ),
+        require_radar_statistics=bool(
+            data_config.get("require_radar_statistics", False)
+        ),
+        frame_ids_by_scene=train_frame_ids_by_scene,
+        voxel_coordinate_frame=data_config.get(
+            "voxel_coordinate_frame", "lidar"
+        ),
     )
     val_dataset_base = NTU4DRadLM_VoxelDataset(
         root_dir=data_config.get('dataset_dir'),
@@ -2676,15 +2960,42 @@ def main():
         radar_normalization=radar_normalization,
         radar_normalization_sha256=radar_normalization_sha256,
         allow_legacy_radar_units=args.allow_legacy_radar_units,
+        scene_names=scene_names,
+        calibration_dir=data_config.get("calibration_dir"),
+        require_real_ir=bool(data_config.get("require_real_ir", False)),
+        require_real_calibration=bool(
+            data_config.get("require_real_calibration", False)
+        ),
+        require_persisted_observed_mask=bool(
+            data_config.get("require_persisted_observed_mask", False)
+        ),
+        require_radar_statistics=bool(
+            data_config.get("require_radar_statistics", False)
+        ),
+        frame_ids_by_scene=val_frame_ids_by_scene,
+        voxel_coordinate_frame=data_config.get(
+            "voxel_coordinate_frame", "lidar"
+        ),
     )
-    if len(train_dataset_base) != len(val_dataset_base):
-        raise RuntimeError("训练/验证 dataset 样本索引不一致，无法安全划分")
-    train_indices, val_indices = temporal_block_split_indices(
-        len(train_dataset_base),
-        train_split=float(data_config.get("train_split", 0.8)),
-    )
-    train_dataset = Subset(train_dataset_base, train_indices)
-    val_dataset = Subset(val_dataset_base, val_indices)
+    if formal_multimodal:
+        assert_formal_dataset_preflight(
+            train_dataset_base,
+            dataset_root=data_config.get("dataset_dir"),
+            scene_names=scene_names,
+            data_protocol=data_protocol,
+        )
+    if formal_multimodal:
+        train_dataset = train_dataset_base
+        val_dataset = val_dataset_base
+    else:
+        if len(train_dataset_base) != len(val_dataset_base):
+            raise RuntimeError("训练/验证 dataset 样本索引不一致，无法安全划分")
+        train_indices, val_indices = temporal_block_split_indices(
+            len(train_dataset_base),
+            train_split=float(data_config.get("train_split", 0.8)),
+        )
+        train_dataset = Subset(train_dataset_base, train_indices)
+        val_dataset = Subset(val_dataset_base, val_indices)
     train_loader = DataLoader(
         train_dataset,
         batch_size=data_config.get('batch_size', 2),
@@ -2708,6 +3019,14 @@ def main():
         vae_type = config.get('vae.config_type', 'ultra_lightweight')
         if args.resume:
             resume_checkpoint = safe_torch_load(args.resume, map_location="cpu")
+            assert_checkpoint_training_identity(
+                resume_checkpoint,
+                expected_stage="vae",
+                checkpoint_protocol=resolve_training_checkpoint_protocol(
+                    data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+                ),
+                data_protocol=data_protocol,
+            )
             vae, resume_metadata = build_vae_from_checkpoint(
                 resume_checkpoint,
                 fallback_config_type=vae_type,
@@ -2735,6 +3054,14 @@ def main():
         
         vae_type = config.get('vae.config_type', 'ultra_lightweight')
         ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
+        assert_checkpoint_training_identity(
+            ckpt,
+            expected_stage="vae",
+            checkpoint_protocol=resolve_training_checkpoint_protocol(
+                data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+            ),
+            data_protocol=data_protocol,
+        )
         vae, _vae_metadata = build_vae_from_checkpoint(
             ckpt, fallback_config_type=vae_type
         )
@@ -2761,6 +3088,14 @@ def main():
 
         vae_type = config.get('vae.config_type', 'ultra_lightweight')
         ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
+        assert_checkpoint_training_identity(
+            ckpt,
+            expected_stage="vae",
+            checkpoint_protocol=resolve_training_checkpoint_protocol(
+                data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+            ),
+            data_protocol=data_protocol,
+        )
         vae, _vae_metadata = build_vae_from_checkpoint(
             ckpt, fallback_config_type=vae_type
         )
@@ -2789,6 +3124,7 @@ def main():
                 'checkpoint_protocol': data_config.get(
                     'checkpoint_protocol', FORMAL_CHECKPOINT_PROTOCOL
                 ),
+                'data_protocol': data_protocol,
             },
         )
         trainer.train(

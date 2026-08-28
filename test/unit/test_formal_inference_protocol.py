@@ -274,15 +274,20 @@ class FormalInferenceProtocolTest(unittest.TestCase):
             with self.subTest(launcher=launcher):
                 text = self._read_project_file(launcher)
                 self.assertIn(
-                    "NTU4DRadLM_Pre_sensor_aware_p1_04_candidate",
+                    "NTU4DRadLM_Deploy_formal_v2_80m_86p8_v1",
                     text,
                 )
-                self.assertIn("formal_p1_04_full120_86p8_v1", text)
+                self.assertIn("formal_v2_80m_86p8_v1", text)
                 self.assertIn(
                     'RESULTS_DIR="${ROOT_DIR}/Result/train_results/${PROTOCOL_TAG}"',
                     text,
                 )
                 self.assertIn("--require_real_ir", text)
+                self.assertIn("--calibration_dir", text)
+                self.assertIn("--deployment_scene_dir", text)
+                self.assertIn("build_deployment_view.py", text)
+                self.assertIn("validate --dataset_dir", text)
+                self.assertIn("--scene", text)
                 self.assertIn("--save_voxel", text)
                 self.assertIn("--save_pointcloud", text)
                 self.assertIn("--save_uncertainty", text)
@@ -290,11 +295,16 @@ class FormalInferenceProtocolTest(unittest.TestCase):
                 self.assertIn("diagnose_checkpoint_chain.py", text)
                 self.assertIn("--vae_ckpt", text)
                 self.assertIn("--ldm_ckpt", text)
-                self.assertIn("--cd_ckpt", text)
+                if launcher.endswith("inference_ldm.sh"):
+                    self.assertIn("--target_stage ldm", text)
+                    self.assertNotIn("--cd_ckpt", text)
+                else:
+                    self.assertIn("--target_stage cd", text)
+                    self.assertIn("--cd_ckpt", text)
                 for token in forbidden:
                     self.assertNotIn(token, text)
                 self.assertLess(
-                    text.index('"${MANIFEST_SCRIPT}" validate'),
+                    text.index('"${DEPLOYMENT_VIEW_SCRIPT}"'),
                     text.index('"${INFER_SCRIPT}"'),
                 )
                 self.assertLess(
@@ -319,12 +329,13 @@ class FormalInferenceProtocolTest(unittest.TestCase):
 
         self.assertIn("evaluate_saved_predictions.py", text)
         self.assertIn(
-            "NTU4DRadLM_Pre_sensor_aware_p1_04_candidate",
+            "NTU4DRadLM_Pre_formal_v2_80m_86p8_v1",
             text,
         )
         self.assertIn("NTU4DRadLM_Raw_p1_01_candidate", text)
-        self.assertIn("formal_p1_04_full120_86p8_v1", text)
+        self.assertIn("formal_v2_80m_86p8_v1", text)
         self.assertIn('"${MANIFEST_SCRIPT}" validate', text)
+        self.assertIn("--expected_profile training", text)
         self.assertIn("--target_voxel_dir", text)
         self.assertIn("--raw_livox_dir", text)
         self.assertIn("--lidar_index_file", text)

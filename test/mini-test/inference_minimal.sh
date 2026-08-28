@@ -22,12 +22,18 @@ case "${MINI_RADAR_PROTOCOL}" in
   legacy)
     DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware"
     DEFAULT_RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
+    DEFAULT_MINI_RESULTS_DIR="${SCRIPT_DIR}/train_results_mini"
+    DEFAULT_MINI_INFERENCE_RESULTS_DIR="${SCRIPT_DIR}/inference_results_mini"
+    DEFAULT_SOURCE_PC_RANGE="0,-20,-6,120,20,10"
     DEFAULT_MODEL_PC_RANGE="0,-20,-6,40,20,10"
     ;;
   formal)
-    DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
-    DEFAULT_RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw_p1_01_candidate"
-    DEFAULT_MODEL_PC_RANGE="0,-20,-6,120,20,10"
+    DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Deploy_formal_v2_80m_86p8_v1"
+    DEFAULT_RAW_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Raw"
+    DEFAULT_MINI_RESULTS_DIR="${ROOT_DIR}/test/result/formal_mini_v2_80m_8gb_v1"
+    DEFAULT_MINI_INFERENCE_RESULTS_DIR="${DEFAULT_MINI_RESULTS_DIR}/inference"
+    DEFAULT_SOURCE_PC_RANGE="0,-20,-6,80,20,10"
+    DEFAULT_MODEL_PC_RANGE="0,-20,-6,80,20,10"
     ;;
   *)
     echo "Error: MINI_RADAR_PROTOCOL must be legacy or formal"
@@ -36,11 +42,12 @@ case "${MINI_RADAR_PROTOCOL}" in
 esac
 PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${DEFAULT_PREPROCESSED_ROOT}}"
 RAW_ROOT="${RAW_ROOT:-${DEFAULT_RAW_ROOT}}"
-MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SCRIPT_DIR}/train_results_mini}"
-MINI_INFERENCE_RESULTS_DIR="${MINI_INFERENCE_RESULTS_DIR:-${SCRIPT_DIR}/inference_results_mini}"
+MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${DEFAULT_MINI_RESULTS_DIR}}"
+MINI_INFERENCE_RESULTS_DIR="${MINI_INFERENCE_RESULTS_DIR:-${DEFAULT_MINI_INFERENCE_RESULTS_DIR}}"
 MINI_TARGET_SIZE="${MINI_TARGET_SIZE:-32,128,128}"
-MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-0,-20,-6,120,20,10}"
+MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-${DEFAULT_SOURCE_PC_RANGE}}"
 MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-${DEFAULT_MODEL_PC_RANGE}}"
+CALIBRATION_DIR="${CALIBRATION_DIR:-${ROOT_DIR}/Data/config}"
 
 MODEL_TYPE="${1:-ldm}"
 MAX_INFER_FILES="${MAX_INFER_FILES:-20}"
@@ -58,7 +65,8 @@ REAL_IR_ARGS=()
 if [[ "${MINI_RADAR_PROTOCOL}" == "legacy" ]]; then
   RADAR_PROTOCOL_ARGS+=(--allow_legacy_radar_units)
 else
-  REAL_IR_ARGS+=(--require_real_ir)
+  # mini 权重只能在显式 smoke 授权下读取严格 deployment Radar+IR 输入。
+  REAL_IR_ARGS+=(--require_real_ir --allow_formal_mini_checkpoint)
 fi
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
@@ -177,11 +185,6 @@ echo "=========================================="
 
 for SCENE in "${TEST_SCENES[@]}"; do
   RADAR_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/radar_voxel"
-  TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
-  RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
-  RAW_RADAR_DIR="${RAW_ROOT}/${SCENE}/radar_pcl"
-  LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
-  RADAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/radar_index_sequence.txt"
   if [[ -n "${USER_OUTPUT_DIR}" ]]; then
     OUTPUT_DIR="${USER_OUTPUT_DIR}"
   else
@@ -193,15 +196,28 @@ for SCENE in "${TEST_SCENES[@]}"; do
     continue
   fi
 
+  INPUT_IDENTITY_ARGS=()
   EXTRA_COMPARE_ARGS=()
-  if [[ -d "${RAW_LIVOX_DIR}" && -f "${LIDAR_INDEX_FILE}" ]]; then
-    EXTRA_COMPARE_ARGS+=(--compare_with_lidar)
-    EXTRA_COMPARE_ARGS+=(--raw_livox_dir "${RAW_LIVOX_DIR}")
-    EXTRA_COMPARE_ARGS+=(--lidar_index_file "${LIDAR_INDEX_FILE}")
-  fi
-  if [[ -d "${TARGET_VOXEL_DIR}" ]]; then
-    EXTRA_COMPARE_ARGS+=(--target_voxel_dir "${TARGET_VOXEL_DIR}")
-    EXTRA_COMPARE_ARGS+=(--compare_with_target)
+  if [[ "${MINI_RADAR_PROTOCOL}" == "legacy" ]]; then
+    TARGET_VOXEL_DIR="${PREPROCESSED_ROOT}/${SCENE}/target_voxel"
+    RAW_LIVOX_DIR="${RAW_ROOT}/${SCENE}/livox_lidar"
+    RAW_RADAR_DIR="${RAW_ROOT}/${SCENE}/radar_pcl"
+    LIDAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/lidar_index_sequence.txt"
+    RADAR_INDEX_FILE="${RAW_ROOT}/${SCENE}/radar_index_sequence.txt"
+    INPUT_IDENTITY_ARGS+=(--raw_radar_dir "${RAW_RADAR_DIR}")
+    INPUT_IDENTITY_ARGS+=(--radar_index_file "${RADAR_INDEX_FILE}")
+    if [[ -d "${RAW_LIVOX_DIR}" && -f "${LIDAR_INDEX_FILE}" ]]; then
+      EXTRA_COMPARE_ARGS+=(--compare_with_lidar)
+      EXTRA_COMPARE_ARGS+=(--raw_livox_dir "${RAW_LIVOX_DIR}")
+      EXTRA_COMPARE_ARGS+=(--lidar_index_file "${LIDAR_INDEX_FILE}")
+    fi
+    if [[ -d "${TARGET_VOXEL_DIR}" ]]; then
+      EXTRA_COMPARE_ARGS+=(--target_voxel_dir "${TARGET_VOXEL_DIR}")
+      EXTRA_COMPARE_ARGS+=(--compare_with_target)
+    fi
+  else
+    INPUT_IDENTITY_ARGS+=(--deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}")
+    INPUT_IDENTITY_ARGS+=(--calibration_dir "${CALIBRATION_DIR}")
   fi
 
   echo "Running minimal inference for scene: ${SCENE}"
@@ -214,8 +230,6 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --device "${DEVICE}" \
     --train_duration_seconds "${TRAIN_DURATION_SECONDS}" \
     --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
-    --raw_radar_dir "${RAW_RADAR_DIR}" \
-    --radar_index_file "${RADAR_INDEX_FILE}" \
     --max_files "${MAX_INFER_FILES}" \
     --occ_threshold "${OCC_THRESHOLD}" \
     --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
@@ -229,6 +243,7 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --output_dir "${OUTPUT_DIR}" \
     "${RADAR_PROTOCOL_ARGS[@]}" \
     "${REAL_IR_ARGS[@]}" \
+    "${INPUT_IDENTITY_ARGS[@]}" \
     "${MULTIMODAL_META_ARGS[@]}" \
     "${EXTRA_COMPARE_ARGS[@]}"
 

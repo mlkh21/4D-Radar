@@ -145,7 +145,9 @@ bash diffusion_consistency_radar/launch/inference_cd.sh
 
 - LDM：`Result/inference_results/<scene>_formal_p1_04_full120_86p8_v1_ldm_deploy/`
 - CD：`Result/inference_results/<scene>_formal_p1_04_full120_86p8_v1_cd_1step_deploy/`
-- 运行协议：`inference_run.json`、`inference_runtime.csv`
+- 运行协议：`inference_run.json`、`inference_runtime.csv`；正式 `inference_run.json`
+  同时逐帧绑定 prediction voxel 与 observed mask 的文件名、SHA-256、CZXY shape
+  和 dtype，严格地图入口不接受缺少任一内容收据的旧推理目录
 - 预测产物：`*_voxel.npy`、`*_pcl.npy` 和可用的 `*_uncertainty.npy`
 
 如果你想直接调用 Python 入口：
@@ -219,6 +221,46 @@ python diffusion_consistency_radar/scripts/evaluate.py \
   --output_path <output_json>
 ```
 
+## Formal v2 训练入口
+
+当前正式训练合同为 0--80 m、Doppler scale 86.8 m/s、持久化 observed mask、
+temporal purge split、train-only normalization 和 Radar point-count/Doppler-validity
+统计。旧 full120 数据、artifact 与 mini checkpoint 仅用于 legacy/diagnostic，不能与
+formal v2 结果混用。
+
+正式 VAE 的准备与启动顺序如下：
+
+```bash
+# 1. fresh 全量重建；脚本会拒绝覆盖任何已有正式输出
+bash NTU4DRadLM_pre_processing/preprocess-v2.sh
+
+# 2. 记录新 normalization artifact 的固定身份
+sha256sum \
+  diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json
+
+# 3. 在训练机器上只读预检；不会写训练配置，也不会启动 GPU 训练
+EXPECTED_ARTIFACT_SHA256=<上一步的64位哈希> \
+CUDA_DEVICES=0 \
+FORMAL_EPOCHS=20 \
+PREFLIGHT_ONLY=1 \
+conda run -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh vae
+
+# 4. 只在具备长期训练条件的服务器上启动正式 VAE
+EXPECTED_ARTIFACT_SHA256=<同一个64位哈希> \
+CUDA_DEVICES=0 \
+FORMAL_EPOCHS=20 \
+conda run -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh vae
+```
+
+`CUDA_DEVICES` 接受 `0` 或 `0,1` 形式。8 GB RTX 4070 Laptop 只建议执行预检和
+短时 CPU/接口验证，不建议承担 formal v2 全量 VAE 长训练。已有同协议结果时 launcher
+默认拒绝覆盖；只有确认 checkpoint 与协议一致后才能显式设置 `ALLOW_RESUME=1`。
+正式服务器 launcher 固定 VAE/LDM/CD 各 20 epoch，并显式删除任何 mini 帧限制；garden
+完整 temporal split 为 3210 train / 774 validation。正式阶段仍应按 `vae → ldm → cd`
+顺序执行和验收，不能把笔记本的 400/100 checkpoint 接入正式链。
+
 ## Mini Test
 
 `test/mini-test/` 是隔离的小规模验证区，用来快速做 train / infer / diagnose，不污染正式 `Result/` 目录。
@@ -231,11 +273,17 @@ python diffusion_consistency_radar/scripts/evaluate.py \
 常用命令：
 
 ```bash
-# 先只读预检，不启动训练
+# 当前 formal v2：先只读预检，再由用户显式启动 8/4 帧 VAE mini
 MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae
-
-# 8 GB 笔记本：正式数据协议、分阶段、带温度/显存/时长门禁
 bash test/mini-test/run_formal_mini_8gb.sh vae
+
+# 1 epoch smoke 验收后，可在独立目录预检/运行 fresh 3 epoch VAE
+MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae short_train
+bash test/mini-test/run_formal_mini_8gb.sh vae short_train
+
+# RTX 4070 Laptop 中型质量筛查：固定 400 train + 100 validation、每阶段 20 epoch
+MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae medium_train
+bash test/mini-test/run_formal_mini_8gb.sh vae medium_train
 
 # 历史 legacy mini
 bash test/mini-test/train_minimal.sh all
@@ -245,7 +293,10 @@ bash test/mini-test/diagnose_minimal.sh
 
 默认输出位置：
 
-- `test/result/formal_mini_p1_04_8gb_v1/`（8 GB formal mini）
+- `test/result/formal_mini_v2_80m_8gb_v1/`（8 GB formal v2 mini）
+- `test/result/formal_mini_v2_80m_8gb_short_v1/`（fresh 3 epoch VAE short profile）
+- `test/result/formal_medium_v2_80m_laptop_500f_20ep_v2/`（RTX 4070 Laptop 500 帧中型筛查；稳定 CUDA allocator）
+- `test/result/formal_medium_v2_80m_laptop_500f_20ep_v1/`（失败现场，只用于 allocator 诊断，不续训）
 - `test/mini-test/train_results_mini/`
 - `test/mini-test/inference_results_mini/`
 - `test/mini-test/diagnostics/`
@@ -254,16 +305,25 @@ bash test/mini-test/diagnose_minimal.sh
 
 如果你要做正式实验，推荐顺序是：
 
-1. 先运行预处理，确保 `target_voxel` 基于当前逻辑重新生成
-2. 训练 `vae`
-3. 训练 `ldm`
-4. 运行 `inference_ldm.sh`
-5. 运行 `diagnose.sh`
-6. 需要更快的推理时再考虑 `cd`
+1. 运行 `preprocess-v2.sh`，生成正式 training/deployment 数据与全部 artifact
+2. 记录 normalization SHA-256，并用 `PREFLIGHT_ONLY=1` 完成无训练验收
+3. 在服务器训练 `vae`
+4. VAE 验收后训练 `ldm`
+5. 使用 deployment v3 数据运行 `inference_ldm.sh`
+6. 运行独立诊断与评价入口
+7. 需要更快推理时再单独训练 `cd`
 
-如果你只是想验证逻辑是否跑通，推荐直接走 `test/mini-test/`。
-
-8 GB formal mini 保持正式体素数量与 Radar 单位，只减少帧数、epoch 和 batch；它的 `formal_mini_chain_v1` checkpoint 不可替代正式全量训练结果。具体温度门禁和逐阶段命令见 [test/mini-test/README.md](./test/mini-test/README.md)。
+如果你只是想验证当前 formal v2 数据合同，可先使用预检和 `test/unit/` 聚焦测试；
+需要验证 backward/checkpoint 时再分阶段运行 8 GB mini。它直接读取 0--80 m 正式数据，
+按正式 split 取每场景 8 个 train 和 4 个 validation 帧，并写出
+`formal_mini_chain_v2`。该 checkpoint 只用于接口 smoke，不能替代正式训练结果或进入
+正式部署链。完整保护门禁见 [test/mini-test/README.md](./test/mini-test/README.md)。
+formal mini 的 LDM/CD 无训练预检会在创建配置和输出前验证父 checkpoint 的
+stage/protocol/data identity；short VAE 的后续阶段必须显式复用同一 short 结果根。
+`medium_train` 是独立的 400/100、20 epoch 链，三阶段均需使用该 profile 和同一结果根。
+VAE/LDM 会逐 epoch 使用 100 帧 validation；当前 CD 训练器只消费 400 帧 train，100 帧
+留出集用于 CD 完成后的独立推理/评价。该中型结果可用于初步判断训练趋势和指标是否接近
+需求，但不能替代服务器 full split 的正式训练与评价。
 
 ## 已知说明
 

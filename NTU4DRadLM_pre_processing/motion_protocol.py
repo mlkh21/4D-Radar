@@ -15,6 +15,23 @@ VELOCITY_MODES = ("none", "fixed", "recorded")
 VELOCITY_FRAMES = ("radar", "lidar")
 
 
+def sensor_to_reference_motion_delta(
+    sensor_timestamp: float,
+    reference_timestamp: float,
+) -> float:
+    """返回点坐标平移使用的有符号时间量 ``t_sensor - t_reference``。
+
+    对静态世界点和平台速度 ``v``，统一使用
+    ``p_reference = p_sensor + v * (t_sensor - t_reference)``。参考传感器
+    自身的时间量因此严格为 0，避免两份点云被同时同向移动。
+    """
+    sensor_timestamp = float(sensor_timestamp)
+    reference_timestamp = float(reference_timestamp)
+    if not np.isfinite(sensor_timestamp) or not np.isfinite(reference_timestamp):
+        raise ValueError("sensor/reference timestamp 必须是有限数")
+    return sensor_timestamp - reference_timestamp
+
+
 def sha256_file(path: str) -> str:
     """计算速度源文件内容 hash，供 preprocess_policy 固化实际输入。"""
     digest = hashlib.sha256()

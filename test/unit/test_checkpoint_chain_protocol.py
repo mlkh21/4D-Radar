@@ -78,6 +78,22 @@ class CheckpointChainProtocolTest(unittest.TestCase):
             },
         }
 
+    def _data_protocol(self):
+        """构造绑定监督、划分、observed、同步和标定身份的最小 v2 协议。"""
+        return {
+            "protocol": "formal_data_v2",
+            "dataset_manifest_sha256": {"unit_scene": "1" * 64},
+            "split_artifact_sha256": "2" * 64,
+            "target_policy_sha256": {"unit_scene": "3" * 64},
+            "observed_mask_protocol": "persisted_lidar_ray_v1",
+            "observed_mask_sha256": {"unit_scene": "4" * 64},
+            "calibration_sha256": {
+                "lidar_to_thermal": "5" * 64,
+                "thermal_intrinsics": "6" * 64,
+            },
+            "radar_ir_sync_sha256": {"unit_scene": "7" * 64},
+        }
+
     def _write_chain(
         self,
         root,
@@ -91,7 +107,9 @@ class CheckpointChainProtocolTest(unittest.TestCase):
         mismatched_cd_normalization_hash=False,
         nonformal_normalization_stage=None,
         vae_has_normalization=False,
-        checkpoint_protocol="formal_chain_v1",
+        checkpoint_protocol="formal_chain_v2",
+        missing_data_protocol_stage=None,
+        mismatched_data_protocol_stage=None,
     ):
         from diffusion_consistency_radar.checkpoint_chain import sha256_file
 
@@ -114,6 +132,8 @@ class CheckpointChainProtocolTest(unittest.TestCase):
                 "data_grid_config": grid,
                 "occupancy_activation": "sigmoid",
         }
+        if missing_data_protocol_stage != "vae":
+            vae_payload["data_protocol"] = self._data_protocol()
         if vae_has_normalization:
             vae_payload["radar_normalization"] = self._radar_normalization()
             vae_payload["radar_normalization_sha256"] = "b" * 64
@@ -139,6 +159,10 @@ class CheckpointChainProtocolTest(unittest.TestCase):
                 "data_grid_config": ldm_grid,
                 "vae_checkpoint_sha256": sha256_file(vae_path),
         }
+        if missing_data_protocol_stage != "ldm":
+            ldm_payload["data_protocol"] = self._data_protocol()
+            if mismatched_data_protocol_stage == "ldm":
+                ldm_payload["data_protocol"]["split_artifact_sha256"] = "8" * 64
         if missing_normalization_stage != "ldm":
             ldm_normalization = self._radar_normalization()
             if nonformal_normalization_stage == "ldm":
@@ -166,6 +190,10 @@ class CheckpointChainProtocolTest(unittest.TestCase):
                 "vae_checkpoint_sha256": cd_vae_hash,
                 "ldm_checkpoint_sha256": sha256_file(ldm_path),
         }
+        if missing_data_protocol_stage != "cd":
+            cd_payload["data_protocol"] = self._data_protocol()
+            if mismatched_data_protocol_stage == "cd":
+                cd_payload["data_protocol"]["split_artifact_sha256"] = "8" * 64
         if missing_normalization_stage != "cd":
             cd_normalization = self._radar_normalization()
             if mismatched_cd_normalization:
@@ -190,7 +218,7 @@ class CheckpointChainProtocolTest(unittest.TestCase):
             report = validate_formal_checkpoint_chain(*paths)
 
         self.assertTrue(report["chain_valid"])
-        self.assertEqual(report["protocol"], "formal_chain_v1")
+        self.assertEqual(report["protocol"], "formal_chain_v2")
         self.assertEqual(set(report["stages"]), {"vae", "ldm", "cd"})
         self.assertEqual(len(report["sha256"]), 3)
         self.assertEqual(report["radar_normalization_protocol"], "radar_normalization_v1")
@@ -212,6 +240,55 @@ class CheckpointChainProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checkpoint_protocol"):
             resolve_training_checkpoint_protocol("legacy_or_typo")
 
+    def test_formal_mini_selection_is_strict_and_part_of_resume_identity(self):
+        from diffusion_consistency_radar.checkpoint_chain import (
+            CheckpointChainError,
+            assert_checkpoint_training_identity,
+            build_formal_mini_selection,
+        )
+
+        selection = build_formal_mini_selection(8, 4)
+        self.assertEqual(
+            selection,
+            {
+                "protocol": "formal_mini_selection_v1",
+                "strategy": "ordered_prefix_per_scene",
+                "train_frames_per_scene": 8,
+                "validation_frames_per_scene": 4,
+            },
+        )
+        for invalid in (0, -1, True, "8"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "frames_per_scene"
+            ):
+                build_formal_mini_selection(invalid, 4)
+
+        current_protocol = self._data_protocol()
+        current_protocol["mini_selection"] = selection
+        checkpoint_protocol = self._data_protocol()
+        checkpoint_protocol["mini_selection"] = build_formal_mini_selection(7, 4)
+        checkpoint = {
+            "stage": "vae",
+            "checkpoint_protocol": "formal_mini_chain_v2",
+            "data_protocol": checkpoint_protocol,
+        }
+        with self.assertRaisesRegex(CheckpointChainError, "data_protocol"):
+            assert_checkpoint_training_identity(
+                checkpoint,
+                expected_stage="vae",
+                checkpoint_protocol="formal_mini_chain_v2",
+                data_protocol=current_protocol,
+            )
+
+        del checkpoint["data_protocol"]["mini_selection"]
+        with self.assertRaisesRegex(CheckpointChainError, "mini_selection"):
+            assert_checkpoint_training_identity(
+                checkpoint,
+                expected_stage="vae",
+                checkpoint_protocol="formal_mini_chain_v2",
+                data_protocol=current_protocol,
+            )
+
     def test_formal_validator_rejects_isolated_mini_chain(self):
         from diffusion_consistency_radar.checkpoint_chain import (
             CheckpointChainError,
@@ -221,10 +298,64 @@ class CheckpointChainProtocolTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             paths = self._write_chain(
                 root,
-                checkpoint_protocol="formal_mini_chain_v1",
+                checkpoint_protocol="formal_mini_chain_v2",
             )
-            with self.assertRaisesRegex(CheckpointChainError, "formal_chain_v1"):
+            with self.assertRaisesRegex(CheckpointChainError, "formal_chain_v2"):
                 validate_formal_checkpoint_chain(*paths)
+
+    def test_target_ldm_validates_only_vae_and_ldm(self):
+        from diffusion_consistency_radar.checkpoint_chain import (
+            validate_formal_checkpoint_chain,
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            vae_path, ldm_path, _cd_path = self._write_chain(root)
+            report = validate_formal_checkpoint_chain(
+                vae_path,
+                ldm_path,
+                target_stage="ldm",
+            )
+
+        self.assertEqual(report["target_stage"], "ldm")
+        self.assertEqual(report["stages"], ["vae", "ldm"])
+
+    def test_v2_data_protocol_is_required_and_must_match_parent(self):
+        from diffusion_consistency_radar.checkpoint_chain import (
+            CheckpointChainError,
+            validate_formal_checkpoint_chain,
+        )
+
+        for kwargs in (
+            {"missing_data_protocol_stage": "vae"},
+            {"missing_data_protocol_stage": "ldm"},
+            {"mismatched_data_protocol_stage": "ldm"},
+        ):
+            with self.subTest(kwargs=kwargs), tempfile.TemporaryDirectory() as root:
+                vae_path, ldm_path, _cd_path = self._write_chain(root, **kwargs)
+                with self.assertRaisesRegex(CheckpointChainError, "data_protocol"):
+                    validate_formal_checkpoint_chain(
+                        vae_path,
+                        ldm_path,
+                        target_stage="ldm",
+                    )
+
+    def test_v1_chain_is_diagnostic_only_with_explicit_legacy_switch(self):
+        from diffusion_consistency_radar.checkpoint_chain import (
+            CheckpointChainError,
+            validate_formal_checkpoint_chain,
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            paths = self._write_chain(root, checkpoint_protocol="formal_chain_v1")
+            with self.assertRaisesRegex(CheckpointChainError, "formal_chain_v2"):
+                validate_formal_checkpoint_chain(*paths)
+            report = validate_formal_checkpoint_chain(
+                *paths,
+                allow_legacy_protocol=True,
+            )
+
+        self.assertTrue(report["legacy_diagnostic"])
+        self.assertEqual(report["protocol"], "formal_chain_v1")
 
     def test_missing_or_mismatched_radar_normalization_is_rejected(self):
         from diffusion_consistency_radar.checkpoint_chain import (

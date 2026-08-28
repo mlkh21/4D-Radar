@@ -52,8 +52,13 @@ from diffusion_consistency_radar.cm.dataset_loader import (
 )
 from diffusion_consistency_radar.checkpoint_chain import (
     FORMAL_CHECKPOINT_PROTOCOL,
+    FORMAL_MINI_CHECKPOINT_PROTOCOL,
+    assert_checkpoint_training_identity,
+    build_formal_mini_selection,
     resolve_training_checkpoint_protocol,
+    safe_torch_load as safe_checkpoint_load,
     sha256_file,
+    validate_checkpoint_data_protocol,
 )
 from diffusion_consistency_radar.radar_normalization import (
     RadarNormalizationError,
@@ -62,21 +67,23 @@ from diffusion_consistency_radar.radar_normalization import (
     load_radar_normalization_artifact,
     radar_normalization_from_checkpoint,
 )
+from diffusion_consistency_radar.formal_data_protocol import (
+    load_formal_data_protocol_artifact,
+)
+from diffusion_consistency_radar.temporal_split import (
+    limit_frame_ids_by_scene,
+    load_temporal_split_artifact,
+    split_frame_ids_by_scene,
+)
 
 
-def safe_torch_load(path, map_location):
-    """兼容不同 PyTorch 版本的 checkpoint 加载逻辑。"""
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    except TypeError:
-        # HACK: 低版本 PyTorch 不支持 weights_only，回退到兼容模式。
-        return torch.load(path, map_location=map_location)
-    except Exception as exc:
-        # NOTE: 某些历史权重包含自定义对象，weights_only=True 会拒绝加载。
-        msg = str(exc)
-        if "Weights only load failed" in msg or "Unsupported global" in msg:
-            return torch.load(path, map_location=map_location)
-        raise
+def safe_torch_load(path, map_location, *, allow_legacy_pickle=False):
+    """CD 正式入口默认只允许 weights-only checkpoint。"""
+    return safe_checkpoint_load(
+        path,
+        map_location=map_location,
+        allow_legacy_pickle=allow_legacy_pickle,
+    )
 
 
 def checkpoint_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
@@ -103,6 +110,64 @@ def resolve_data_grid_config(data_config: Dict[str, Any]):
         tuple(float(v) for v in source_pc_range),
         tuple(float(v) for v in model_pc_range),
     )
+
+
+def assert_formal_cd_data_config(data_config: Dict[str, Any]) -> None:
+    """让独立 CD 入口与统一训练入口使用相同的正式数据门禁。"""
+    scene_names = data_config.get("scene_names")
+    if (
+        not isinstance(scene_names, list)
+        or not scene_names
+        or any(not isinstance(scene, str) or not scene.strip() for scene in scene_names)
+    ):
+        raise ValueError("正式 CD 必须显式配置非空 data.scene_names")
+    if data_config.get("require_real_ir") is not True:
+        raise ValueError("正式 CD 必须设置 data.require_real_ir=true")
+    if data_config.get("require_real_calibration") is not True:
+        raise ValueError("正式 CD 必须设置 data.require_real_calibration=true")
+    if data_config.get("voxel_coordinate_frame") != "lidar":
+        raise ValueError("当前正式 CD 只接受 voxel_coordinate_frame=lidar")
+    if data_config.get("require_persisted_observed_mask") is not True:
+        raise ValueError(
+            "正式 CD 必须设置 data.require_persisted_observed_mask=true"
+        )
+    if data_config.get("require_radar_statistics") is not True:
+        raise ValueError(
+            "正式 CD 必须设置 data.require_radar_statistics=true"
+        )
+
+
+def is_formal_cd_training(
+    checkpoint_protocol: str,
+    allow_legacy_radar_units: bool,
+) -> bool:
+    """统一识别全量与 mini-v2；legacy 显式开关始终关闭正式门禁。"""
+    return (
+        checkpoint_protocol
+        in {FORMAL_CHECKPOINT_PROTOCOL, FORMAL_MINI_CHECKPOINT_PROTOCOL}
+        and not allow_legacy_radar_units
+    )
+
+
+def prepare_cd_data_protocol(
+    data_protocol: Dict[str, Any],
+    data_config: Dict[str, Any],
+    *,
+    checkpoint_protocol: str,
+) -> Dict[str, Any]:
+    """为独立 CD 入口绑定 mini 子集身份，并拒绝全量链隐式截断。"""
+    resolved = dict(data_protocol)
+    train_limit = data_config.get("mini_train_frames_per_scene")
+    validation_limit = data_config.get("mini_validation_frames_per_scene")
+    if checkpoint_protocol == FORMAL_MINI_CHECKPOINT_PROTOCOL:
+        selection = build_formal_mini_selection(train_limit, validation_limit)
+        configured = resolved.get("mini_selection")
+        if configured is not None and configured != selection:
+            raise ValueError("CD data protocol 的 mini_selection 与当前配置不一致")
+        resolved["mini_selection"] = selection
+    elif train_limit not in (None, "") or validation_limit not in (None, ""):
+        raise ValueError("正式全量 CD 链禁止隐式截断 train/validation 帧")
+    return validate_checkpoint_data_protocol(resolved, stage="cd")
 
 
 def resolve_cd_radar_normalization(
@@ -356,7 +421,22 @@ class ConsistencyDistillationTrainer:
         self.checkpoint_protocol = resolve_training_checkpoint_protocol(
             self.config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
         )
+        configured_data_protocol = self.config.get("data_protocol")
+        if configured_data_protocol is None and self.allow_legacy_radar_units:
+            self.data_protocol = {"protocol": "legacy_data_v0"}
+        else:
+            self.data_protocol = validate_checkpoint_data_protocol(
+                configured_data_protocol,
+                stage="cd",
+            )
         teacher_checkpoint = safe_torch_load(ldm_ckpt_path, map_location="cpu")
+        if not self.allow_legacy_radar_units:
+            assert_checkpoint_training_identity(
+                teacher_checkpoint,
+                expected_stage="ldm",
+                checkpoint_protocol=self.checkpoint_protocol,
+                data_protocol=self.data_protocol,
+            )
         self.radar_normalization, self.radar_normalization_sha256 = (
             resolve_cd_radar_normalization(
                 teacher_checkpoint,
@@ -370,6 +450,13 @@ class ConsistencyDistillationTrainer:
         resume_path = self.config.get('resume_path')
         if resume_path and os.path.exists(resume_path):
             resume_checkpoint = safe_torch_load(resume_path, map_location="cpu")
+            if not self.allow_legacy_radar_units:
+                assert_checkpoint_training_identity(
+                    resume_checkpoint,
+                    expected_stage="cd",
+                    checkpoint_protocol=self.checkpoint_protocol,
+                    data_protocol=self.data_protocol,
+                )
             assert_checkpoint_radar_normalization(
                 resume_checkpoint,
                 self.radar_normalization,
@@ -818,6 +905,7 @@ class ConsistencyDistillationTrainer:
             "training_semantics": "ldm_initialized_ema_consistency_v1",
             "ldm_role": "initialization_checkpoint",
             "consistency_target_source": "cd_model_ema",
+            "data_protocol": dict(self.data_protocol),
         }
         if self.radar_normalization is not None:
             payload["radar_normalization"] = dict(self.radar_normalization)
@@ -898,6 +986,12 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--grad_accum_steps", type=int, default=8)
     parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="显式恢复 CD checkpoint；不再按输出目录自动探测",
+    )
+    parser.add_argument(
         "--allow_legacy_radar_units",
         action="store_true",
         help="仅供 mini-test/旧诊断保留未归一化 Radar；正式 CD 禁止使用",
@@ -910,6 +1004,63 @@ def main():
     ldm_config = dict(config.get("ldm", {}) if isinstance(config.get("ldm", {}), dict) else {})
     opt_config = dict(config.get("optimization", {}) if isinstance(config.get("optimization", {}), dict) else {})
     data_config = dict(config.get("data", {}) if isinstance(config.get("data", {}), dict) else {})
+    checkpoint_protocol = resolve_training_checkpoint_protocol(
+        data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
+    )
+    formal_training = is_formal_cd_training(
+        checkpoint_protocol,
+        args.allow_legacy_radar_units,
+    )
+    if formal_training:
+        assert_formal_cd_data_config(data_config)
+    dataset_dir = data_config.get("dataset_dir", args.dataset_dir)
+    scene_names = data_config.get("scene_names")
+    split_artifact_path = data_config.get("temporal_split_artifact")
+    data_protocol_path = data_config.get("data_protocol_path")
+    if data_protocol_path:
+        data_protocol, _data_protocol_sha256 = load_formal_data_protocol_artifact(
+            data_protocol_path,
+            dataset_dir=dataset_dir,
+            scenes=scene_names,
+            split_artifact_path=split_artifact_path,
+            stage="cd",
+        )
+    elif args.allow_legacy_radar_units and data_config.get("data_protocol") is None:
+        data_protocol = {"protocol": "legacy_data_v0"}
+    else:
+        data_protocol = validate_checkpoint_data_protocol(
+            data_config.get("data_protocol"),
+            stage="cd",
+        )
+    if formal_training:
+        data_protocol = prepare_cd_data_protocol(
+            data_protocol,
+            data_config,
+            checkpoint_protocol=checkpoint_protocol,
+        )
+    train_frame_ids_by_scene = None
+    split_artifact_sha256 = None
+    if formal_training:
+        if not split_artifact_path:
+            raise ValueError("正式 CD 必须配置 temporal_split_artifact")
+        split_artifact, split_artifact_sha256 = load_temporal_split_artifact(
+            split_artifact_path,
+            dataset_dir=dataset_dir,
+            expected_scenes=scene_names,
+            require_formal=True,
+        )
+        if data_protocol.get("split_artifact_sha256") != split_artifact_sha256:
+            raise ValueError("CD split artifact 与 data protocol 不一致")
+        train_frame_ids_by_scene = split_frame_ids_by_scene(
+            split_artifact,
+            "train",
+        )
+        if checkpoint_protocol == FORMAL_MINI_CHECKPOINT_PROTOCOL:
+            train_frame_ids_by_scene = limit_frame_ids_by_scene(
+                train_frame_ids_by_scene,
+                data_protocol["mini_selection"]["train_frames_per_scene"],
+                partition="train",
+            )
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
     ldm_config.setdefault("fusion_voxel_shape", list(target_size))
     ldm_config.setdefault("fusion_pc_range", list(model_pc_range))
@@ -936,11 +1087,18 @@ def main():
                 model_pc_range=model_pc_range,
                 doppler_scale_mps=scale_mps,
                 require_formal=True,
+                expected_split_artifact_sha256=split_artifact_sha256,
             )
         )
 
     # 加载 VAE
     ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
+    assert_checkpoint_training_identity(
+        ckpt,
+        expected_stage="vae",
+        checkpoint_protocol=checkpoint_protocol,
+        data_protocol=data_protocol,
+    )
     vae_config = config.get("vae", {}) if isinstance(config.get("vae", {}), dict) else {}
     vae, _vae_metadata = build_cd_vae_from_checkpoint(
         ckpt,
@@ -949,7 +1107,7 @@ def main():
     
     # 创建数据加载器
     dataset = NTU4DRadLM_VoxelDataset(
-        root_dir=args.dataset_dir,
+        root_dir=dataset_dir,
         split='train',
         use_augmentation=False,
         target_size=target_size,
@@ -958,6 +1116,20 @@ def main():
         radar_normalization=radar_normalization,
         radar_normalization_sha256=radar_normalization_sha256,
         allow_legacy_radar_units=args.allow_legacy_radar_units,
+        scene_names=scene_names,
+        calibration_dir=data_config.get("calibration_dir"),
+        require_real_ir=bool(data_config.get("require_real_ir", False)),
+        require_real_calibration=bool(
+            data_config.get("require_real_calibration", False)
+        ),
+        require_persisted_observed_mask=bool(
+            data_config.get("require_persisted_observed_mask", False)
+        ),
+        require_radar_statistics=bool(
+            data_config.get("require_radar_statistics", False)
+        ),
+        frame_ids_by_scene=train_frame_ids_by_scene,
+        voxel_coordinate_frame=data_config.get("voxel_coordinate_frame", "lidar"),
     )
     train_loader = DataLoader(
         dataset,
@@ -970,10 +1142,10 @@ def main():
     
     cd_save_dir = cd_config.get("save_dir", args.save_dir)
 
-    # 检查是否有检查点可以恢复
-    resume_path = os.path.join(cd_save_dir, 'cd_best.pt')
-    if not os.path.exists(resume_path):
-        resume_path = None
+    # 恢复必须由 CLI 明确授权，禁止跨协议目录自动续训。
+    resume_path = args.resume or None
+    if resume_path and not os.path.isfile(resume_path):
+        raise FileNotFoundError(f"显式 CD resume checkpoint 不存在: {resume_path}")
     
     # 创建训练器并训练
     trainer = ConsistencyDistillationTrainer(
@@ -994,9 +1166,8 @@ def main():
             'radar_normalization': radar_normalization,
             'radar_normalization_sha256': radar_normalization_sha256,
             'allow_legacy_radar_units': args.allow_legacy_radar_units,
-            'checkpoint_protocol': data_config.get(
-                'checkpoint_protocol', FORMAL_CHECKPOINT_PROTOCOL
-            ),
+            'checkpoint_protocol': checkpoint_protocol,
+            'data_protocol': data_protocol,
         },
     )
     

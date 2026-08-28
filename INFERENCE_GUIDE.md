@@ -1,81 +1,87 @@
-# ÍÆÀíÊ¹ÓÃÖ¸ÄÏ
+# æ¨ç†ä½¿ç”¨æŒ‡å—
 
-±¾ÎÄµµ»ùÓÚµ±Ç°²Ö¿â´úÂë£¬¸ø³ö¿ÉÖ±½ÓÖ´ĞĞµÄÍÆÀíÓëÔÚÏßµØÍ¼¸üĞÂËµÃ÷¡£
+æœ¬æ–‡æ¡£åŸºäºå½“å‰ä»“åº“ä»£ç ï¼Œç»™å‡ºå¯ç›´æ¥æ‰§è¡Œçš„æ¨ç†ä¸åœ¨çº¿åœ°å›¾æ›´æ–°è¯´æ˜ã€‚
 
-## Ò»¡¢×¼±¸¹¤×÷
+## ä¸€ã€å‡†å¤‡å·¥ä½œ
 
-### 1. ¼¤»î»·¾³
+### 1. æ¿€æ´»ç¯å¢ƒ
 
 ```bash
 conda activate Radar
 ```
 
-### 2. È·ÈÏÄ£ĞÍÒÑÑµÁ·
+### 2. ç¡®è®¤æ¨¡å‹å·²è®­ç»ƒ
 
 ```bash
 cd /home/ps/zxj_workspace/src/4D-Radar/diffusion_consistency_radar
 
-# VAE£¨±ØĞè£©
+# VAEï¼ˆå¿…éœ€ï¼‰
 ls train_results/vae/vae_best.pt
 
-# LDM£¨¿ÉÑ¡£¬ÔËĞĞ LDM ÍÆÀíÊ±±ØĞè£©
+# LDMï¼ˆå¯é€‰ï¼Œè¿è¡Œ LDM æ¨ç†æ—¶å¿…éœ€ï¼‰
 ls train_results/ldm/ldm_best.pt
 
-# CD£¨¿ÉÑ¡£¬ÔËĞĞ CD ÍÆÀíÊ±±ØĞè£©
+# CDï¼ˆå¯é€‰ï¼Œè¿è¡Œ CD æ¨ç†æ—¶å¿…éœ€ï¼‰
 ls train_results/cd/cd_best.pt
 ```
 
-Èç¹ûÄ£ĞÍ²»´æÔÚ£¬ÇëÏÈÑµÁ·£º
+å¦‚æœæ¨¡å‹ä¸å­˜åœ¨ï¼Œè¯·å…ˆè®­ç»ƒï¼š
 
 ```bash
 bash launch/train_unified.sh vae
 bash launch/train_unified.sh ldm
 bash launch/train_unified.sh cd
 ```
-## ¶ş¡¢ÍÆÀí·½·¨
 
-### ·½·¨ 1£ºÊ¹ÓÃÆô¶¯½Å±¾£¨ÍÆ¼ö£©
+## äºŒã€æ¨ç†æ–¹æ³•
 
-µ±Ç°Æô¶¯½Å±¾ÊÇ°´³¡¾°ÖğÎÄ¼şÍÆÀíÄ£Ê½£¬³¡¾°À´Ô´ÓÚ£º
-- `diffusion_consistency_radar/config/data_loading_config.yml` µÄ `data.test`
+### æ–¹æ³• 1ï¼šä½¿ç”¨å¯åŠ¨è„šæœ¬ï¼ˆæ¨èï¼‰
 
-#### LDM ÍÆÀí
+å½“å‰å¯åŠ¨è„šæœ¬æ˜¯æŒ‰åœºæ™¯é€æ–‡ä»¶æ¨ç†æ¨¡å¼ï¼Œåœºæ™¯æ¥æºäºï¼š
+
+- `diffusion_consistency_radar/config/data_loading_config.yml` çš„ `data.test`
+
+#### LDM æ¨ç†
 
 ```bash
 cd /home/ps/zxj_workspace/src/4D-Radar
 bash diffusion_consistency_radar/launch/inference_ldm.sh
 ```
 
-Êä³öÄ¿Â¼Ê¾Àı£º
+è¾“å‡ºç›®å½•ç¤ºä¾‹ï¼š
+
 - `Result/inference_results/<scene>_ldm_eval/`
 
-Ö÷ÒªÊä³öÎÄ¼ş£º
-- `*_pcl.npy`£ºÖğÎÄ¼şµãÔÆÊä³ö
-- `comparison_metrics.csv`£ºÓë LiDAR ¶Ô±ÈµÄ Chamfer Ö¸±ê£¨ÆôÓÃ¶Ô±ÈÊ±£©
+ä¸»è¦è¾“å‡ºæ–‡ä»¶ï¼š
 
-#### CD ÍÆÀí
+- `*_pcl.npy`ï¼šé€æ–‡ä»¶ç‚¹äº‘è¾“å‡º
+- `comparison_metrics.csv`ï¼šä¸ LiDAR å¯¹æ¯”çš„ Chamfer æŒ‡æ ‡ï¼ˆå¯ç”¨å¯¹æ¯”æ—¶ï¼‰
+
+#### CD æ¨ç†
 
 ```bash
 bash diffusion_consistency_radar/launch/inference_cd.sh
 ```
 
-Êä³öÄ¿Â¼Ê¾Àı£º
+è¾“å‡ºç›®å½•ç¤ºä¾‹ï¼š
+
 - `Result/inference_results/<scene>_cd_eval/`
 
-#### ÍêÕûÍÆÀíÊ¾Àı
+#### å®Œæ•´æ¨ç†ç¤ºä¾‹
 
 ```bash
 bash diffusion_consistency_radar/launch/run_inference_example.sh
 ```
 
-¸Ã½Å±¾»á°´ test ³¡¾°Ö´ĞĞ£º
-1. LDM ÍÆÀí£¨40²½£©
-2. CD ÍÆÀí£¨1²½£©
-3. CD ÍÆÀí£¨4²½£©
+è¯¥è„šæœ¬ä¼šæŒ‰ test åœºæ™¯æ‰§è¡Œï¼š
 
-### ·½·¨ 2£ºÊ¹ÓÃ Python ÃüÁî£¨¿Éµ÷²ÎÊı£©
+1. LDM æ¨ç†ï¼ˆ40æ­¥ï¼‰
+2. CD æ¨ç†ï¼ˆ1æ­¥ï¼‰
+3. CD æ¨ç†ï¼ˆ4æ­¥ï¼‰
 
-#### A. ³¡¾°ÖğÎÄ¼şÍÆÀí£¨Óë launch ½Å±¾Ò»ÖÂ£©
+### æ–¹æ³• 2ï¼šä½¿ç”¨ Python å‘½ä»¤ï¼ˆå¯è°ƒå‚æ•°ï¼‰
+
+#### A. åœºæ™¯é€æ–‡ä»¶æ¨ç†ï¼ˆä¸ launch è„šæœ¬ä¸€è‡´ï¼‰
 
 ```bash
 cd /home/ps/zxj_workspace/src/4D-Radar
@@ -92,12 +98,13 @@ python diffusion_consistency_radar/scripts/inference.py \
   --device cuda
 ```
 
-¿ÉÑ¡ LiDAR ¶Ô±È²ÎÊı£º
+å¯é€‰ LiDAR å¯¹æ¯”å‚æ•°ï¼š
+
 - `--compare_with_lidar`
 - `--raw_livox_dir /path/to/livox_lidar`
 - `--lidar_index_file /path/to/lidar_index_sequence.txt`
 
-#### B. ÅúÁ¿Ñù±¾ÍÆÀí£¨Êä³öÒ»¸ö¾ÛºÏ .npy£©
+#### B. æ‰¹é‡æ ·æœ¬æ¨ç†ï¼ˆè¾“å‡ºä¸€ä¸ªèšåˆ .npyï¼‰
 
 ```bash
 python diffusion_consistency_radar/scripts/inference.py \
@@ -110,20 +117,21 @@ python diffusion_consistency_radar/scripts/inference.py \
   --output_dir Result/inference_results/cd
 ```
 
-¸ÃÄ£Ê½Êä³ö£º
+è¯¥æ¨¡å¼è¾“å‡ºï¼š
+
 - `Result/inference_results/cd/cd_samples_1steps.npy`
 
-#### ²ÎÊıËµÃ÷
+#### å‚æ•°è¯´æ˜
 
-- `--model_type`: `ldm` »ò `cd`
-- `--steps`: ²ÉÑù²½Êı£¨LDM ³£ÓÃ 40£»CD ³£ÓÃ 1/2/4£©
-- `--sampler`: `heun` »ò `euler`
-- `--radar_voxel_dir`: ÆôÓÃÖğÎÄ¼şÍÆÀíÄ£Ê½
-- `--num_samples`: ÅúÁ¿Ñù±¾ÍÆÀíÄ£Ê½µÄÑù±¾Êı
-- `--save_pointcloud`: ÖğÑù±¾±£´æµãÔÆ
-- `--save_voxel`: ÖğÑù±¾±£´æÌåËØ
+- `--model_type`: `ldm` æˆ– `cd`
+- `--steps`: é‡‡æ ·æ­¥æ•°ï¼ˆLDM å¸¸ç”¨ 40ï¼›CD å¸¸ç”¨ 1/2/4ï¼‰
+- `--sampler`: `heun` æˆ– `euler`
+- `--radar_voxel_dir`: å¯ç”¨é€æ–‡ä»¶æ¨ç†æ¨¡å¼
+- `--num_samples`: æ‰¹é‡æ ·æœ¬æ¨ç†æ¨¡å¼çš„æ ·æœ¬æ•°
+- `--save_pointcloud`: é€æ ·æœ¬ä¿å­˜ç‚¹äº‘
+- `--save_voxel`: é€æ ·æœ¬ä¿å­˜ä½“ç´ 
 
-### ·½·¨ 3£ºPython ´úÂëµ÷ÓÃ
+### æ–¹æ³• 3ï¼šPython ä»£ç è°ƒç”¨
 
 ```python
 import sys
@@ -150,11 +158,11 @@ np.save('my_samples.npy', samples.cpu().numpy())
 print(samples.shape)
 ```
 
-## Èı¡¢¿ÉÊÓ»¯½á¹û
+## ä¸‰ã€å¯è§†åŒ–ç»“æœ
 
-¿ÉÊÓ»¯½Å±¾Í¨³£ÓÃÓÚ¡°ÅúÁ¿Ñù±¾ÍÆÀíÄ£Ê½¡±²ú³öµÄ¾ÛºÏ `.npy` ÎÄ¼ş¡£
+å¯è§†åŒ–è„šæœ¬é€šå¸¸ç”¨äºâ€œæ‰¹é‡æ ·æœ¬æ¨ç†æ¨¡å¼â€äº§å‡ºçš„èšåˆ `.npy` æ–‡ä»¶ã€‚
 
-### »ù´¡¿ÉÊÓ»¯
+### åŸºç¡€å¯è§†åŒ–
 
 ```bash
 python diffusion_consistency_radar/scripts/visualize_results.py \
@@ -163,7 +171,7 @@ python diffusion_consistency_radar/scripts/visualize_results.py \
   --num_samples 5
 ```
 
-### ¶Ô±È¿ÉÊÓ»¯
+### å¯¹æ¯”å¯è§†åŒ–
 
 ```bash
 python diffusion_consistency_radar/scripts/visualize_results.py \
@@ -172,12 +180,13 @@ python diffusion_consistency_radar/scripts/visualize_results.py \
   --output_dir diffusion_consistency_radar/visualizations/comparison
 ```
 
-## ËÄ¡¢ÔÚÏß¸ÅÂÊµØÍ¼¸üĞÂ
+## å››ã€åœ¨çº¿æ¦‚ç‡åœ°å›¾æ›´æ–°
 
-¸ÃÄ£Ê½ÓÃÓÚÔÚÏß½¨Í¼ÑéÖ¤£¬ÊäÈëÎªÀ×´ïÌåËØĞòÁĞ£¬Êä³ö¸ÅÂÊÕ¤¸ñÓë DEM£º
-- Õ¼ÓÃ¸ÅÂÊÍ¼£¨D-S ÈÚºÏ£©
-- DEM ¾ùÖµ/·½²î
-- ¾Ö²¿½üÕÏ²éÑ¯Ö¸±ê
+è¯¥æ¨¡å¼ç”¨äºåœ¨çº¿å»ºå›¾éªŒè¯ï¼Œè¾“å…¥ä¸ºé›·è¾¾ä½“ç´ åºåˆ—ï¼Œè¾“å‡ºæ¦‚ç‡æ …æ ¼ä¸ DEMï¼š
+
+- å ç”¨æ¦‚ç‡å›¾ï¼ˆD-S èåˆï¼‰
+- DEM å‡å€¼/æ–¹å·®
+- å±€éƒ¨è¿‘éšœæŸ¥è¯¢æŒ‡æ ‡
 
 ```bash
 cd /home/ps/zxj_workspace/src/4D-Radar
@@ -190,7 +199,7 @@ python diffusion_consistency_radar/scripts/streaming_map_update.py \
   --save_every 20
 ```
 
-¿ÉÑ¡ÈÚºÏ²ÎÊı£º
+å¯é€‰èåˆå‚æ•°ï¼š
 
 ```bash
 python diffusion_consistency_radar/scripts/streaming_map_update.py \
@@ -200,26 +209,27 @@ python diffusion_consistency_radar/scripts/streaming_map_update.py \
   --output_dir Result/inference_results/streaming_map_fused
 ```
 
-Êä³öÎÄ¼ş£º
+è¾“å‡ºæ–‡ä»¶ï¼š
+
 - `streaming_metrics.csv`
 - `map_snapshot_*.npz`
 - `map_final.npz`
 
-## Îå¡¢³£¼ûÎÊÌâ
+## äº”ã€å¸¸è§é—®é¢˜
 
-### 1. CUDA ÏÔ´æ²»×ã
+### 1. CUDA æ˜¾å­˜ä¸è¶³
 
 ```bash
-# ½µµÍÑù±¾Êı
+# é™ä½æ ·æœ¬æ•°
 python diffusion_consistency_radar/scripts/inference.py ... --num_samples 1
 
-# Ê¹ÓÃ CPU
+# ä½¿ç”¨ CPU
 python diffusion_consistency_radar/scripts/inference.py ... --device cpu
 ```
 
-### 2. Ä£ĞÍÎÄ¼şÕÒ²»µ½
+### 2. æ¨¡å‹æ–‡ä»¶æ‰¾ä¸åˆ°
 
-ÇëºË¶ÔÊµ¼ÊÎÄ¼şÃû£º
+è¯·æ ¸å¯¹å®é™…æ–‡ä»¶åï¼š
 
 ```bash
 ls -lh Result/train_results/vae/vae_best.pt
@@ -227,32 +237,32 @@ ls -lh Result/train_results/ldm/ldm_best.pt
 ls -lh Result/train_results/cd/cd_best.pt
 ```
 
-### 3. ÍÆÀíËÙ¶ÈÂı
+### 3. æ¨ç†é€Ÿåº¦æ…¢
 
-- LDM£º¼õÉÙ `--steps`£¬»òÇĞ»» `--sampler euler`
-- CD£ºÓÅÏÈ 1 ²½»ò 2 ²½ÍÆÀí
+- LDMï¼šå‡å°‘ `--steps`ï¼Œæˆ–åˆ‡æ¢ `--sampler euler`
+- CDï¼šä¼˜å…ˆ 1 æ­¥æˆ– 2 æ­¥æ¨ç†
 
-### 4. Éú³ÉÖÊÁ¿²»¼Ñ
+### 4. ç”Ÿæˆè´¨é‡ä¸ä½³
 
-- LDM£ºÔö¼Ó `--steps`
-- CD£ºÊ¹ÓÃ 2 ²½»ò 4 ²½
-- ¶Ô±È²»Í¬ `--occ_threshold` ¹Û²ìµãÔÆÏ¡Êè³Ì¶È
+- LDMï¼šå¢åŠ  `--steps`
+- CDï¼šä½¿ç”¨ 2 æ­¥æˆ– 4 æ­¥
+- å¯¹æ¯”ä¸åŒ `--occ_threshold` è§‚å¯Ÿç‚¹äº‘ç¨€ç–ç¨‹åº¦
 
-## Áù¡¢ĞÔÄÜ¶Ô±È±í
+## å…­ã€æ€§èƒ½å¯¹æ¯”è¡¨
 
-ÏÂ±í½ö±íÊ¾µäĞÍÇ÷ÊÆ£¬¾ßÌåºÄÊ±È¡¾öÓÚ GPU¡¢ÊäÈë¹æÄ£Óë I/O£º
+ä¸‹è¡¨ä»…è¡¨ç¤ºå…¸å‹è¶‹åŠ¿ï¼Œå…·ä½“è€—æ—¶å–å†³äº GPUã€è¾“å…¥è§„æ¨¡ä¸ I/Oï¼š
 
-| Ä£ĞÍ | ²½Êı | ²ÉÑùÆ÷ | ËÙ¶ÈÇ÷ÊÆ | ÖÊÁ¿Ç÷ÊÆ | ÊÊÓÃ³¡¾° |
-|------|------|--------|----------|----------|----------|
-| LDM | 40 | Heun | ½ÏÂı | ½Ï¸ß | ÀëÏß¸ßÖÊÁ¿Éú³É |
-| LDM | 20 | Euler | ÖĞµÈ | ÖĞµÈ | ¿ìËÙÑéÖ¤ |
-| CD | 1 | Euler | ×î¿ì | ÖĞµÈ | ÔÚÏß¿ìËÙÍÆÀí |
-| CD | 2 | Euler | ¿ì | ½Ï¸ß | ÊµÊ±ÕÛÖĞ |
-| CD | 4 | Euler | ÖĞµÈ | ¸ß | ÖÊÁ¿ÓÅÏÈÔÚÏßÍÆÀí |
+| æ¨¡å‹ | æ­¥æ•° | é‡‡æ ·å™¨ | é€Ÿåº¦è¶‹åŠ¿ | è´¨é‡è¶‹åŠ¿ | é€‚ç”¨åœºæ™¯         |
+| ---- | ---- | ------ | -------- | -------- | ---------------- |
+| LDM  | 40   | Heun   | è¾ƒæ…¢     | è¾ƒé«˜     | ç¦»çº¿é«˜è´¨é‡ç”Ÿæˆ   |
+| LDM  | 20   | Euler  | ä¸­ç­‰     | ä¸­ç­‰     | å¿«é€ŸéªŒè¯         |
+| CD   | 1    | Euler  | æœ€å¿«     | ä¸­ç­‰     | åœ¨çº¿å¿«é€Ÿæ¨ç†     |
+| CD   | 2    | Euler  | å¿«       | è¾ƒé«˜     | å®æ—¶æŠ˜ä¸­         |
+| CD   | 4    | Euler  | ä¸­ç­‰     | é«˜       | è´¨é‡ä¼˜å…ˆåœ¨çº¿æ¨ç† |
 
-## Æß¡¢ÅúÁ¿ÍÆÀí
+## ä¸ƒã€æ‰¹é‡æ¨ç†
 
-ÓÃÓÚÉú³É¾ÛºÏÑù±¾ÎÄ¼ş£¨±ãÓÚ¿ÉÊÓ»¯»òÀëÏß·ÖÎö£©£º
+ç”¨äºç”Ÿæˆèšåˆæ ·æœ¬æ–‡ä»¶ï¼ˆä¾¿äºå¯è§†åŒ–æˆ–ç¦»çº¿åˆ†æï¼‰ï¼š
 
 ```bash
 python diffusion_consistency_radar/scripts/inference.py \
@@ -276,9 +286,9 @@ python diffusion_consistency_radar/scripts/inference.py \
   --output_dir Result/inference_results/cd_batch
 ```
 
-## °Ë¡¢Êä³öÊı¾İ¸ñÊ½
+## å…«ã€è¾“å‡ºæ•°æ®æ ¼å¼
 
-### 1. ÅúÁ¿Ñù±¾Ä£Ê½Êä³ö
+### 1. æ‰¹é‡æ ·æœ¬æ¨¡å¼è¾“å‡º
 
 `<model_type>_samples_<steps>steps.npy`
 
@@ -289,20 +299,21 @@ data = np.load('Result/inference_results/cd/cd_samples_1steps.npy')
 print(data.shape)  # (num_samples, 4, 32, 128, 128)
 ```
 
-Í¨µÀË³Ğò£º
+é€šé“é¡ºåºï¼š
+
 - `0`: Occupancy
 - `1`: Intensity
 - `2`: Doppler
 - `3`: Variance
 
-### 2. ÖğÎÄ¼şÍÆÀíÄ£Ê½Êä³ö
+### 2. é€æ–‡ä»¶æ¨ç†æ¨¡å¼è¾“å‡º
 
-- `*_pcl.npy`£ºµãÔÆ `(N, 4)`£¬ÁĞÎª `x, y, z, intensity`
-- `*_voxel.npy`£ºÌåËØ£¨ÆôÓÃ `--save_voxel`£©
-- `comparison_metrics.csv`£ºChamfer ¶Ô±ÈÖ¸±ê£¨ÆôÓÃ¶Ô±ÈÊ±£©
+- `*_pcl.npy`ï¼šç‚¹äº‘ `(N, 4)`ï¼Œåˆ—ä¸º `x, y, z, intensity`
+- `*_voxel.npy`ï¼šä½“ç´ ï¼ˆå¯ç”¨ `--save_voxel`ï¼‰
+- `comparison_metrics.csv`ï¼šChamfer å¯¹æ¯”æŒ‡æ ‡ï¼ˆå¯ç”¨å¯¹æ¯”æ—¶ï¼‰
 
-## ¾Å¡¢ÏÂÒ»²½
+## ä¹ã€ä¸‹ä¸€æ­¥
 
-- Ê¹ÓÃ `scripts/evaluate.py` ×öÏµÍ³»¯ÀëÏßÆÀ¹À¡£
-- ½«ÍÆÀíÊä³ö½ÓÈë `scripts/streaming_map_update.py` ×öÔÚÏßµØÍ¼¸üĞÂÑéÖ¤¡£
-- »ùÓÚÊµ¼Ê³¡¾°µ÷½Ú `steps/sampler/occ_threshold`£¬ĞÎ³ÉÎÈ¶¨²ÎÊıÅäÖÃ¡£
+- ä½¿ç”¨ `scripts/evaluate.py` åšç³»ç»ŸåŒ–ç¦»çº¿è¯„ä¼°ã€‚
+- å°†æ¨ç†è¾“å‡ºæ¥å…¥ `scripts/streaming_map_update.py` åšåœ¨çº¿åœ°å›¾æ›´æ–°éªŒè¯ã€‚
+- åŸºäºå®é™…åœºæ™¯è°ƒèŠ‚ `steps/sampler/occ_threshold`ï¼Œå½¢æˆç¨³å®šå‚æ•°é…ç½®ã€‚

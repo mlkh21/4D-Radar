@@ -30,16 +30,36 @@ from diffusion_consistency_radar.scripts.unified_train import (
     LDM_VALIDATION_SELECTOR,
     OptimizedVAETrainer,
     OptimizedLDMTrainer,
+    assert_formal_dataset_preflight,
     atomic_copy_file,
     atomic_torch_save,
     decoded_occupancy_auxiliary_loss,
     temporal_block_split_indices,
     seed_training_run,
     micro_occupancy_metrics,
+    is_formal_multimodal_training,
+    resolve_training_data_protocol,
 )
+from diffusion_consistency_radar.dataset_manifest import sha256_json_value
 
 
 class VAECheckpointProtocolTest(unittest.TestCase):
+    @staticmethod
+    def _data_protocol():
+        return {
+            "protocol": "formal_data_v2",
+            "dataset_manifest_sha256": {"garden": "a" * 64},
+            "split_artifact_sha256": "b" * 64,
+            "target_policy_sha256": {"garden": "c" * 64},
+            "observed_mask_sha256": {"garden": "d" * 64},
+            "observed_mask_protocol": "lidar_ray_observed_v1",
+            "calibration_sha256": {
+                "lidar_to_thermal": "e" * 64,
+                "thermal_intrinsics": "f" * 64,
+            },
+            "radar_ir_sync_sha256": {"garden": "1" * 64},
+        }
+
     @staticmethod
     def _radar_normalization_spec():
         return {
@@ -96,6 +116,123 @@ class VAECheckpointProtocolTest(unittest.TestCase):
     def test_training_seed_rejects_negative_values(self):
         with self.assertRaisesRegex(ValueError, "training_seed"):
             seed_training_run(-1)
+
+    def test_formal_mini_v2_uses_formal_gates_and_binds_selection(self):
+        config = {
+            "checkpoint_protocol": "formal_mini_chain_v2",
+            "data_protocol_path": "/tmp/formal_data.json",
+            "temporal_split_artifact": "/tmp/split.json",
+            "dataset_dir": "/tmp/dataset",
+            "scene_names": ["garden"],
+            "mini_train_frames_per_scene": 8,
+            "mini_validation_frames_per_scene": 4,
+        }
+        with mock.patch(
+            "diffusion_consistency_radar.scripts.unified_train."
+            "load_formal_data_protocol_artifact",
+            return_value=(self._data_protocol(), "9" * 64),
+        ):
+            protocol = resolve_training_data_protocol(config, "vae")
+
+        self.assertTrue(
+            is_formal_multimodal_training(
+                "formal_mini_chain_v2",
+                allow_legacy_radar_units=False,
+            )
+        )
+        self.assertEqual(
+            protocol["mini_selection"],
+            {
+                "protocol": "formal_mini_selection_v1",
+                "strategy": "ordered_prefix_per_scene",
+                "train_frames_per_scene": 8,
+                "validation_frames_per_scene": 4,
+            },
+        )
+
+    def test_full_formal_chain_rejects_hidden_mini_limits(self):
+        config = {
+            "checkpoint_protocol": "formal_chain_v2",
+            "data_protocol": self._data_protocol(),
+            "mini_train_frames_per_scene": 8,
+            "mini_validation_frames_per_scene": 4,
+        }
+        with self.assertRaisesRegex(ValueError, "禁止隐式截断"):
+            resolve_training_data_protocol(config, "vae")
+
+    def test_formal_preflight_cross_checks_manifest_provenance(self):
+        """正式训练不得只比 manifest 总 hash 而忽略协议中重复声明的关键来源。"""
+        protocol = self._data_protocol()
+        observed_records = [
+            {
+                "frame_id": "000000",
+                "path": "observed_mask/000000.npz",
+                "size": 1,
+                "sha256": "8" * 64,
+            }
+        ]
+        protocol["observed_mask_sha256"]["garden"] = sha256_json_value(
+            observed_records
+        )
+        manifest = {
+            "content_sha256": protocol["dataset_manifest_sha256"]["garden"],
+            "preprocessing": {
+                "provenance": {
+                    "target_policy": {
+                        "sha256": protocol["target_policy_sha256"]["garden"]
+                    },
+                    "radar_ir_sync": {
+                        "sha256": protocol["radar_ir_sync_sha256"]["garden"]
+                    },
+                    "lidar_to_thermal": {
+                        "sha256": protocol["calibration_sha256"]["lidar_to_thermal"]
+                    },
+                    "thermal_intrinsics": {
+                        "sha256": protocol["calibration_sha256"]["thermal_intrinsics"]
+                    },
+                }
+            },
+            "modalities": {"observed_mask": observed_records},
+        }
+        sample = (
+            torch.zeros(1),
+            torch.zeros(1),
+            {
+                "is_mock_ir": False,
+                "is_mock_calib": False,
+                "extrinsic_source_frame": "lidar",
+                "occupancy_observed_mask_source": "persisted_lidar_ray_v1",
+                "radar_statistics": [
+                    {
+                        "protocol": "radar_point_count_doppler_validity_v1",
+                        "occupied_voxels": 1,
+                        "total_point_count": 1,
+                        "total_doppler_valid_count": 1,
+                    }
+                ],
+            },
+        )
+        with mock.patch(
+            "diffusion_consistency_radar.scripts.unified_train.validate_scene_manifest",
+            return_value=manifest,
+        ):
+            assert_formal_dataset_preflight(
+                [sample],
+                dataset_root="/unused",
+                scene_names=["garden"],
+                data_protocol=protocol,
+            )
+
+            manifest["preprocessing"]["provenance"]["radar_ir_sync"][
+                "sha256"
+            ] = "9" * 64
+            with self.assertRaisesRegex(RuntimeError, "Radar-IR sync"):
+                assert_formal_dataset_preflight(
+                    [sample],
+                    dataset_root="/unused",
+                    scene_names=["garden"],
+                    data_protocol=protocol,
+                )
 
     def test_lightweight_preset_keeps_historical_architecture(self):
         config = create_lightweight_vae_config()
@@ -298,6 +435,7 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             "model_pc_range": [0, -20, -6, 40, 20, 10],
         }
         trainer.occupancy_activation = "sigmoid"
+        trainer.data_protocol = self._data_protocol()
 
         payload = trainer._checkpoint_payload(
             epoch=3,
@@ -321,16 +459,17 @@ class VAECheckpointProtocolTest(unittest.TestCase):
         self.assertTrue(required.issubset(payload))
         self.assertEqual(payload["vae_config"], config)
         self.assertEqual(payload["best_iou"], 0.6)
-        self.assertEqual(payload["checkpoint_protocol"], "formal_chain_v1")
+        self.assertEqual(payload["checkpoint_protocol"], "formal_chain_v2")
+        self.assertEqual(payload["data_protocol"], self._data_protocol())
         self.assertEqual(payload["stage"], "vae")
         self.assertNotIn("radar_normalization", payload)
         self.assertNotIn("radar_normalization_sha256", payload)
 
-        trainer.checkpoint_protocol = "formal_mini_chain_v1"
+        trainer.checkpoint_protocol = "formal_mini_chain_v2"
         mini_payload = trainer._checkpoint_payload(3, 0.4, 0.3, 0.6)
         self.assertEqual(
             mini_payload["checkpoint_protocol"],
-            "formal_mini_chain_v1",
+            "formal_mini_chain_v2",
         )
 
     def test_ldm_checkpoint_payload_contains_chain_metadata(self):
@@ -371,10 +510,12 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             "denoising_latent_loss": 0.35,
             "denoising_occupancy_iou": 0.55,
         }
+        trainer.data_protocol = self._data_protocol()
 
         payload = trainer._checkpoint_payload(epoch=1, loss=0.2, best_loss=0.2)
 
-        self.assertEqual(payload["checkpoint_protocol"], "formal_chain_v1")
+        self.assertEqual(payload["checkpoint_protocol"], "formal_chain_v2")
+        self.assertEqual(payload["data_protocol"], self._data_protocol())
         self.assertEqual(payload["stage"], "ldm")
         self.assertEqual(payload["vae_checkpoint_sha256"], "a" * 64)
         self.assertEqual(payload["model_config"]["fusion_voxel_shape"], [4, 8, 8])
@@ -384,11 +525,11 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             payload["ldm_validation"]["selector"], LDM_VALIDATION_SELECTOR
         )
 
-        trainer.checkpoint_protocol = "formal_mini_chain_v1"
+        trainer.checkpoint_protocol = "formal_mini_chain_v2"
         mini_payload = trainer._checkpoint_payload(epoch=1, loss=0.2, best_loss=0.2)
         self.assertEqual(
             mini_payload["checkpoint_protocol"],
-            "formal_mini_chain_v1",
+            "formal_mini_chain_v2",
         )
 
     def test_ldm_resume_rejects_normalization_before_loading_model_state(self):
@@ -434,6 +575,7 @@ class VAECheckpointProtocolTest(unittest.TestCase):
         trainer.vae_config_type = "ultra_lightweight"
         trainer.data_grid_config = {}
         trainer.occupancy_activation = "sigmoid"
+        trainer.data_protocol = self._data_protocol()
         trainer.best_loss = 1.0
         trainer.best_iou = 0.2
 
@@ -465,6 +607,7 @@ class VAECheckpointProtocolTest(unittest.TestCase):
         trainer.vae_config_type = "ultra_lightweight"
         trainer.data_grid_config = {}
         trainer.occupancy_activation = "sigmoid"
+        trainer.data_protocol = self._data_protocol()
 
         payload = trainer._checkpoint_payload(2, 0.8, 0.8, 0.4)
 
@@ -486,6 +629,9 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             "scheduler_state_dict": source_scheduler.state_dict(),
             "best_loss": 0.7,
             "best_iou": 0.5,
+            "checkpoint_protocol": "formal_chain_v2",
+            "stage": "vae",
+            "data_protocol": self._data_protocol(),
         }
 
         trainer = OptimizedVAETrainer.__new__(OptimizedVAETrainer)
@@ -495,6 +641,8 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             trainer.optimizer, T_max=10
         )
         trainer.device = torch.device("cpu")
+        trainer.checkpoint_protocol = "formal_chain_v2"
+        trainer.data_protocol = self._data_protocol()
         with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
             torch.save(checkpoint, handle.name)
             trainer._resume_from_checkpoint(handle.name)
@@ -508,7 +656,7 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             source_optimizer.param_groups[0]["lr"],
         )
 
-    def test_legacy_resume_advances_scheduler_without_resetting_lr(self):
+    def test_legacy_resume_is_rejected_before_optimizer_state_is_loaded(self):
         config = create_ultra_lightweight_vae_config()
         source_model = VAE3D(**config)
         source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=0.03)
@@ -526,13 +674,16 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             trainer.optimizer, T_max=10
         )
         trainer.device = torch.device("cpu")
+        trainer.checkpoint_protocol = "formal_chain_v2"
+        trainer.data_protocol = self._data_protocol()
 
         with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
             torch.save(checkpoint, handle.name)
-            trainer._resume_from_checkpoint(handle.name)
+            with self.assertRaisesRegex(ValueError, "checkpoint_protocol|data_protocol"):
+                trainer._resume_from_checkpoint(handle.name)
 
-        self.assertEqual(trainer.scheduler.last_epoch, 3)
-        self.assertEqual(trainer.optimizer.param_groups[0]["lr"], 0.03)
+        self.assertEqual(trainer.scheduler.last_epoch, 0)
+        self.assertEqual(trainer.optimizer.param_groups[0]["lr"], 0.1)
 
     def test_atomic_save_and_alias_leave_no_temp_and_same_content(self):
         with tempfile.TemporaryDirectory() as tmpdir:

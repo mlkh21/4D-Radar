@@ -18,11 +18,32 @@ if ROOT not in sys.path:
 from NTU4DRadLM_pre_processing.motion_protocol import (
     load_recorded_velocity_table,
     resolve_frame_velocity,
+    sensor_to_reference_motion_delta,
     transform_velocity,
 )
 
 
 class PreprocessingMotionProtocolTest(unittest.TestCase):
+    def test_only_non_reference_sensor_receives_signed_motion_delta(self):
+        radar_timestamp = 10.00
+        lidar_timestamp = 10.04
+        self.assertAlmostEqual(
+            sensor_to_reference_motion_delta(radar_timestamp, lidar_timestamp),
+            -0.04,
+        )
+        self.assertEqual(
+            sensor_to_reference_motion_delta(lidar_timestamp, lidar_timestamp),
+            0.0,
+        )
+        self.assertEqual(
+            sensor_to_reference_motion_delta(radar_timestamp, radar_timestamp),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            sensor_to_reference_motion_delta(lidar_timestamp, radar_timestamp),
+            0.04,
+        )
+
     def test_none_mode_never_invents_a_velocity(self):
         self.assertIsNone(
             resolve_frame_velocity(

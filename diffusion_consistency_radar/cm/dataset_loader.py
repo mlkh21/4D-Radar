@@ -10,6 +10,17 @@ import logging
 from typing import Dict, Optional, Sequence, Tuple
 
 try:
+    from ..observed_mask import (
+        build_lidar_observed_mask,
+        load_observed_mask,
+    )
+except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加入 sys.path 的旧脚本
+    from observed_mask import (  # type: ignore
+        build_lidar_observed_mask,
+        load_observed_mask,
+    )
+
+try:
     from ..radar_normalization import (
         LEGACY_RADAR_NORMALIZATION_PROTOCOL,
         RADAR_NORMALIZATION_PROTOCOL,
@@ -26,6 +37,19 @@ except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加�
         apply_radar_normalization,
         validate_radar_normalization_sha256,
         validate_radar_normalization_spec,
+    )
+
+try:
+    from ..radar_statistics import (
+        RADAR_STATISTICS_PROTOCOL,
+        load_sparse_radar_voxel,
+        validate_sparse_radar_statistics,
+    )
+except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加入 sys.path 的旧脚本
+    from radar_statistics import (  # type: ignore
+        RADAR_STATISTICS_PROTOCOL,
+        load_sparse_radar_voxel,
+        validate_sparse_radar_statistics,
     )
 
 try:
@@ -46,7 +70,6 @@ EPS = 1e-6
 DEFAULT_PC_RANGE = (0.0, -20.0, -6.0, 120.0, 20.0, 10.0)
 DEFAULT_TARGET_SIZE = (32, 128, 128)
 THERMAL_OUTPUT_SIZE = (640, 480)  # (width, height)，与模型 IR 输入一致
-LEGACY_SYNC_DISPLACEMENT_X_M = 0.01
 DEFAULT_THERMAL_K = np.asarray(
     [[457.2, 0.0, 323.1], [0.0, 457.9, 242.5], [0.0, 0.0, 1.0]],
     dtype=np.float32,
@@ -72,6 +95,25 @@ def _read_calibration_txt(path: str) -> Tuple[Optional[torch.Tensor], Optional[t
     r_mat = torch.tensor(r_vals, dtype=torch.float32).view(3, 3) if r_vals and len(r_vals) == 9 else None
     t_vec = torch.tensor(t_vals, dtype=torch.float32) if t_vals and len(t_vals) == 3 else None
     return r_mat, t_vec
+
+
+def _validate_extrinsic(
+    r_mat: torch.Tensor,
+    t_vec: torch.Tensor,
+    *,
+    path: str,
+) -> None:
+    """拒绝非有限、非旋转或维度错误的外参。"""
+    if tuple(r_mat.shape) != (3, 3) or tuple(t_vec.shape) != (3,):
+        raise ValueError(f"外参 R/T 维度无效: {path}")
+    if not torch.isfinite(r_mat).all() or not torch.isfinite(t_vec).all():
+        raise ValueError(f"外参 R/T 含非有限数: {path}")
+    identity = torch.eye(3, dtype=r_mat.dtype)
+    if not torch.allclose(r_mat @ r_mat.T, identity, atol=5e-3, rtol=0.0):
+        raise ValueError(f"外参 R 不是正交旋转矩阵: {path}")
+    determinant = float(torch.det(r_mat))
+    if abs(determinant - 1.0) > 5e-3:
+        raise ValueError(f"外参 R determinant 必须接近 1，实际为 {determinant}: {path}")
 
 
 def _read_thermal_camera_calibration(path: str):
@@ -115,33 +157,37 @@ def _read_thermal_camera_calibration(path: str):
     }
 
 
-def apply_legacy_sync_compensation(
-    t_vec: torch.Tensor,
-    displacement_x_m: float = LEGACY_SYNC_DISPLACEMENT_X_M,
-) -> torch.Tensor:
-    """统一应用历史固定同步位移，返回副本且不修改输入张量。"""
-    result = torch.as_tensor(t_vec).clone()
-    if result.shape[-1:] != (3,):
-        raise ValueError(f"t_vec 最后一维必须是 3，当前为 {tuple(result.shape)}")
-    displacement = float(displacement_x_m)
-    if not np.isfinite(displacement):
-        raise ValueError("同步位移必须是有限数")
-    result[..., 0] += displacement
-    return result
-
-
 class CalibrationProvider:
-    """加载数据集标定，并显式区分真实 thermal 外参与 fallback。"""
+    """按体素坐标系加载 IR 外参，并显式区分正式标定与 fallback。"""
 
-    def __init__(self, root_dir: str):
+    def __init__(
+        self,
+        root_dir: str,
+        calibration_dir: Optional[str] = None,
+        *,
+        require_real: bool = False,
+        voxel_coordinate_frame: str = "lidar",
+    ):
         self.root_dir = root_dir
-        candidates = [
-            os.path.join(root_dir, "config"),
-            os.path.join(os.path.dirname(root_dir), "config"),
-        ]
-        project_data = os.path.abspath(os.path.join(os.getcwd(), "Data"))
-        if os.path.abspath(root_dir).startswith(project_data):
-            candidates.append(os.path.join(project_data, "config"))
+        self.require_real = bool(require_real)
+        self.voxel_coordinate_frame = str(voxel_coordinate_frame).strip().lower()
+        if self.voxel_coordinate_frame not in ("lidar", "radar"):
+            raise ValueError("voxel_coordinate_frame 必须是 lidar 或 radar")
+        if self.require_real and not calibration_dir:
+            raise ValueError("正式标定模式必须显式提供 calibration_dir")
+        if calibration_dir:
+            calibration_dir = os.path.abspath(os.fspath(calibration_dir))
+            if os.path.islink(calibration_dir) or not os.path.isdir(calibration_dir):
+                raise ValueError(f"calibration_dir 必须是普通目录: {calibration_dir}")
+            candidates = [calibration_dir]
+        else:
+            candidates = [
+                os.path.join(root_dir, "config"),
+                os.path.join(os.path.dirname(root_dir), "config"),
+            ]
+            project_data = os.path.abspath(os.path.join(os.getcwd(), "Data"))
+            if os.path.abspath(root_dir).startswith(project_data):
+                candidates.append(os.path.join(project_data, "config"))
         self.config_dirs = []
         for path in candidates:
             if path not in self.config_dirs:
@@ -152,6 +198,7 @@ class CalibrationProvider:
             path = os.path.join(config_dir, name)
             r_mat, t_vec = _read_calibration_txt(path)
             if r_mat is not None and t_vec is not None:
+                _validate_extrinsic(r_mat, t_vec, path=path)
                 return r_mat, t_vec, path
         return None, None, ""
 
@@ -167,8 +214,8 @@ class CalibrationProvider:
     def load_with_metadata(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
         """返回 IR 投影可用标定和来源信息。
 
-        只有 radar-to-thermal 外参可以作为真实 IR 标定。radar-to-livox
-        外参只记录存在性，不再冒充 thermal 外参参与红外投影。
+        LiDAR 对齐体素只允许 LiDAR-to-Thermal；Radar 对齐的 legacy 数据才使用
+        Radar-to-Thermal。时间补偿不在此处修改外参，统一由预处理负责。
         """
         thermal_intrinsics = self._try_read_thermal_intrinsics()
         if thermal_intrinsics is None:
@@ -184,15 +231,63 @@ class CalibrationProvider:
             thermal_intrinsics_source = "calib_cam_thermal.txt"
             thermal_intrinsics_path = thermal_intrinsics["path"]
         k_mat = torch.from_numpy(k_np.copy()).float()
-        thermal_r, thermal_t, thermal_path = self._try_read_named_calib("calib_radar_to_thermal.txt")
+        extrinsic_name = (
+            "calib_livox_to_thermal.txt"
+            if self.voxel_coordinate_frame == "lidar"
+            else "calib_radar_to_thermal.txt"
+        )
+        thermal_r, thermal_t, thermal_path = self._try_read_named_calib(extrinsic_name)
         livox_r, livox_t, livox_path = self._try_read_named_calib("calib_radar_to_livox.txt")
         has_livox = livox_r is not None and livox_t is not None
+        lidar_thermal_r, lidar_thermal_t, _lidar_thermal_path = (
+            self._try_read_named_calib("calib_livox_to_thermal.txt")
+        )
+        radar_thermal_r, radar_thermal_t, _radar_thermal_path = (
+            self._try_read_named_calib("calib_radar_to_thermal.txt")
+        )
+        closure_available = all(
+            value is not None
+            for value in (
+                livox_r,
+                livox_t,
+                lidar_thermal_r,
+                lidar_thermal_t,
+                radar_thermal_r,
+                radar_thermal_t,
+            )
+        )
+        if closure_available:
+            composed_r = lidar_thermal_r @ livox_r
+            composed_t = lidar_thermal_r @ livox_t + lidar_thermal_t
+            closure_rotation_max_abs = float(
+                torch.max(torch.abs(composed_r - radar_thermal_r))
+            )
+            closure_translation_l2_m = float(
+                torch.linalg.vector_norm(composed_t - radar_thermal_t)
+            )
+        else:
+            closure_rotation_max_abs = -1.0
+            closure_translation_l2_m = -1.0
+        closure_metadata = {
+            "calibration_closure_available": bool(closure_available),
+            "calibration_closure_rotation_max_abs": closure_rotation_max_abs,
+            "calibration_closure_translation_l2_m": closure_translation_l2_m,
+            "calibration_closure_composition": (
+                "radar_to_livox_then_livox_to_thermal"
+            ),
+        }
+        if self.require_real and thermal_intrinsics is None:
+            raise RuntimeError(
+                "正式 IR 标定缺失或格式无效: calib_cam_thermal.txt"
+            )
         if thermal_r is not None and thermal_t is not None:
             metadata = {
                 "is_mock_calib": False,
-                "calib_source": "calib_radar_to_thermal.txt",
+                "calib_source": extrinsic_name,
                 "calib_path": thermal_path,
                 "calib_is_thermal": True,
+                "extrinsic_source_frame": self.voxel_coordinate_frame,
+                "extrinsic_target_frame": "thermal_camera",
                 "has_thermal_calib": True,
                 "has_livox_calib": bool(has_livox),
                 "livox_calib_path": livox_path,
@@ -204,8 +299,17 @@ class CalibrationProvider:
                 "thermal_intrinsics_source": thermal_intrinsics_source,
                 "thermal_intrinsics_path": thermal_intrinsics_path,
                 "has_thermal_intrinsics": thermal_intrinsics is not None,
+                **closure_metadata,
             }
             return thermal_r, thermal_t, k_mat, metadata
+
+        if self.require_real:
+            missing = [extrinsic_name]
+            if thermal_intrinsics is None:
+                missing.append("calib_cam_thermal.txt")
+            raise RuntimeError(
+                "正式 IR 标定缺失或格式无效: " + ", ".join(missing)
+            )
 
         fallback_reason = (
             "thermal_missing_livox_available_not_used_for_ir"
@@ -217,6 +321,8 @@ class CalibrationProvider:
             "calib_source": "mock_default",
             "calib_path": "",
             "calib_is_thermal": False,
+            "extrinsic_source_frame": self.voxel_coordinate_frame,
+            "extrinsic_target_frame": "thermal_camera",
             "has_thermal_calib": False,
             "has_livox_calib": bool(has_livox),
             "livox_calib_path": livox_path,
@@ -228,6 +334,7 @@ class CalibrationProvider:
             "thermal_intrinsics_source": thermal_intrinsics_source,
             "thermal_intrinsics_path": thermal_intrinsics_path,
             "has_thermal_intrinsics": thermal_intrinsics is not None,
+            **closure_metadata,
         }
         return torch.eye(3, dtype=torch.float32), torch.zeros(3, dtype=torch.float32), k_mat, metadata
 
@@ -245,84 +352,6 @@ def load_sparse_voxel(filename):
     if coords.shape[0] > 0:
         voxel_grid[coords[:, 0], coords[:, 1], coords[:, 2]] = data['features']
     return voxel_grid
-
-
-def build_lidar_observed_mask(
-    lidar_voxel: np.ndarray,
-    pc_range: Sequence[float],
-    ray_step_fraction: float = 0.5,
-) -> np.ndarray:
-    """从 LiDAR occupied 端点沿传感器原点投射可见体素 mask。
-
-    返回轴序为 ``(X,Y,Z)`` 的 bool 数组。射线端点和端点前的体素均标记为
-    observed；没有 occupied 端点时返回全 False，避免把空体素误解释成 free。
-    该轻量实现只用于训练样本的监督 mask，不修改原始 target voxel。
-    """
-    voxel = np.asarray(lidar_voxel, dtype=np.float32)
-    if voxel.ndim != 4 or voxel.shape[-1] < 1:
-        raise ValueError(f"lidar_voxel 必须是 (X,Y,Z,C)，当前为 {voxel.shape}")
-    if not np.all(np.isfinite(voxel)):
-        raise ValueError("lidar_voxel 必须全部为有限数")
-    bounds = tuple(float(value) for value in pc_range)
-    if len(bounds) != 6 or not np.all(np.isfinite(bounds)):
-        raise ValueError(f"pc_range 必须包含 6 个有限数，当前为 {pc_range}")
-    if any(bounds[axis] >= bounds[axis + 3] for axis in range(3)):
-        raise ValueError(f"pc_range 上下界无效: {bounds}")
-    ray_step_fraction = float(ray_step_fraction)
-    if not np.isfinite(ray_step_fraction) or ray_step_fraction <= 0.0:
-        raise ValueError("ray_step_fraction 必须是正有限数")
-
-    observed = np.zeros(voxel.shape[:3], dtype=bool)
-    occupied = voxel[..., 0] > 0.5
-    occupied_coords = np.argwhere(occupied)
-    if occupied_coords.size == 0:
-        return observed
-
-    observed[tuple(occupied_coords.T)] = True
-    voxel_size = np.asarray(
-        [(bounds[axis + 3] - bounds[axis]) / voxel.shape[axis] for axis in range(3)],
-        dtype=np.float32,
-    )
-    origin = np.zeros(3, dtype=np.float32)
-    centers = np.asarray(bounds[:3], dtype=np.float32) + (
-        occupied_coords.astype(np.float32) + 0.5
-    ) * voxel_size
-    # 同一离散方向只保留最近端点，避免对遮挡后的共线点重复投射。
-    origin_index = np.floor(
-        (origin - np.asarray(bounds[:3], dtype=np.float32)) / voxel_size
-    ).astype(np.int64)
-    directions = occupied_coords.astype(np.int64) - origin_index
-    gcd = np.gcd.reduce(np.abs(directions), axis=1)
-    gcd[gcd == 0] = 1
-    normalized_directions = directions // gcd[:, np.newaxis]
-    distances = np.linalg.norm(centers - origin[np.newaxis, :], axis=1)
-    order = np.argsort(distances, kind="stable")
-    _, first_indices = np.unique(
-        normalized_directions[order], axis=0, return_index=True
-    )
-    selected = order[first_indices]
-    min_step = max(float(np.min(voxel_size)) * ray_step_fraction, 1e-6)
-
-    for endpoint in centers[selected]:
-        vector = endpoint - origin
-        distance = float(np.linalg.norm(vector))
-        step_count = max(1, int(np.ceil(distance / min_step)))
-        samples = origin + vector * (
-            np.arange(1, step_count + 1, dtype=np.float32)[:, np.newaxis]
-            / float(step_count)
-        )
-        indices = np.floor(
-            (samples - np.asarray(bounds[:3], dtype=np.float32)) / voxel_size
-        ).astype(np.int64)
-        valid = np.all(
-            (indices >= 0)
-            & (indices < np.asarray(voxel.shape[:3], dtype=np.int64)),
-            axis=1,
-        )
-        indices = indices[valid]
-        if indices.size:
-            observed[indices[:, 0], indices[:, 1], indices[:, 2]] = True
-    return observed
 
 
 def resize_voxel_channels(voxel_tensor: torch.Tensor, target_size, mask_channel: Optional[int] = None) -> torch.Tensor:
@@ -563,8 +592,8 @@ def collate_voxel_samples(batch):
     collated_metadata = {}
     for key in metadata_keys:
         values = [metadata[key] for metadata in metadata_items]
-        if key == "preprocess_policy":
-            # policy 是审计 provenance，允许保留合法 JSON null，不参与模型张量计算。
+        if key in ("preprocess_policy", "radar_statistics"):
+            # 审计 provenance 允许 JSON null/嵌套列表，不参与模型张量计算。
             collated_metadata[key] = values
         else:
             collated_metadata[key] = default_collate(values)
@@ -584,7 +613,13 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                  use_augmentation=True, augmentation_config=None, sequence_length=1,
                  target_size=DEFAULT_TARGET_SIZE, source_pc_range=DEFAULT_PC_RANGE,
                  model_pc_range=None, radar_normalization=None,
-                 radar_normalization_sha256=None, allow_legacy_radar_units=False):
+                 radar_normalization_sha256=None, allow_legacy_radar_units=False,
+                 scene_names=None, calibration_dir=None,
+                 require_real_ir=False, require_real_calibration=False,
+                 require_persisted_observed_mask=False,
+                 require_radar_statistics=False,
+                 frame_ids_by_scene=None,
+                 voxel_coordinate_frame="lidar"):
         """
         工业闭环重构版：完美支持独立场景内部时序滑窗、动态几何参数分发的多模态数据迭代器
         """
@@ -592,10 +627,44 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         self.transform = transform
         self.return_path = return_path
         self.alignment_size = alignment_size
-        self.samples = []  # (radar_seq_paths_list, target_path, ir_path, scene, lidar_path)
+        # 样本包含显式 observed mask 路径，避免正式训练运行时重建监督域。
+        self.samples = []  # (radar_seq, target, ir, scene, lidar, observed_mask)
         self.scene_policies: Dict[str, dict] = {}
         self.split = split
         self.seq_len = max(1, int(sequence_length))
+        self.require_real_ir = bool(require_real_ir)
+        self.require_real_calibration = bool(require_real_calibration)
+        self.require_persisted_observed_mask = bool(
+            require_persisted_observed_mask
+        )
+        if type(require_radar_statistics) is not bool:
+            raise ValueError("require_radar_statistics 必须是 bool")
+        self.require_radar_statistics = require_radar_statistics
+        self.radar_statistics_by_path: Dict[str, Dict[str, object]] = {}
+        self.frame_ids_by_scene = None
+        if frame_ids_by_scene is not None:
+            if not isinstance(frame_ids_by_scene, dict) or not frame_ids_by_scene:
+                raise ValueError("frame_ids_by_scene 必须是非空场景映射")
+            validated_frame_ids = {}
+            for frame_scene, frame_ids in frame_ids_by_scene.items():
+                if (
+                    not isinstance(frame_scene, str)
+                    or not frame_scene
+                    or os.path.basename(frame_scene) != frame_scene
+                    or not isinstance(frame_ids, (list, tuple))
+                    or not frame_ids
+                    or any(
+                        not isinstance(frame_id, str)
+                        or len(frame_id) != 6
+                        or not frame_id.isdigit()
+                        for frame_id in frame_ids
+                    )
+                    or len(set(frame_ids)) != len(frame_ids)
+                ):
+                    raise ValueError("frame_ids_by_scene 场景或 frame ID 无效")
+                validated_frame_ids[frame_scene] = tuple(frame_ids)
+            self.frame_ids_by_scene = validated_frame_ids
+        self.voxel_coordinate_frame = str(voxel_coordinate_frame).strip().lower()
         self.target_size = tuple(int(v) for v in target_size)
         self.source_pc_range = tuple(float(v) for v in source_pc_range)
         self.model_pc_range = tuple(
@@ -639,7 +708,12 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             self.radar_normalization_protocol = RADAR_NORMALIZATION_PROTOCOL
             self.legacy_radar_units = False
         self.ir_dir = os.path.join(root_dir, "ir_image")
-        self.calibration_provider = CalibrationProvider(root_dir)
+        self.calibration_provider = CalibrationProvider(
+            root_dir,
+            calibration_dir=calibration_dir,
+            require_real=self.require_real_calibration,
+            voxel_coordinate_frame=self.voxel_coordinate_frame,
+        )
 
         # 统一标定外参参数常驻（规避写死常量造成的域泄漏）
         self.default_K = torch.from_numpy(DEFAULT_THERMAL_K.copy()).float()
@@ -666,32 +740,85 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         # Only directories containing a complete radar/target pair participate
         # in train/validation scene splitting. Dataset-level config and other
         # auxiliary directories must not be treated as scenes.
-        scenes = sorted([
+        discovered_scenes = sorted([
             d for d in os.listdir(root_dir)
             if os.path.isdir(os.path.join(root_dir, d, "radar_voxel"))
             and os.path.isdir(os.path.join(root_dir, d, "target_voxel"))
         ])
-
-        if len(scenes) == 1:
-            target_scenes = scenes
+        if scene_names is not None:
+            if isinstance(scene_names, str):
+                scene_names = [scene_names]
+            target_scenes = [str(scene).strip() for scene in scene_names]
+            if (
+                not target_scenes
+                or len(set(target_scenes)) != len(target_scenes)
+                or any(not scene or os.path.basename(scene) != scene for scene in target_scenes)
+            ):
+                raise ValueError("scene_names 必须是非空、无重复的普通场景名列表")
+            missing_scenes = [
+                scene for scene in target_scenes if scene not in discovered_scenes
+            ]
+            if missing_scenes:
+                raise FileNotFoundError(f"显式场景不存在或模态不完整: {missing_scenes}")
+        elif self.require_real_ir or self.require_real_calibration:
+            raise ValueError("正式多模态 Dataset 必须显式提供 scene_names")
+        elif len(discovered_scenes) == 1:
+            target_scenes = discovered_scenes
             print(f"Warning: Only 1 scene found. Using it for {split}.")
         else:
-            split_idx = int(len(scenes) * 0.8)
+            split_idx = int(len(discovered_scenes) * 0.8)
             if split_idx == 0: split_idx = 1
-            target_scenes = scenes[:split_idx] if split == 'train' else scenes[split_idx:]
+            target_scenes = (
+                discovered_scenes[:split_idx]
+                if split == 'train'
+                else discovered_scenes[split_idx:]
+            )
 
         print(f"Loading {split} dataset from {len(target_scenes)} scenes: {target_scenes}")
+
+        if self.frame_ids_by_scene is not None and set(self.frame_ids_by_scene) != set(
+            target_scenes
+        ):
+            raise ValueError(
+                "frame_ids_by_scene 场景集合必须与 target scenes 精确一致"
+            )
+        collected_frame_ids = {scene: set() for scene in target_scenes}
 
         for scene in target_scenes:
             radar_voxel_dir = os.path.join(root_dir, scene, "radar_voxel")
             target_voxel_dir = os.path.join(root_dir, scene, "target_voxel")
+            observed_mask_dir = os.path.join(root_dir, scene, "observed_mask")
             ir_dir = os.path.join(root_dir, scene, "ir_image")
+            if self.require_persisted_observed_mask and not os.path.isdir(
+                observed_mask_dir
+            ):
+                raise FileNotFoundError(
+                    f"正式 Dataset 缺少 observed mask 目录: {observed_mask_dir}"
+                )
             policy_path = os.path.join(root_dir, scene, "preprocess_policy.json")
             if os.path.exists(policy_path):
                 with open(policy_path, "r", encoding="utf-8") as f:
                     self.scene_policies[scene] = json.load(f)
             else:
                 self.scene_policies[scene] = {}
+            policy_frame = self.scene_policies[scene].get("voxel_coordinate_frame")
+            if policy_frame is None:
+                policy_frame = self.scene_policies[scene].get("align_to")
+            if policy_frame is not None and policy_frame != self.voxel_coordinate_frame:
+                raise ValueError(
+                    f"场景 {scene} voxel frame={policy_frame!r} 与 Dataset "
+                    f"{self.voxel_coordinate_frame!r} 不一致"
+                )
+            policy_statistics_protocol = self.scene_policies[scene].get(
+                "radar_statistics_protocol"
+            )
+            if (
+                self.require_radar_statistics
+                and policy_statistics_protocol != RADAR_STATISTICS_PROTOCOL
+            ):
+                raise ValueError(
+                    f"场景 {scene} Radar statistics policy 缺失或协议不匹配"
+                )
 
             if not os.path.exists(radar_voxel_dir) or not os.path.exists(target_voxel_dir):
                 continue
@@ -708,6 +835,12 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 
                 # 对应当前最终切片截面时刻 (t) 的真值标签路径
                 target_f = files[i + self.seq_len - 1]
+                target_frame_id = os.path.splitext(target_f)[0]
+                if (
+                    self.frame_ids_by_scene is not None
+                    and target_frame_id not in self.frame_ids_by_scene[scene]
+                ):
+                    continue
                 target_path = os.path.join(target_voxel_dir, target_f)
 
                 # 原代码扩展名不一致兼容 HACK 逻辑
@@ -737,9 +870,58 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                     if not os.path.exists(lidar_path):
                         lidar_path = ""
 
+                observed_mask_path = os.path.join(
+                    observed_mask_dir,
+                    f"{target_frame_id}.npz",
+                )
+                if not os.path.exists(observed_mask_path):
+                    observed_mask_path = ""
+                if self.require_persisted_observed_mask and not observed_mask_path:
+                    raise FileNotFoundError(
+                        f"正式 Dataset 缺少 observed mask: scene={scene}, "
+                        f"frame={target_f}"
+                    )
+
                 if os.path.exists(target_path):
+                    if self.require_radar_statistics:
+                        for radar_path in radar_seq_paths:
+                            if not radar_path.endswith(".npz"):
+                                raise ValueError(
+                                    "正式 Radar statistics 只支持稀疏 NPZ: "
+                                    f"{radar_path}"
+                                )
+                            if radar_path not in self.radar_statistics_by_path:
+                                summary = validate_sparse_radar_statistics(radar_path)
+                                self.radar_statistics_by_path[radar_path] = {
+                                    **summary,
+                                    "frame_id": os.path.splitext(
+                                        os.path.basename(radar_path)
+                                    )[0],
+                                    "reference": (
+                                        "pre_augmentation_persisted_radar_voxel"
+                                    ),
+                                    "model_consumed": False,
+                                }
                     self.samples.append(
-                        (radar_seq_paths, target_path, ir_path, scene, lidar_path)
+                        (
+                            radar_seq_paths,
+                            target_path,
+                            ir_path,
+                            scene,
+                            lidar_path,
+                            observed_mask_path,
+                        )
+                    )
+                    collected_frame_ids[scene].add(target_frame_id)
+
+        if self.frame_ids_by_scene is not None:
+            for scene, expected_ids in self.frame_ids_by_scene.items():
+                missing = sorted(set(expected_ids) - collected_frame_ids[scene])
+                extra = sorted(collected_frame_ids[scene] - set(expected_ids))
+                if missing or extra:
+                    raise FileNotFoundError(
+                        f"Dataset 未精确收集 split frame: scene={scene}, "
+                        f"missing={missing}, extra={extra}"
                     )
 
         print(f"Found {len(self.samples)} temporal sliding-window samples for {split}.")
@@ -747,21 +929,16 @@ class NTU4DRadLM_VoxelDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _get_mock_calibration(
+    def _get_calibration(
         self,
-        velocity_m_s: float = 50.0,
-        dt_mu_s: float = 200.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
+        """读取与体素 frame 一致的标定；不在加载阶段伪造时间位移。"""
         r_mat, t_vec, k_mat, calib_meta = self.calibration_provider.load_with_metadata()
         if calib_meta["is_mock_calib"]:
             r_mat = self.R_cam_to_lidar.clone()
             t_vec = self.T_cam_to_lidar.clone()
-        displacement_x = float(velocity_m_s) * (float(dt_mu_s) / 1e6)
-        t_vec = apply_legacy_sync_compensation(t_vec, displacement_x)
         calib_meta = dict(calib_meta)
-        calib_meta["velocity_m_s"] = float(velocity_m_s)
-        calib_meta["dt_sync_us"] = float(dt_mu_s)
-        calib_meta["sync_displacement_x_m"] = float(displacement_x)
+        calib_meta["time_alignment_compensation"] = "preprocessing_signed_delta_only"
         return r_mat, t_vec, k_mat, calib_meta
 
     def _load_ir_tensor(
@@ -774,10 +951,19 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             return _resize_or_pad_ir_tensor(
                 torch.from_numpy(arr), calibration_metadata
             ), False
+        if self.require_real_ir:
+            raise FileNotFoundError(f"正式多模态样本缺少 IR 文件: {ir_path}")
         return _mock_ir_image(), True
 
     def __getitem__(self, idx):
-        radar_seq_paths, target_path, ir_path, scene, lidar_path = self.samples[idx]
+        (
+            radar_seq_paths,
+            target_path,
+            ir_path,
+            scene,
+            lidar_path,
+            observed_mask_path,
+        ) = self.samples[idx]
 
         # 无缝复原原本完全体的张量空间轴向变换流与重采样
         # 1. 加载并转换主监督真值体素
@@ -786,7 +972,14 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         else:
             target_voxel = np.load(target_path).astype(np.float32)
 
-        if lidar_path:
+        if observed_mask_path:
+            observed_mask_np = load_observed_mask(
+                observed_mask_path,
+                expected_shape=target_voxel.shape[:3],
+                expected_pc_range=self.source_pc_range,
+            )
+            observed_mask_source = "persisted_lidar_ray_v1"
+        elif lidar_path:
             if lidar_path.endswith('.npz'):
                 lidar_voxel = load_sparse_voxel(lidar_path)
             else:
@@ -831,10 +1024,35 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 
         # 2. 时序雷达滑窗包流式解析重采样
         radar_seq_tensors = []
+        radar_statistics = []
+        statistics_declared = (
+            self.scene_policies.get(scene, {}).get("radar_statistics_protocol")
+            == RADAR_STATISTICS_PROTOCOL
+        )
         for path in radar_seq_paths:
             if path.endswith('.npz'):
-                radar_voxel = load_sparse_voxel(path)
+                if self.require_radar_statistics or statistics_declared:
+                    radar_voxel, summary = load_sparse_radar_voxel(
+                        path,
+                        require_statistics=True,
+                    )
+                    radar_statistics.append(
+                        {
+                            **summary,
+                            "frame_id": os.path.splitext(os.path.basename(path))[0],
+                            # 摘要描述磁盘中的原始稀疏体素，不随数据增强变换。
+                            "reference": "pre_augmentation_persisted_radar_voxel",
+                            # 当前模型仍只消费原四通道 Radar tensor。
+                            "model_consumed": False,
+                        }
+                    )
+                else:
+                    radar_voxel = load_sparse_voxel(path)
             else:
+                if self.require_radar_statistics or statistics_declared:
+                    raise ValueError(
+                        f"Radar statistics policy 不允许稠密 NPY: {path}"
+                    )
                 radar_voxel = np.load(path).astype(np.float32)
 
             r_tensor = torch.from_numpy(radar_voxel).permute(3, 2, 0, 1)
@@ -847,7 +1065,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         radar_tensor = radar_seq_tensors[-1]
 
         # 3. 加载共享 thermal 标定，并按同一 K/D/S 协议准备红外图像
-        r_mat, t_vec, k_mat, calib_meta = self._get_mock_calibration()
+        r_mat, t_vec, k_mat, calib_meta = self._get_calibration()
         ir_img, is_mock_ir = self._load_ir_tensor(ir_path, calib_meta)
 
         # 完美保留：多模态双成对几何空间一致性增强
@@ -886,10 +1104,24 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             "thermal_output_size": calib_meta["thermal_output_size"],
             "thermal_distortion": calib_meta["thermal_distortion"],
             "has_thermal_intrinsics": bool(calib_meta["has_thermal_intrinsics"]),
-            "velocity_m_s": float(calib_meta["velocity_m_s"]),
-            "dt_sync_us": float(calib_meta["dt_sync_us"]),
-            "sync_displacement_x_m": float(calib_meta["sync_displacement_x_m"]),
+            "time_alignment_compensation": calib_meta["time_alignment_compensation"],
+            "extrinsic_source_frame": calib_meta["extrinsic_source_frame"],
+            "extrinsic_target_frame": calib_meta["extrinsic_target_frame"],
+            "calibration_closure_available": bool(
+                calib_meta["calibration_closure_available"]
+            ),
+            "calibration_closure_rotation_max_abs": float(
+                calib_meta["calibration_closure_rotation_max_abs"]
+            ),
+            "calibration_closure_translation_l2_m": float(
+                calib_meta["calibration_closure_translation_l2_m"]
+            ),
+            "calibration_closure_composition": calib_meta[
+                "calibration_closure_composition"
+            ],
+            "voxel_coordinate_frame": self.voxel_coordinate_frame,
             "preprocess_policy": self.scene_policies.get(scene, {}),
+            "radar_statistics": radar_statistics if radar_statistics else None,
             "model_pc_range": list(self.model_pc_range),
             "target_size": list(self.target_size),
             "radar_normalization_protocol": self.radar_normalization_protocol,

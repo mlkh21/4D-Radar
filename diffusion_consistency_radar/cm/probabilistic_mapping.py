@@ -19,6 +19,29 @@ import numpy as np
 EPS = 1e-6
 
 
+def compute_safety_distance_m(
+    speed_m_s: float,
+    reaction_time_s: float,
+    brake_deceleration_m_s2: float,
+    margin_m: float,
+) -> float:
+    """按反应距离、制动距离和余量计算最小安全查询距离。"""
+    values = np.asarray(
+        [speed_m_s, reaction_time_s, brake_deceleration_m_s2, margin_m],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("安全距离参数必须全部为有限数")
+    speed, reaction_time, brake_deceleration, margin = values.tolist()
+    if speed < 0.0 or reaction_time < 0.0 or brake_deceleration <= 0.0 or margin < 0.0:
+        raise ValueError("速度/反应时间/余量必须非负，制动减速度必须为正")
+    return float(
+        speed * reaction_time
+        + speed * speed / (2.0 * brake_deceleration)
+        + margin
+    )
+
+
 @dataclass
 class GridMapConfig:
     """2D grid map configuration."""
@@ -39,6 +62,8 @@ class GridMapConfig:
     radar_reliability: float = 0.75
     infrared_reliability: float = 0.65
     speed_m_s: float = 50.0
+    # 模型 evidence 可小于地图范围；范围外地图单元保持初始 unknown。
+    evidence_pc_range: Optional[Tuple[float, float, float, float, float, float]] = None
 
     def __post_init__(self) -> None:
         static_decay = float(self.decay_rate)
@@ -49,6 +74,34 @@ class GridMapConfig:
             raise ValueError("dynamic_decay_rate 必须是有限非负数")
         if not np.isfinite(float(self.speed_m_s)) or float(self.speed_m_s) <= 0.0:
             raise ValueError("speed_m_s 必须是有限正数")
+        map_range = np.asarray(
+            [self.x_min, self.y_min, self.z_min, self.x_max, self.y_max, self.z_max],
+            dtype=np.float64,
+        )
+        resolutions = np.asarray(
+            [self.x_resolution, self.y_resolution, self.z_resolution],
+            dtype=np.float64,
+        )
+        if (
+            not np.all(np.isfinite(map_range))
+            or not np.all(map_range[3:] > map_range[:3])
+            or not np.all(np.isfinite(resolutions))
+            or not np.all(resolutions > 0.0)
+        ):
+            raise ValueError("地图范围与分辨率必须是有效有限数")
+        if self.evidence_pc_range is None:
+            evidence_range = map_range
+        else:
+            evidence_range = np.asarray(self.evidence_pc_range, dtype=np.float64)
+            if evidence_range.shape != (6,) or not np.all(np.isfinite(evidence_range)):
+                raise ValueError("evidence_pc_range 必须包含 6 个有限数")
+            if not np.all(evidence_range[3:] > evidence_range[:3]):
+                raise ValueError("evidence_pc_range 上下界无效")
+            if not np.allclose(evidence_range[:3], map_range[:3], atol=1e-9, rtol=0.0):
+                raise ValueError("当前地图协议要求 evidence 与 map 使用相同最小边界")
+            if np.any(evidence_range[3:] > map_range[3:] + 1e-9):
+                raise ValueError("evidence_pc_range 必须完全位于地图范围内")
+        self.evidence_pc_range = tuple(float(value) for value in evidence_range)
         # Faster flight leaves fewer frames inside the same local volume, so the
         # map should forget stale observations sooner and keep a shorter window.
         speed_scale = float(np.clip(self.speed_m_s / 50.0, 0.5, 2.0))
@@ -68,6 +121,24 @@ class GridMapConfig:
         nx, ny = self.shape_xy
         nz = int(round((self.z_max - self.z_min) / self.z_resolution))
         return nx, ny, nz
+
+    @property
+    def evidence_shape_xyz(self) -> Tuple[int, int, int]:
+        """返回模型 evidence 按地图分辨率对应的源体素尺寸。"""
+        values = []
+        resolutions = (self.x_resolution, self.y_resolution, self.z_resolution)
+        for axis, resolution in enumerate(resolutions):
+            span = self.evidence_pc_range[axis + 3] - self.evidence_pc_range[axis]
+            cells = int(round(span / resolution))
+            if cells <= 0 or not np.isclose(
+                cells * resolution,
+                span,
+                atol=1e-6,
+                rtol=0.0,
+            ):
+                raise ValueError("evidence_pc_range 不能被地图分辨率整除")
+            values.append(cells)
+        return tuple(values)
 
 
 class DSEvidenceFusion:
@@ -139,6 +210,10 @@ class SlidingProbabilisticGridMap:
 
         self.last_timestamp = 0.0
         self.last_T_local_body = np.eye(4, dtype=np.float32)
+        self.last_T_body_voxel = np.eye(4, dtype=np.float32)
+        self.last_T_local_voxel = np.eye(4, dtype=np.float32)
+        self.last_pose_contract = "identity_legacy"
+        self.last_body_pose_available = False
         self._has_voxel_update = False
         self.history: Deque[Dict[str, np.ndarray]] = deque(maxlen=self.cfg.window_size)
         self.ds_fuser = DSEvidenceFusion()
@@ -299,20 +374,23 @@ class SlidingProbabilisticGridMap:
         )
 
     @staticmethod
-    def _validated_pose(T_local_body: Optional[np.ndarray]) -> np.ndarray:
-        """校验 body→local 的齐次刚体变换；缺省为兼容用单位变换。"""
-        if T_local_body is None:
+    def _validated_pose(
+        transform_value: Optional[np.ndarray],
+        label: str = "T_local_body",
+    ) -> np.ndarray:
+        """校验命名刚体变换；缺省为兼容用单位变换。"""
+        if transform_value is None:
             return np.eye(4, dtype=np.float32)
-        transform = np.asarray(T_local_body, dtype=np.float64)
+        transform = np.asarray(transform_value, dtype=np.float64)
         if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
-            raise ValueError("T_local_body 必须是有限的 4x4 齐次刚体矩阵")
+            raise ValueError(f"{label} 必须是有限的 4x4 齐次刚体矩阵")
         if not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6):
-            raise ValueError("T_local_body 最后一行必须为 [0,0,0,1]")
+            raise ValueError(f"{label} 最后一行必须为 [0,0,0,1]")
         rotation = transform[:3, :3]
         if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5):
-            raise ValueError("T_local_body 旋转部分必须正交")
+            raise ValueError(f"{label} 旋转部分必须正交")
         if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5):
-            raise ValueError("T_local_body 旋转部分必须是 det=+1 的右手旋转")
+            raise ValueError(f"{label} 旋转部分必须是 det=+1 的右手旋转")
         return transform.astype(np.float32)
 
     def _validated_timestamp(self, timestamp: float) -> float:
@@ -360,10 +438,10 @@ class SlidingProbabilisticGridMap:
         source_mask: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """计算已观测源体素中心到 local map 体素的前向映射。"""
-        if tuple(voxel_shape) != (self.nx, self.ny, self.nz):
+        if tuple(voxel_shape) != self.cfg.evidence_shape_xyz:
             raise ValueError(
-                f"voxel XYZ shape {voxel_shape} != map shape "
-                f"{(self.nx, self.ny, self.nz)}"
+                f"voxel XYZ shape {voxel_shape} != evidence shape "
+                f"{self.cfg.evidence_shape_xyz}"
             )
         mask = np.asarray(source_mask, dtype=np.float32)
         if mask.shape != voxel_shape:
@@ -659,7 +737,10 @@ class SlidingProbabilisticGridMap:
         base = self.cfg.infrared_reliability if sensor == "infrared" else self.cfg.radar_reliability
         nx = voxel_xyzc.shape[0]
         x_centers = self.cfg.x_min + (np.arange(nx, dtype=np.float32) + 0.5) * self.cfg.x_resolution
-        max_range = max(self.cfg.x_max - self.cfg.x_min, EPS)
+        max_range = max(
+            self.cfg.evidence_pc_range[3] - self.cfg.evidence_pc_range[0],
+            EPS,
+        )
         speed_scale = float(np.clip(self.cfg.speed_m_s / 50.0, 0.7, 1.4))
         range_conf = np.clip(
             1.0 - 0.65 * speed_scale * ((x_centers - self.cfg.x_min) / max_range),
@@ -711,24 +792,60 @@ class SlidingProbabilisticGridMap:
         calib_confidence: float = 1.0,
         observed_mask: Optional[np.ndarray] = None,
         T_local_body: Optional[np.ndarray] = None,
+        T_body_voxel: Optional[np.ndarray] = None,
+        T_local_voxel: Optional[np.ndarray] = None,
         dynamic_probability: Optional[np.ndarray] = None,
         dynamic_observed_mask: Optional[np.ndarray] = None,
     ) -> None:
-        """把 body 系 `(X,Y,Z,C)` 体素变换到 local 系后更新分层与 BEV 地图。"""
+        """把 voxel 系 evidence 经 ``body`` 变换到 ``local`` 后更新地图。
+
+        兼容调用省略 ``T_body_voxel`` 时表示 voxel frame 就是 body；机载正式
+        LiDAR-frame inference 必须显式传入 LiDAR→body。仅离线经验合同可直接
+        传入 ``T_local_voxel``，并且不得同时伪造 body 链。
+        """
         voxel_xyzc = np.asarray(voxel_xyzc, dtype=np.float32)
         if voxel_xyzc.ndim != 4 or voxel_xyzc.shape[-1] < 1:
             raise ValueError(f"voxel_xyzc 必须是 (X,Y,Z,C)，当前为 {voxel_xyzc.shape}")
-        if tuple(voxel_xyzc.shape[:3]) != (self.nx, self.ny, self.nz):
+        if tuple(voxel_xyzc.shape[:3]) != self.cfg.evidence_shape_xyz:
             raise ValueError(
-                f"voxel XYZ shape {voxel_xyzc.shape[:3]} != map shape "
-                f"{(self.nx, self.ny, self.nz)}"
+                f"voxel XYZ shape {voxel_xyzc.shape[:3]} != evidence shape "
+                f"{self.cfg.evidence_shape_xyz}"
             )
         if not np.all(np.isfinite(voxel_xyzc)):
             raise ValueError("voxel_xyzc 必须全部为有限数")
 
         # 所有外部输入必须在时间衰减或证据融合前完成校验，失败时地图无副作用。
         validated_timestamp = self._validated_timestamp(timestamp)
-        validated_pose = self._validated_pose(T_local_body)
+        if T_local_voxel is not None:
+            if T_local_body is not None or T_body_voxel is not None:
+                raise ValueError("T_local_voxel 与 T_local_body/T_body_voxel 互斥")
+            validated_local_voxel = self._validated_pose(
+                T_local_voxel,
+                "T_local_voxel",
+            )
+            validated_body_pose = np.eye(4, dtype=np.float32)
+            validated_body_voxel = np.eye(4, dtype=np.float32)
+            pose_contract = "direct_local_voxel"
+            body_pose_available = False
+        else:
+            validated_body_pose = self._validated_pose(
+                T_local_body,
+                "T_local_body",
+            )
+            validated_body_voxel = self._validated_pose(
+                T_body_voxel,
+                "T_body_voxel",
+            )
+            validated_local_voxel = self._validated_pose(
+                validated_body_pose @ validated_body_voxel,
+                "T_local_voxel",
+            )
+            pose_contract = (
+                "body_chain"
+                if T_local_body is not None or T_body_voxel is not None
+                else "identity_legacy"
+            )
+            body_pose_available = T_local_body is not None
         voxel_shape = tuple(int(value) for value in voxel_xyzc.shape[:3])
         dynamic_probability, dynamic_observed = self._validated_dynamic_evidence(
             dynamic_probability,
@@ -771,7 +888,7 @@ class SlidingProbabilisticGridMap:
             self._warp_voxel_to_local(
                 voxel_xyzc,
                 mapping_mask,
-                validated_pose,
+                validated_local_voxel,
             )
         )
         warped_static_occ_layers = self._scatter_layer_max(
@@ -838,7 +955,11 @@ class SlidingProbabilisticGridMap:
             model_uncertainty=np.max(warped_uncertainty_layers, axis=2),
         )
         self.last_timestamp = validated_timestamp
-        self.last_T_local_body = validated_pose.copy()
+        self.last_T_local_body = validated_body_pose.copy()
+        self.last_T_body_voxel = validated_body_voxel.copy()
+        self.last_T_local_voxel = validated_local_voxel.copy()
+        self.last_pose_contract = pose_contract
+        self.last_body_pose_available = body_pose_available
         self._has_voxel_update = True
 
     def update_from_ir_bev(
@@ -902,6 +1023,13 @@ class SlidingProbabilisticGridMap:
             "dem_mean": self.dem_mean.copy(),
             "dem_var": self.dem_var.copy(),
             "last_T_local_body": self.last_T_local_body.copy(),
+            "last_T_body_voxel": self.last_T_body_voxel.copy(),
+            "last_T_local_voxel": self.last_T_local_voxel.copy(),
+            "last_pose_contract": np.asarray(self.last_pose_contract),
+            "last_body_pose_available": np.asarray(
+                self.last_body_pose_available,
+                dtype=np.uint8,
+            ),
             "last_timestamp": np.asarray(self.last_timestamp, dtype=np.float64),
             "dynamic_layer_enabled": np.asarray(
                 self.dynamic_occ_prob_layers is not None,
@@ -993,12 +1121,20 @@ class LazyLocalMapQuery:
         self.occ_threshold = float(occ_threshold)
         self._occupied_xy_m: Optional[np.ndarray] = None
         self._belief_map: Optional[np.ndarray] = None
+        self._unknown_map: Optional[np.ndarray] = None
         self._occupied_xyz_m: Optional[np.ndarray] = None
         self._belief_layers: Optional[np.ndarray] = None
+        self._unknown_layers: Optional[np.ndarray] = None
 
     def refresh(self, map_snapshot: Dict[str, np.ndarray]) -> None:
         occ = map_snapshot["occ_prob"]
         belief = map_snapshot["belief"]
+        unknown = np.asarray(
+            map_snapshot.get("unknown_mass", np.ones_like(occ)),
+            dtype=np.float32,
+        )
+        if unknown.shape != occ.shape or not np.all(np.isfinite(unknown)):
+            raise ValueError("unknown_mass 必须与 occ_prob 形状一致且全部有限")
 
         idx = np.argwhere(occ >= self.occ_threshold)
         if idx.shape[0] == 0:
@@ -1008,6 +1144,7 @@ class LazyLocalMapQuery:
             y_m = self.cfg.y_min + (idx[:, 1].astype(np.float32) + 0.5) * self.cfg.y_resolution
             self._occupied_xy_m = np.stack([x_m, y_m], axis=1)
         self._belief_map = belief
+        self._unknown_map = np.clip(unknown, 0.0, 1.0)
 
         # 新快照优先缓存三维层；缺少 layers 的旧快照仍保持二维查询能力。
         occ_layers = map_snapshot.get("occ_prob_layers")
@@ -1015,6 +1152,7 @@ class LazyLocalMapQuery:
         if occ_layers is None or belief_layers is None:
             self._occupied_xyz_m = None
             self._belief_layers = None
+            self._unknown_layers = None
             return
         occ_layers = np.asarray(occ_layers, dtype=np.float32)
         belief_layers = np.asarray(belief_layers, dtype=np.float32)
@@ -1031,6 +1169,17 @@ class LazyLocalMapQuery:
             z_m = self.cfg.z_min + (layer_idx[:, 2].astype(np.float32) + 0.5) * self.cfg.z_resolution
             self._occupied_xyz_m = np.stack([x_m, y_m, z_m], axis=1)
         self._belief_layers = belief_layers
+        unknown_layers = np.asarray(
+            map_snapshot.get("unknown_mass_layers", np.ones_like(occ_layers)),
+            dtype=np.float32,
+        )
+        if unknown_layers.shape != occ_layers.shape or not np.all(
+            np.isfinite(unknown_layers)
+        ):
+            raise ValueError(
+                "unknown_mass_layers 必须与 occ_prob_layers 形状一致且全部有限"
+            )
+        self._unknown_layers = np.clip(unknown_layers, 0.0, 1.0)
 
     def query_proximity(
         self,
@@ -1038,13 +1187,48 @@ class LazyLocalMapQuery:
         y_m: float,
         search_radius: float = 15.0,
         z_m: Optional[float] = None,
-    ) -> Dict[str, float]:
-        """查询最近障碍；提供 `z_m` 且快照含 layers 时执行三维距离查询。"""
-        values = [float(x_m), float(y_m), float(search_radius)]
+        speed_m_s: float = 0.0,
+        reaction_time_s: float = 0.0,
+        brake_deceleration_m_s2: float = 1.0,
+        safety_margin_m: float = 5.0,
+        max_unknown_mass: float = 0.5,
+    ) -> Dict[str, object]:
+        """返回 ``clear/obstacle/unknown`` 三态最近障碍查询和可审计原因。"""
+        values = [
+            float(x_m),
+            float(y_m),
+            float(search_radius),
+            float(max_unknown_mass),
+        ]
         if z_m is not None:
             values.append(float(z_m))
-        if not np.all(np.isfinite(values)) or float(search_radius) < 0.0:
-            raise ValueError("查询坐标和 search_radius 必须是有限数，且半径非负")
+        if (
+            not np.all(np.isfinite(values))
+            or float(search_radius) < 0.0
+            or float(max_unknown_mass) < 0.0
+            or float(max_unknown_mass) > 1.0
+        ):
+            raise ValueError(
+                "查询坐标/search_radius/max_unknown_mass 必须有限且位于有效范围"
+            )
+        safety_distance = compute_safety_distance_m(
+            speed_m_s,
+            reaction_time_s,
+            brake_deceleration_m_s2,
+            safety_margin_m,
+        )
+
+        def result(state, reason, distance=float("inf"), uncertainty=1.0, **extra):
+            payload = {
+                "state": state,
+                "reason": reason,
+                "distance": float(distance),
+                "uncertainty": float(uncertainty),
+                "safety_distance_m": float(safety_distance),
+                "is_risky": 0.0 if state == "clear" else 1.0,
+            }
+            payload.update(extra)
+            return payload
 
         use_layers = (
             z_m is not None
@@ -1053,36 +1237,91 @@ class LazyLocalMapQuery:
         )
         occupied = self._occupied_xyz_m if use_layers else self._occupied_xy_m
         belief = self._belief_layers if use_layers else self._belief_map
-        if occupied is None or belief is None:
-            return {"distance": float("inf"), "uncertainty": 1.0, "is_risky": 0.0}
+        unknown = self._unknown_layers if use_layers else self._unknown_map
+        if occupied is None or belief is None or unknown is None:
+            return result("unknown", "map_not_initialized")
 
-        if occupied.shape[0] == 0:
-            return {"distance": float("inf"), "uncertainty": 1.0, "is_risky": 0.0}
+        min_dist = float("inf")
+        uncertainty = 1.0
+        if occupied.shape[0] > 0:
+            query_values = [x_m, y_m, z_m] if use_layers else [x_m, y_m]
+            q = np.asarray(query_values, dtype=np.float32)
+            dists = np.linalg.norm(occupied - q[np.newaxis, :], axis=1)
+            min_idx = int(np.argmin(dists))
+            min_dist = float(dists[min_idx])
+            px = int(np.clip((occupied[min_idx, 0] - self.cfg.x_min) / self.cfg.x_resolution, 0, belief.shape[0] - 1))
+            py = int(np.clip((occupied[min_idx, 1] - self.cfg.y_min) / self.cfg.y_resolution, 0, belief.shape[1] - 1))
+            if use_layers:
+                pz = int(np.clip((occupied[min_idx, 2] - self.cfg.z_min) / self.cfg.z_resolution, 0, belief.shape[2] - 1))
+                nearest_belief = belief[px, py, pz]
+            else:
+                nearest_belief = belief[px, py]
+            uncertainty = float(np.clip(1.0 - nearest_belief, 0.0, 1.0))
+            if min_dist <= min(float(search_radius), safety_distance):
+                return result(
+                    "obstacle",
+                    "obstacle_within_safety_distance",
+                    min_dist,
+                    uncertainty,
+                )
 
-        query_values = [x_m, y_m, z_m] if use_layers else [x_m, y_m]
-        q = np.asarray(query_values, dtype=np.float32)
-        dists = np.linalg.norm(occupied - q[np.newaxis, :], axis=1)
-        min_idx = int(np.argmin(dists))
-        min_dist = float(dists[min_idx])
+        if float(search_radius) + EPS < safety_distance:
+            return result(
+                "unknown",
+                "search_radius_below_safety_distance",
+                min_dist,
+                uncertainty,
+            )
 
-        if min_dist > search_radius:
-            return {"distance": min_dist, "uncertainty": 1.0, "is_risky": 0.0}
-
-        px = int(np.clip((occupied[min_idx, 0] - self.cfg.x_min) / self.cfg.x_resolution, 0, belief.shape[0] - 1))
-        py = int(np.clip((occupied[min_idx, 1] - self.cfg.y_min) / self.cfg.y_resolution, 0, belief.shape[1] - 1))
+        boundary_clearance = min(
+            float(x_m) - self.cfg.x_min,
+            self.cfg.x_max - float(x_m),
+            float(y_m) - self.cfg.y_min,
+            self.cfg.y_max - float(y_m),
+        )
         if use_layers:
-            pz = int(np.clip((occupied[min_idx, 2] - self.cfg.z_min) / self.cfg.z_resolution, 0, belief.shape[2] - 1))
-            nearest_belief = belief[px, py, pz]
-        else:
-            nearest_belief = belief[px, py]
-        uncertainty = float(np.clip(1.0 - nearest_belief, 0.0, 1.0))
-        # TODO: 将固定风险阈值替换为与飞行速度和反应时长相关的动态安全距离模型。
+            boundary_clearance = min(
+                boundary_clearance,
+                float(z_m) - self.cfg.z_min,
+                self.cfg.z_max - float(z_m),
+            )
+        if boundary_clearance + EPS < safety_distance:
+            return result(
+                "unknown",
+                "map_extent_below_safety_distance",
+                min_dist,
+                uncertainty,
+                map_boundary_clearance_m=float(max(boundary_clearance, 0.0)),
+            )
 
-        return {
-            "distance": min_dist,
-            "uncertainty": uncertainty,
-            "is_risky": float(min_dist < 5.0 and uncertainty < 0.7),
-        }
+        x0 = max(0, int(np.floor((float(x_m) - safety_distance - self.cfg.x_min) / self.cfg.x_resolution)))
+        x1 = min(unknown.shape[0], int(np.ceil((float(x_m) + safety_distance - self.cfg.x_min) / self.cfg.x_resolution)))
+        y0 = max(0, int(np.floor((float(y_m) - safety_distance - self.cfg.y_min) / self.cfg.y_resolution)))
+        y1 = min(unknown.shape[1], int(np.ceil((float(y_m) + safety_distance - self.cfg.y_min) / self.cfg.y_resolution)))
+        if use_layers:
+            z0 = max(0, int(np.floor((float(z_m) - safety_distance - self.cfg.z_min) / self.cfg.z_resolution)))
+            z1 = min(unknown.shape[2], int(np.ceil((float(z_m) + safety_distance - self.cfg.z_min) / self.cfg.z_resolution)))
+            unknown_patch = unknown[x0:x1, y0:y1, z0:z1]
+        else:
+            unknown_patch = unknown[x0:x1, y0:y1]
+        if unknown_patch.size == 0:
+            return result("unknown", "observed_domain_empty", min_dist, uncertainty)
+        unknown_max = float(np.max(unknown_patch))
+        if unknown_max > float(max_unknown_mass):
+            return result(
+                "unknown",
+                "unknown_mass_above_threshold",
+                min_dist,
+                uncertainty,
+                observed_domain_unknown_mass_max=unknown_max,
+            )
+        return result(
+            "clear",
+            "observed_clear_within_safety_distance",
+            min_dist,
+            0.0 if not np.isfinite(min_dist) else uncertainty,
+            observed_domain_unknown_mass_max=unknown_max,
+        )
 
 
 def load_sparse_voxel_npz(path: str) -> np.ndarray:

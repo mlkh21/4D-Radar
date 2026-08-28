@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """生成并验证严格、可移植的场景级数据集内容 manifest。"""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -12,7 +14,11 @@ from typing import Dict, List, Mapping, Sequence, Tuple
 
 MANIFEST_FILENAME = "dataset_manifest.json"
 SCHEMA_VERSION = 1
+SCHEMA_VERSION_V2 = 2
+SCHEMA_VERSION_DEPLOYMENT = 3
 POLICY_FILENAME = "preprocess_policy.json"
+DEPLOYMENT_RECEIPT_FILENAME = "deployment_view.json"
+SOURCE_TRAINING_MANIFEST_FILENAME = "source_training_manifest.json"
 REQUIRED_PROVENANCE = (
     "preprocess_script",
     "calibration",
@@ -23,7 +29,52 @@ MODALITY_PATTERNS = {
     "radar_voxel": re.compile(r"^(\d{6})\.(?:npy|npz)$"),
     "lidar_voxel": re.compile(r"^(\d{6})\.(?:npy|npz)$"),
     "target_voxel": re.compile(r"^(\d{6})\.(?:npy|npz)$"),
+    "observed_mask": re.compile(r"^(\d{6})\.npz$"),
     "ir_image": re.compile(r"^(\d{6})_ir\.npy$"),
+}
+LEGACY_MODALITIES = ("radar_voxel", "lidar_voxel", "target_voxel", "ir_image")
+PROFILE_MODALITIES = {
+    "training": (
+        "radar_voxel",
+        "lidar_voxel",
+        "target_voxel",
+        "observed_mask",
+        "ir_image",
+    ),
+    "deployment": ("radar_voxel", "ir_image"),
+}
+PROFILE_PROVENANCE = {
+    "training": (
+        "preprocess_script",
+        "radar_to_lidar",
+        "radar_to_thermal",
+        "lidar_to_thermal",
+        "thermal_intrinsics",
+        "radar_lidar_sync",
+        "radar_ir_sync",
+        "target_policy",
+    ),
+    "deployment": (
+        "preprocess_script",
+        "radar_to_lidar",
+        "radar_to_thermal",
+        "lidar_to_thermal",
+        "thermal_intrinsics",
+        "radar_ir_sync",
+    ),
+}
+DEPLOYMENT_V3_PROVENANCE = PROFILE_PROVENANCE["deployment"] + (
+    "source_training_manifest",
+    "deployment_view_receipt",
+)
+DEPLOYMENT_V3_SCENE_ENTRIES = {
+    "radar_voxel",
+    "ir_image",
+    POLICY_FILENAME,
+    SOURCE_TRAINING_MANIFEST_FILENAME,
+    DEPLOYMENT_RECEIPT_FILENAME,
+    "radar_ir_sync.csv",
+    MANIFEST_FILENAME,
 }
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -44,6 +95,11 @@ def _canonical_bytes(value: object) -> bytes:
 
 def _sha256_bytes(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def sha256_json_value(value: object) -> str:
+    """返回规范 JSON 值的内容 SHA-256，供派生 artifact 绑定清单子集。"""
+    return _sha256_bytes(value)
 
 
 def sha256_file(path: str) -> str:
@@ -151,7 +207,7 @@ def _collect_modalities(
         )
     frame_ids_by_modality: Dict[str, List[str]] = {}
     records_by_modality: Dict[str, List[Dict[str, object]]] = {}
-    for modality in MODALITY_PATTERNS:
+    for modality in LEGACY_MODALITIES:
         frame_ids, records = _scan_modality(scene_dir, modality)
         frame_ids_by_modality[modality] = frame_ids
         records_by_modality[modality] = records
@@ -160,7 +216,7 @@ def _collect_modalities(
     for modality, frame_ids in frame_ids_by_modality.items():
         if frame_ids != reference:
             raise DatasetManifestError(
-                "四模态 frame ID 集合不一致: "
+                "legacy 四模态 frame ID 集合不一致: "
                 f"radar_voxel={reference}, {modality}={frame_ids}"
             )
     expected = [f"{index:06d}" for index in range(expected_frame_count)]
@@ -191,6 +247,99 @@ def _collect_provenance(
     return provenance
 
 
+def _profile_contract(profile: str, schema_version: int = SCHEMA_VERSION_V2):
+    profile = str(profile).strip().lower()
+    if profile not in PROFILE_MODALITIES:
+        raise DatasetManifestError(
+            f"manifest profile 必须为 {sorted(PROFILE_MODALITIES)}，实际为 {profile!r}"
+        )
+    if schema_version == SCHEMA_VERSION_DEPLOYMENT:
+        if profile != "deployment":
+            raise DatasetManifestError("manifest schema v3 只允许 deployment profile")
+        provenance = DEPLOYMENT_V3_PROVENANCE
+    elif schema_version == SCHEMA_VERSION_V2:
+        provenance = PROFILE_PROVENANCE[profile]
+    else:
+        raise DatasetManifestError(f"未知 profile manifest schema: {schema_version}")
+    return profile, PROFILE_MODALITIES[profile], provenance
+
+
+def _collect_modalities_v2(
+    scene_dir: str,
+    expected_frame_count: int,
+    required_modalities: Sequence[str],
+) -> Dict[str, List[Dict[str, object]]]:
+    """按 profile 精确扫描模态；required 集合内禁止缺帧或不连续。"""
+    if type(expected_frame_count) is not int or expected_frame_count <= 0:
+        raise DatasetManifestError("expected_frame_count 必须是严格正整数")
+    records_by_modality: Dict[str, List[Dict[str, object]]] = {}
+    frame_ids_by_modality: Dict[str, List[str]] = {}
+    for modality in required_modalities:
+        frame_ids, records = _scan_modality(scene_dir, modality)
+        frame_ids_by_modality[modality] = frame_ids
+        records_by_modality[modality] = records
+    reference_name = required_modalities[0]
+    reference = frame_ids_by_modality[reference_name]
+    for modality, frame_ids in frame_ids_by_modality.items():
+        if frame_ids != reference:
+            raise DatasetManifestError(
+                f"profile 模态 frame ID 集合不一致: {reference_name}={reference}, "
+                f"{modality}={frame_ids}"
+            )
+    expected = [f"{index:06d}" for index in range(expected_frame_count)]
+    if reference != expected:
+        raise DatasetManifestError(
+            "frame ID 必须从 000000 严格连续且匹配 expected_frame_count: "
+            f"expected={expected}, actual={reference}"
+        )
+    return records_by_modality
+
+
+def _collect_provenance_v2(
+    provenance_paths: Mapping[str, str],
+    required_provenance: Sequence[str],
+) -> Dict[str, Dict[str, str]]:
+    if set(provenance_paths) != set(required_provenance):
+        raise DatasetManifestError(
+            "v2 provenance 字段必须精确包含: " + str(list(required_provenance))
+        )
+    provenance: Dict[str, Dict[str, str]] = {}
+    for key in required_provenance:
+        path = os.fspath(provenance_paths[key])
+        _require_file(path, f"provenance {key}")
+        provenance[key] = {
+            "name": os.path.basename(path),
+            "sha256": sha256_file(path),
+        }
+    return provenance
+
+
+def _manifest_payload_v2(
+    *,
+    scene: str,
+    profile: str,
+    frame_count: int,
+    voxel_coordinate_frame: str,
+    policy_sha256: str,
+    provenance: Mapping[str, Mapping[str, str]],
+    modalities: Mapping[str, Sequence[Mapping[str, object]]],
+    schema_version: int = SCHEMA_VERSION_V2,
+) -> Dict[str, object]:
+    return {
+        "schema_version": schema_version,
+        "profile": profile,
+        "scene": scene,
+        "frame_count": frame_count,
+        "voxel_coordinate_frame": voxel_coordinate_frame,
+        "preprocessing": {
+            "policy_path": POLICY_FILENAME,
+            "policy_sha256": policy_sha256,
+            "provenance": dict(provenance),
+        },
+        "modalities": dict(modalities),
+    }
+
+
 def _manifest_payload(
     scene: str,
     frame_count: int,
@@ -216,26 +365,63 @@ def build_scene_manifest(
     scene: str,
     expected_frame_count: int,
     provenance_paths: Mapping[str, str],
+    *,
+    profile: str | None = None,
 ) -> Dict[str, object]:
-    """扫描一个干净场景并构建未落盘的 manifest v1。"""
+    """扫描干净场景；未指定 profile 仅用于兼容构建 v1 测试数据。"""
     scene_dir = os.path.abspath(scene_dir)
     _require_directory(scene_dir, "scene")
     if not isinstance(scene, str) or not scene:
         raise DatasetManifestError("scene 必须是非空字符串")
-    _policy, policy_sha256 = _load_policy(
+    policy, policy_sha256 = _load_policy(
         scene_dir,
         scene,
         expected_frame_count,
     )
-    modalities = _collect_modalities(scene_dir, expected_frame_count)
-    provenance = _collect_provenance(provenance_paths)
-    payload = _manifest_payload(
-        scene,
-        expected_frame_count,
-        policy_sha256,
-        provenance,
-        modalities,
-    )
+    if profile is None:
+        modalities = _collect_modalities(scene_dir, expected_frame_count)
+        provenance = _collect_provenance(provenance_paths)
+        payload = _manifest_payload(
+            scene,
+            expected_frame_count,
+            policy_sha256,
+            provenance,
+            modalities,
+        )
+    else:
+        manifest_schema = (
+            SCHEMA_VERSION_DEPLOYMENT
+            if str(profile).strip().lower() == "deployment"
+            else SCHEMA_VERSION_V2
+        )
+        profile, modalities_required, provenance_required = _profile_contract(
+            profile,
+            manifest_schema,
+        )
+        voxel_coordinate_frame = policy.get("voxel_coordinate_frame") or policy.get("align_to")
+        if voxel_coordinate_frame not in ("lidar", "radar"):
+            raise DatasetManifestError(
+                "v2 preprocess_policy 必须声明 voxel_coordinate_frame=lidar|radar"
+            )
+        modalities = _collect_modalities_v2(
+            scene_dir,
+            expected_frame_count,
+            modalities_required,
+        )
+        provenance = _collect_provenance_v2(
+            provenance_paths,
+            provenance_required,
+        )
+        payload = _manifest_payload_v2(
+            scene=scene,
+            profile=profile,
+            frame_count=expected_frame_count,
+            voxel_coordinate_frame=voxel_coordinate_frame,
+            policy_sha256=policy_sha256,
+            provenance=provenance,
+            modalities=modalities,
+            schema_version=manifest_schema,
+        )
     manifest = dict(payload)
     manifest["content_sha256"] = _sha256_bytes(payload)
     return manifest
@@ -246,6 +432,8 @@ def write_scene_manifest_atomic(
     scene: str,
     expected_frame_count: int,
     provenance_paths: Mapping[str, str],
+    *,
+    profile: str | None = None,
 ) -> str:
     """原子发布 manifest；正式文件存在时拒绝覆盖。"""
     scene_dir = os.path.abspath(scene_dir)
@@ -258,6 +446,7 @@ def write_scene_manifest_atomic(
         scene,
         expected_frame_count,
         provenance_paths,
+        profile=profile,
     )
 
     descriptor, temp_path = tempfile.mkstemp(
@@ -321,11 +510,145 @@ def _validate_provenance_records(value: object) -> Dict[str, Dict[str, str]]:
     return validated
 
 
+def _validate_provenance_records_v2(
+    value: object,
+    required_provenance: Sequence[str],
+) -> Dict[str, Dict[str, str]]:
+    if not isinstance(value, dict) or set(value) != set(required_provenance):
+        raise DatasetManifestError("manifest v2 provenance 字段不完整")
+    validated: Dict[str, Dict[str, str]] = {}
+    for key in required_provenance:
+        record = value[key]
+        if not isinstance(record, dict) or set(record) != {"name", "sha256"}:
+            raise DatasetManifestError(f"manifest provenance {key} 记录格式无效")
+        name = record.get("name")
+        digest = record.get("sha256")
+        if not isinstance(name, str) or not name or os.path.basename(name) != name:
+            raise DatasetManifestError(f"manifest provenance {key} name 无效")
+        if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+            raise DatasetManifestError(f"manifest provenance {key} sha256 无效")
+        validated[key] = {"name": name, "sha256": digest}
+    return validated
+
+
+def _validate_profile_manifest(
+    scene_dir: str,
+    expected_scene: str,
+    expected_profile: str | None,
+    manifest: Mapping[str, object],
+    schema_version: int,
+) -> Dict[str, object]:
+    expected_top_keys = {
+        "schema_version",
+        "profile",
+        "scene",
+        "frame_count",
+        "voxel_coordinate_frame",
+        "preprocessing",
+        "modalities",
+        "content_sha256",
+    }
+    if set(manifest) != expected_top_keys:
+        raise DatasetManifestError(
+            f"dataset_manifest.json 顶层字段不符合 v{schema_version}"
+        )
+    if manifest.get("schema_version") != schema_version:
+        raise DatasetManifestError("manifest schema_version 与验证入口不一致")
+    recorded_content_sha256 = manifest.get("content_sha256")
+    payload = {key: value for key, value in manifest.items() if key != "content_sha256"}
+    if (
+        not isinstance(recorded_content_sha256, str)
+        or _sha256_bytes(payload) != recorded_content_sha256
+    ):
+        raise DatasetManifestError("manifest content_sha256 不一致")
+    profile, modalities_required, provenance_required = _profile_contract(
+        manifest.get("profile"),
+        schema_version,
+    )
+    if expected_profile is not None and profile != expected_profile:
+        raise DatasetManifestError(
+            f"manifest profile 与入口期望不一致: expected={expected_profile!r}, "
+            f"actual={profile!r}"
+        )
+    if manifest.get("scene") != expected_scene:
+        raise DatasetManifestError("manifest scene 与入口期望不一致")
+    frame_count = manifest.get("frame_count")
+    if type(frame_count) is not int or frame_count <= 0:
+        raise DatasetManifestError("manifest frame_count 必须是严格正整数")
+    voxel_coordinate_frame = manifest.get("voxel_coordinate_frame")
+    if voxel_coordinate_frame not in ("lidar", "radar"):
+        raise DatasetManifestError("manifest voxel_coordinate_frame 无效")
+    preprocessing = manifest.get("preprocessing")
+    if not isinstance(preprocessing, dict) or set(preprocessing) != {
+        "policy_path",
+        "policy_sha256",
+        "provenance",
+    }:
+        raise DatasetManifestError(
+            f"manifest preprocessing 字段不符合 v{schema_version}"
+        )
+    if preprocessing.get("policy_path") != POLICY_FILENAME:
+        raise DatasetManifestError(
+            f"manifest policy_path 不符合 v{schema_version}"
+        )
+    recorded_policy_sha256 = preprocessing.get("policy_sha256")
+    if (
+        not isinstance(recorded_policy_sha256, str)
+        or _SHA256_PATTERN.fullmatch(recorded_policy_sha256) is None
+    ):
+        raise DatasetManifestError("manifest policy_sha256 无效")
+    provenance = _validate_provenance_records_v2(
+        preprocessing.get("provenance"),
+        provenance_required,
+    )
+    policy, actual_policy_sha256 = _load_policy(
+        scene_dir,
+        expected_scene,
+        frame_count,
+    )
+    if actual_policy_sha256 != recorded_policy_sha256:
+        raise DatasetManifestError("preprocess policy SHA-256 不一致")
+    policy_frame = policy.get("voxel_coordinate_frame") or policy.get("align_to")
+    if policy_frame != voxel_coordinate_frame:
+        raise DatasetManifestError("manifest voxel frame 与 preprocess policy 不一致")
+    if schema_version == SCHEMA_VERSION_DEPLOYMENT:
+        with os.scandir(scene_dir) as iterator:
+            actual_entries = {entry.name for entry in iterator}
+        if actual_entries != DEPLOYMENT_V3_SCENE_ENTRIES:
+            extra = sorted(actual_entries - DEPLOYMENT_V3_SCENE_ENTRIES)
+            missing = sorted(DEPLOYMENT_V3_SCENE_ENTRIES - actual_entries)
+            raise DatasetManifestError(
+                "严格 deployment 场景包含未知或缺失目录项: "
+                f"extra={extra}, missing={missing}"
+            )
+    actual_modalities = _collect_modalities_v2(
+        scene_dir,
+        frame_count,
+        modalities_required,
+    )
+    if manifest.get("modalities") != actual_modalities:
+        raise DatasetManifestError("manifest 模态文件内容不一致")
+    actual_payload = _manifest_payload_v2(
+        scene=expected_scene,
+        profile=profile,
+        frame_count=frame_count,
+        voxel_coordinate_frame=voxel_coordinate_frame,
+        policy_sha256=actual_policy_sha256,
+        provenance=provenance,
+        modalities=actual_modalities,
+        schema_version=schema_version,
+    )
+    if _sha256_bytes(actual_payload) != recorded_content_sha256:
+        raise DatasetManifestError("场景内容与 manifest content_sha256 不一致")
+    return dict(manifest)
+
+
 def validate_scene_manifest(
     scene_dir: str,
     expected_scene: str,
+    expected_profile: str | None = None,
 ) -> Dict[str, object]:
-    """重新扫描并验证场景内容与 manifest v1 完全一致。"""
+    """自动识别 v1/v2/v3；正式 deployment 入口只接受严格 v3。"""
     scene_dir = os.path.abspath(scene_dir)
     _require_directory(scene_dir, "scene")
     manifest_path = os.path.join(scene_dir, MANIFEST_FILENAME)
@@ -339,6 +662,31 @@ def validate_scene_manifest(
         ) from exc
     if not isinstance(manifest, dict):
         raise DatasetManifestError("dataset_manifest.json 必须是 JSON 对象")
+    manifest_schema = manifest.get("schema_version")
+    if manifest_schema == SCHEMA_VERSION_V2:
+        if expected_profile == "deployment":
+            raise DatasetManifestError(
+                "严格 deployment 入口要求 schema v3，拒绝旧 v2 deployment"
+            )
+        return _validate_profile_manifest(
+            scene_dir,
+            expected_scene,
+            expected_profile,
+            manifest,
+            SCHEMA_VERSION_V2,
+        )
+    if manifest_schema == SCHEMA_VERSION_DEPLOYMENT:
+        return _validate_profile_manifest(
+            scene_dir,
+            expected_scene,
+            expected_profile,
+            manifest,
+            SCHEMA_VERSION_DEPLOYMENT,
+        )
+    if expected_profile is not None:
+        raise DatasetManifestError(
+            f"入口要求 manifest profile={expected_profile!r}，legacy v1 不包含 profile"
+        )
     expected_top_keys = {
         "schema_version",
         "scene",

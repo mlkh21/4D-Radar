@@ -20,9 +20,17 @@ MINI_RADAR_PROTOCOL="${MINI_RADAR_PROTOCOL:-legacy}"
 case "${MINI_RADAR_PROTOCOL}" in
 	legacy)
 		DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware"
+		DEFAULT_MINI_TARGET_SIZE="32,128,128"
+		DEFAULT_MINI_SOURCE_PC_RANGE="0,-20,-6,120,20,10"
+		DEFAULT_MINI_MODEL_PC_RANGE="0,-20,-6,40,20,10"
+		DEFAULT_MINI_DATASET_DIR="${SELF_DIR}/.tmp_mini_train_dataset"
 		;;
 	formal)
-		DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
+		DEFAULT_PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1"
+		DEFAULT_MINI_TARGET_SIZE="32,128,128"
+		DEFAULT_MINI_SOURCE_PC_RANGE="0,-20,-6,80,20,10"
+		DEFAULT_MINI_MODEL_PC_RANGE="0,-20,-6,80,20,10"
+		DEFAULT_MINI_DATASET_DIR="${DEFAULT_PREPROCESSED_ROOT}"
 		;;
 	*)
 		echo "Error: MINI_RADAR_PROTOCOL must be legacy or formal"
@@ -35,7 +43,7 @@ if [[ ${MINI_DATASET_DIR+x} == x && -z "${MINI_DATASET_DIR}" ]]; then
 	echo "Error: unsafe MINI_DATASET_DIR: path is empty"
 	exit 1
 fi
-MINI_DATASET_DIR="${MINI_DATASET_DIR:-${SELF_DIR}/.tmp_mini_train_dataset}"
+MINI_DATASET_DIR="${MINI_DATASET_DIR:-${DEFAULT_MINI_DATASET_DIR}}"
 MINI_DATASET_DIR_INPUT="${MINI_DATASET_DIR}"
 MINI_CONFIG_PATH="${MINI_CONFIG_PATH:-${SELF_DIR}/.default_config.mini_override.yaml}"
 MINI_CONFIG_PATH_INPUT="${MINI_CONFIG_PATH}"
@@ -43,13 +51,17 @@ MINI_RESULTS_DIR="${MINI_RESULTS_DIR:-${SELF_DIR}/train_results_mini}"
 MINI_REQUIRE_FRESH_SCRATCH="${MINI_REQUIRE_FRESH_SCRATCH:-0}"
 MINI_REQUIRE_FRESH_CONFIG="${MINI_REQUIRE_FRESH_CONFIG:-0}"
 MINI_PREFLIGHT_ONLY="${MINI_PREFLIGHT_ONLY:-0}"
-MINI_TARGET_SIZE="${MINI_TARGET_SIZE:-32,128,128}"
-MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-0,-20,-6,120,20,10}"
-MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-0,-20,-6,40,20,10}"
-MINI_RADAR_NORMALIZATION_PATH="${MINI_RADAR_NORMALIZATION_PATH:-${PROJECT_DIR}/config/radar_normalization_garden_32x128x128_full120_86p8_v1.json}"
+MINI_TARGET_SIZE="${MINI_TARGET_SIZE:-${DEFAULT_MINI_TARGET_SIZE}}"
+MINI_SOURCE_PC_RANGE="${MINI_SOURCE_PC_RANGE:-${DEFAULT_MINI_SOURCE_PC_RANGE}}"
+MINI_MODEL_PC_RANGE="${MINI_MODEL_PC_RANGE:-${DEFAULT_MINI_MODEL_PC_RANGE}}"
+MINI_RADAR_NORMALIZATION_PATH="${MINI_RADAR_NORMALIZATION_PATH:-${PROJECT_DIR}/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json}"
 MINI_DOPPLER_SCALE_MPS="${MINI_DOPPLER_SCALE_MPS:-86.8}"
-MINI_CHECKPOINT_PROTOCOL="${MINI_CHECKPOINT_PROTOCOL:-formal_mini_chain_v1}"
-EXPECTED_FORMAL_ARTIFACT_SHA256="${EXPECTED_FORMAL_ARTIFACT_SHA256:-2c9c92650b98ec686d621b53eccb5e7f376cb6b8ea1047d4fb594349af90c4d5}"
+MINI_CHECKPOINT_PROTOCOL="${MINI_CHECKPOINT_PROTOCOL:-formal_mini_chain_v2}"
+EXPECTED_FORMAL_ARTIFACT_SHA256="${EXPECTED_FORMAL_ARTIFACT_SHA256:-11f59d84cc186c39256c112154faf458ec9ead5fec9b08b997abd5058b68e97c}"
+MINI_TEMPORAL_SPLIT_ARTIFACT="${MINI_TEMPORAL_SPLIT_ARTIFACT:-${PREPROCESSED_ROOT}/temporal_split_garden_train80_purge3s_v1.json}"
+MINI_DATA_PROTOCOL_PATH="${MINI_DATA_PROTOCOL_PATH:-${PREPROCESSED_ROOT}/formal_data_protocol_garden_train80_purge3s_v1.json}"
+MINI_TRAIN_FRAMES_PER_SCENE="${MINI_TRAIN_FRAMES_PER_SCENE:-8}"
+MINI_VALIDATION_FRAMES_PER_SCENE="${MINI_VALIDATION_FRAMES_PER_SCENE:-4}"
 MINI_VAE_CONFIG_TYPE="${MINI_VAE_CONFIG_TYPE:-ultra_lightweight}"
 MINI_VAE_LATENT_DIM="${MINI_VAE_LATENT_DIM:-}"
 MINI_VAE_OCC_LOSS="${MINI_VAE_OCC_LOSS:-bce_dice}"
@@ -115,6 +127,23 @@ validate_mini_dataset_dir() {
 	normalized_preprocessed_root="$(realpath -m -- "${PREPROCESSED_ROOT}")"
 	normalized_results_dir="$(realpath -m -- "${MINI_RESULTS_DIR}")"
 	MINI_RESULTS_DIR="${normalized_results_dir}"
+	MINI_DATASET_DIR="${normalized_path}"
+
+	if [[ "${MINI_RADAR_PROTOCOL}" == "formal" ]]; then
+		if [[ "${MINI_REQUIRE_FRESH_SCRATCH}" != "0" ]]; then
+			echo "Error: formal v2 mini 直接只读正式数据根，不允许 fresh scratch"
+			exit 1
+		fi
+		if [[ "${normalized_path}" != "${normalized_preprocessed_root}" ]]; then
+			echo "Error: formal v2 MINI_DATASET_DIR 必须等于 PREPROCESSED_ROOT"
+			exit 1
+		fi
+		if [[ -L "${MINI_DATASET_DIR_INPUT}" || ! -d "${MINI_DATASET_DIR_INPUT}" ]]; then
+			echo "Error: formal v2 数据根必须是现有普通目录: ${MINI_DATASET_DIR_INPUT}"
+			exit 1
+		fi
+		return 0
+	fi
 
 	if [[ "${MINI_REQUIRE_FRESH_SCRATCH}" == "1" ]]; then
 		if [[ -e "${MINI_DATASET_DIR_INPUT}" || -L "${MINI_DATASET_DIR_INPUT}" ]]; then
@@ -147,8 +176,6 @@ validate_mini_dataset_dir() {
 		esac
 		MINI_CONFIG_PATH="${normalized_config_path}"
 	fi
-	MINI_DATASET_DIR="${normalized_path}"
-
 	if [[ "${MINI_DATASET_DIR}" == "/" ||
 		"${MINI_DATASET_DIR}" == "/tmp" ||
 		"${MINI_DATASET_DIR}" == "${ROOT_DIR}" ||
@@ -175,8 +202,8 @@ validate_mini_radar_protocol() {
 	if [[ "${MINI_RADAR_PROTOCOL}" == "legacy" ]]; then
 		return 0
 	fi
-	if [[ "${MINI_CHECKPOINT_PROTOCOL}" != "formal_mini_chain_v1" ]]; then
-		echo "Error: formal mini checkpoint protocol must be formal_mini_chain_v1"
+	if [[ "${MINI_CHECKPOINT_PROTOCOL}" != "formal_mini_chain_v2" ]]; then
+		echo "Error: formal mini checkpoint protocol must be formal_mini_chain_v2"
 		exit 1
 	fi
 	if [[ ! -f "${MINI_RADAR_NORMALIZATION_PATH}" ]]; then
@@ -191,20 +218,136 @@ validate_mini_radar_protocol() {
 		"${MINI_TARGET_SIZE}" \
 		"${MINI_SOURCE_PC_RANGE}" \
 		"${MINI_MODEL_PC_RANGE}" \
-		"${MINI_DOPPLER_SCALE_MPS}" <<'PY'
+		"${MINI_DOPPLER_SCALE_MPS}" \
+		"${PREPROCESSED_ROOT}" \
+		"${MINI_TEMPORAL_SPLIT_ARTIFACT}" \
+		"${MINI_DATA_PROTOCOL_PATH}" \
+		"${MODE}" \
+		"${MINI_RESULTS_DIR}" \
+		"${MINI_TRAIN_FRAMES_PER_SCENE}" \
+		"${MINI_VALIDATION_FRAMES_PER_SCENE}" \
+		"${TRAIN_SCENES[@]}" <<'PY'
+import hashlib
+import os
 import sys
 
-root, artifact, expected_sha256, target_raw, source_raw, model_raw, scale_raw = sys.argv[1:]
+(
+    root,
+    artifact,
+    expected_sha256,
+    target_raw,
+    source_raw,
+    model_raw,
+    scale_raw,
+    dataset_dir,
+    split_path,
+    data_protocol_path,
+    stage,
+    results_dir,
+    train_limit_raw,
+    validation_limit_raw,
+    *scenes,
+) = sys.argv[1:]
 if root not in sys.path:
     sys.path.insert(0, root)
 
+from diffusion_consistency_radar.formal_data_protocol import (
+    load_formal_data_protocol_artifact,
+)
+from diffusion_consistency_radar.checkpoint_chain import (
+    assert_checkpoint_training_identity,
+    build_formal_mini_selection,
+    checkpoint_state_dict,
+    safe_torch_load,
+    sha256_file,
+)
 from diffusion_consistency_radar.radar_normalization import (
     load_radar_normalization_artifact,
+)
+from diffusion_consistency_radar.temporal_split import (
+    limit_frame_ids_by_scene,
+    load_temporal_split_artifact,
+    split_frame_ids_by_scene,
 )
 
 target_size = [int(value) for value in target_raw.split(',')]
 source_pc_range = [float(value) for value in source_raw.split(',')]
 model_pc_range = [float(value) for value in model_raw.split(',')]
+with open(artifact, "rb") as handle:
+    artifact_file_sha256 = hashlib.sha256(handle.read()).hexdigest()
+if artifact_file_sha256 != expected_sha256:
+    raise SystemExit(
+        "formal mini normalization SHA-256 mismatch: "
+        f"expected={expected_sha256}, actual={artifact_file_sha256}"
+    )
+split_artifact, split_sha256 = load_temporal_split_artifact(
+    split_path,
+    dataset_dir=dataset_dir,
+    expected_scenes=scenes,
+    require_formal=True,
+)
+data_protocol, _data_protocol_sha256 = load_formal_data_protocol_artifact(
+    data_protocol_path,
+    dataset_dir=dataset_dir,
+    scenes=scenes,
+    split_artifact_path=split_path,
+    stage=stage,
+)
+if data_protocol.get("split_artifact_sha256") != split_sha256:
+    raise SystemExit("formal mini data protocol 与 temporal split SHA-256 不一致")
+train_ids = limit_frame_ids_by_scene(
+    split_frame_ids_by_scene(split_artifact, "train"),
+    int(train_limit_raw),
+    partition="train",
+)
+validation_ids = limit_frame_ids_by_scene(
+    split_frame_ids_by_scene(split_artifact, "validation"),
+    int(validation_limit_raw),
+    partition="validation",
+)
+current_data_protocol = dict(data_protocol)
+current_data_protocol["mini_selection"] = build_formal_mini_selection(
+    int(train_limit_raw),
+    int(validation_limit_raw),
+)
+
+# LDM/CD 的无训练预检必须和真正训练入口使用同一身份断言，避免把错误父权重
+# 延迟到 CUDA 训练进程启动后才发现。VAE stage 没有父 checkpoint。
+parent_specs = []
+if stage in {"ldm", "cd"}:
+    parent_specs.append(("vae", os.path.join(results_dir, "vae", "vae_best.pt")))
+if stage == "cd":
+    parent_specs.append(("ldm", os.path.join(results_dir, "ldm", "ldm_best.pt")))
+parent_hashes = {}
+parent_checkpoints = {}
+for parent_stage, parent_path in parent_specs:
+    if os.path.islink(parent_path) or not os.path.isfile(parent_path):
+        raise SystemExit(
+            f"formal mini {parent_stage} parent 必须是现有普通文件: {parent_path}"
+        )
+    checkpoint = safe_torch_load(parent_path, map_location="cpu")
+    assert_checkpoint_training_identity(
+        checkpoint,
+        expected_stage=parent_stage,
+        checkpoint_protocol="formal_mini_chain_v2",
+        data_protocol=current_data_protocol,
+    )
+    checkpoint_state_dict(checkpoint)
+    parent_checkpoints[parent_stage] = checkpoint
+    parent_hashes[parent_stage] = sha256_file(parent_path)
+if stage == "cd":
+    if parent_checkpoints["ldm"].get("vae_checkpoint_sha256") != parent_hashes["vae"]:
+        raise SystemExit(
+            "formal mini LDM 记录的 vae_checkpoint_sha256 与当前 VAE 文件不一致"
+        )
+if parent_specs:
+    print(
+        "Formal mini parent checkpoint validated: "
+        + ", ".join(
+            f"{parent_stage}={parent_hashes[parent_stage]}"
+            for parent_stage, _parent_path in parent_specs
+        )
+    )
 _spec, actual_sha256 = load_radar_normalization_artifact(
     artifact,
     target_size=target_size,
@@ -212,6 +355,7 @@ _spec, actual_sha256 = load_radar_normalization_artifact(
     model_pc_range=model_pc_range,
     doppler_scale_mps=float(scale_raw),
     require_formal=True,
+    expected_split_artifact_sha256=split_sha256,
 )
 if actual_sha256 != expected_sha256:
     raise SystemExit(
@@ -219,6 +363,11 @@ if actual_sha256 != expected_sha256:
         f"expected={expected_sha256}, actual={actual_sha256}"
     )
 print(f"Formal mini Radar normalization validated: {actual_sha256}")
+print(
+    "Formal mini v2 data protocol validated: "
+    f"train={sum(map(len, train_ids.values()))}, "
+    f"validation={sum(map(len, validation_ids.values()))}"
+)
 PY
 }
 
@@ -227,6 +376,15 @@ validate_mini_dataset_dir
 if [[ "${MINI_PREFLIGHT_ONLY}" != "0" && "${MINI_PREFLIGHT_ONLY}" != "1" ]]; then
 	echo "Error: MINI_PREFLIGHT_ONLY must be 0 or 1"
 	exit 1
+fi
+if [[ "${MINI_RADAR_PROTOCOL}" == "formal" ]]; then
+	for setting in MINI_TRAIN_FRAMES_PER_SCENE MINI_VALIDATION_FRAMES_PER_SCENE; do
+		value="${!setting}"
+		if [[ ! "${value}" =~ ^[0-9]+$ || "${value}" -lt 1 ]]; then
+			echo "Error: ${setting} must be a positive integer"
+			exit 1
+		fi
+	done
 fi
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
@@ -248,8 +406,6 @@ else
 	CONFIG_PYTHON_CMD=("${PYTHON_CMD[@]}")
 fi
 
-validate_mini_radar_protocol
-
 if [[ ! -f "${DATA_LOADING_CONFIG}" ]]; then
 	echo "Error: data loading config not found: ${DATA_LOADING_CONFIG}"
 	exit 1
@@ -261,6 +417,7 @@ elif [[ -n "${SCENE:-}" ]]; then
 	TRAIN_SCENES=("${SCENE}")
 else
 mapfile -t TRAIN_SCENES < <("${CONFIG_PYTHON_CMD[@]}" - "${DATA_LOADING_CONFIG}" <<'PY'
+import os
 import sys
 import yaml
 
@@ -296,22 +453,31 @@ for SCENE in "${TRAIN_SCENES[@]}"; do
 	fi
 done
 
+validate_mini_radar_protocol
+
 echo "=========================================="
 echo "Minimal training setup"
 echo "mode: ${MODE}"
 echo "train scenes: ${TRAIN_SCENES[*]}"
-echo "samples per scene: ${SAMPLES_PER_SCENE}"
+if [[ "${MINI_RADAR_PROTOCOL}" == "legacy" ]]; then
+	echo "legacy samples per scene: ${SAMPLES_PER_SCENE}"
+fi
 echo "mini epochs: vae=${MINI_VAE_EPOCHS}, ldm=${MINI_LDM_EPOCHS}, cd=${MINI_CD_EPOCHS}"
 echo "project dir: ${PROJECT_DIR}"
 echo "preprocessed root: ${PREPROCESSED_ROOT}"
 echo "results dir: ${MINI_RESULTS_DIR}"
-echo "mini dataset dir: ${MINI_DATASET_DIR}"
+echo "training dataset dir: ${MINI_DATASET_DIR}"
 echo "target size [Z,X,Y]: ${MINI_TARGET_SIZE}"
 echo "source pc range: ${MINI_SOURCE_PC_RANGE}"
 echo "model pc range: ${MINI_MODEL_PC_RANGE}"
 echo "radar protocol: ${MINI_RADAR_PROTOCOL}"
 echo "radar normalization: ${MINI_RADAR_NORMALIZATION_PATH}"
 echo "checkpoint protocol: ${MINI_CHECKPOINT_PROTOCOL}"
+if [[ "${MINI_RADAR_PROTOCOL}" == "formal" ]]; then
+	echo "temporal split: ${MINI_TEMPORAL_SPLIT_ARTIFACT}"
+	echo "formal data protocol: ${MINI_DATA_PROTOCOL_PATH}"
+	echo "formal mini train/validation frames per scene: ${MINI_TRAIN_FRAMES_PER_SCENE}/${MINI_VALIDATION_FRAMES_PER_SCENE}"
+fi
 echo "vae config type: ${MINI_VAE_CONFIG_TYPE}"
 echo "vae latent dim: ${MINI_VAE_LATENT_DIM:-preset}"
 echo "vae occupancy loss: ${MINI_VAE_OCC_LOSS}"
@@ -339,6 +505,7 @@ if [[ "${MINI_PREFLIGHT_ONLY}" == "1" ]]; then
 	exit 0
 fi
 
+if [[ "${MINI_RADAR_PROTOCOL}" == "legacy" ]]; then
 if [[ "${MINI_REQUIRE_FRESH_SCRATCH}" == "1" ]]; then
 	mkdir -- "${MINI_DATASET_DIR}"
 	CREATED_DATASET_DIR="$(realpath -m -- "${MINI_DATASET_DIR}")"
@@ -409,10 +576,16 @@ for SCENE in "${TRAIN_SCENES[@]}"; do
 		fi
 	done
 done
+fi
 
 mkdir -p "${MINI_RESULTS_DIR}/vae" "${MINI_RESULTS_DIR}/ldm" "${MINI_RESULTS_DIR}/cd"
 
-"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" "${MINI_TARGET_SIZE}" "${MINI_SOURCE_PC_RANGE}" "${MINI_MODEL_PC_RANGE}" "${MINI_RADAR_PROTOCOL}" "${MINI_RADAR_NORMALIZATION_PATH}" "${MINI_DOPPLER_SCALE_MPS}" "${MINI_CHECKPOINT_PROTOCOL}" "${MINI_VAE_CONFIG_TYPE}" "${MINI_VAE_LATENT_DIM}" "${MINI_VAE_OCC_LOSS}" "${MINI_TRAIN_SPLIT}" "${MINI_SPLIT_SEED}" "${MINI_LDM_DECODED_WEIGHT}" "${MINI_LDM_DECODED_FP_WEIGHT}" "${MINI_LDM_DECODED_MASS_WEIGHT}" "${MINI_LDM_HEIGHT_WEIGHT}" "${MINI_LDM_TOP_WEIGHT}" "${MINI_LDM_TOP_OVERSHOOT_WEIGHT}" "${MINI_LDM_CONTINUITY_WEIGHT}" "${MINI_LDM_DENSITY_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT}" "${MINI_LDM_UNCERTAINTY_WEIGHT}" "${MINI_LDM_COLUMN_CURRICULUM_ENABLED}" "${MINI_LDM_COLUMN_POSITIVE_START_WEIGHT}" "${MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT}" "${MINI_LDM_COLUMN_POSITIVE_WEIGHT}" "${MINI_LDM_COLUMN_NEGATIVE_WEIGHT}" "${MINI_LDM_COLUMN_TEMPERATURE}" "${MINI_REQUIRE_FRESH_CONFIG}" <<'PY'
+OLD_IFS="${IFS}"
+IFS=,
+TRAIN_SCENES_CSV="${TRAIN_SCENES[*]}"
+IFS="${OLD_IFS}"
+
+"${CONFIG_PYTHON_CMD[@]}" - "${DEFAULT_CONFIG_PATH}" "${MINI_CONFIG_PATH}" "${MINI_DATASET_DIR}" "${MINI_BATCH_SIZE}" "${MINI_NUM_WORKERS}" "${MINI_USE_AUG}" "${MINI_VAE_EPOCHS}" "${MINI_LDM_EPOCHS}" "${MINI_CD_EPOCHS}" "${MINI_GRAD_ACCUM}" "${MINI_RESULTS_DIR}" "${MINI_TARGET_SIZE}" "${MINI_SOURCE_PC_RANGE}" "${MINI_MODEL_PC_RANGE}" "${MINI_RADAR_PROTOCOL}" "${MINI_RADAR_NORMALIZATION_PATH}" "${MINI_DOPPLER_SCALE_MPS}" "${MINI_CHECKPOINT_PROTOCOL}" "${MINI_TEMPORAL_SPLIT_ARTIFACT}" "${MINI_DATA_PROTOCOL_PATH}" "${MINI_TRAIN_FRAMES_PER_SCENE}" "${MINI_VALIDATION_FRAMES_PER_SCENE}" "${CALIB_CONFIG_DIR}" "${TRAIN_SCENES_CSV}" "${MINI_VAE_CONFIG_TYPE}" "${MINI_VAE_LATENT_DIM}" "${MINI_VAE_OCC_LOSS}" "${MINI_TRAIN_SPLIT}" "${MINI_SPLIT_SEED}" "${MINI_LDM_DECODED_WEIGHT}" "${MINI_LDM_DECODED_FP_WEIGHT}" "${MINI_LDM_DECODED_MASS_WEIGHT}" "${MINI_LDM_HEIGHT_WEIGHT}" "${MINI_LDM_TOP_WEIGHT}" "${MINI_LDM_TOP_OVERSHOOT_WEIGHT}" "${MINI_LDM_CONTINUITY_WEIGHT}" "${MINI_LDM_DENSITY_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_OCC_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_NEGATIVE_WEIGHT}" "${MINI_LDM_IR_FRUSTUM_TOP_WEIGHT}" "${MINI_LDM_UNCERTAINTY_WEIGHT}" "${MINI_LDM_COLUMN_CURRICULUM_ENABLED}" "${MINI_LDM_COLUMN_POSITIVE_START_WEIGHT}" "${MINI_LDM_COLUMN_NEGATIVE_START_WEIGHT}" "${MINI_LDM_COLUMN_POSITIVE_WEIGHT}" "${MINI_LDM_COLUMN_NEGATIVE_WEIGHT}" "${MINI_LDM_COLUMN_TEMPERATURE}" "${MINI_REQUIRE_FRESH_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -435,6 +608,12 @@ import yaml
 		radar_normalization_path,
 		doppler_scale_mps,
 		checkpoint_protocol,
+		temporal_split_artifact,
+		data_protocol_path,
+		mini_train_frames_per_scene,
+		mini_validation_frames_per_scene,
+		calibration_dir,
+		scene_names_csv,
 		vae_config_type,
 		vae_latent_dim,
 		vae_occ_loss,
@@ -459,7 +638,7 @@ import yaml
 		ldm_column_negative_weight,
 		ldm_column_temperature,
 		require_fresh_config,
-) = sys.argv[1:43]
+) = sys.argv[1:49]
 
 
 def parse_numbers(raw, caster):
@@ -477,7 +656,12 @@ def parse_strict_bool(raw, variable_name):
 		)
 
 with open(src_cfg, 'r', encoding='utf-8') as f:
-		cfg = yaml.safe_load(f) or {}
+			cfg = yaml.safe_load(f) or {}
+
+allocator_conf = __import__('os').environ.get('PYTORCH_CUDA_ALLOC_CONF', '').strip()
+if allocator_conf:
+			cfg.setdefault('hardware', {})
+			cfg['hardware']['cuda_allocator_conf'] = allocator_conf
 
 target_size = parse_numbers(target_size_raw, int)
 source_pc_range = parse_numbers(source_pc_range_raw, float)
@@ -498,11 +682,26 @@ cfg['data']['model_pc_range'] = model_pc_range
 cfg['data']['train_split'] = float(train_split)
 cfg['data']['split_seed'] = int(split_seed)
 if radar_protocol == 'formal':
-		if checkpoint_protocol != 'formal_mini_chain_v1':
-			raise SystemExit('formal mini checkpoint protocol must be formal_mini_chain_v1')
+		if checkpoint_protocol != 'formal_mini_chain_v2':
+			raise SystemExit('formal mini checkpoint protocol must be formal_mini_chain_v2')
+		scene_names = [value.strip() for value in scene_names_csv.split(',') if value.strip()]
+		if not scene_names:
+			raise SystemExit('formal mini scene_names must not be empty')
 		cfg['data']['radar_normalization_path'] = radar_normalization_path
 		cfg['data']['doppler_scale_mps'] = float(doppler_scale_mps)
 		cfg['data']['checkpoint_protocol'] = checkpoint_protocol
+		cfg['data']['temporal_split_artifact'] = temporal_split_artifact
+		cfg['data']['data_protocol_path'] = data_protocol_path
+		cfg['data'].pop('data_protocol', None)
+		cfg['data']['mini_train_frames_per_scene'] = int(mini_train_frames_per_scene)
+		cfg['data']['mini_validation_frames_per_scene'] = int(mini_validation_frames_per_scene)
+		cfg['data']['scene_names'] = scene_names
+		cfg['data']['calibration_dir'] = calibration_dir
+		cfg['data']['require_real_ir'] = True
+		cfg['data']['require_real_calibration'] = True
+		cfg['data']['require_persisted_observed_mask'] = True
+		cfg['data']['require_radar_statistics'] = True
+		cfg['data']['voxel_coordinate_frame'] = 'lidar'
 		cfg.setdefault('hardware', {})
 		cfg['hardware']['device'] = 'cuda'
 		cfg['hardware']['num_gpus'] = 1
@@ -511,6 +710,14 @@ elif radar_protocol == 'legacy':
 		cfg['data']['radar_normalization_path'] = ''
 		cfg['data']['doppler_scale_mps'] = None
 		cfg['data'].pop('checkpoint_protocol', None)
+		for key in (
+				'temporal_split_artifact', 'data_protocol_path', 'data_protocol',
+				'mini_train_frames_per_scene', 'mini_validation_frames_per_scene',
+				'scene_names', 'calibration_dir', 'require_real_ir',
+				'require_real_calibration', 'require_persisted_observed_mask',
+				'require_radar_statistics', 'voxel_coordinate_frame',
+		):
+				cfg['data'].pop(key, None)
 else:
 		raise SystemExit(f'unsupported MINI_RADAR_PROTOCOL={radar_protocol!r}')
 

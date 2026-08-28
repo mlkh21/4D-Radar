@@ -7,13 +7,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
-MANIFEST_SCRIPT="${PROJECT_DIR}/scripts/dataset_manifest.py"
+DEPLOYMENT_VIEW_SCRIPT="${PROJECT_DIR}/scripts/build_deployment_view.py"
 CHECKPOINT_CHAIN_SCRIPT="${PROJECT_DIR}/scripts/diagnose_checkpoint_chain.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 DEFAULT_CONFIG="${PROJECT_DIR}/config/default_config.yaml"
-PROTOCOL_TAG="formal_p1_04_full120_86p8_v1"
+PROTOCOL_TAG="${PROTOCOL_TAG:-formal_v2_80m_86p8_v1}"
 RESULTS_DIR="${ROOT_DIR}/Result/train_results/${PROTOCOL_TAG}"
-PREPROCESSED_ROOT="${ROOT_DIR}/Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
+PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Deploy_formal_v2_80m_86p8_v1}"
+CALIBRATION_DIR="${CALIBRATION_DIR:-${ROOT_DIR}/Data/config}"
 
 INFER_DEFAULTS=$(python - "${DEFAULT_CONFIG}" <<'PY'
 import sys
@@ -62,6 +63,7 @@ CD_CKPT="${RESULTS_DIR}/cd/cd_best.pt"
 
 echo "校验正式 VAE/LDM/CD checkpoint 链"
 python "${CHECKPOINT_CHAIN_SCRIPT}" validate \
+    --target_stage cd \
     --vae_ckpt "${VAE_CKPT}" \
     --ldm_ckpt "${LDM_CKPT}" \
     --cd_ckpt "${CD_CKPT}"
@@ -94,13 +96,12 @@ if [ ${#TEST_SCENES[@]} -eq 0 ]; then
     exit 1
 fi
 
-# 统一入口只校验一次全部场景，后续各采样分支复用该结果。
+# 统一入口只校验一次完整 deployment dataset，后续各采样分支复用。
+DEPLOYMENT_VALIDATE_ARGS=(validate --dataset_dir "${PREPROCESSED_ROOT}")
 for SCENE in "${TEST_SCENES[@]}"; do
-    SCENE_DIR="${PREPROCESSED_ROOT}/${SCENE}"
-    python "${MANIFEST_SCRIPT}" validate \
-        --scene_dir "${SCENE_DIR}" \
-        --expected_scene "${SCENE}"
+    DEPLOYMENT_VALIDATE_ARGS+=(--scene "${SCENE}")
 done
+python "${DEPLOYMENT_VIEW_SCRIPT}" "${DEPLOYMENT_VALIDATE_ARGS[@]}"
 
 RUN_LDM=true
 RUN_CD=true
@@ -124,6 +125,8 @@ if [ "$RUN_LDM" = true ]; then
             --steps 40 \
             --sampler heun \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
+            --deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}" \
+            --calibration_dir "${CALIBRATION_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
             --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
@@ -157,6 +160,8 @@ if [ "$RUN_CD" = true ]; then
             --steps 1 \
             --sampler euler \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
+            --deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}" \
+            --calibration_dir "${CALIBRATION_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
             --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
@@ -188,6 +193,8 @@ if [ "$RUN_CD" = true ]; then
             --steps 4 \
             --sampler euler \
             --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
+            --deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}" \
+            --calibration_dir "${CALIBRATION_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
             --occ_threshold "${OCC_THRESHOLD}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \

@@ -4,19 +4,30 @@
 
 # --- Data Configuration ---
 data:
-  # 已验收的 header-time、sensor-aware 正式候选数据根。
-  dataset_dir: "./Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate"
+  # formal v2 只训练/评价 0--80 m；80--120 m 由地图端保持 unknown。
+  dataset_dir: "./Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1"
+  scene_names: ["garden"]
+  calibration_dir: "./Data/config"
+  require_real_ir: true
+  require_real_calibration: true
+  require_persisted_observed_mask: true
+  # 统计只作为审计 metadata；当前模型输入仍为原四通道 Radar voxel。
+  require_radar_statistics: true
+  voxel_coordinate_frame: "lidar"
+  checkpoint_protocol: "formal_chain_v2"
+  # 由 v2 manifest、唯一 split、target/observed 和标定 hash 自动生成。
+  temporal_split_artifact: "./Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1/temporal_split_garden_train80_purge3s_v1.json"
+  data_protocol_path: "./Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1/formal_data_protocol_garden_train80_purge3s_v1.json"
   batch_size: 2
   num_workers: 4
-  train_split: 0.8
+  train_split: 0.8  # 仅 legacy 入口使用；formal v2 消费唯一 split artifact。
   alignment_size: 32
   use_augmentation: true
   # 显式冻结训练/推理共用网格，必须与 normalization artifact 一致。
   target_size: [32, 128, 128]
-  source_pc_range: [0, -20, -6, 120, 20, 10]
-  model_pc_range: [0, -20, -6, 120, 20, 10]
-  # 仅由训练场景 garden 全 4013 帧生成的正式统计文件。
-  radar_normalization_path: "./diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_full120_86p8_v1.json"
+  source_pc_range: [0, -20, -6, 80, 20, 10]
+  model_pc_range: [0, -20, -6, 80, 20, 10]
+  radar_normalization_path: "./diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json"
   # 传感器 Doppler 显式物理量程（m/s），与 artifact 严格匹配。
   doppler_scale_mps: 86.8
   augmentation:
@@ -48,7 +59,7 @@ vae:
   epochs: 100
   lr: 1.0e-4
   save_every: 10
-  save_dir: "./Result/train_results/formal_p1_04_full120_86p8_v1/vae"
+  save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/vae"
 
 # --- Latent Diffusion Model Configuration ---
 ldm:
@@ -76,7 +87,7 @@ ldm:
   epochs: 200 # Number of training epochs
   lr: 1.0e-4
   save_every: 10 # Save checkpoint every N epochs
-  save_dir: "./Result/train_results/formal_p1_04_full120_86p8_v1/ldm"
+  save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/ldm"
 
 # --- Consistency Distillation Configuration ---
 cd:
@@ -95,7 +106,7 @@ cd:
   # Training parameters
   lr: 5.0e-5
   save_every: 10 # Save checkpoint every N epochs
-  save_dir: "./Result/train_results/formal_p1_04_full120_86p8_v1/cd"
+  save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/cd"
 
 # --- Optimization Configuration ---
 optimization:

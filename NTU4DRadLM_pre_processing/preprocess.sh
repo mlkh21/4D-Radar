@@ -7,7 +7,6 @@
 
 # 默认物理参数配置（针对无人机高动态任务量身定制）
 DEFAULT_VX=50.0        # legacy fixed 模式参数；默认 none 模式不会使用
-DEFAULT_DT=0.002       # 默认红外-雷达硬件触发时钟残差 (秒)，即 2ms
 DEFAULT_RADAR_LIDAR_MAX_DELTA=0.045 # 12Hz Radar 对 10Hz LiDAR 的正常最近邻窗口
 DEFAULT_RADAR_IR_MAX_DELTA=0.025    # 25Hz Thermal 半周期加采样抖动余量
 DEFAULT_MAX_REJECTED_FRACTION=0.01  # 只允许跳过少量掉帧型 Radar-LiDAR 候选
@@ -21,7 +20,6 @@ MAX_REJECTED_FRACTION="${MAX_REJECTED_FRACTION:-$DEFAULT_MAX_REJECTED_FRACTION}"
 
 # 解析输入的命令行参数
 VX=${1:-$DEFAULT_VX}
-DT_SYNC=${2:-$DEFAULT_DT}
 VISIBILITY_MODE="${VISIBILITY_MODE:-preserve}"
 
 if [[ "$VISIBILITY_MODE" != "preserve" && "$VISIBILITY_MODE" != "hard" ]]; then
@@ -44,7 +42,7 @@ fi
 echo "======================================================================"
 echo "🚀 启动 NTU4DRadLM 高动态机载数据预处理流水线"
 echo "   固定速度参数  --vx      : ${VX} m/s（仅 fixed 模式生效）"
-echo "   设定硬件时滞  --dt_sync : ${DT_SYNC} s"
+echo "   时序补偿：读取逐帧 signed delta，仅移动非参考传感器"
 echo "   Radar-LiDAR 最大时差   : ${RADAR_LIDAR_MAX_DELTA} s"
 echo "   Radar-IR 最大时差      : ${RADAR_IR_MAX_DELTA} s"
 echo "   Radar-LiDAR 最大拒绝比例: ${MAX_REJECTED_FRACTION}"
@@ -88,7 +86,7 @@ echo -e "\n[STEP 2/2] 正在执行机载高速自身运动多普勒补偿与红�
 if [ -f "$SCRIPT_DIR/NTU4DRadLM_pre_processing.py" ]; then
     # 💡 严格核对：确保所有变量与路径的双引号完美闭合，消除所有 Bad Token
     python3 "$SCRIPT_DIR/NTU4DRadLM_pre_processing.py" \
-        --vx "$VX" --dt_sync "$DT_SYNC" \
+        --vx "$VX" \
         --velocity_mode "$VELOCITY_MODE" --velocity_frame "$VELOCITY_FRAME" \
         --velocity_file "$VELOCITY_FILE" --velocity_max_delta "$VELOCITY_MAX_DELTA" \
         --radar_lidar_max_delta "$RADAR_LIDAR_MAX_DELTA" \
