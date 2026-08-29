@@ -19,10 +19,7 @@ except ImportError:
     USE_3D_LOSS = False
     print("警告: 无法导入3D损失模块，使用2D LPIPS作为后备")
 
-from . import dist_util
-
 from .nn import mean_flat, append_dims, append_zero
-from .random_util import get_generator
 
 def get_weightings(weight_schedule, snrs, sigma_data):
     """
@@ -62,6 +59,7 @@ class KarrasDenoiser:
         weight_schedule="karras",
         distillation=False,
         loss_norm="lpips",
+        device=None,
     ):
         """
         输入:
@@ -72,6 +70,7 @@ class KarrasDenoiser:
             weight_schedule: 权重调度策略。
             distillation: 是否为蒸馏模式。
             loss_norm: 损失范数类型 ("lpips", "l1", "l2", "l2-32")。
+            device: 感知损失所在设备；未指定时按当前运行环境选择 CUDA 或 CPU。
         输出:
             无
         作用: 初始化 KarrasDenoiser。
@@ -85,6 +84,11 @@ class KarrasDenoiser:
         self.weight_schedule = weight_schedule
         self.distillation = distillation
         self.loss_norm = loss_norm
+        self.device = th.device(
+            device
+            if device is not None
+            else ("cuda" if th.cuda.is_available() else "cpu")
+        )
 
         self.rho = rho
         self.num_timesteps = 40
@@ -93,11 +97,11 @@ class KarrasDenoiser:
         if USE_3D_LOSS:
             self.perceptual_loss = Perceptual3DLoss(
                 in_channels=4
-            ).cuda()
+            ).to(self.device)
             print("使用3D感知损失")
         else:
             self.perceptual_loss = LPIPS(replace_pooling=True, reduction="none")
-            self.perceptual_loss.cuda()
+            self.perceptual_loss.to(self.device)
             print("使用2D LPIPS损失（后备模式）")
         
     def get_snr(self, sigmas):
@@ -611,7 +615,8 @@ def karras_sample(
     6. 调用采样函数生成样本。
     """
     if generator is None:
-        generator = get_generator("dummy")
+        # 默认随机接口直接使用 torch，避免训练/导入路径隐式初始化旧 MPI 栈。
+        generator = th
 
     if sampler == "progdist":
         sigmas = get_sigmas_karras(steps + 1, sigma_min, sigma_max, rho, device=device)
@@ -1176,8 +1181,8 @@ def iterative_colorization(
             matrix = -matrix
         return matrix
 
-    Q = th.from_numpy(obtain_orthogonal_matrix()).to(dist_util.dev()).to(th.float32)
-    mask = th.zeros(*x.shape[1:], device=dist_util.dev())
+    Q = th.from_numpy(obtain_orthogonal_matrix()).to(x.device).to(th.float32)
+    mask = th.zeros(*x.shape[1:], device=x.device)
     mask[0, ...] = 1.0
 
     def replacement(x0, x1):
@@ -1236,9 +1241,9 @@ def iterative_inpainting(
     # NOTE: 将图像转换为 numpy 数组。
     img_np = np.array(img)
     img_np = img_np.transpose(2, 0, 1)
-    img_th = th.from_numpy(img_np).to(dist_util.dev())
+    img_th = th.from_numpy(img_np).to(x.device)
 
-    mask = th.zeros(*x.shape, device=dist_util.dev())
+    mask = th.zeros(*x.shape, device=x.device)
     mask = mask.reshape(-1, 7, 3, image_size, image_size)
 
     mask[::2, :, img_th > 0.5] = 1.0
@@ -1290,7 +1295,7 @@ def iterative_superres(
             matrix = -matrix
         return matrix
 
-    Q = th.from_numpy(obtain_orthogonal_matrix()).to(dist_util.dev()).to(th.float32)
+    Q = th.from_numpy(obtain_orthogonal_matrix()).to(x.device).to(th.float32)
 
     image_size = x.shape[-1]
 

@@ -1082,7 +1082,10 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                 self.radar_normalization,
             )
 
+        # 样本身份只绑定场景和帧号，不绑定可随机器变化的绝对数据根。
+        sample_id = f"{scene}/{os.path.splitext(os.path.basename(target_path))[0]}"
         meta_dict = {
+            "sample_id": sample_id,
             "ir_img": ir_img,
             "occupancy_observed_mask": observed_mask_tensor,
             "occupancy_observed_mask_source": observed_mask_source,

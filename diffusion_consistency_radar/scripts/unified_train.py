@@ -10,6 +10,7 @@
 """
 
 import argparse
+import atexit
 import math
 import os
 import random
@@ -22,6 +23,7 @@ import torch.nn as nn
 from pathlib import Path
 from typing import Dict, Optional, Any, List, Tuple
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 from torch.optim.adamw import AdamW
@@ -71,10 +73,12 @@ from diffusion_consistency_radar.checkpoint_chain import (
     FORMAL_MINI_CHECKPOINT_PROTOCOL,
     assert_checkpoint_training_identity,
     build_formal_mini_selection,
+    build_formal_stage_training_selection,
     resolve_training_checkpoint_protocol,
     safe_torch_load as safe_checkpoint_load,
     sha256_file,
     validate_checkpoint_data_protocol,
+    validate_formal_stage_training_selection,
 )
 from diffusion_consistency_radar.radar_normalization import (
     LEGACY_RADAR_NORMALIZATION_PROTOCOL,
@@ -100,6 +104,23 @@ from diffusion_consistency_radar.formal_data_protocol import (
 )
 from diffusion_consistency_radar.observed_mask import OBSERVED_MASK_PROTOCOL
 from diffusion_consistency_radar.radar_statistics import RADAR_STATISTICS_PROTOCOL
+from diffusion_consistency_radar.distributed_training import (
+    DistributedContext,
+    DistributedEvalSampler,
+    WorldBatchPlan,
+    all_ranks_true,
+    assert_distributed_config_compatible,
+    assert_resume_distributed_compatible,
+    cleanup_distributed,
+    distributed_barrier,
+    distributed_checkpoint_metadata,
+    deterministic_noise_from_sample_ids,
+    initialize_distributed,
+    reduce_named_sums,
+    set_loader_epoch,
+    unwrap_model,
+    wrap_model_for_ddp,
+)
 
 
 def resolve_training_radar_normalization(
@@ -176,7 +197,9 @@ def unpack_training_batch(batch):
         target, radar, meta = batch
         return target, radar, meta
     if len(batch) == 4:
-        target, radar, meta, _path = batch
+        target, radar, meta, sample_path = batch
+        meta = dict(meta or {})
+        meta["_sample_path"] = sample_path
         return target, radar, meta
     raise ValueError(f"Unsupported batch format with {len(batch)} elements")
 
@@ -956,6 +979,7 @@ def resolve_ldm_validation_config(ldm_config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "protocol": LDM_VALIDATION_PROTOCOL,
         "split": LDM_VALIDATION_SPLIT,
+        "noise_identity": "scene_frame_sha256_v1",
         "seed": seed,
         **resolved,
     }
@@ -1240,6 +1264,27 @@ def align_ldm_grid_config(config: "ConfigManager", target_size, model_pc_range):
     ldm_cfg.setdefault("fusion_pc_range", list(model_pc_range))
 
 
+def resolve_formal_stage_frame_limits(
+    stage: str,
+    stage_config: Dict[str, Any],
+) -> Tuple[int, int]:
+    """解析正式阶段每场景帧上限；0 表示使用完整 temporal partition。"""
+    if stage not in ("vae", "ldm", "cd"):
+        raise ValueError(f"未知训练阶段: {stage!r}")
+    values = (
+        stage_config.get("train_frames_per_epoch", 0),
+        stage_config.get("validation_frames_per_epoch", 0),
+    )
+    names = ("train_frames_per_epoch", "validation_frames_per_epoch")
+    for name, value in zip(names, values):
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"{stage}.{name} 必须是非负整数，0 表示使用完整 partition，"
+                f"实际为 {value!r}"
+            )
+    return values
+
+
 class ConfigManager:
     """配置管理器 - 统一加载和管理配置"""
     
@@ -1266,12 +1311,18 @@ class ConfigManager:
 class MemoryOptimizer:
     """显存优化器 - 统一管理显存优化策略"""
     
-    def __init__(self, config: ConfigManager):
+    def __init__(
+        self,
+        config: ConfigManager,
+        distributed: Optional[DistributedContext] = None,
+    ):
         self.use_amp = config.get('optimization.use_amp', True)
         self.use_checkpoint = config.get('optimization.use_checkpoint', True)
         self.grad_accum_steps = config.get('optimization.gradient_accumulation_steps', 1)
         device_cfg = config.get('hardware.device', 'cuda') or 'cuda'
-        self.device = torch.device(device_cfg)
+        self.device = torch.device(
+            distributed.device if distributed is not None else device_cfg
+        )
         
         self.scaler = GradScaler('cuda') if self.use_amp else None
     
@@ -1300,6 +1351,37 @@ class MemoryOptimizer:
                   f"{stats['peak_gb']:.1f}GB peak")
 
 
+def _trainer_distributed_context(trainer) -> DistributedContext:
+    """兼容由单元测试直接构造的旧 trainer 对象。"""
+    context = getattr(trainer, "distributed", None)
+    if context is not None:
+        return context
+    return DistributedContext.single_process(getattr(trainer, "device", "cpu"))
+
+
+def _trainer_runtime_metadata(trainer, train_loader, grad_accum_steps: int):
+    """从真实 DataLoader 构造 checkpoint 使用的分布式运行身份。"""
+    context = _trainer_distributed_context(trainer)
+    batch_size = int(getattr(train_loader, "batch_size", 1))
+    try:
+        dataset_size = len(train_loader.dataset)
+    except (AttributeError, TypeError):
+        dataset_size = len(train_loader) * batch_size * context.world_size
+    batch_plan = WorldBatchPlan(
+        world_size=context.world_size,
+        per_rank_batch_size=batch_size,
+        gradient_accumulation_steps=int(grad_accum_steps),
+        effective_global_batch_size=(
+            context.world_size * batch_size * int(grad_accum_steps)
+        ),
+    )
+    return batch_plan, distributed_checkpoint_metadata(
+        context,
+        batch_plan,
+        train_dataset_size=dataset_size,
+    )
+
+
 class OptimizedVAETrainer:
     """优化的 VAE 训练器"""
 
@@ -1326,13 +1408,20 @@ class OptimizedVAETrainer:
         resume_path: Optional[str] = None,
         vae_model_config: Optional[Dict[str, Any]] = None,
         vae_config_type: Optional[str] = None,
+        distributed: Optional[DistributedContext] = None,
     ):
         self.config = config
         self.memory_opt = memory_opt
         self.device = memory_opt.device
+        self.distributed = distributed or DistributedContext.single_process(
+            self.device
+        )
         
         # 将模型移到设备
-        self.model = model.to(self.device)
+        self.model = wrap_model_for_ddp(
+            model.to(self.device),
+            self.distributed,
+        )
         
         # 训练参数
         self.vae_config = config.get('vae', {}) or {}
@@ -1351,6 +1440,15 @@ class OptimizedVAETrainer:
             config.get("data", {}) or {},
             "vae",
         )
+        configured_selection = config.get("data.stage_training_selection")
+        self.stage_training_selection = (
+            validate_formal_stage_training_selection(
+                configured_selection,
+                expected_stage="vae",
+            )
+            if configured_selection is not None
+            else None
+        )
         target_size, source_range, model_range = resolve_data_grid_config(
             config.get("data", {}) or {}
         )
@@ -1365,7 +1463,9 @@ class OptimizedVAETrainer:
             else "raw"
         )
         
-        os.makedirs(self.save_dir, exist_ok=True)
+        if self.distributed.is_main_process:
+            os.makedirs(self.save_dir, exist_ok=True)
+        distributed_barrier(self.distributed)
         
         # 优化器和调度器
         self.optimizer = AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
@@ -1399,6 +1499,15 @@ class OptimizedVAETrainer:
     
     def _setup_logging(self):
         """设置日志系统"""
+        distributed = _trainer_distributed_context(self)
+        if not distributed.is_main_process:
+            self.logger = logging.getLogger(
+                f"{__name__}.vae.rank{distributed.rank}"
+            )
+            self.logger.handlers.clear()
+            self.logger.addHandler(logging.NullHandler())
+            self.logger.propagate = False
+            return
         # 确定日志文件模式：恢复训练时追加，新训练时覆盖
         log_mode = 'a' if self.is_resumed else 'w'
         
@@ -1451,20 +1560,32 @@ class OptimizedVAETrainer:
     
     def _resume_from_checkpoint(self, ckpt_path: str):
         """从检查点恢复训练"""
-        print(f"Resuming from checkpoint: {ckpt_path}")
+        distributed = _trainer_distributed_context(self)
+        if distributed.is_main_process:
+            print(f"Resuming from checkpoint: {ckpt_path}")
         ckpt = safe_torch_load(ckpt_path, map_location=self.device)
         assert_checkpoint_training_identity(
             ckpt,
             expected_stage="vae",
             checkpoint_protocol=self.checkpoint_protocol,
             data_protocol=self.data_protocol,
+            stage_training_selection=getattr(
+                self, "stage_training_selection", None
+            ),
         )
+        # 单元测试可能通过 __new__ 构造最小 trainer；正式入口始终具备两项配置。
+        if hasattr(self, "config") and hasattr(self, "memory_opt"):
+            assert_resume_distributed_compatible(
+                ckpt,
+                expected_effective_global_batch_size=(
+                    distributed.world_size
+                    * int(self.config.get("data.batch_size", 2))
+                    * self.memory_opt.grad_accum_steps
+                ),
+            )
         
         # 加载模型
-        if isinstance(self.model, nn.DataParallel):
-            self.model.module.load_state_dict(ckpt['model_state_dict'])
-        else:
-            self.model.load_state_dict(ckpt['model_state_dict'])
+        unwrap_model(self.model).load_state_dict(ckpt['model_state_dict'])
         
         # 加载优化器
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -1483,10 +1604,11 @@ class OptimizedVAETrainer:
         self.best_loss = ckpt.get('best_loss', ckpt.get('loss', float('inf')))
         self.best_iou = ckpt.get('best_iou', float('-inf'))
         
-        print(
-            f"Resumed from epoch {self.start_epoch - 1}, "
-            f"best loss: {self.best_loss:.4f}, best IoU: {self.best_iou:.4f}"
-        )
+        if distributed.is_main_process:
+            print(
+                f"Resumed from epoch {self.start_epoch - 1}, "
+                f"best loss: {self.best_loss:.4f}, best IoU: {self.best_iou:.4f}"
+            )
     
     def _log_metrics(
         self,
@@ -1518,6 +1640,7 @@ class OptimizedVAETrainer:
     
     def train_epoch(self, epoch: int, train_loader: DataLoader) -> tuple:
         """训练一个 epoch"""
+        distributed = _trainer_distributed_context(self)
         self.model.train()
         total_loss = 0
         total_recon = 0
@@ -1531,13 +1654,23 @@ class OptimizedVAETrainer:
         accumulation_count = 0
         
         # 创建进度条
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{self.epochs}")
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}/{self.epochs}",
+            disable=not distributed.is_main_process,
+        )
         
         for batch_idx, batch in enumerate(pbar):
             target, cond, meta_dict = unpack_training_batch(batch)
             target = target.to(self.device, non_blocking=True)
             
-            if not torch.isfinite(target).all():
+            target_is_finite = bool(torch.isfinite(target).all().item())
+            if not all_ranks_true(target_is_finite, distributed):
+                if distributed.initialized:
+                    self.optimizer.zero_grad()
+                    raise RuntimeError(
+                        f"VAE batch {batch_idx} 至少一个 rank 的 target 含 NaN/Inf"
+                    )
                 print(f"Warning: Batch {batch_idx} target contains NaN or Inf")
                 continue
             
@@ -1550,15 +1683,16 @@ class OptimizedVAETrainer:
                         self.device,
                         non_blocking=True,
                     )
+                loss_model = unwrap_model(self.model)
                 if observed_mask is None:
                     # 兼容旧模型/旧 batch 的三参数 compute_loss 接口。
-                    loss, recon_loss, kl_loss = self.model.compute_loss(
+                    loss, recon_loss, kl_loss = loss_model.compute_loss(
                         target,
                         recon,
                         (mean, logvar),
                     )
                 else:
-                    loss, recon_loss, kl_loss = self.model.compute_loss(
+                    loss, recon_loss, kl_loss = loss_model.compute_loss(
                         target,
                         recon,
                         (mean, logvar),
@@ -1566,7 +1700,15 @@ class OptimizedVAETrainer:
                     )
 
             losses = (loss, recon_loss, kl_loss)
-            if not all(torch.isfinite(value).all() for value in losses):
+            locally_finite = all(
+                bool(torch.isfinite(value).all().item()) for value in losses
+            )
+            if not all_ranks_true(locally_finite, distributed):
+                if distributed.initialized:
+                    self.optimizer.zero_grad()
+                    raise RuntimeError(
+                        f"VAE batch {batch_idx} 至少一个 rank 的 loss 含 NaN/Inf"
+                    )
                 print(f"Warning: Batch {batch_idx} loss contains NaN or Inf")
                 continue
 
@@ -1599,7 +1741,7 @@ class OptimizedVAETrainer:
             total_recon += recon_loss.item()
             total_kl += kl_loss.item()
             valid_batch_count += 1
-            component_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            component_model = unwrap_model(self.model)
             for name, value in component_model.loss_components.items():
                 if name in total_components:
                     total_components[name] += value.item()
@@ -1641,19 +1783,37 @@ class OptimizedVAETrainer:
             self.optimizer.zero_grad()
         
         self.scheduler.step()
-        self.last_epoch_valid_batch_count = valid_batch_count
+        totals = reduce_named_sums(
+            {
+                "loss": total_loss,
+                "recon": total_recon,
+                "kl": total_kl,
+                "valid_batch_count": valid_batch_count,
+                **{
+                    f"component_{name}": value
+                    for name, value in total_components.items()
+                },
+            },
+            distributed,
+        )
+        global_batch_count = int(totals["valid_batch_count"])
+        if global_batch_count == 0:
+            raise RuntimeError("VAE 全局 epoch 没有有限的有效 batch")
+        self.last_epoch_valid_batch_count = global_batch_count
         self.last_epoch_loss_components = {
-            name: value / valid_batch_count for name, value in total_components.items()
+            name: totals[f"component_{name}"] / global_batch_count
+            for name in total_components
         }
         return (
-            total_loss / valid_batch_count,
-            total_recon / valid_batch_count,
-            total_kl / valid_batch_count,
+            totals["loss"] / global_batch_count,
+            totals["recon"] / global_batch_count,
+            totals["kl"] / global_batch_count,
         )
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """使用确定性编码在完整验证集上计算 threshold=0.5 微平均指标。"""
+        distributed = _trainer_distributed_context(self)
         self.model.eval()
         counts = {
             "intersection": 0,
@@ -1662,7 +1822,7 @@ class OptimizedVAETrainer:
             "predicted_positive": 0,
         }
         batch_count = 0
-        model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        model = unwrap_model(self.model)
         for batch in val_loader:
             target, _condition, _meta = unpack_training_batch(batch)
             target = target.to(self.device, non_blocking=True)
@@ -1679,12 +1839,16 @@ class OptimizedVAETrainer:
             for key, value in batch_counts.items():
                 counts[key] += value
             batch_count += 1
-        if batch_count == 0:
+        reduced = reduce_named_sums(
+            {**counts, "batch_count": batch_count},
+            distributed,
+        )
+        if reduced["batch_count"] == 0:
             raise RuntimeError("验证 DataLoader 为空，无法计算 occupancy 指标")
         return {
-            "iou": counts["intersection"] / max(counts["union"], 1),
-            "recall": counts["intersection"] / max(counts["target_positive"], 1),
-            "precision": counts["intersection"] / max(counts["predicted_positive"], 1),
+            "iou": reduced["intersection"] / max(reduced["union"], 1),
+            "recall": reduced["intersection"] / max(reduced["target_positive"], 1),
+            "precision": reduced["intersection"] / max(reduced["predicted_positive"], 1),
         }
 
     def _checkpoint_payload(
@@ -1697,14 +1861,9 @@ class OptimizedVAETrainer:
         """构造训练、诊断和推理均可直接消费的自描述 checkpoint。"""
         if not self.vae_model_config:
             raise RuntimeError("保存 VAE checkpoint 前必须提供完整 vae_model_config")
-        state_dict = (
-            self.model.module.state_dict()
-            if isinstance(self.model, nn.DataParallel)
-            else self.model.state_dict()
-        )
-        return {
+        payload = {
             "epoch": epoch,
-            "model_state_dict": state_dict,
+            "model_state_dict": unwrap_model(self.model).state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "loss": loss,
@@ -1722,6 +1881,13 @@ class OptimizedVAETrainer:
             "stage": "vae",
             "data_protocol": dict(self.data_protocol),
         }
+        if getattr(self, "stage_training_selection", None) is not None:
+            payload["stage_training_selection"] = dict(
+                self.stage_training_selection
+            )
+        if hasattr(self, "distributed_training"):
+            payload["distributed_training"] = dict(self.distributed_training)
+        return payload
 
     def _update_best_metrics(self, loss: float, val_iou: float):
         """先原子更新本 epoch 的全局最佳状态，再允许构建 checkpoint。"""
@@ -1735,6 +1901,22 @@ class OptimizedVAETrainer:
     
     def train(self, train_loader: DataLoader, val_loader: DataLoader):
         """完整训练流程"""
+        distributed = _trainer_distributed_context(self)
+        batch_plan = WorldBatchPlan(
+            world_size=distributed.world_size,
+            per_rank_batch_size=int(train_loader.batch_size),
+            gradient_accumulation_steps=self.memory_opt.grad_accum_steps,
+            effective_global_batch_size=(
+                distributed.world_size
+                * int(train_loader.batch_size)
+                * self.memory_opt.grad_accum_steps
+            ),
+        )
+        self.distributed_training = distributed_checkpoint_metadata(
+            distributed,
+            batch_plan,
+            train_dataset_size=len(train_loader.dataset),
+        )
         estimated_total_steps = self.epochs * len(train_loader)
         
         msg = "=" * 70 + "\n"
@@ -1745,28 +1927,32 @@ class OptimizedVAETrainer:
         msg += f"  Start epoch: {self.start_epoch}\n"
         msg += f"  Batch size: {train_loader.batch_size}\n"
         msg += f"  Gradient accumulation: {self.memory_opt.grad_accum_steps}\n"
-        msg += f"  Effective batch size: {train_loader.batch_size * self.memory_opt.grad_accum_steps}\n"
+        msg += f"  Effective batch size: {batch_plan.effective_global_batch_size}\n"
+        msg += f"  Distributed world size: {distributed.world_size}\n"
         msg += f"  Learning rate: {self.lr}\n"
         msg += f"  Device: {self.device}\n"
         msg += f"  Save directory: {self.save_dir}\n"
         msg += f"  Log file: {self.log_file}\n"
         msg += f"  CSV file: {self.csv_file}\n"
         msg += "=" * 70
-        print(msg)
-        self.logger.info(msg)
+        if distributed.is_main_process:
+            print(msg)
+            self.logger.info(msg)
         
         start_time = time.time()
         
         for epoch in range(self.start_epoch, self.epochs + 1):
+            set_loader_epoch(train_loader, epoch)
             epoch_start = time.time()
             loss, recon_loss, kl_loss = self.train_epoch(epoch, train_loader)
             val_metrics = self.validate(val_loader)
             epoch_time = time.time() - epoch_start
             
             # 记录到 CSV
-            self._log_metrics(
-                epoch, loss, recon_loss, kl_loss, epoch_time, val_metrics
-            )
+            if distributed.is_main_process:
+                self._log_metrics(
+                    epoch, loss, recon_loss, kl_loss, epoch_time, val_metrics
+                )
             
             # 打印和记录 epoch 总结
             summary = (f"\n[Epoch {epoch}/{self.epochs}] "
@@ -1775,28 +1961,32 @@ class OptimizedVAETrainer:
                       f"Recall: {val_metrics['recall']:.4f} | "
                       f"Precision: {val_metrics['precision']:.4f} | "
                       f"Time: {epoch_time:.1f}s")
-            print(summary)
-            self.logger.info(summary)
+            if distributed.is_main_process:
+                print(summary)
+                self.logger.info(summary)
             
             # 显存统计
-            self.memory_opt.print_stats(prefix="  ")
+            if distributed.is_main_process:
+                self.memory_opt.print_stats(prefix="  ")
             
             improved_loss, improved_iou = self._update_best_metrics(
                 loss, val_metrics["iou"]
             )
-            checkpoint_payload = self._checkpoint_payload(
-                epoch, loss, self.best_loss, self.best_iou
-            )
+            checkpoint_payload = None
+            if distributed.is_main_process:
+                checkpoint_payload = self._checkpoint_payload(
+                    epoch, loss, self.best_loss, self.best_iou
+                )
 
             # NOTE: 本 epoch 的所有保存路径共享更新完两个 best 后的同一 payload。
-            if improved_loss:
+            if distributed.is_main_process and improved_loss:
                 best_ckpt = os.path.join(self.save_dir, "vae_best_loss.pt")
                 atomic_torch_save(checkpoint_payload, best_ckpt)
                 msg = f"  ✓ Saved best model (loss: {loss:.4f})"
                 print(msg)
                 self.logger.info(msg)
 
-            if improved_iou:
+            if distributed.is_main_process and improved_iou:
                 best_iou_path = os.path.join(self.save_dir, "vae_best_iou.pt")
                 atomic_torch_save(checkpoint_payload, best_iou_path)
                 # NOTE: 兼容历史路径，内容始终与 best-IoU checkpoint 一致。
@@ -1809,7 +1999,10 @@ class OptimizedVAETrainer:
                 self.logger.info(msg)
             
             # 定期保存
-            if epoch % self.vae_config.get('save_every', 10) == 0:
+            if (
+                distributed.is_main_process
+                and epoch % self.vae_config.get('save_every', 10) == 0
+            ):
                 ckpt_path = os.path.join(self.save_dir, f"vae_epoch{epoch:04d}.pt")
                 atomic_torch_save(checkpoint_payload, ckpt_path)
                 msg = f"  ✓ Saved checkpoint: {ckpt_path}"
@@ -1821,8 +2014,9 @@ class OptimizedVAETrainer:
         final_msg += f"Training completed in {total_time/3600:.2f} hours\n"
         final_msg += f"Best loss: {self.best_loss:.4f}\n"
         final_msg += "=" * 70
-        print(final_msg)
-        self.logger.info(final_msg)
+        if distributed.is_main_process:
+            print(final_msg)
+            self.logger.info(final_msg)
 
 
 class OptimizedLDMTrainer:
@@ -1838,6 +2032,7 @@ class OptimizedLDMTrainer:
         radar_normalization=None,
         radar_normalization_sha256: str = "",
         allow_legacy_radar_units: bool = False,
+        distributed: Optional[DistributedContext] = None,
     ):
         self.vae = vae.to(memory_opt.device)
         self.vae.eval()
@@ -1847,6 +2042,9 @@ class OptimizedLDMTrainer:
         self.config = config
         self.memory_opt = memory_opt
         self.device = memory_opt.device
+        self.distributed = distributed or DistributedContext.single_process(
+            self.device
+        )
         
         ldm_config: Dict[str, Any] = config.get('ldm', {}) or {}
         self.ldm_config = ldm_config
@@ -1859,6 +2057,15 @@ class OptimizedLDMTrainer:
             config.get("data", {}) or {},
             "ldm",
             allow_legacy_data=allow_legacy_radar_units,
+        )
+        configured_selection = config.get("data.stage_training_selection")
+        self.stage_training_selection = (
+            validate_formal_stage_training_selection(
+                configured_selection,
+                expected_stage="ldm",
+            )
+            if configured_selection is not None
+            else None
         )
         self.vae_checkpoint_sha256 = str(vae_checkpoint_sha256 or "")
         curriculum_total_epochs = ldm_config.get('epochs', 200)
@@ -1949,12 +2156,14 @@ class OptimizedLDMTrainer:
             self.radar_normalization_protocol = self.radar_normalization["protocol"]
         if resume_path and os.path.exists(resume_path):
             resume_checkpoint = safe_torch_load(resume_path, map_location="cpu")
-            assert_checkpoint_training_identity(
-                resume_checkpoint,
-                expected_stage="ldm",
-                checkpoint_protocol=self.checkpoint_protocol,
-                data_protocol=self.data_protocol,
-            )
+            if not allow_legacy_radar_units:
+                assert_checkpoint_training_identity(
+                    resume_checkpoint,
+                    expected_stage="ldm",
+                    checkpoint_protocol=self.checkpoint_protocol,
+                    data_protocol=self.data_protocol,
+                    stage_training_selection=self.stage_training_selection,
+                )
             assert_checkpoint_radar_normalization(
                 resume_checkpoint,
                 self.radar_normalization,
@@ -1966,7 +2175,9 @@ class OptimizedLDMTrainer:
                 context="LDM resume preflight",
             )
             self._preloaded_resume_checkpoint = resume_checkpoint
-        os.makedirs(self.save_dir, exist_ok=True)
+        if self.distributed.is_main_process:
+            os.makedirs(self.save_dir, exist_ok=True)
+        distributed_barrier(self.distributed)
         self.model = CompleteDualModalityPerceptionNet(
             base_unet,
             voxel_shape=fusion_voxel_shape,
@@ -1974,6 +2185,12 @@ class OptimizedLDMTrainer:
             downsample_to_latent=True,
             latent_shape=fusion_latent_shape,
         ).to(self.device)
+        # 可选不确定性头以零权重接入静态计算图，避免 DDP 出现未使用参数分叉。
+        self.model = wrap_model_for_ddp(
+            self.model,
+            self.distributed,
+            find_unused_parameters=False,
+        )
         
         # 优化器
         self.optimizer = AdamW(
@@ -1988,6 +2205,7 @@ class OptimizedLDMTrainer:
             sigma_max=ldm_config.get('sigma_max', 80.0),
             sigma_min=ldm_config.get('sigma_min', 0.002),
             loss_norm='l2',
+            device=self.device,
         )
         self.decoded_loss_weight = float(ldm_config.get('decoded_loss_weight', 0.0))
         self.decoded_false_positive_weight = float(ldm_config.get('decoded_false_positive_weight', 0.0))
@@ -2123,6 +2341,15 @@ class OptimizedLDMTrainer:
     
     def _setup_logging(self):
         """设置日志系统"""
+        distributed = _trainer_distributed_context(self)
+        if not distributed.is_main_process:
+            self.logger = logging.getLogger(
+                f"{__name__}.ldm.rank{distributed.rank}"
+            )
+            self.logger.handlers.clear()
+            self.logger.addHandler(logging.NullHandler())
+            self.logger.propagate = False
+            return
         # 确定日志文件模式：恢复训练时追加，新训练时覆盖
         log_mode = 'a' if self.is_resumed else 'w'
         
@@ -2149,7 +2376,9 @@ class OptimizedLDMTrainer:
     
     def _resume_from_checkpoint(self, ckpt_path: str):
         """从检查点恢复训练"""
-        print(f"Resuming LDM from checkpoint: {ckpt_path}")
+        distributed = _trainer_distributed_context(self)
+        if distributed.is_main_process:
+            print(f"Resuming LDM from checkpoint: {ckpt_path}")
         ckpt = getattr(self, "_preloaded_resume_checkpoint", None)
         if ckpt is None:
             ckpt = safe_torch_load(ckpt_path, map_location=self.device)
@@ -2163,6 +2392,16 @@ class OptimizedLDMTrainer:
             allow_legacy_radar_units=self.allow_legacy_radar_units,
             context="LDM resume checkpoint",
         )
+        # 兼容通过 __new__ 构造的最小测试对象；正式入口始终执行该身份校验。
+        if hasattr(self, "config") and hasattr(self, "memory_opt"):
+            assert_resume_distributed_compatible(
+                ckpt,
+                expected_effective_global_batch_size=(
+                    distributed.world_size
+                    * int(self.config.get("data.batch_size", 2))
+                    * self.memory_opt.grad_accum_steps
+                ),
+            )
         saved_loss_config = ckpt.get('ldm_loss_config', {})
         curriculum_fields = (
             "decoded_column_curriculum_enabled",
@@ -2231,7 +2470,10 @@ class OptimizedLDMTrainer:
         
         # 验证协议属于恢复前置条件，必须在模型/优化器状态发生任何修改前校验。
         self._restore_ldm_validation_state(ckpt)
-        self.model.load_state_dict(migrate_ir_gate_state_dict(self.model, ckpt['model_state_dict']))
+        base_model = unwrap_model(self.model)
+        base_model.load_state_dict(
+            migrate_ir_gate_state_dict(base_model, ckpt['model_state_dict'])
+        )
         if 'optimizer_state_dict' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         
@@ -2248,7 +2490,8 @@ class OptimizedLDMTrainer:
                 f", best val IoU: {self.best_val_iou:.4f}, "
                 f"best val latent loss: {self.best_val_loss:.4f}"
             )
-        print(resume_message)
+        if distributed.is_main_process:
+            print(resume_message)
 
     def _restore_ldm_validation_state(self, checkpoint: Dict[str, Any]):
         """恢复并严格校验新协议验证状态；旧 checkpoint 由首轮验证升级。"""
@@ -2263,6 +2506,9 @@ class OptimizedLDMTrainer:
             "split": self.validation_config["split"],
             "selector": self.validation_selector,
         }
+        noise_identity = self.validation_config.get("noise_identity")
+        if noise_identity is not None:
+            expected_text["noise_identity"] = noise_identity
         for field, expected in expected_text.items():
             if saved.get(field) != expected:
                 raise ValueError(
@@ -2344,6 +2590,7 @@ class OptimizedLDMTrainer:
     
     def train_epoch(self, epoch: int, train_loader: DataLoader) -> float:
         """训练一个 epoch"""
+        distributed = _trainer_distributed_context(self)
         effective_positive_weight, effective_negative_weight = (
             self._column_weights_for_epoch(epoch)
         )
@@ -2358,7 +2605,11 @@ class OptimizedLDMTrainer:
         accumulation_count = 0
         
         # 创建进度条
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}",
+            disable=not distributed.is_main_process,
+        )
         
         for batch_idx, batch in enumerate(pbar):
             target, cond, meta_dict = unpack_training_batch(batch)
@@ -2413,15 +2664,23 @@ class OptimizedLDMTrainer:
                         denoised, uncertainty = model_out
                     else:
                         denoised, uncertainty = model_out, None
-                    ir_frustum_mask = getattr(self.model, "last_ir_frustum_mask", None)
+                    ir_frustum_mask = getattr(
+                        unwrap_model(self.model), "last_ir_frustum_mask", None
+                    )
                     if ir_frustum_mask is not None:
                         total_meta["ir_frustum_voxel_ratio"] += float(ir_frustum_mask.float().mean().item())
                 else:
                     # Legacy batches without IR metadata still train the same 16-channel UNet backbone.
                     if z_cond is None:
                         raise RuntimeError("legacy LDM batch 缺少 condition latent")
+                    if self.distributed.initialized:
+                        raise RuntimeError(
+                            "DDP LDM 不支持缺少 IR/标定的 legacy 旁路 batch"
+                        )
                     model_input = pad_ldm_input_to_sixteen_channels(torch.cat([noised_z, z_cond], dim=1))
-                    denoised = self.model.unet_3d(model_input, sigmas)
+                    denoised = unwrap_model(self.model).unet_3d(
+                        model_input, sigmas
+                    )
                     ir_frustum_mask = None
                 loss, loss_components = compute_ldm_loss_components(
                     denoised,
@@ -2507,32 +2766,57 @@ class OptimizedLDMTrainer:
                 self.optimizer.step()
             self.optimizer.zero_grad()
 
+        totals = reduce_named_sums(
+            {
+                "loss": total_loss,
+                "batch_count": len(train_loader),
+                **{
+                    f"loss_component_{name}": value
+                    for name, value in total_components.items()
+                },
+                **{
+                    f"meta_component_{name}": value
+                    for name, value in total_meta.items()
+                },
+            },
+            distributed,
+        )
+        global_batch_count = int(totals["batch_count"])
+        if global_batch_count == 0:
+            raise RuntimeError("LDM 全局训练 DataLoader 为空")
         self.last_epoch_loss_components = {
-            name: total_components[name] / len(train_loader)
+            name: totals[f"loss_component_{name}"] / global_batch_count
             for name in LDM_LOSS_COMPONENT_NAMES
         }
         self.last_epoch_meta_components = {
-            name: total_meta[name] / len(train_loader)
+            name: totals[f"meta_component_{name}"] / global_batch_count
             for name in LDM_META_COMPONENT_NAMES
         }
-        if self.last_epoch_meta_components["mock_ir_ratio"] > 0.5:
+        if (
+            distributed.is_main_process
+            and self.last_epoch_meta_components["mock_ir_ratio"] > 0.5
+        ):
             self.logger.warning(
                 "LDM epoch %s mock IR ratio is %.3f; 当前结果不能作为真实红外融合收益。",
                 epoch,
                 self.last_epoch_meta_components["mock_ir_ratio"],
             )
-        if self.last_epoch_meta_components["mock_calib_ratio"] > 0.5:
+        if (
+            distributed.is_main_process
+            and self.last_epoch_meta_components["mock_calib_ratio"] > 0.5
+        ):
             self.logger.warning(
                 "LDM epoch %s mock calib ratio is %.3f; IR 投影几何可信度较低。",
                 epoch,
                 self.last_epoch_meta_components["mock_calib_ratio"],
             )
-        return total_loss / len(train_loader)
+        return totals["loss"] / global_batch_count
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """在独立时间块上用固定噪声计算单步去噪代理指标。"""
-        if len(val_loader) == 0:
+        distributed = _trainer_distributed_context(self)
+        if len(val_loader) == 0 and not distributed.initialized:
             raise RuntimeError("LDM 验证 DataLoader 为空")
 
         was_training = self.model.training
@@ -2545,7 +2829,7 @@ class OptimizedLDMTrainer:
             "target_positive": 0,
             "predicted_positive": 0,
         }
-        generator = None
+        validation_model = unwrap_model(self.model)
         try:
             for batch in val_loader:
                 target, cond, meta_dict = unpack_training_batch(batch)
@@ -2559,26 +2843,38 @@ class OptimizedLDMTrainer:
                     meta_dict,
                 )
 
-                if generator is None:
-                    generator = torch.Generator(device=z_target.device)
-                    generator.manual_seed(self.validation_config["seed"])
                 sigmas = torch.full(
                     (z_target.shape[0],),
                     self.validation_config["sigma"],
                     device=z_target.device,
                     dtype=z_target.dtype,
                 )
-                noise = torch.randn(
-                    z_target.shape,
-                    generator=generator,
-                    device=z_target.device,
-                    dtype=z_target.dtype,
-                )
+                sample_ids = meta_dict.get("sample_id")
+                if sample_ids is None:
+                    # legacy/单元测试继续保留固定 batch seed。
+                    generator = torch.Generator(device=z_target.device)
+                    generator.manual_seed(self.validation_config["seed"])
+                    noise = torch.randn(
+                        z_target.shape,
+                        generator=generator,
+                        device=z_target.device,
+                        dtype=z_target.dtype,
+                    )
+                else:
+                    if isinstance(sample_ids, str):
+                        sample_ids = [sample_ids]
+                    if len(sample_ids) != z_target.shape[0]:
+                        raise RuntimeError("LDM 验证 sample_id 数量与 batch 不一致")
+                    noise = deterministic_noise_from_sample_ids(
+                        z_target,
+                        sample_ids,
+                        seed=self.validation_config["seed"],
+                    )
                 noised_z = z_target + noise * sigmas.view(-1, 1, 1, 1, 1)
 
                 with autocast('cuda', enabled=self.memory_opt.use_amp):
                     if has_multimodal_meta(meta_dict):
-                        model_out = self.model(
+                        model_out = validation_model(
                             cond,
                             meta_dict["ir_img"],
                             meta_dict["r_mat"],
@@ -2598,7 +2894,9 @@ class OptimizedLDMTrainer:
                         model_input = pad_ldm_input_to_sixteen_channels(
                             torch.cat([noised_z, z_cond], dim=1)
                         )
-                        denoised = self.model.unet_3d(model_input, sigmas)
+                        denoised = validation_model.unet_3d(
+                            model_input, sigmas
+                        )
 
                     decoded = self.vae.decode(denoised)
 
@@ -2619,15 +2917,24 @@ class OptimizedLDMTrainer:
         finally:
             self.model.train(was_training)
 
-        if latent_element_count == 0:
+        reduced = reduce_named_sums(
+            {
+                "latent_squared_error": latent_squared_error,
+                "latent_element_count": latent_element_count,
+                **occupancy_counts,
+            },
+            distributed,
+        )
+        if reduced["latent_element_count"] == 0:
             raise RuntimeError("LDM 验证集没有可计算的 latent 元素")
         return _validated_ldm_validation_metrics({
             "denoising_latent_loss": (
-                latent_squared_error / latent_element_count
+                reduced["latent_squared_error"]
+                / reduced["latent_element_count"]
             ),
             "denoising_occupancy_iou": (
-                occupancy_counts["intersection"]
-                / max(occupancy_counts["union"], 1)
+                reduced["intersection"]
+                / max(reduced["union"], 1)
             ),
         })
 
@@ -2657,7 +2964,7 @@ class OptimizedLDMTrainer:
         payload = {
             "epoch": epoch,
             "step": self.global_step,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": unwrap_model(self.model).state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "loss": loss,
             "best_loss": best_loss,
@@ -2678,8 +2985,12 @@ class OptimizedLDMTrainer:
             "data_grid_config": dict(self.data_grid_config),
             "vae_checkpoint_sha256": self.vae_checkpoint_sha256,
             "model_family": "multimodal",
-            "data_protocol": dict(self.data_protocol),
+            "data_protocol": dict(getattr(self, "data_protocol", {})),
         }
+        if getattr(self, "stage_training_selection", None) is not None:
+            payload["stage_training_selection"] = dict(
+                self.stage_training_selection
+            )
         if self.last_validation_metrics is not None:
             payload["ldm_validation"] = {
                 **dict(self.validation_config),
@@ -2695,13 +3006,21 @@ class OptimizedLDMTrainer:
         if self.radar_normalization is not None:
             payload["radar_normalization"] = dict(self.radar_normalization)
             payload["radar_normalization_sha256"] = self.radar_normalization_sha256
+        if hasattr(self, "distributed_training"):
+            payload["distributed_training"] = dict(self.distributed_training)
         return payload
     
     def train(self, train_loader: DataLoader, val_loader: DataLoader):
         """使用独立训练/验证 DataLoader 完成 LDM 训练。"""
+        distributed = _trainer_distributed_context(self)
+        batch_plan, self.distributed_training = _trainer_runtime_metadata(
+            self,
+            train_loader,
+            self.memory_opt.grad_accum_steps,
+        )
         if len(train_loader) == 0:
             raise RuntimeError("LDM 训练 DataLoader 为空")
-        if len(val_loader) == 0:
+        if len(val_loader) == 0 and not distributed.initialized:
             raise RuntimeError("LDM 验证 DataLoader 为空")
         if train_loader is val_loader:
             raise ValueError("LDM 训练与验证不能复用同一个 DataLoader")
@@ -2727,17 +3046,20 @@ class OptimizedLDMTrainer:
         msg += f"  Start epoch: {self.start_epoch}\n"
         msg += f"  Batch size: {train_loader.batch_size}\n"
         msg += f"  Gradient accumulation: {self.memory_opt.grad_accum_steps}\n"
-        msg += f"  Effective batch size: {train_loader.batch_size * self.memory_opt.grad_accum_steps}\n"
+        msg += f"  Effective batch size: {batch_plan.effective_global_batch_size}\n"
+        msg += f"  Distributed world size: {distributed.world_size}\n"
         msg += f"  Save directory: {self.save_dir}\n"
         msg += f"  Log file: {self.log_file}\n"
         msg += f"  CSV file: {self.csv_file}\n"
         msg += "=" * 70
-        print(msg)
-        self.logger.info(msg)
+        if distributed.is_main_process:
+            print(msg)
+            self.logger.info(msg)
         
         start_time = time.time()
         
         for epoch in range(self.start_epoch, epochs + 1):
+            set_loader_epoch(train_loader, epoch)
             epoch_start = time.time()
             loss = self.train_epoch(epoch, train_loader)
             self.global_step += len(train_loader)
@@ -2747,13 +3069,14 @@ class OptimizedLDMTrainer:
             epoch_time = time.time() - epoch_start
             
             # 记录到 CSV
-            self._log_metrics(
-                epoch,
-                self.global_step,
-                loss,
-                validation_metrics,
-                epoch_time,
-            )
+            if distributed.is_main_process:
+                self._log_metrics(
+                    epoch,
+                    self.global_step,
+                    loss,
+                    validation_metrics,
+                    epoch_time,
+                )
             
             summary = (
                 f"\n[Epoch {epoch}/{epochs}] Train loss: {loss:.4f} | "
@@ -2763,12 +3086,13 @@ class OptimizedLDMTrainer:
                 f"{validation_metrics['denoising_occupancy_iou']:.4f} | "
                 f"Step: {self.global_step} | Time: {epoch_time:.1f}s"
             )
-            print(summary)
-            self.logger.info(summary)
-            self.memory_opt.print_stats(prefix="  ")
+            if distributed.is_main_process:
+                print(summary)
+                self.logger.info(summary)
+                self.memory_opt.print_stats(prefix="  ")
             
             # best 只由独立验证集决定，训练损失仅保留为审计字段。
-            if validation_improved:
+            if distributed.is_main_process and validation_improved:
                 best_ckpt = os.path.join(self.save_dir, "ldm_best.pt")
                 atomic_torch_save(
                     self._checkpoint_payload(epoch, loss, self.best_loss),
@@ -2783,7 +3107,7 @@ class OptimizedLDMTrainer:
                 self.logger.info(msg)
             
             # 定期按epoch保存
-            if epoch % save_every == 0:
+            if distributed.is_main_process and epoch % save_every == 0:
                 ckpt_path = os.path.join(self.save_dir, f"ldm_epoch{epoch:04d}.pt")
                 atomic_torch_save(
                     self._checkpoint_payload(epoch, loss, self.best_loss),
@@ -2800,8 +3124,9 @@ class OptimizedLDMTrainer:
         final_msg += f"Best validation occupancy IoU: {self.best_val_iou:.4f}\n"
         final_msg += f"Best validation latent loss: {self.best_val_loss:.4f}\n"
         final_msg += "=" * 70
-        print(final_msg)
-        self.logger.info(final_msg)
+        if distributed.is_main_process:
+            print(final_msg)
+            self.logger.info(final_msg)
 
 
 def main():
@@ -2827,6 +3152,10 @@ def main():
     
     # 加载配置
     config = ConfigManager(args.config)
+    distributed = initialize_distributed(
+        config.get('hardware.device', 'cuda') or 'cuda'
+    )
+    atexit.register(cleanup_distributed, distributed)
     data_config = config.get('data', {})
     data_protocol = resolve_training_data_protocol(
         data_config,
@@ -2834,8 +3163,23 @@ def main():
         allow_legacy_data=args.allow_legacy_radar_units,
     )
     training_seed = int(data_config.get("training_seed", data_config.get("split_seed", 42)))
-    train_loader_generator = seed_training_run(training_seed)
-    memory_opt = MemoryOptimizer(config)
+    train_loader_generator = seed_training_run(
+        training_seed + distributed.rank
+    )
+    memory_opt = MemoryOptimizer(config, distributed)
+    optimization_config = config.get('optimization', {})
+    runtime_batch_plan = assert_distributed_config_compatible(
+        distributed,
+        per_rank_batch_size=int(data_config.get('batch_size', 2)),
+        gradient_accumulation_steps=int(
+            optimization_config.get('gradient_accumulation_steps', 8)
+        ),
+        configured_protocol=config.get('hardware.distributed_protocol'),
+        configured_world_size=config.get('hardware.world_size'),
+        configured_effective_global_batch_size=config.get(
+            'hardware.effective_global_batch_size'
+        ),
+    )
     checkpoint_protocol = resolve_training_checkpoint_protocol(
         data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
     )
@@ -2868,6 +3212,7 @@ def main():
 
     train_frame_ids_by_scene = None
     val_frame_ids_by_scene = None
+    stage_training_selection = None
     split_artifact_sha256 = None
     if formal_multimodal:
         split_artifact_path = data_config.get("temporal_split_artifact")
@@ -2903,12 +3248,46 @@ def main():
                 mini_selection.get("validation_frames_per_scene"),
                 partition="validation",
             )
-            print(
-                "Formal mini v2 frame selection: "
-                f"train={sum(map(len, train_frame_ids_by_scene.values()))}, "
-                f"validation={sum(map(len, val_frame_ids_by_scene.values()))}, "
-                f"strategy={mini_selection.get('strategy')}"
+            if distributed.is_main_process:
+                print(
+                    "Formal mini v2 frame selection: "
+                    f"train={sum(map(len, train_frame_ids_by_scene.values()))}, "
+                    f"validation={sum(map(len, val_frame_ids_by_scene.values()))}, "
+                    f"strategy={mini_selection.get('strategy')}"
+                )
+        elif checkpoint_protocol == FORMAL_CHECKPOINT_PROTOCOL:
+            stage_config = config.get(args.mode, {}) or {}
+            train_frame_limit, validation_frame_limit = (
+                resolve_formal_stage_frame_limits(args.mode, stage_config)
             )
+            if train_frame_limit > 0:
+                train_frame_ids_by_scene = limit_frame_ids_by_scene(
+                    train_frame_ids_by_scene,
+                    train_frame_limit,
+                    partition=f"{args.mode} train",
+                )
+            if validation_frame_limit > 0:
+                val_frame_ids_by_scene = limit_frame_ids_by_scene(
+                    val_frame_ids_by_scene,
+                    validation_frame_limit,
+                    partition=f"{args.mode} validation",
+                )
+            stage_training_selection = build_formal_stage_training_selection(
+                stage=args.mode,
+                train_frame_ids_by_scene=train_frame_ids_by_scene,
+                validation_frame_ids_by_scene=val_frame_ids_by_scene,
+                configured_train_frames_per_scene=train_frame_limit,
+                configured_validation_frames_per_scene=validation_frame_limit,
+            )
+            # Trainer 和 checkpoint 共用同一个已解析选择，避免再次读取原始上限。
+            data_config["stage_training_selection"] = stage_training_selection
+            if distributed.is_main_process:
+                print(
+                    f"Formal {args.mode} frame selection: "
+                    f"train={sum(map(len, train_frame_ids_by_scene.values()))}, "
+                    f"validation={sum(map(len, val_frame_ids_by_scene.values()))}, "
+                    "strategy=ordered_prefix_per_scene"
+                )
 
     # 创建数据加载器
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
@@ -2953,6 +3332,7 @@ def main():
     val_dataset_base = NTU4DRadLM_VoxelDataset(
         root_dir=data_config.get('dataset_dir'),
         split='train',
+        return_path=True,
         use_augmentation=False,
         target_size=target_size,
         source_pc_range=source_pc_range,
@@ -2996,10 +3376,27 @@ def main():
         )
         train_dataset = Subset(train_dataset_base, train_indices)
         val_dataset = Subset(val_dataset_base, val_indices)
+    train_sampler = None
+    val_sampler = None
+    if distributed.initialized:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=True,
+            seed=training_seed,
+            drop_last=False,
+        )
+        val_sampler = DistributedEvalSampler(
+            val_dataset,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+        )
     train_loader = DataLoader(
         train_dataset,
         batch_size=data_config.get('batch_size', 2),
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=data_config.get('num_workers', 4),
         pin_memory=False,
         generator=train_loader_generator,
@@ -3009,6 +3406,7 @@ def main():
         val_dataset,
         batch_size=data_config.get('batch_size', 2),
         shuffle=False,
+        sampler=val_sampler,
         num_workers=data_config.get('num_workers', 4),
         pin_memory=False,
         collate_fn=collate_voxel_samples,
@@ -3026,6 +3424,7 @@ def main():
                     data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
                 ),
                 data_protocol=data_protocol,
+                stage_training_selection=stage_training_selection,
             )
             vae, resume_metadata = build_vae_from_checkpoint(
                 resume_checkpoint,
@@ -3044,6 +3443,7 @@ def main():
             resume_path=args.resume,
             vae_model_config=vae_config,
             vae_config_type=vae_type,
+            distributed=distributed,
         )
         trainer.train(train_loader, val_loader)
     
@@ -3075,6 +3475,7 @@ def main():
             radar_normalization=radar_normalization,
             radar_normalization_sha256=radar_normalization_sha256,
             allow_legacy_radar_units=args.allow_legacy_radar_units,
+            distributed=distributed,
         )
         trainer.train(train_loader, val_loader)
 
@@ -3125,6 +3526,11 @@ def main():
                     'checkpoint_protocol', FORMAL_CHECKPOINT_PROTOCOL
                 ),
                 'data_protocol': data_protocol,
+                'stage_training_selection': stage_training_selection,
+                'distributed_context': distributed,
+                'expected_effective_global_batch_size': (
+                    runtime_batch_plan.effective_global_batch_size
+                ),
             },
         )
         trainer.train(
@@ -3134,7 +3540,9 @@ def main():
             grad_accum_steps=opt_cfg.get('gradient_accumulation_steps', 8),
         )
     
-    print("Training completed!")
+    if distributed.is_main_process:
+        print("Training completed!")
+    cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":

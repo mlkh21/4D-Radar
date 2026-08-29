@@ -1866,3 +1866,25 @@ far too small to explain the previous screen/full metric divergence.
 - 失败 `v1` 仅有 `mini_vae_config.yaml`、日志和空 metrics 表头，没有 checkpoint，已登记并原样保留；新运行使用 fresh `v2` 结果根，禁止把失败现场伪装成 resume。
 - 本项不改变 target、observed mask、模型结构、loss、样本选择、每帧 `524288` 个空间体素或指标公式，只改变进程级 CUDA 内存分配策略与审计元数据。
 - CPU 回归通过配置/安全 103/103、脚本协议 20/20、shell/Python 静态检查和 `git diff --check`。真实无训练预检因当前桌面占用导致空闲显存 6375 MiB，低于固定 6500 MiB 门槛而正确拒绝；没有放宽保护，也没有启动 GPU backward。
+
+## 2026-08-28 正式训练单机 2--4 GPU DDP
+
+- `train_unified.sh` 过去只设置 `CUDA_VISIBLE_DEVICES`，VAE/LDM/CD 实际仍各自使用单一 CUDA 设备；直接套用 `torchrun` 会导致全量数据重复读取和多进程并发写同一日志/checkpoint。
+- 现由 shell 父进程为 VAE、LDM、CD 分别启动独立 DDP 作业，`all` 保持 `vae → ldm → cd` 串行父 checkpoint 依赖；只接受 1--4 个不重复 GPU 编号。
+- 1/2/4 GPU 的有效全局 batch 固定为 16；3 GPU 显式采用 18。checkpoint 记录 world size、per-rank batch、梯度累积、有效全局 batch 和训练 sampler 补齐数，resume 允许换卡数但拒绝有效 batch 漂移。
+- 训练使用等长 `DistributedSampler`，验证使用无补齐且无重复的 rank 步进 sampler；所有 loss/占用计数跨 rank 精确归并，仅 rank 0 写日志、CSV 和 checkpoint。
+- 隐形依赖修复包括：移除 Karras import 时的旧 MPI 初始化、解包 checkpoint 避免 `module.` 前缀、CD 仅包装在线学生而保持 EMA 本地同步，以及拒绝多卡 LDM/CD 的 legacy 内部 UNet 旁路。
+- 收尾 CPU 回归进一步发现 `KarrasDenoiser` 感知损失硬编码 `.cuda()`；现由 LDM/CD trainer 和推理入口显式传入当前 rank-local device，其他调用在未指定时才按 CUDA 可用性回退 CPU。
+- launcher 写入的 distributed protocol/world size/effective global batch 现由 unified 与独立 CD Python 入口共同校验；不再允许配置只声明多卡身份、实际却以不同 batch 或进程数运行。
+- 本项不改变监督 target、observed mask、损失公式、模型结构输出或指标公式，单帧仍为 `32×128×128=524288` 个空间体素。训练可能最多补齐 `world_size-1` 个样本；验证样本不补齐、不重复。formal LDM 验证噪声改为按稳定样本身份确定，以保持跨卡数可比。
+- LDM 验证身份最终使用 `scene/frame_id` 而非绝对 sample path，避免数据从笔记本迁到服务器后同一帧噪声改变；`noise_identity` 同时纳入 resume 校验。
+- 本地仅有单 GPU，未执行真实 NCCL 2--4 GPU 训练。已完成短时 CPU/静态/协议回归；服务器正式长训前必须先做只读 preflight 和短时多卡 smoke。
+
+## 2026-08-29 正式训练 YAML 默认值与临时覆盖合同
+
+- `default_config.yaml` 现在声明 VAE/LDM/CD 各 20 epoch、每场景每轮 3210 train / 774 validation 唯一帧、默认 `CUDA_DEVICES=0,1,2,3` 和固定 normalization SHA-256；launcher 不再用 shell 硬编码替代这些默认值。
+- 临时值优先级为“阶段专用变量 > `FORMAL_*` 通用变量 > YAML”；实际 GPU 列表和数量会回写运行时 override，避免进程数与配置身份不一致。
+- formal 帧数是在唯一 temporal split 内按场景确定性取有序前缀；`0` 表示完整 partition。实际 frame ID 哈希与数量写入 `stage_training_selection`，同阶段 resume 必须一致，跨阶段父链仍比较共同的 `formal_data_v2`。
+- DDP 训练为保持各 rank 等长，可能对上述唯一 train 帧补齐少量重复访问；补齐量仍由 `distributed_training` 单独记录。validation 不补齐，CD 的 validation 数当前只固定留出身份，不代表存在逐 epoch CD 验证指标。
+- 真实 Conda preflight 已只读核对 garden 4013 帧 manifest/Radar statistics、normalization SHA 和 formal data protocol，输出确认默认 20/20/20、3210/774；未生成训练配置或启动训练。
+- 本项不改变 target、observed mask、四通道输入、模型结构、loss 或指标公式；每帧仍为 `32×128×128=524288` 个空间体素。缩小帧数只改变每轮唯一样本覆盖和 checkpoint 训练身份。

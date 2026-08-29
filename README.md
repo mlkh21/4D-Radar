@@ -82,43 +82,48 @@ python NTU4DRadLM_pre_processing/NTU4DRadLM_pre_processing.py
 只训练 VAE：
 
 ```bash
-bash diffusion_consistency_radar/launch/train_unified.sh vae
+conda run --no-capture-output -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh vae
 ```
 
 只训练 LDM：
 
 ```bash
-bash diffusion_consistency_radar/launch/train_unified.sh ldm
+conda run --no-capture-output -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh ldm
 ```
 
 蒸馏 CD：
 
 ```bash
-bash diffusion_consistency_radar/launch/train_unified.sh cd
+conda run --no-capture-output -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh cd
 ```
 
 完整流程：
 
 ```bash
-bash diffusion_consistency_radar/launch/train_unified.sh all
+conda run --no-capture-output -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh all
 ```
 
 默认输出目录：
 
-- `Result/train_results/formal_p1_04_full120_86p8_v1/vae/`
-- `Result/train_results/formal_p1_04_full120_86p8_v1/ldm/`
-- `Result/train_results/formal_p1_04_full120_86p8_v1/cd/`
+- `Result/train_results/formal_v2_80m_86p8_v1/vae/`
+- `Result/train_results/formal_v2_80m_86p8_v1/ldm/`
+- `Result/train_results/formal_v2_80m_86p8_v1/cd/`
 
 正式入口固定使用：
 
-- 数据：`Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/`
-- Radar normalization：`radar_normalization_garden_32x128x128_full120_86p8_v1.json`
+- 数据：`Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1/`
+- Radar normalization：`radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json`
 - Doppler 物理量程：`86.8 m/s`
 
 已有结果目录默认拒绝隐式续训。确认恢复的是同一正式协议后，显式执行：
 
 ```bash
-ALLOW_RESUME=1 bash diffusion_consistency_radar/launch/train_unified.sh <vae|ldm|cd|all>
+ALLOW_RESUME=1 conda run --no-capture-output -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh <vae|ldm|cd|all>
 ```
 
 训练配置文件：
@@ -234,32 +239,51 @@ formal v2 结果混用。
 # 1. fresh 全量重建；脚本会拒绝覆盖任何已有正式输出
 bash NTU4DRadLM_pre_processing/preprocess-v2.sh
 
-# 2. 记录新 normalization artifact 的固定身份
-sha256sum \
-  diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json
-
-# 3. 在训练机器上只读预检；不会写训练配置，也不会启动 GPU 训练
-EXPECTED_ARTIFACT_SHA256=<上一步的64位哈希> \
-CUDA_DEVICES=0 \
-FORMAL_EPOCHS=20 \
+# 2. 在训练机器上只读预检；不会写训练配置，也不会启动 GPU 训练
 PREFLIGHT_ONLY=1 \
-conda run -n Radar-Diffusion bash \
+conda run --no-capture-output -n Radar-Diffusion bash \
   diffusion_consistency_radar/launch/train_unified.sh vae
 
-# 4. 只在具备长期训练条件的服务器上启动正式 VAE
-EXPECTED_ARTIFACT_SHA256=<同一个64位哈希> \
-CUDA_DEVICES=0 \
-FORMAL_EPOCHS=20 \
-conda run -n Radar-Diffusion bash \
+# 3. 只在具备长期训练条件的服务器上启动完整正式链
+conda run --no-capture-output -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh all
+```
+
+默认 epoch、每场景每 epoch 的 train/validation 帧数、GPU 列表以及 normalization
+SHA-256 都位于 `diffusion_consistency_radar/config/default_config.yaml`。当前默认分别为
+VAE/LDM/CD `20/20/20` epoch、各阶段 `3210/774` 帧和 `CUDA_DEVICES=0,1,2,3`。
+阶段帧数的 `0` 表示消费对应 temporal partition 的全部帧。
+
+临时覆盖优先级为“阶段专用环境变量 > `FORMAL_*` 通用环境变量 > YAML”。例如：
+
+```bash
+CUDA_DEVICES=0,1 \
+FORMAL_EPOCHS=10 \
+VAE_EPOCHS=5 \
+FORMAL_TRAIN_FRAMES_PER_EPOCH=1000 \
+VAE_VALIDATION_FRAMES_PER_EPOCH=200 \
+conda run --no-capture-output -n Radar-Diffusion bash \
   diffusion_consistency_radar/launch/train_unified.sh vae
 ```
 
-`CUDA_DEVICES` 接受 `0` 或 `0,1` 形式。8 GB RTX 4070 Laptop 只建议执行预检和
-短时 CPU/接口验证，不建议承担 formal v2 全量 VAE 长训练。已有同协议结果时 launcher
-默认拒绝覆盖；只有确认 checkpoint 与协议一致后才能显式设置 `ALLOW_RESUME=1`。
-正式服务器 launcher 固定 VAE/LDM/CD 各 20 epoch，并显式删除任何 mini 帧限制；garden
-完整 temporal split 为 3210 train / 774 validation。正式阶段仍应按 `vae → ldm → cd`
-顺序执行和验收，不能把笔记本的 400/100 checkpoint 接入正式链。
+可用的阶段前缀为 `VAE_`、`LDM_`、`CD_`，帧数后缀为
+`TRAIN_FRAMES_PER_EPOCH` 和 `VALIDATION_FRAMES_PER_EPOCH`。`EXPECTED_ARTIFACT_SHA256`
+仍可临时覆盖 YAML 中的固定 artifact 身份。
+
+`CUDA_DEVICES` 接受 1--4 个不重复 GPU 编号，例如 `0`、`0,1` 或 `0,1,2,3`。
+多卡时 launcher 会为 VAE、LDM、CD 分别启动一个单机 DDP 作业，`all` 仍按父 checkpoint
+依赖顺序串行执行三个阶段。1/2/4 GPU 的有效全局 batch 均为 16；3 GPU 因整数梯度累积
+限制显式使用 18，配置、日志和 checkpoint 都会记录该差异，因此 16 与 18 之间不能直接
+resume。8 GB RTX 4070 Laptop 只建议执行预检和短时 CPU/接口验证，不建议承担 formal v2
+全量 VAE 长训练。已有同协议结果时 launcher 默认拒绝覆盖；只有确认 checkpoint 与协议
+一致后才能显式设置 `ALLOW_RESUME=1`。
+正式服务器 launcher 默认 VAE/LDM/CD 各 20 epoch；garden 完整 temporal split 为
+3210 train / 774 validation。若临时缩小帧数，实际有序 frame ID、数量和 SHA-256 会写入
+阶段 checkpoint，同阶段 resume 必须保持一致。正式阶段仍应按 `vae → ldm → cd`
+顺序执行和验收，不能把笔记本的 400/100 checkpoint 接入正式链。本地没有完成真实
+2--4 GPU NCCL 训练验证，服务器正式长训前仍需先执行预检和短时多卡 smoke。
+这里的帧数表示每场景每轮选择的唯一 frame 数；DDP 为保持各 rank 迭代步数一致，训练
+sampler 可能补齐少量重复访问，补齐数量会独立写入 checkpoint，不会伪装成新的唯一帧。
 
 ## Mini Test
 

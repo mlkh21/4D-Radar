@@ -20,7 +20,7 @@ data:
   data_protocol_path: "./Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1/formal_data_protocol_garden_train80_purge3s_v1.json"
   batch_size: 2
   num_workers: 4
-  train_split: 0.8  # 仅 legacy 入口使用；formal v2 消费唯一 split artifact。
+  train_split: 0.8 # 仅 legacy 入口使用；formal v2 消费唯一 split artifact。
   alignment_size: 32
   use_augmentation: true
   # 显式冻结训练/推理共用网格，必须与 normalization artifact 一致。
@@ -28,10 +28,12 @@ data:
   source_pc_range: [0, -20, -6, 80, 20, 10]
   model_pc_range: [0, -20, -6, 80, 20, 10]
   radar_normalization_path: "./diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json"
+  # 固定 artifact 文件身份；单次运行可用 EXPECTED_ARTIFACT_SHA256 临时覆盖。
+  radar_normalization_sha256: "11f59d84cc186c39256c112154faf458ec9ead5fec9b08b997abd5058b68e97c"
   # 传感器 Doppler 显式物理量程（m/s），与 artifact 严格匹配。
   doppler_scale_mps: 86.8
   augmentation:
-    # Keep viewpoint geometry fixed for forward-looking radar densification.
+    # 保持视点几何形状固定，以实现前视雷达致密化
     enable_flip: false
     enable_rotate: false
     flip_prob: 0.0
@@ -56,19 +58,22 @@ vae:
   false_positive_weight: 4.0
   occupancy_mass_weight: 1.0
   # Training parameters
-  epochs: 100
+  # 正式默认值；0 帧表示使用对应 temporal partition 的全部帧。
+  epochs: 20
+  train_frames_per_epoch: 3210
+  validation_frames_per_epoch: 774
   lr: 1.0e-4
   save_every: 10
   save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/vae"
 
-# --- Latent Diffusion Model Configuration ---
+# --- LDM模型配置 ---
 ldm:
   # Model architecture
   model_channels: 32
   channel_mult: [1, 2, 3]
   num_res_blocks: 1
-  attention_resolutions: [] # Disable attention to save memory
-  # Diffusion parameters (Karras)
+  attention_resolutions: [] #禁用注意力以节省内存
+  # 扩散参数 (Karras)
   sigma_data: 0.5
   sigma_max: 80.0
   sigma_min: 0.002
@@ -83,57 +88,65 @@ ldm:
   decoded_height_distribution_weight: 0.02
   decoded_vertical_continuity_weight: 0.02
   uncertainty_loss_weight: 0.05
-  # Training parameters
-  epochs: 200 # Number of training epochs
+  # 训练参数
+  epochs: 20
+  train_frames_per_epoch: 3210
+  validation_frames_per_epoch: 774
   lr: 1.0e-4
-  save_every: 10 # Save checkpoint every N epochs
+  save_every: 10 # 每 N 个时期保存检查点
   save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/ldm"
 
-# --- Consistency Distillation Configuration ---
+# --- CD蒸馏配置 ---
 cd:
   # 兼容字段名：该 LDM checkpoint 只初始化 CD/EMA，不作为持续冻结教师。
-  teacher_model_path: "" # LDM initialization checkpoint path
-  # EMA consistency training parameters
+  teacher_model_path: "" # LDM初始化检查点路径
+  # EMA一致性训练参数
   training_mode: "consistency_distillation"
   target_ema_mode: "fixed"
   start_ema: 0.95
   scale_mode: "fixed"
   start_scales: 40
   end_scales: 40
-  epochs: 200 # Number of training epochs (100 epochs * 2007 batches ≈ 200k steps)
+
   distill_steps_per_iter: 50000
   loss_norm: "l2" # l1 / l2 / lpips
   # Training parameters
+  epochs: 20
+  train_frames_per_epoch: 3210
+  # CD 暂无逐 epoch 验证循环；该值仍固定留出集身份，供 checkpoint 审计。
+  validation_frames_per_epoch: 774
   lr: 5.0e-5
   save_every: 10 # Save checkpoint every N epochs
   save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/cd"
 
-# --- Optimization Configuration ---
+# --- 优化配置 ---
 optimization:
-  use_amp: false # Mixed precision training (disabled due to type mismatch in VAE)
+  use_amp: false # 混合精度训练（由于 VAE 中类型不匹配而禁用）
   gradient_accumulation_steps: 8
-  use_checkpoint: true # Gradient checkpointing
-  use_fp16: false # FP16 model weights
+  use_checkpoint: true # 梯度检查点
+  use_fp16: false # FP16
   max_grad_norm: 1.0
 
-# --- Hardware Configuration ---
+# --- 硬件配置 ---
 hardware:
   device: "cuda"
-  num_gpus: 2
+  # 正式服务器默认使用2卡；单次运行可用 CUDA_DEVICES 覆盖，例如 0,1,2,3。
+  cuda_devices: "0,1"
+  num_gpus: 4 # 兼容旧配置读取；launcher 以 cuda_devices 的实际列表为准。
 
-# --- Logging Configuration ---
+# --- 日志记录配置 ---
 logging:
-  log_interval: 100
-  save_samples: true
-  sample_interval: 1000
-  tensorboard: true
-  wandb: false
+  log_interval: 100 # 每 N 个训练步骤记录一次日志
+  save_samples: true # 是否启用样本保存
+  sample_interval: 1000 # 保存间隔
+  tensorboard: true # 是否使用 TensorBoard
+  wandb: false # 是否使用 Weights & Biases
 
-# --- Inference Configuration ---
+# --- 推理配置 ---
 inference:
-  # Per-scene file cap for batch inference scripts (0 means all files)
+  # 批量推理脚本的每个场景文件上限（0 表示所有文件）
   max_infer_files: 100
-  # If thresholded occupancy is empty, keep top-k occupancy voxels as fallback (0 disables)
+  # 如果阈值占用为空，则保留前 k 个占用体素作为后备（0 禁用）
   empty_fallback_topk: 0
   # TODO: 新增速度分档参数(35/50/70mps)用于动态窗口与衰减策略配置。
   # TODO: 新增在线融合参数（IR质量门控、DEM先验置信图、风险判定反应时）。

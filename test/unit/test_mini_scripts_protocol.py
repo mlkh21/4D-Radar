@@ -457,29 +457,52 @@ class MiniScriptsProtocolTest(unittest.TestCase):
         self.assertIn("cfg['data']['radar_normalization_path']", script)
         self.assertIn("cfg['data']['doppler_scale_mps'] = 86.8", script)
         self.assertNotIn("Please train VAE first: sh ", script)
-        self.assertIn('EXPECTED_ARTIFACT_SHA256="${EXPECTED_ARTIFACT_SHA256:-}"', script)
+        self.assertIn(
+            'EXPECTED_ARTIFACT_SHA256="${EXPECTED_ARTIFACT_SHA256:-${YAML_EXPECTED_ARTIFACT_SHA256}}"',
+            script,
+        )
         self.assertIn("temporal_split_garden_train80_purge3s_v1.json", script)
         self.assertIn("formal_data_protocol_garden_train80_purge3s_v1.json", script)
         self.assertIn("cfg['data']['require_persisted_observed_mask'] = True", script)
         self.assertIn("cfg['data']['require_radar_statistics'] = True", script)
         self.assertIn(
-            'CUDA_DEVICES="${CUDA_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"',
+            'CUDA_DEVICES="${CUDA_DEVICES:-${CUDA_VISIBLE_DEVICES:-${YAML_CUDA_DEVICES}}}"',
             script,
         )
         self.assertIn('PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"', script)
-        self.assertIn('FORMAL_EPOCHS="${FORMAL_EPOCHS:-20}"', script)
-        self.assertIn("正式服务器训练固定 VAE/LDM/CD epochs=20/20/20", script)
+        self.assertIn(
+            'VAE_EPOCHS="${VAE_EPOCHS:-${FORMAL_EPOCHS:-${YAML_VAE_EPOCHS}}}"',
+            script,
+        )
+        self.assertIn(
+            'LDM_EPOCHS="${LDM_EPOCHS:-${FORMAL_EPOCHS:-${YAML_LDM_EPOCHS}}}"',
+            script,
+        )
+        self.assertIn(
+            'CD_EPOCHS="${CD_EPOCHS:-${FORMAL_EPOCHS:-${YAML_CD_EPOCHS}}}"',
+            script,
+        )
+        self.assertIn('FORMAL_TRAIN_FRAMES_PER_EPOCH="${FORMAL_TRAIN_FRAMES_PER_EPOCH:-}"', script)
+        self.assertIn('FORMAL_VALIDATION_FRAMES_PER_EPOCH="${FORMAL_VALIDATION_FRAMES_PER_EPOCH:-}"', script)
         self.assertIn('export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"', script)
         self.assertIn('if [ "${PREFLIGHT_ONLY}" = "1" ]; then', script)
         self.assertIn("Radar statistics 预检通过", script)
         self.assertIn("cfg['data'].pop('mini_train_frames_per_scene', None)", script)
         self.assertIn("cfg['data'].pop('mini_validation_frames_per_scene', None)", script)
-        self.assertIn("cfg[stage]['epochs'] = int(formal_epochs)", script)
+        self.assertIn("cfg[stage]['epochs'] = int(stage_values[stage]['epochs'])", script)
+        self.assertIn(
+            "cfg[stage]['train_frames_per_epoch'] = int(stage_values[stage]['train_frames'])",
+            script,
+        )
+        self.assertIn(
+            "cfg[stage]['validation_frames_per_epoch'] = int(stage_values[stage]['validation_frames'])",
+            script,
+        )
         self.assertIn(
             "cfg['hardware']['cuda_allocator_conf'] = allocator_conf", script
         )
         self.assertIn('echo "CUDA allocator: ${PYTORCH_CUDA_ALLOC_CONF}"', script)
-        self.assertIn('echo "Formal epochs per stage: ${FORMAL_EPOCHS}"', script)
+        self.assertIn('echo "Formal epochs: vae=${VAE_EPOCHS}, ldm=${LDM_EPOCHS}, cd=${CD_EPOCHS}"', script)
         self.assertNotIn("CUDA_VISIBLE_DEVICES=0,1", script)
         self.assertNotIn("CUDA_VISIBLE_DEVICES=0 python", script)
         self.assertLess(

@@ -1845,3 +1845,21 @@ test/unit/test_interactive_inference_compare.py` passed.
 - 已沿 runner、训练脚本、Python 入口和 memory helper 核对真实依赖；移除 `expandable_segments`，固定 `max_split_size_mb:128`，并把 allocator 打印且记录到生成 YAML。默认 medium 结果根升级为 fresh `v2`。
 - 新增 hostile 环境覆盖、fresh 结果根和正式 launcher 配置审计测试；修复过程中暴露并修正两个 heredoc import 边界问题。最终配置/安全 103/103、脚本协议 20/20、shell/Python 静态检查与 `git diff --check` 通过。
 - 真实无训练 preflight 在 RTX 4070 Laptop 上因空闲显存 6375 MiB 小于 6500 MiB 安全门槛而拒绝；GPU 43°C、无计算进程，未放宽门禁、未运行 backward、未创建 `v2` 结果。
+
+## 2026-08-28 正式训练单机 2--4 GPU DDP 改造
+
+- 新增共享分布式训练模块，正式 VAE/LDM/CD 已接入单机 NCCL DDP、分布式 train/eval sampler、跨 rank 指标归并、rank-0 I/O 和无 `module.` 前缀 checkpoint。
+- launcher 现支持 1--4 个不重复 GPU，单卡仍使用普通 Python，多卡按 stage 使用 `torch.distributed.run`；`all` 不嵌套进程组，继续串行执行三阶段。
+- 补齐恢复合同、训练 sampler padding 元数据、LDM 样本身份验证噪声、CD EMA/尾部累积，并消除 Karras 模块的旧 MPI 隐形依赖与 legacy DDP forward 旁路。
+- 收尾回归命中并修复 Karras 感知损失硬编码 `.cuda()` 的设备接口问题，正式训练与推理现在显式使用当前 rank-local device。
+- LDM formal 验证噪声改用不依赖绝对数据根的 `scene/frame_id` 身份，并把 noise identity 纳入 checkpoint 恢复校验，支持项目迁移到服务器后保持同帧验证输入不变。
+- 回归通过分布式协议、mini launcher、VAE checkpoint/sparse loss、LDM validation/vertical loss，以及 CD entrypoint/多模态接口测试；shell 语法、Python 编译和 diff 空白检查通过。完整 airborne CPU 套件因超过 60 秒主动停止，未宣称通过。
+- 本项没有启动 GPU/NCCL 训练，没有删除或覆盖数据、checkpoint、日志和结果。真实 2--4 GPU 行为仍需在服务器先以短时 smoke 验证。
+
+## 2026-08-29 正式训练 YAML 预设改造
+
+- 已把正式 20/20/20 epoch、每阶段每场景 3210/774 帧、4 卡默认列表和 normalization 固定 SHA 写入 YAML；launcher 解析后再接受阶段或通用环境变量临时覆盖。
+- 已实现 `formal_stage_selection_v1`，记录每阶段 ordered-prefix 的实际数量和有序 frame ID SHA-256；三个阶段 checkpoint 写入该字段，同阶段 resume 在加载模型/优化器前拒绝身份漂移。
+- launcher 运行时 override 同步记录实际 `cuda_devices/num_gpus/world_size`，DDP batch 仍由共享安全计划解析，不由 YAML 帧数旁路。
+- 新增 5 项 YAML/覆盖/选择测试；通过 launcher/DDP 37 项、VAE checkpoint 26 项、LDM validation 5 项及 CD 入口回归。shell 语法、Python 3.8 模块导入和 diff 空白检查纳入收尾。
+- 真实 `PREFLIGHT_ONLY=1` 在 `Radar-Diffusion` Conda 环境中通过全部 4013 帧只读数据门禁，未创建 override、checkpoint 或训练结果，也未启动 GPU forward/backward。

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -26,6 +27,7 @@ LEGACY_FORMAL_CHECKPOINT_PROTOCOL = "formal_chain_v1"
 LEGACY_FORMAL_MINI_CHECKPOINT_PROTOCOL = "formal_mini_chain_v1"
 FORMAL_DATA_PROTOCOL = "formal_data_v2"
 FORMAL_MINI_SELECTION_PROTOCOL = "formal_mini_selection_v1"
+FORMAL_STAGE_SELECTION_PROTOCOL = "formal_stage_selection_v1"
 _TRAINING_CHECKPOINT_PROTOCOLS = {
     FORMAL_CHECKPOINT_PROTOCOL,
     FORMAL_MINI_CHECKPOINT_PROTOCOL,
@@ -78,6 +80,179 @@ def build_formal_mini_selection(
         "train_frames_per_scene": train_frames_per_scene,
         "validation_frames_per_scene": validation_frames_per_scene,
     }
+
+
+def _frame_ids_sha256(frame_ids: Sequence[str]) -> str:
+    """对有序 frame ID 列表计算稳定哈希，顺序变化也会改变训练身份。"""
+    payload = json.dumps(
+        list(frame_ids),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def build_formal_stage_training_selection(
+    *,
+    stage: str,
+    train_frame_ids_by_scene: Mapping[str, Sequence[str]],
+    validation_frame_ids_by_scene: Mapping[str, Sequence[str]],
+    configured_train_frames_per_scene: int,
+    configured_validation_frames_per_scene: int,
+) -> Dict[str, Any]:
+    """构造每阶段正式训练实际消费帧的可恢复身份。"""
+    if stage not in _STAGE_ORDER:
+        raise ValueError(f"stage 必须为 {_STAGE_ORDER} 之一")
+    configured = {
+        "configured_train_frames_per_scene": configured_train_frames_per_scene,
+        "configured_validation_frames_per_scene": (
+            configured_validation_frames_per_scene
+        ),
+    }
+    for name, value in configured.items():
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} 必须是非负整数，0 表示使用完整 partition")
+    mappings = {
+        "train": train_frame_ids_by_scene,
+        "validation": validation_frame_ids_by_scene,
+    }
+    normalized: Dict[str, Dict[str, list[str]]] = {}
+    for partition, mapping in mappings.items():
+        if not isinstance(mapping, Mapping) or not mapping:
+            raise ValueError(f"{partition}_frame_ids_by_scene 必须是非空映射")
+        normalized[partition] = {}
+        for scene, frame_ids in mapping.items():
+            if not isinstance(scene, str) or not scene or os.path.basename(scene) != scene:
+                raise ValueError(f"{partition} 包含非法场景名 {scene!r}")
+            if not isinstance(frame_ids, Sequence) or isinstance(frame_ids, (str, bytes)):
+                raise ValueError(f"{partition}.{scene} frame IDs 必须是数组")
+            ids = list(frame_ids)
+            if not ids or any(not isinstance(item, str) or not item for item in ids):
+                raise ValueError(f"{partition}.{scene} frame IDs 必须是非空字符串数组")
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"{partition}.{scene} frame IDs 不得重复")
+            normalized[partition][scene] = ids
+    if set(normalized["train"]) != set(normalized["validation"]):
+        raise ValueError("train/validation stage selection 场景集合不一致")
+    limits = {
+        "train": configured_train_frames_per_scene,
+        "validation": configured_validation_frames_per_scene,
+    }
+    for partition, limit in limits.items():
+        if limit > 0:
+            for scene, ids in normalized[partition].items():
+                if len(ids) != limit:
+                    raise ValueError(
+                        f"{partition}.{scene} 实际 {len(ids)} 帧与配置上限 {limit} 不一致"
+                    )
+    for scene in normalized["train"]:
+        overlap = set(normalized["train"][scene]).intersection(
+            normalized["validation"][scene]
+        )
+        if overlap:
+            raise ValueError(f"train/validation frame IDs 在场景 {scene!r} 中重叠")
+    return {
+        "protocol": FORMAL_STAGE_SELECTION_PROTOCOL,
+        "stage": stage,
+        "strategy": "ordered_prefix_per_scene",
+        **configured,
+        "train_frame_count_by_scene": {
+            scene: len(ids) for scene, ids in normalized["train"].items()
+        },
+        "validation_frame_count_by_scene": {
+            scene: len(ids) for scene, ids in normalized["validation"].items()
+        },
+        "train_frame_ids_sha256": {
+            scene: _frame_ids_sha256(ids)
+            for scene, ids in normalized["train"].items()
+        },
+        "validation_frame_ids_sha256": {
+            scene: _frame_ids_sha256(ids)
+            for scene, ids in normalized["validation"].items()
+        },
+    }
+
+
+def validate_formal_stage_training_selection(
+    value: Any,
+    *,
+    expected_stage: str,
+    errors: list[str] | None = None,
+) -> Dict[str, Any] | None:
+    """校验 checkpoint 中每阶段帧选择字段的结构和哈希。"""
+    own_errors: list[str] = [] if errors is None else errors
+    start_count = len(own_errors)
+    name = f"{expected_stage}.stage_training_selection"
+    if not isinstance(value, Mapping):
+        own_errors.append(f"{name} 必须是对象")
+    else:
+        expected_keys = {
+            "protocol",
+            "stage",
+            "strategy",
+            "configured_train_frames_per_scene",
+            "configured_validation_frames_per_scene",
+            "train_frame_count_by_scene",
+            "validation_frame_count_by_scene",
+            "train_frame_ids_sha256",
+            "validation_frame_ids_sha256",
+        }
+        if set(value) != expected_keys:
+            own_errors.append(f"{name} 字段必须精确为 {sorted(expected_keys)}")
+        if value.get("protocol") != FORMAL_STAGE_SELECTION_PROTOCOL:
+            own_errors.append(
+                f"{name}.protocol 必须为 {FORMAL_STAGE_SELECTION_PROTOCOL!r}"
+            )
+        if value.get("stage") != expected_stage:
+            own_errors.append(f"{name}.stage 必须为 {expected_stage!r}")
+        if value.get("strategy") != "ordered_prefix_per_scene":
+            own_errors.append(f"{name}.strategy 必须为 'ordered_prefix_per_scene'")
+        for key in (
+            "configured_train_frames_per_scene",
+            "configured_validation_frames_per_scene",
+        ):
+            item = value.get(key)
+            if type(item) is not int or item < 0:
+                own_errors.append(f"{name}.{key} 必须是非负整数")
+        count_scene_sets = []
+        for key in (
+            "train_frame_count_by_scene",
+            "validation_frame_count_by_scene",
+        ):
+            mapping = value.get(key)
+            if not isinstance(mapping, Mapping) or not mapping:
+                own_errors.append(f"{name}.{key} 必须是非空场景计数映射")
+                continue
+            count_scene_sets.append(set(mapping))
+            for scene, count in mapping.items():
+                if not isinstance(scene, str) or not scene:
+                    own_errors.append(f"{name}.{key} 包含非法场景名")
+                if type(count) is not int or count <= 0:
+                    own_errors.append(f"{name}.{key}.{scene} 必须是正整数")
+        hash_scene_sets = []
+        for key in ("train_frame_ids_sha256", "validation_frame_ids_sha256"):
+            mapping = value.get(key)
+            _validate_hash_mapping(mapping, f"{name}.{key}", own_errors)
+            if isinstance(mapping, Mapping):
+                hash_scene_sets.append(set(mapping))
+        scene_sets = count_scene_sets + hash_scene_sets
+        if scene_sets and any(scene_set != scene_sets[0] for scene_set in scene_sets[1:]):
+            own_errors.append(f"{name} 的计数与哈希场景集合必须一致")
+        for partition in ("train", "validation"):
+            limit = value.get(f"configured_{partition}_frames_per_scene")
+            counts = value.get(f"{partition}_frame_count_by_scene")
+            if type(limit) is int and limit > 0 and isinstance(counts, Mapping):
+                for scene, count in counts.items():
+                    if count != limit:
+                        own_errors.append(
+                            f"{name}.{partition}_frame_count_by_scene.{scene} "
+                            f"必须等于配置上限 {limit}"
+                        )
+    if errors is None and own_errors:
+        raise CheckpointChainError(own_errors)
+    if len(own_errors) != start_count:
+        return None
+    return dict(value)
 
 
 def _validate_formal_mini_selection(
@@ -253,6 +428,7 @@ def assert_checkpoint_training_identity(
     expected_stage: str,
     checkpoint_protocol: str,
     data_protocol: Mapping[str, Any],
+    stage_training_selection: Mapping[str, Any] | None = None,
 ) -> None:
     """在恢复优化器状态前验证 stage、链协议和完整数据身份。"""
     errors: list[str] = []
@@ -294,6 +470,25 @@ def assert_checkpoint_training_identity(
     )
     if validated is not None and dict(validated) != dict(data_protocol):
         errors.append("resume data_protocol 与当前训练数据协议不一致")
+    if stage_training_selection is not None:
+        current_selection = validate_formal_stage_training_selection(
+            stage_training_selection,
+            expected_stage=expected_stage,
+            errors=errors,
+        )
+        checkpoint_selection = validate_formal_stage_training_selection(
+            checkpoint.get("stage_training_selection"),
+            expected_stage=expected_stage,
+            errors=errors,
+        )
+        if (
+            current_selection is not None
+            and checkpoint_selection is not None
+            and current_selection != checkpoint_selection
+        ):
+            errors.append(
+                "resume stage_training_selection 与当前阶段帧选择不一致"
+            )
     if errors:
         raise CheckpointChainError(errors)
 

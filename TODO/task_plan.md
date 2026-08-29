@@ -577,3 +577,22 @@
 - [x] 完成 103 项配置/安全回归、20 项脚本协议回归与静态检查
 - [ ] 关闭部分图形程序、空闲显存恢复到至少 6500 MiB 后，先跑无训练 preflight，再跑受限的短 backward 诊断
 - [ ] 短诊断超过原失败点且温度正常后，由用户显式启动 fresh `v2` 的 20 epoch VAE
+
+### 正式训练单机 2--4 GPU DDP（2026-08-28）
+
+- [x] 沿 launcher、DataLoader、VAE/LDM/CD trainer、EMA、指标与 checkpoint 审计真实调用链
+- [x] 冻结 1/2/4 GPU 有效 batch 16、3 GPU 有效 batch 18，以及训练补齐/验证无补齐合同
+- [x] 实现 NCCL 进程组、LOCAL_RANK 绑定、DDP 包装、全局指标归并和 rank-0 写入
+- [x] 让 `all` 按阶段启动独立 torchrun 作业，并保持单卡和旧 checkpoint state 字典兼容
+- [x] 修复旧 MPI import、LDM/CD legacy DDP 旁路、EMA/checkpoint unwrap 和 CD 尾部梯度累积问题
+- [x] 完成短时协议/单元/静态回归并记录监督、体素与指标影响；未运行长训练
+- [ ] 在服务器先运行只读 preflight，再运行 2--4 GPU 短时 NCCL smoke；通过后才启动 full split 20 epoch 正式链
+
+### 正式训练 YAML 默认值与临时覆盖（2026-08-29）
+
+- [x] 审计 YAML、launcher、formal split、DDP sampler 和 checkpoint/resume 调用链
+- [x] 增加各阶段 epoch、train/validation 帧数、默认 GPU 和 artifact SHA 的 YAML 默认值
+- [x] 实现阶段专用环境变量、`FORMAL_*` 通用变量、YAML 的三级优先级
+- [x] 固化阶段实际帧选择 hash/count，并让 VAE/LDM/CD 同阶段 resume 严格校验
+- [x] 完成真实零训练 preflight、单元/协议/静态回归和 README 使用说明
+- [ ] 在服务器执行 2--4 GPU 短时 NCCL smoke；通过后再由用户显式启动正式长训练

@@ -2,6 +2,7 @@
 .vscode/
 .codex/
 ./agents/
+./docs/
 pull-to-server.sh
 pull-from-server.sh
 

@@ -81,6 +81,7 @@ class LDMValidationProtocolTest(unittest.TestCase):
         trainer.validation_config = {
             "protocol": LDM_VALIDATION_PROTOCOL,
             "split": "temporal_block_validation_suffix",
+            "noise_identity": "scene_frame_sha256_v1",
             "seed": 42,
             "sigma": 0.5,
             "occupancy_threshold": 0.5,

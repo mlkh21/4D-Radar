@@ -936,6 +936,7 @@ class RadarGenerator:
             sigma_max=80.0,
             sigma_min=0.002,
             loss_norm='l2',
+            device=self.device,
         )
         
         print("Models loaded successfully!")

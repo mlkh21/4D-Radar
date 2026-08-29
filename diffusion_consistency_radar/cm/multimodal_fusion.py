@@ -380,4 +380,7 @@ class CompleteDualModalityPerceptionNet(nn.Module):
                     for key, value in uncertainty.items()
                 }
             return out, uncertainty
-        return out
+        # NOTE: 无显式 uncertainty loss 时仍以零权重连接学习方差头，保证
+        # NOTE: DDP 可使用固定参数图，不必与自定义梯度 checkpoint 组合
+        # NOTE: find_unused_parameters=True；监督值和前向输出均不改变。
+        return out + learned_variance.mean() * 0.0

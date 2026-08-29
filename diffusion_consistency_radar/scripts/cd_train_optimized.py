@@ -11,6 +11,7 @@ LDM 初始化的 EMA Consistency 训练脚本
 
 import sys
 import os
+import atexit
 
 # 直接执行本文件时同时暴露仓库根和包目录：前者支持
 # diffusion_consistency_radar.*，后者兼容既有 cm.* 导入。
@@ -25,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 import argparse
 import logging
@@ -59,6 +61,7 @@ from diffusion_consistency_radar.checkpoint_chain import (
     safe_torch_load as safe_checkpoint_load,
     sha256_file,
     validate_checkpoint_data_protocol,
+    validate_formal_stage_training_selection,
 )
 from diffusion_consistency_radar.radar_normalization import (
     RadarNormalizationError,
@@ -75,6 +78,20 @@ from diffusion_consistency_radar.temporal_split import (
     load_temporal_split_artifact,
     split_frame_ids_by_scene,
 )
+from diffusion_consistency_radar.distributed_training import (
+    DistributedContext,
+    WorldBatchPlan,
+    assert_distributed_config_compatible,
+    assert_resume_distributed_compatible,
+    cleanup_distributed,
+    distributed_barrier,
+    distributed_checkpoint_metadata,
+    initialize_distributed,
+    reduce_named_sums,
+    set_loader_epoch,
+    unwrap_model,
+    wrap_model_for_ddp,
+)
 
 
 def safe_torch_load(path, map_location, *, allow_legacy_pickle=False):
@@ -84,6 +101,17 @@ def safe_torch_load(path, map_location, *, allow_legacy_pickle=False):
         map_location=map_location,
         allow_legacy_pickle=allow_legacy_pickle,
     )
+
+
+def atomic_torch_save(payload: Any, path: str) -> None:
+    """在 checkpoint 同目录原子替换，避免中断留下半写文件。"""
+    temp_path = f"{path}.tmp-{os.getpid()}-{time.time_ns()}"
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 def checkpoint_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
@@ -373,7 +401,8 @@ def call_cd_denoiser(
     meta_dict: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     """Call legacy or multimodal denoisers through one CD training interface."""
-    if getattr(model, "is_multimodal", False):
+    base_model = unwrap_model(model)
+    if getattr(base_model, "is_multimodal", False):
         if has_multimodal_meta(meta_dict) and radar_voxel is not None:
             return model(
                 radar_voxel,
@@ -387,10 +416,22 @@ def call_cd_denoiser(
         if z_cond is None:
             raise ValueError("缺少 legacy multimodal CD condition latent")
         model_input = pad_latent_input_to_sixteen_channels(torch.cat([x_t, z_cond], dim=1))
-        return model.unet_3d(model_input, timesteps)
+        if model is not base_model:
+            raise RuntimeError(
+                "DDP 多模态 CD 不支持缺少 IR/标定的 legacy 旁路 batch"
+            )
+        return base_model.unet_3d(model_input, timesteps)
     if z_cond is None:
         raise ValueError("缺少 legacy CD condition latent")
     return model(torch.cat([x_t, z_cond], dim=1), timesteps)
+
+
+def _trainer_distributed_context(trainer) -> DistributedContext:
+    """兼容单元测试直接构造的单进程 CD trainer。"""
+    context = getattr(trainer, "distributed", None)
+    if context is not None:
+        return context
+    return DistributedContext.single_process(getattr(trainer, "device", "cpu"))
 
 
 class ConsistencyDistillationTrainer:
@@ -410,8 +451,11 @@ class ConsistencyDistillationTrainer:
         device: str = "cuda",
         config: dict = None,
     ):
-        self.device = device
         self.config = config or {}
+        self.distributed = self.config.get("distributed_context") or (
+            DistributedContext.single_process(device)
+        )
+        self.device = torch.device(self.distributed.device)
         self.data_grid_config = dict(
             self.config.get("data_grid_config", {}) or {}
         )
@@ -429,6 +473,15 @@ class ConsistencyDistillationTrainer:
                 configured_data_protocol,
                 stage="cd",
             )
+        configured_selection = self.config.get("stage_training_selection")
+        self.stage_training_selection = (
+            validate_formal_stage_training_selection(
+                configured_selection,
+                expected_stage="cd",
+            )
+            if configured_selection is not None
+            else None
+        )
         teacher_checkpoint = safe_torch_load(ldm_ckpt_path, map_location="cpu")
         if not self.allow_legacy_radar_units:
             assert_checkpoint_training_identity(
@@ -456,6 +509,7 @@ class ConsistencyDistillationTrainer:
                     expected_stage="cd",
                     checkpoint_protocol=self.checkpoint_protocol,
                     data_protocol=self.data_protocol,
+                    stage_training_selection=self.stage_training_selection,
                 )
             assert_checkpoint_radar_normalization(
                 resume_checkpoint,
@@ -471,7 +525,9 @@ class ConsistencyDistillationTrainer:
         
         # 设置保存目录和日志
         self.save_dir = self.config.get('save_dir', './Result/train_results/cd')
-        os.makedirs(self.save_dir, exist_ok=True)
+        if self.distributed.is_main_process:
+            os.makedirs(self.save_dir, exist_ok=True)
+        distributed_barrier(self.distributed)
         
         # 初始化训练状态
         self.start_epoch = 1
@@ -506,19 +562,28 @@ class ConsistencyDistillationTrainer:
         # LDM 仅提供初始权重；后续 consistency target 来自 CD EMA。
         self.ldm_model = self._load_ldm_model(ldm_ckpt_path)
         self.use_multimodal = bool(getattr(self.ldm_model, "is_multimodal", False))
-        self.vae = vae.to(device)
+        self.vae = vae.to(self.device)
         self.vae.eval()
         for param in self.vae.parameters():
             param.requires_grad = False
         
         # 创建 CD 学生模型（与 LDM 同结构）
-        self.cd_model = create_cd_model(self.use_multimodal, self.model_config).to(device)
+        self.cd_model = create_cd_model(
+            self.use_multimodal, self.model_config
+        ).to(self.device)
         
         # 创建 EMA 目标模型
         self.cd_model_ema = self._create_ema_model(self.cd_model)
         
         # 初始化 CD 模型为 LDM 的拷贝
         self._initialize_from_ldm()
+        # LDM 仅用于一次初始化，释放其 GPU 副本以降低 CD 训练常驻显存。
+        del self.ldm_model
+        self.cd_model = wrap_model_for_ddp(
+            self.cd_model,
+            self.distributed,
+            find_unused_parameters=False,
+        )
         
         # 优化器
         self.optimizer = torch.optim.AdamW(
@@ -533,6 +598,7 @@ class ConsistencyDistillationTrainer:
             sigma_max=80.0,
             sigma_min=0.002,
             loss_norm='l2',
+            device=self.device,
         )
         
         # 禁用混合精度（避免 FP16/FP32 类型不匹配）
@@ -587,7 +653,8 @@ class ConsistencyDistillationTrainer:
         for param in model.parameters():
             param.requires_grad = False
         
-        print(f"Loaded LDM initialization checkpoint from {ckpt_path}")
+        if self.distributed.is_main_process:
+            print(f"Loaded LDM initialization checkpoint from {ckpt_path}")
         return model
     
     def _create_ema_model(self, model: nn.Module) -> nn.Module:
@@ -614,6 +681,14 @@ class ConsistencyDistillationTrainer:
     
     def _setup_logging(self):
         """设置日志系统"""
+        if not self.distributed.is_main_process:
+            self.logger = logging.getLogger(
+                f"{__name__}.cd.rank{self.distributed.rank}"
+            )
+            self.logger.handlers.clear()
+            self.logger.addHandler(logging.NullHandler())
+            self.logger.propagate = False
+            return
         # 确定日志文件模式
         log_mode = 'a' if self.is_resumed else 'w'
         
@@ -642,7 +717,8 @@ class ConsistencyDistillationTrainer:
     
     def _resume_from_checkpoint(self, ckpt_path: str):
         """从检查点恢复训练"""
-        print(f"Resuming CD from checkpoint: {ckpt_path}")
+        if self.distributed.is_main_process:
+            print(f"Resuming CD from checkpoint: {ckpt_path}")
         ckpt = getattr(self, "_preloaded_resume_checkpoint", None)
         if ckpt is None:
             ckpt = safe_torch_load(ckpt_path, map_location=self.device)
@@ -656,9 +732,19 @@ class ConsistencyDistillationTrainer:
             allow_legacy_radar_units=self.allow_legacy_radar_units,
             context="CD resume checkpoint",
         )
+        expected_effective_batch = self.config.get(
+            "expected_effective_global_batch_size"
+        )
+        if expected_effective_batch is not None:
+            assert_resume_distributed_compatible(
+                ckpt,
+                expected_effective_global_batch_size=int(
+                    expected_effective_batch
+                ),
+            )
         
         # 加载模型
-        self.cd_model.load_state_dict(ckpt['model_state_dict'])
+        unwrap_model(self.cd_model).load_state_dict(ckpt['model_state_dict'])
         if 'ema_model_state_dict' in ckpt:
             self.cd_model_ema.load_state_dict(ckpt['ema_model_state_dict'])
         
@@ -669,7 +755,8 @@ class ConsistencyDistillationTrainer:
         self.start_epoch = ckpt.get('epoch', 0) + 1
         self.best_loss = ckpt.get('best_loss', ckpt.get('loss', float('inf')))
         
-        print(f"Resumed from epoch {self.start_epoch - 1}, best loss: {self.best_loss:.4f}")
+        if self.distributed.is_main_process:
+            print(f"Resumed from epoch {self.start_epoch - 1}, best loss: {self.best_loss:.4f}")
     
     def _log_metrics(self, epoch: int, loss: float, epoch_time: float):
         """记录指标到 CSV 文件"""
@@ -687,13 +774,14 @@ class ConsistencyDistillationTrainer:
         if not self.is_resumed:
             self.cd_model.load_state_dict(self.ldm_model.state_dict())
             self.cd_model_ema.load_state_dict(self.ldm_model.state_dict())
-            print("Initialized CD model and EMA target from LDM checkpoint")
+            if self.distributed.is_main_process:
+                print("Initialized CD model and EMA target from LDM checkpoint")
     
     def _update_ema(self, ema_rate: float = 0.999):
         """更新 EMA 模型"""
         with torch.no_grad():
             for src_param, ema_param in zip(
-                self.cd_model.parameters(),
+                unwrap_model(self.cd_model).parameters(),
                 self.cd_model_ema.parameters()
             ):
                 ema_param.mul_(ema_rate).add_(src_param.data, alpha=1 - ema_rate)
@@ -823,10 +911,15 @@ class ConsistencyDistillationTrainer:
         grad_accum_steps: int = 8,
     ) -> float:
         """训练一个 epoch"""
+        distributed = _trainer_distributed_context(self)
         self.cd_model.train()
         total_loss = 0
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}",
+            disable=not distributed.is_main_process,
+        )
         self.optimizer.zero_grad()
         
         for batch_idx, batch in enumerate(pbar):
@@ -870,12 +963,23 @@ class ConsistencyDistillationTrainer:
             pbar.set_postfix({'loss': f'{loss.item() * grad_accum_steps:.6f}'})
 
         if len(train_loader) % grad_accum_steps != 0:
+            accumulation_count = len(train_loader) % grad_accum_steps
+            tail_scale = float(grad_accum_steps) / float(accumulation_count)
+            for parameter in self.cd_model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(tail_scale)
             torch.nn.utils.clip_grad_norm_(self.cd_model.parameters(), 1.0)
             self.optimizer.step()
             self.optimizer.zero_grad()
             self._update_ema(ema_rate=0.999)
         
-        return total_loss / len(train_loader)
+        totals = reduce_named_sums(
+            {"loss": total_loss, "batch_count": len(train_loader)},
+            distributed,
+        )
+        if totals["batch_count"] == 0:
+            raise RuntimeError("CD 全局训练 DataLoader 为空")
+        return totals["loss"] / totals["batch_count"]
 
     def _checkpoint_payload(self, epoch: int, loss: float, best_loss: float) -> Dict[str, Any]:
         """构造带完整网格和父 checkpoint hash 的正式 CD checkpoint。"""
@@ -883,7 +987,7 @@ class ConsistencyDistillationTrainer:
             "epoch": epoch,
             "loss": loss,
             "best_loss": best_loss,
-            "model_state_dict": self.cd_model.state_dict(),
+            "model_state_dict": unwrap_model(self.cd_model).state_dict(),
             "ema_model_state_dict": self.cd_model_ema.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "latent_dim": int(self.model_config["latent_dim"]),
@@ -907,9 +1011,15 @@ class ConsistencyDistillationTrainer:
             "consistency_target_source": "cd_model_ema",
             "data_protocol": dict(self.data_protocol),
         }
+        if getattr(self, "stage_training_selection", None) is not None:
+            payload["stage_training_selection"] = dict(
+                self.stage_training_selection
+            )
         if self.radar_normalization is not None:
             payload["radar_normalization"] = dict(self.radar_normalization)
             payload["radar_normalization_sha256"] = self.radar_normalization_sha256
+        if hasattr(self, "distributed_training"):
+            payload["distributed_training"] = dict(self.distributed_training)
         return payload
     
     def train(
@@ -920,6 +1030,25 @@ class ConsistencyDistillationTrainer:
         grad_accum_steps: int = 8,
     ):
         """完整训练流程"""
+        distributed = _trainer_distributed_context(self)
+        batch_size = int(getattr(train_loader, "batch_size", 1))
+        try:
+            train_dataset_size = len(train_loader.dataset)
+        except (AttributeError, TypeError):
+            train_dataset_size = len(train_loader) * batch_size * distributed.world_size
+        batch_plan = WorldBatchPlan(
+            world_size=distributed.world_size,
+            per_rank_batch_size=batch_size,
+            gradient_accumulation_steps=int(grad_accum_steps),
+            effective_global_batch_size=(
+                distributed.world_size * batch_size * int(grad_accum_steps)
+            ),
+        )
+        self.distributed_training = distributed_checkpoint_metadata(
+            distributed,
+            batch_plan,
+            train_dataset_size=train_dataset_size,
+        )
         estimated_total_steps = num_epochs * len(train_loader)
         
         msg = "="*70 + "\n"
@@ -930,30 +1059,37 @@ class ConsistencyDistillationTrainer:
         msg += f"  Start epoch: {self.start_epoch}\n"
         msg += f"  Batch size: {train_loader.batch_size}\n"
         msg += f"  Gradient accumulation: {grad_accum_steps}\n"
+        msg += f"  Effective batch size: {batch_plan.effective_global_batch_size}\n"
+        msg += f"  Distributed world size: {distributed.world_size}\n"
         msg += f"  Learning rate: {self.optimizer.param_groups[0]['lr']:.2e}\n"
         msg += f"  Save directory: {self.save_dir}\n"
         msg += f"  Log file: {self.log_file}\n"
         msg += f"  CSV file: {self.csv_file}\n"
         msg += "="*70
-        print(msg) 
-        self.logger.info(msg)
+        if distributed.is_main_process:
+            print(msg)
+            self.logger.info(msg)
 
         for epoch in range(self.start_epoch, num_epochs + 1):
+            set_loader_epoch(train_loader, epoch)
             epoch_start = time.time()
             loss = self.train_epoch(epoch, train_loader, grad_accum_steps=grad_accum_steps)
             epoch_time = time.time() - epoch_start
             
             # 记录日志
             msg = f"\n[Epoch {epoch}/{num_epochs}] Loss: {loss:.4f} | LR: {self.optimizer.param_groups[0]['lr']:.2e} | Time: {epoch_time:.1f}s"
-            print(msg)
-            self.logger.info(msg)
-            self._log_metrics(epoch, loss, epoch_time)
+            if distributed.is_main_process:
+                print(msg)
+                self.logger.info(msg)
+                self._log_metrics(epoch, loss, epoch_time)
             
             # 保存最佳模型
-            if loss < self.best_loss:
+            improved = loss < self.best_loss
+            if improved:
                 self.best_loss = loss
+            if distributed.is_main_process and improved:
                 best_ckpt = os.path.join(self.save_dir, "cd_best.pt")
-                torch.save(
+                atomic_torch_save(
                     self._checkpoint_payload(epoch, loss, self.best_loss),
                     best_ckpt,
                 )
@@ -961,17 +1097,18 @@ class ConsistencyDistillationTrainer:
                 self.logger.info(msg)
             
             # 定期保存检查点
-            if epoch % save_every == 0:
+            if distributed.is_main_process and epoch % save_every == 0:
                 ckpt_path = os.path.join(self.save_dir, f"cd_epoch{epoch:04d}.pt")
-                torch.save(
+                atomic_torch_save(
                     self._checkpoint_payload(epoch, loss, self.best_loss),
                     ckpt_path,
                 )
                 self.logger.info(f"  Saved checkpoint: {ckpt_path}")
         
         msg = "\nTraining completed!"
-        print(msg)
-        self.logger.info(msg)
+        if distributed.is_main_process:
+            print(msg)
+            self.logger.info(msg)
 
 
 def main():
@@ -1000,10 +1137,29 @@ def main():
     args = parser.parse_args()
     
     config = load_yaml_config(args.config)
+    hardware_config = (
+        config.get("hardware", {})
+        if isinstance(config.get("hardware", {}), dict)
+        else {}
+    )
+    distributed = initialize_distributed(hardware_config.get("device", "cuda"))
+    atexit.register(cleanup_distributed, distributed)
     cd_config = dict(config.get("cd", {}) if isinstance(config.get("cd", {}), dict) else {})
     ldm_config = dict(config.get("ldm", {}) if isinstance(config.get("ldm", {}), dict) else {})
     opt_config = dict(config.get("optimization", {}) if isinstance(config.get("optimization", {}), dict) else {})
     data_config = dict(config.get("data", {}) if isinstance(config.get("data", {}), dict) else {})
+    runtime_batch_plan = assert_distributed_config_compatible(
+        distributed,
+        per_rank_batch_size=int(data_config.get("batch_size", args.batch_size)),
+        gradient_accumulation_steps=int(
+            opt_config.get("gradient_accumulation_steps", args.grad_accum_steps)
+        ),
+        configured_protocol=hardware_config.get("distributed_protocol"),
+        configured_world_size=hardware_config.get("world_size"),
+        configured_effective_global_batch_size=hardware_config.get(
+            "effective_global_batch_size"
+        ),
+    )
     checkpoint_protocol = resolve_training_checkpoint_protocol(
         data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
     )
@@ -1131,11 +1287,22 @@ def main():
         frame_ids_by_scene=train_frame_ids_by_scene,
         voxel_coordinate_frame=data_config.get("voxel_coordinate_frame", "lidar"),
     )
+    train_sampler = None
+    if distributed.initialized:
+        train_sampler = DistributedSampler(
+            dataset,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=True,
+            seed=int(data_config.get("training_seed", 42)),
+            drop_last=False,
+        )
     train_loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
+        batch_size=int(data_config.get("batch_size", args.batch_size)),
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=int(data_config.get("num_workers", 4)),
         pin_memory=False,
         collate_fn=collate_voxel_samples,
     )
@@ -1168,6 +1335,10 @@ def main():
             'allow_legacy_radar_units': args.allow_legacy_radar_units,
             'checkpoint_protocol': checkpoint_protocol,
             'data_protocol': data_protocol,
+            'distributed_context': distributed,
+            'expected_effective_global_batch_size': (
+                runtime_batch_plan.effective_global_batch_size
+            ),
         },
     )
     
@@ -1178,7 +1349,9 @@ def main():
         grad_accum_steps=int(opt_config.get("gradient_accumulation_steps", args.grad_accum_steps)),
     )
     
-    print("Training completed!")
+    if distributed.is_main_process:
+        print("Training completed!")
+    cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":

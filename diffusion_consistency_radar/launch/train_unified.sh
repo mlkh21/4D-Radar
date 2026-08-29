@@ -25,19 +25,70 @@ SCRIPT_DIR="${PROJECT_DIR}/scripts"
 MANIFEST_SCRIPT="${PROJECT_DIR}/scripts/dataset_manifest.py"
 DEFAULT_CONFIG_PATH="${PROJECT_DIR}/config/default_config.yaml"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
+if [ ! -f "${DEFAULT_CONFIG_PATH}" ]; then
+    echo "错误：未找到默认训练配置：${DEFAULT_CONFIG_PATH}"
+    exit 1
+fi
+
+# YAML 是正式训练默认值的唯一来源；环境变量只覆盖本次运行。
+mapfile -t YAML_TRAINING_DEFAULTS < <(python - "${DEFAULT_CONFIG_PATH}" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    config = yaml.safe_load(handle) or {}
+
+for stage in ("vae", "ldm", "cd"):
+    stage_config = config.get(stage) or {}
+    print(stage_config.get("epochs", ""))
+    print(stage_config.get("train_frames_per_epoch", ""))
+    print(stage_config.get("validation_frames_per_epoch", ""))
+hardware = config.get("hardware") or {}
+data = config.get("data") or {}
+print(hardware.get("cuda_devices", ""))
+print(data.get("radar_normalization_sha256", ""))
+PY
+)
+if [ "${#YAML_TRAINING_DEFAULTS[@]}" -ne 11 ]; then
+    echo "错误：default_config.yaml 缺少正式训练默认值"
+    exit 1
+fi
+YAML_VAE_EPOCHS="${YAML_TRAINING_DEFAULTS[0]}"
+YAML_VAE_TRAIN_FRAMES="${YAML_TRAINING_DEFAULTS[1]}"
+YAML_VAE_VALIDATION_FRAMES="${YAML_TRAINING_DEFAULTS[2]}"
+YAML_LDM_EPOCHS="${YAML_TRAINING_DEFAULTS[3]}"
+YAML_LDM_TRAIN_FRAMES="${YAML_TRAINING_DEFAULTS[4]}"
+YAML_LDM_VALIDATION_FRAMES="${YAML_TRAINING_DEFAULTS[5]}"
+YAML_CD_EPOCHS="${YAML_TRAINING_DEFAULTS[6]}"
+YAML_CD_TRAIN_FRAMES="${YAML_TRAINING_DEFAULTS[7]}"
+YAML_CD_VALIDATION_FRAMES="${YAML_TRAINING_DEFAULTS[8]}"
+YAML_CUDA_DEVICES="${YAML_TRAINING_DEFAULTS[9]}"
+YAML_EXPECTED_ARTIFACT_SHA256="${YAML_TRAINING_DEFAULTS[10]}"
+
 PROTOCOL_TAG="${PROTOCOL_TAG:-formal_v2_80m_86p8_v1}"
 PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1}"
 RADAR_NORMALIZATION_ARTIFACT="${RADAR_NORMALIZATION_ARTIFACT:-${PROJECT_DIR}/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json}"
-EXPECTED_ARTIFACT_SHA256="${EXPECTED_ARTIFACT_SHA256:-}"
+EXPECTED_ARTIFACT_SHA256="${EXPECTED_ARTIFACT_SHA256:-${YAML_EXPECTED_ARTIFACT_SHA256}}"
 TEMPORAL_SPLIT_ARTIFACT="${TEMPORAL_SPLIT_ARTIFACT:-${PREPROCESSED_ROOT}/temporal_split_garden_train80_purge3s_v1.json}"
 DATA_PROTOCOL_ARTIFACT="${DATA_PROTOCOL_ARTIFACT:-${PREPROCESSED_ROOT}/formal_data_protocol_garden_train80_purge3s_v1.json}"
 CALIBRATION_DIR="${CALIBRATION_DIR:-${ROOT_DIR}/Data/config}"
 CONFIG_PATH="${PROJECT_DIR}/config/.default_config.train_override.yaml"
 RESULTS_DIR="${ROOT_DIR}/Result/train_results/${PROTOCOL_TAG}"
 ALLOW_RESUME="${ALLOW_RESUME:-0}"
-CUDA_DEVICES="${CUDA_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"
+CUDA_DEVICES="${CUDA_DEVICES:-${CUDA_VISIBLE_DEVICES:-${YAML_CUDA_DEVICES}}}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
-FORMAL_EPOCHS="${FORMAL_EPOCHS:-20}"
+FORMAL_EPOCHS="${FORMAL_EPOCHS:-}"
+FORMAL_TRAIN_FRAMES_PER_EPOCH="${FORMAL_TRAIN_FRAMES_PER_EPOCH:-}"
+FORMAL_VALIDATION_FRAMES_PER_EPOCH="${FORMAL_VALIDATION_FRAMES_PER_EPOCH:-}"
+VAE_EPOCHS="${VAE_EPOCHS:-${FORMAL_EPOCHS:-${YAML_VAE_EPOCHS}}}"
+LDM_EPOCHS="${LDM_EPOCHS:-${FORMAL_EPOCHS:-${YAML_LDM_EPOCHS}}}"
+CD_EPOCHS="${CD_EPOCHS:-${FORMAL_EPOCHS:-${YAML_CD_EPOCHS}}}"
+VAE_TRAIN_FRAMES_PER_EPOCH="${VAE_TRAIN_FRAMES_PER_EPOCH:-${FORMAL_TRAIN_FRAMES_PER_EPOCH:-${YAML_VAE_TRAIN_FRAMES}}}"
+LDM_TRAIN_FRAMES_PER_EPOCH="${LDM_TRAIN_FRAMES_PER_EPOCH:-${FORMAL_TRAIN_FRAMES_PER_EPOCH:-${YAML_LDM_TRAIN_FRAMES}}}"
+CD_TRAIN_FRAMES_PER_EPOCH="${CD_TRAIN_FRAMES_PER_EPOCH:-${FORMAL_TRAIN_FRAMES_PER_EPOCH:-${YAML_CD_TRAIN_FRAMES}}}"
+VAE_VALIDATION_FRAMES_PER_EPOCH="${VAE_VALIDATION_FRAMES_PER_EPOCH:-${FORMAL_VALIDATION_FRAMES_PER_EPOCH:-${YAML_VAE_VALIDATION_FRAMES}}}"
+LDM_VALIDATION_FRAMES_PER_EPOCH="${LDM_VALIDATION_FRAMES_PER_EPOCH:-${FORMAL_VALIDATION_FRAMES_PER_EPOCH:-${YAML_LDM_VALIDATION_FRAMES}}}"
+CD_VALIDATION_FRAMES_PER_EPOCH="${CD_VALIDATION_FRAMES_PER_EPOCH:-${FORMAL_VALIDATION_FRAMES_PER_EPOCH:-${YAML_CD_VALIDATION_FRAMES}}}"
 MODE="${1:-vae}"
 
 case "${ALLOW_RESUME}" in
@@ -56,8 +107,36 @@ case "${PREFLIGHT_ONLY}" in
         ;;
 esac
 
-if [[ ! "${FORMAL_EPOCHS}" =~ ^[0-9]+$ || "${FORMAL_EPOCHS}" -ne 20 ]]; then
-    echo "错误：正式服务器训练固定 VAE/LDM/CD epochs=20/20/20，实际为 ${FORMAL_EPOCHS}"
+validate_positive_integer() {
+    local name="$1"
+    local value="$2"
+    if [[ ! "${value}" =~ ^[0-9]+$ || "${value}" -lt 1 ]]; then
+        echo "错误：${name} 必须是正整数，实际为 ${value}"
+        exit 2
+    fi
+}
+
+validate_nonnegative_integer() {
+    local name="$1"
+    local value="$2"
+    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+        echo "错误：${name} 必须是非负整数，0 表示使用完整 partition，实际为 ${value}"
+        exit 2
+    fi
+}
+
+validate_positive_integer VAE_EPOCHS "${VAE_EPOCHS}"
+validate_positive_integer LDM_EPOCHS "${LDM_EPOCHS}"
+validate_positive_integer CD_EPOCHS "${CD_EPOCHS}"
+validate_nonnegative_integer VAE_TRAIN_FRAMES_PER_EPOCH "${VAE_TRAIN_FRAMES_PER_EPOCH}"
+validate_nonnegative_integer LDM_TRAIN_FRAMES_PER_EPOCH "${LDM_TRAIN_FRAMES_PER_EPOCH}"
+validate_nonnegative_integer CD_TRAIN_FRAMES_PER_EPOCH "${CD_TRAIN_FRAMES_PER_EPOCH}"
+validate_nonnegative_integer VAE_VALIDATION_FRAMES_PER_EPOCH "${VAE_VALIDATION_FRAMES_PER_EPOCH}"
+validate_nonnegative_integer LDM_VALIDATION_FRAMES_PER_EPOCH "${LDM_VALIDATION_FRAMES_PER_EPOCH}"
+validate_nonnegative_integer CD_VALIDATION_FRAMES_PER_EPOCH "${CD_VALIDATION_FRAMES_PER_EPOCH}"
+
+if [[ ! "${EXPECTED_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "错误：EXPECTED_ARTIFACT_SHA256 必须是 64 位小写 SHA-256"
     exit 2
 fi
 
@@ -65,6 +144,21 @@ if [[ ! "${CUDA_DEVICES}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
     echo "错误：CUDA_DEVICES 必须是逗号分隔的非负 GPU 编号，例如 0 或 0,1"
     exit 2
 fi
+
+IFS=',' read -r -a GPU_IDS <<< "${CUDA_DEVICES}"
+GPU_COUNT="${#GPU_IDS[@]}"
+if [ "${GPU_COUNT}" -lt 1 ] || [ "${GPU_COUNT}" -gt 4 ]; then
+    echo "错误：正式训练仅支持单机 1--4 个 GPU，实际为 ${GPU_COUNT}"
+    exit 2
+fi
+declare -A SEEN_GPU_IDS=()
+for GPU_ID in "${GPU_IDS[@]}"; do
+    if [[ -n "${SEEN_GPU_IDS[${GPU_ID}]:-}" ]]; then
+        echo "错误：CUDA_DEVICES 包含重复 GPU 编号：${GPU_ID}"
+        exit 2
+    fi
+    SEEN_GPU_IDS["${GPU_ID}"]=1
+done
 
 case "${MODE}" in
     vae|ldm|cd|all) ;;
@@ -119,7 +213,7 @@ if [ "${PREFLIGHT_ONLY}" != "1" ]; then
 fi
 
 if [ ! -f "${DATA_LOADING_CONFIG}" ]; then
-    echo "Error: data loading config not found: ${DATA_LOADING_CONFIG}"
+    echo "错误：未找到数据加载预设: ${DATA_LOADING_CONFIG}"
     exit 1
 fi
 
@@ -142,7 +236,7 @@ PY
 )
 
 if [ ${#TRAIN_SCENES[@]} -eq 0 ]; then
-    echo "Error: data_loading_config.yml data.train is empty"
+    echo "错误: data_loading_config.yml data.train 为空，无法确定训练场景"
     exit 1
 fi
 
@@ -150,14 +244,14 @@ fi
 for SCENE in "${TRAIN_SCENES[@]}"; do
     SRC_SCENE_DIR="${PREPROCESSED_ROOT}/${SCENE}"
     if [ ! -d "${SRC_SCENE_DIR}" ]; then
-        echo "Error: train scene directory not found: ${SRC_SCENE_DIR}"
+        echo "错误：未找到训练场景目录: ${SRC_SCENE_DIR}"
         exit 1
     fi
     if ! python "${MANIFEST_SCRIPT}" validate \
         --scene_dir "${SRC_SCENE_DIR}" \
         --expected_scene "${SCENE}" \
         --expected_profile training; then
-        echo "Error: dataset manifest validation failed: ${SRC_SCENE_DIR}"
+        echo "错误: 数据集清单验证失败: ${SRC_SCENE_DIR}"
         exit 1
     fi
 done
@@ -177,7 +271,7 @@ if [ ! -f "${RADAR_NORMALIZATION_ARTIFACT}" ]; then
     exit 1
 fi
 if [ -z "${EXPECTED_ARTIFACT_SHA256}" ]; then
-    echo "错误：必须显式设置 EXPECTED_ARTIFACT_SHA256，禁止按文件名信任 normalization。"
+    echo "错误：YAML 或 EXPECTED_ARTIFACT_SHA256 必须声明 normalization 固定身份。"
     exit 1
 fi
 
@@ -299,7 +393,9 @@ print(
 )
 PY
 
-echo "Formal epochs per stage: ${FORMAL_EPOCHS}"
+echo "Formal epochs: vae=${VAE_EPOCHS}, ldm=${LDM_EPOCHS}, cd=${CD_EPOCHS}"
+echo "Formal train frames/scene/epoch: vae=${VAE_TRAIN_FRAMES_PER_EPOCH}, ldm=${LDM_TRAIN_FRAMES_PER_EPOCH}, cd=${CD_TRAIN_FRAMES_PER_EPOCH}"
+echo "Formal validation frames/scene/epoch: vae=${VAE_VALIDATION_FRAMES_PER_EPOCH}, ldm=${LDM_VALIDATION_FRAMES_PER_EPOCH}, cd=${CD_VALIDATION_FRAMES_PER_EPOCH}"
 echo "CUDA allocator: ${PYTORCH_CUDA_ALLOC_CONF}"
 
 if [ "${PREFLIGHT_ONLY}" = "1" ]; then
@@ -308,9 +404,14 @@ if [ "${PREFLIGHT_ONLY}" = "1" ]; then
 fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
+export CUDA_DEVICES EXPECTED_ARTIFACT_SHA256
+export VAE_EPOCHS LDM_EPOCHS CD_EPOCHS
+export VAE_TRAIN_FRAMES_PER_EPOCH LDM_TRAIN_FRAMES_PER_EPOCH CD_TRAIN_FRAMES_PER_EPOCH
+export VAE_VALIDATION_FRAMES_PER_EPOCH LDM_VALIDATION_FRAMES_PER_EPOCH CD_VALIDATION_FRAMES_PER_EPOCH
 
 # 生成本次正式协议的绝对路径配置，避免启动位置改变相对路径语义。
 python - \
+    "${ROOT_DIR}" \
     "${DEFAULT_CONFIG_PATH}" \
     "${CONFIG_PATH}" \
     "${PREPROCESSED_ROOT}" \
@@ -320,12 +421,23 @@ python - \
     "${DATA_PROTOCOL_ARTIFACT}" \
     "${TEMPORAL_SPLIT_ARTIFACT}" \
     "$(IFS=,; echo "${TRAIN_SCENES[*]}")" \
-    "${FORMAL_EPOCHS}" <<'PY'
+    "${VAE_EPOCHS}" \
+    "${VAE_TRAIN_FRAMES_PER_EPOCH}" \
+    "${VAE_VALIDATION_FRAMES_PER_EPOCH}" \
+    "${LDM_EPOCHS}" \
+    "${LDM_TRAIN_FRAMES_PER_EPOCH}" \
+    "${LDM_VALIDATION_FRAMES_PER_EPOCH}" \
+    "${CD_EPOCHS}" \
+    "${CD_TRAIN_FRAMES_PER_EPOCH}" \
+    "${CD_VALIDATION_FRAMES_PER_EPOCH}" \
+    "${CUDA_DEVICES}" \
+    "${GPU_COUNT}" <<'PY'
 import os
 import sys
 import yaml
 
 (
+    root_dir,
     src_cfg,
     dst_cfg,
     dataset_dir,
@@ -335,8 +447,25 @@ import yaml
     data_protocol_path,
     temporal_split_path,
     scenes_csv,
-    formal_epochs,
-) = sys.argv[1:11]
+    vae_epochs,
+    vae_train_frames,
+    vae_validation_frames,
+    ldm_epochs,
+    ldm_train_frames,
+    ldm_validation_frames,
+    cd_epochs,
+    cd_train_frames,
+    cd_validation_frames,
+    cuda_devices,
+    gpu_count,
+) = sys.argv[1:22]
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+from diffusion_consistency_radar.distributed_training import (
+    resolve_world_batch_plan,
+)
+
+batch_plan = resolve_world_batch_plan(int(gpu_count))
 with open(src_cfg, 'r', encoding='utf-8') as f:
     cfg = yaml.safe_load(f)
 allocator_conf = os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '').strip()
@@ -344,7 +473,13 @@ if allocator_conf != 'max_split_size_mb:128':
     raise RuntimeError(f"正式训练 CUDA allocator 配置异常: {allocator_conf!r}")
 cfg.setdefault('hardware', {})
 cfg['hardware']['cuda_allocator_conf'] = allocator_conf
+cfg['hardware']['distributed_protocol'] = 'single_node_ddp_v1'
+cfg['hardware']['cuda_devices'] = cuda_devices
+cfg['hardware']['num_gpus'] = int(gpu_count)
+cfg['hardware']['world_size'] = batch_plan.world_size
+cfg['hardware']['effective_global_batch_size'] = batch_plan.effective_global_batch_size
 cfg.setdefault('data', {})
+cfg['data']['batch_size'] = batch_plan.per_rank_batch_size
 cfg['data']['dataset_dir'] = dataset_dir
 cfg['data']['scene_names'] = [scene for scene in scenes_csv.split(',') if scene]
 cfg['data']['calibration_dir'] = calibration_dir
@@ -365,9 +500,30 @@ cfg['data']['source_pc_range'] = [0, -20, -6, 80, 20, 10]
 cfg['data']['model_pc_range'] = [0, -20, -6, 80, 20, 10]
 cfg['data']['radar_normalization_path'] = artifact_path
 cfg['data']['doppler_scale_mps'] = 86.8
+cfg.setdefault('optimization', {})
+cfg['optimization']['gradient_accumulation_steps'] = batch_plan.gradient_accumulation_steps
+stage_values = {
+    'vae': {
+        'epochs': vae_epochs,
+        'train_frames': vae_train_frames,
+        'validation_frames': vae_validation_frames,
+    },
+    'ldm': {
+        'epochs': ldm_epochs,
+        'train_frames': ldm_train_frames,
+        'validation_frames': ldm_validation_frames,
+    },
+    'cd': {
+        'epochs': cd_epochs,
+        'train_frames': cd_train_frames,
+        'validation_frames': cd_validation_frames,
+    },
+}
 for stage in ('vae', 'ldm', 'cd'):
     cfg.setdefault(stage, {})
-    cfg[stage]['epochs'] = int(formal_epochs)
+    cfg[stage]['epochs'] = int(stage_values[stage]['epochs'])
+    cfg[stage]['train_frames_per_epoch'] = int(stage_values[stage]['train_frames'])
+    cfg[stage]['validation_frames_per_epoch'] = int(stage_values[stage]['validation_frames'])
     cfg[stage]['save_dir'] = os.path.join(results_dir, stage)
 
 temp_path = f"{dst_cfg}.tmp-{os.getpid()}"
@@ -387,6 +543,22 @@ echo "Training config: ${CONFIG_PATH}"
 echo "Training protocol: ${PROTOCOL_TAG}"
 echo "Training results: ${RESULTS_DIR}"
 echo "CUDA devices: ${CUDA_VISIBLE_DEVICES}"
+echo "Distributed GPUs: ${GPU_COUNT}"
+
+launch_training_stage() {
+    local stage="$1"
+    shift
+    if [ "${GPU_COUNT}" -eq 1 ]; then
+        python "${SCRIPT_DIR}/unified_train.py" --mode "${stage}" "$@"
+        return
+    fi
+    python -m torch.distributed.run \
+        --standalone \
+        --nproc_per_node="${GPU_COUNT}" \
+        "${SCRIPT_DIR}/unified_train.py" \
+        --mode "${stage}" \
+        "$@"
+}
 
 case "$MODE" in
     vae)
@@ -399,8 +571,7 @@ case "$MODE" in
         if [ "${ALLOW_RESUME}" = "1" ] && [ -f "${VAE_RESUME}" ]; then
             RESUME_ARGS+=(--resume "${VAE_RESUME}")
         fi
-        python "${SCRIPT_DIR}/unified_train.py" \
-            --mode vae \
+        launch_training_stage vae \
             --config "${CONFIG_PATH}" \
             "${RESUME_ARGS[@]}"
         ;;
@@ -422,8 +593,7 @@ case "$MODE" in
         if [ "${ALLOW_RESUME}" = "1" ] && [ -f "${LDM_RESUME}" ]; then
             RESUME_ARGS+=(--resume "${LDM_RESUME}")
         fi
-        python "${SCRIPT_DIR}/unified_train.py" \
-            --mode ldm \
+        launch_training_stage ldm \
             --config "${CONFIG_PATH}" \
             --vae_ckpt "${VAE_CKPT}" \
             "${RESUME_ARGS[@]}"
@@ -452,8 +622,7 @@ case "$MODE" in
         if [ "${ALLOW_RESUME}" = "1" ] && [ -f "${CD_RESUME}" ]; then
             RESUME_ARGS+=(--resume "${CD_RESUME}")
         fi
-        python "${SCRIPT_DIR}/unified_train.py" \
-            --mode cd \
+        launch_training_stage cd \
             --config "${CONFIG_PATH}" \
             --vae_ckpt "${VAE_CKPT}" \
             --ldm_ckpt "${LDM_CKPT}" \
