@@ -14,8 +14,16 @@ if PROJECT_ROOT not in sys.path:
 
 from diffusion_consistency_radar.dataset_manifest import write_scene_manifest_atomic
 from diffusion_consistency_radar.formal_data_protocol import (
+    FormalDataProtocolError,
     build_and_write_formal_data_protocol,
     load_formal_data_protocol_artifact,
+)
+from diffusion_consistency_radar.extraction_receipt import (
+    CRITICAL_EXTRACTION_TOPICS,
+    finalize_extraction_receipt,
+    mark_bag_processed,
+    new_extraction_receipt,
+    record_extraction_success,
 )
 from diffusion_consistency_radar.temporal_split import (
     TemporalSplitError,
@@ -32,24 +40,82 @@ def _write_bytes(path, payload):
         handle.write(payload)
 
 
-def _create_scene(root, frame_count=6):
+def _create_scene(root, frame_count=6, *, formal_v3=False):
     scene = "garden"
     scene_dir = os.path.join(root, scene)
     os.makedirs(scene_dir)
+    policy = {
+        "source_scene": scene,
+        "frames_written": frame_count,
+        "voxel_coordinate_frame": "lidar",
+        "observed_mask_protocol": "lidar_ray_observed_v1",
+    }
+    if formal_v3:
+        receipt = new_extraction_receipt(scene, ["garden_0.bag"])
+        for topic in CRITICAL_EXTRACTION_TOPICS:
+            record_extraction_success(receipt, topic)
+        mark_bag_processed(receipt, "garden_0.bag")
+        finalize_extraction_receipt(receipt)
+        field_schema = {
+            "protocol": "radar_raw_field_semantics_v1",
+            "storage": {
+                "format": "npy",
+                "dtype": "float32",
+                "column_count": 5,
+            },
+            "fields": {
+                "xyz": {
+                    "column_indices": [0, 1, 2],
+                    "unit": "m",
+                    "coordinate_frame": "radar",
+                },
+                "return_strength": {
+                    "column_index": 3,
+                    "source_field": "intensity",
+                    "quantity": "intensity",
+                    "unit": "sensor_native_linear_nonnegative",
+                    "missing_value": "nan",
+                },
+                "doppler": {
+                    "column_index": 4,
+                    "source_field": "velocity",
+                    "quantity": "radial_velocity",
+                    "unit": "m/s",
+                    "reference": "sensor_relative",
+                    "positive_direction": "toward_sensor",
+                    "missing_value": "nan",
+                },
+            },
+            "verification": {
+                "status": "verified",
+                "authority_type": "official_message_definition",
+                "reference": "RadarPointCloud.msg revision 1",
+                "evidence_file": "RadarPointCloud.msg",
+                "sha256": "9" * 64,
+            },
+        }
+        policy.update(
+            {
+                "radar_statistics_protocol": "radar_point_count_field_validity_v2",
+                "radar_aggregation_semantics": (
+                    "per_field_finite_count_mean_and_doppler_variance_v2"
+                ),
+                "radar_field_schema": field_schema,
+                "radar_field_schema_sha256": "a" * 64,
+                "radar_field_schema_status": "verified",
+                "radar_pointcloud_layout_sha256": "b" * 64,
+                "radar_doppler_positive_direction": "toward_sensor",
+                "extraction_receipt": receipt,
+                "extraction_receipt_sha256": "c" * 64,
+                "extraction_receipt_status": "complete",
+            }
+        )
     with open(
         os.path.join(scene_dir, "preprocess_policy.json"),
         "w",
         encoding="utf-8",
     ) as handle:
-        json.dump(
-            {
-                "source_scene": scene,
-                "frames_written": frame_count,
-                "voxel_coordinate_frame": "lidar",
-                "observed_mask_protocol": "lidar_ray_observed_v1",
-            },
-            handle,
-        )
+        json.dump(policy, handle)
     for index in range(frame_count):
         frame_id = f"{index:06d}"
         for modality in ("radar_voxel", "lidar_voxel", "target_voxel"):
@@ -168,6 +234,69 @@ class TemporalSplitProtocolTest(unittest.TestCase):
                 "lidar_ray_observed_v1",
             )
             self.assertEqual(set(protocol["observed_mask_sha256"]), {"garden"})
+
+    def test_formal_v3_binds_verified_radar_and_complete_extraction_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            _create_scene(root, formal_v3=True)
+            split_path = os.path.join(root, "split.json")
+            build_and_write_temporal_split(
+                dataset_dir=root,
+                scenes=["garden"],
+                output_path=split_path,
+                train_fraction=0.5,
+                purge_seconds=1.0,
+                formal=True,
+            )
+            output = os.path.join(root, "formal_data_v3.json")
+            build_and_write_formal_data_protocol(
+                dataset_dir=root,
+                scenes=["garden"],
+                split_artifact_path=split_path,
+                output_path=output,
+                protocol_version="v3",
+            )
+            protocol, _digest = load_formal_data_protocol_artifact(
+                output,
+                dataset_dir=root,
+                scenes=["garden"],
+                split_artifact_path=split_path,
+                stage="ldm",
+            )
+
+            self.assertEqual(protocol["protocol"], "formal_data_v3")
+            self.assertEqual(
+                protocol["radar_statistics_protocol"],
+                "radar_point_count_field_validity_v2",
+            )
+            self.assertEqual(
+                protocol["radar_input_contract"]["doppler"]["positive_direction"],
+                "toward_sensor",
+            )
+            self.assertEqual(
+                protocol["extraction_receipt_sha256"],
+                {"garden": "c" * 64},
+            )
+
+    def test_formal_v3_rejects_legacy_policy_without_verified_sources(self):
+        with tempfile.TemporaryDirectory() as root:
+            _create_scene(root, formal_v3=False)
+            split_path = os.path.join(root, "split.json")
+            build_and_write_temporal_split(
+                dataset_dir=root,
+                scenes=["garden"],
+                output_path=split_path,
+                train_fraction=0.5,
+                purge_seconds=1.0,
+                formal=True,
+            )
+            with self.assertRaisesRegex(FormalDataProtocolError, "Radar statistics"):
+                build_and_write_formal_data_protocol(
+                    dataset_dir=root,
+                    scenes=["garden"],
+                    split_artifact_path=split_path,
+                    output_path=os.path.join(root, "formal_data_v3.json"),
+                    protocol_version="v3",
+                )
 
     def test_builds_disjoint_train_purge_validation_blocks(self):
         with tempfile.TemporaryDirectory() as root:

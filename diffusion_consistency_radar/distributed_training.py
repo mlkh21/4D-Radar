@@ -17,6 +17,8 @@ from torch.utils.data import Dataset, Sampler
 
 
 DDP_PROTOCOL = "single_node_ddp_v1"
+DDP_NORMALIZATION_PROTOCOL = "sync_batchnorm_v1"
+SINGLE_PROCESS_NORMALIZATION_PROTOCOL = "local_batchnorm_v1"
 
 
 @dataclass(frozen=True)
@@ -219,6 +221,25 @@ def distributed_barrier(context: DistributedContext) -> None:
         dist.barrier()
 
 
+def prepare_model_for_distributed(
+    model: nn.Module,
+    context: DistributedContext,
+) -> nn.Module:
+    """多卡时将本地 BatchNorm 转为跨 rank 同步统计。"""
+    if not context.initialized:
+        return model
+    has_local_batchnorm = any(
+        isinstance(module, nn.modules.batchnorm._BatchNorm)
+        and not isinstance(module, nn.SyncBatchNorm)
+        for module in model.modules()
+    )
+    if not has_local_batchnorm:
+        return model
+    # NOTE: 必须在构造 DDP 与 optimizer 之前转换；state_dict 键保持不变，
+    # 单卡 checkpoint 仍可由普通 BatchNorm 模型加载。
+    return nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+
 def wrap_model_for_ddp(
     model: nn.Module,
     context: DistributedContext,
@@ -228,6 +249,7 @@ def wrap_model_for_ddp(
     """多进程时包装模型；单进程保持原对象和历史 checkpoint 键。"""
     if not context.initialized:
         return model
+    model = prepare_model_for_distributed(model, context)
     return DistributedDataParallel(
         model,
         device_ids=[context.local_rank],
@@ -313,6 +335,11 @@ def distributed_checkpoint_metadata(
     padded_size = math.ceil(train_dataset_size / context.world_size) * context.world_size
     return {
         "protocol": DDP_PROTOCOL,
+        "normalization_protocol": (
+            DDP_NORMALIZATION_PROTOCOL
+            if context.world_size > 1
+            else SINGLE_PROCESS_NORMALIZATION_PROTOCOL
+        ),
         "world_size": context.world_size,
         "per_rank_batch_size": batch_plan.per_rank_batch_size,
         "gradient_accumulation_steps": batch_plan.gradient_accumulation_steps,
@@ -365,6 +392,24 @@ def assert_resume_distributed_compatible(
         return
     if not isinstance(saved, dict) or saved.get("protocol") != DDP_PROTOCOL:
         raise ValueError("checkpoint distributed_training 协议无效")
+    saved_world_size = saved.get("world_size", 1)
+    if type(saved_world_size) is not int or saved_world_size < 1:
+        raise ValueError("checkpoint distributed world_size 必须是正整数")
+    saved_normalization = saved.get("normalization_protocol")
+    if (
+        saved_world_size > 1
+        and saved_normalization != DDP_NORMALIZATION_PROTOCOL
+    ):
+        raise ValueError(
+            "旧多卡 checkpoint 缺少可信的 normalization protocol；"
+            "其 rank0 BatchNorm buffer 不能作为全局状态恢复"
+        )
+    if saved_normalization not in {
+        None,
+        DDP_NORMALIZATION_PROTOCOL,
+        SINGLE_PROCESS_NORMALIZATION_PROTOCOL,
+    }:
+        raise ValueError("checkpoint normalization protocol 无效")
     actual = saved.get("effective_global_batch_size")
     if type(actual) is not int or actual < 1:
         raise ValueError("checkpoint effective_global_batch_size 必须是正整数")

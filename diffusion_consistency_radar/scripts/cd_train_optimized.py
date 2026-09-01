@@ -31,6 +31,7 @@ from torch.cuda.amp import autocast, GradScaler
 import argparse
 import logging
 import csv
+import math
 import time
 from typing import Any, Dict, Optional, Tuple
 from tqdm import tqdm
@@ -57,6 +58,7 @@ from diffusion_consistency_radar.checkpoint_chain import (
     FORMAL_MINI_CHECKPOINT_PROTOCOL,
     assert_checkpoint_training_identity,
     build_formal_mini_selection,
+    build_formal_stage_training_selection,
     resolve_training_checkpoint_protocol,
     safe_torch_load as safe_checkpoint_load,
     sha256_file,
@@ -73,6 +75,27 @@ from diffusion_consistency_radar.radar_normalization import (
 from diffusion_consistency_radar.formal_data_protocol import (
     load_formal_data_protocol_artifact,
 )
+from diffusion_consistency_radar.cd_validation_protocol import (
+    CD_VALIDATION_PROTOCOL,
+    CD_VALIDATION_SELECTOR,
+    CD_VALIDATION_SPLIT,
+)
+from diffusion_consistency_radar.cd_training_protocol import (
+    CD_DENOISING_PARAMETERIZATION,
+    CD_TRAINING_SEMANTICS,
+    resolve_cd_consistency_config,
+    validate_cd_consistency_receipt,
+)
+from diffusion_consistency_radar.occupancy_threshold_artifact import (
+    DEFAULT_THRESHOLD_CANDIDATES,
+    THRESHOLD_SWEEP_PROTOCOL,
+    threshold_sweep_batch_counts,
+    threshold_sweep_metrics,
+    validate_checkpoint_threshold_sweep,
+    validate_threshold_candidates,
+    build_threshold_artifact,
+    write_threshold_artifact,
+)
 from diffusion_consistency_radar.temporal_split import (
     limit_frame_ids_by_scene,
     load_temporal_split_artifact,
@@ -80,18 +103,238 @@ from diffusion_consistency_radar.temporal_split import (
 )
 from diffusion_consistency_radar.distributed_training import (
     DistributedContext,
+    DistributedEvalSampler,
     WorldBatchPlan,
     assert_distributed_config_compatible,
     assert_resume_distributed_compatible,
     cleanup_distributed,
     distributed_barrier,
     distributed_checkpoint_metadata,
+    deterministic_noise_from_sample_ids,
     initialize_distributed,
+    prepare_model_for_distributed,
     reduce_named_sums,
     set_loader_epoch,
     unwrap_model,
     wrap_model_for_ddp,
 )
+
+
+CD_EMA_UPDATE_PROTOCOL = "named_parameter_and_buffer_ema_v1"
+
+
+def _validated_cd_validation_metrics(
+    metrics: Dict[str, Any],
+    *,
+    source: str,
+) -> tuple:
+    """校验 CD 部署选优所依赖的 observed-domain 指标。"""
+    if not isinstance(metrics, dict):
+        raise ValueError(f"{source} CD validation metrics 必须为字典")
+    try:
+        latent_loss = float(metrics["denoising_latent_loss"])
+        occupancy_iou = float(metrics["denoising_occupancy_iou"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{source} CD validation metrics 缺少有效 loss/IoU"
+        ) from exc
+    if not math.isfinite(latent_loss) or latent_loss < 0.0:
+        raise ValueError(f"{source} denoising_latent_loss 必须为非负有限数")
+    if not math.isfinite(occupancy_iou) or not 0.0 <= occupancy_iou <= 1.0:
+        raise ValueError(f"{source} denoising_occupancy_iou 必须位于 [0, 1]")
+    return latent_loss, occupancy_iou
+
+
+def select_cd_deployment_weight_source(
+    online_metrics: Dict[str, Any],
+    ema_metrics: Dict[str, Any],
+) -> str:
+    """按 observed IoU 优先、latent loss 次优选择部署权重；完全相同取 EMA。"""
+    online_loss, online_iou = _validated_cd_validation_metrics(
+        online_metrics,
+        source="online",
+    )
+    ema_loss, ema_iou = _validated_cd_validation_metrics(
+        ema_metrics,
+        source="EMA",
+    )
+    online_rank = (online_iou, -online_loss)
+    ema_rank = (ema_iou, -ema_loss)
+    return (
+        "model_state_dict"
+        if online_rank > ema_rank
+        else "ema_model_state_dict"
+    )
+
+
+def resolve_cd_validation_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """解析 CD online/EMA 共用的确定性 validation 配置。"""
+    seed = config.get("validation_seed", 42)
+    if type(seed) is not int or seed < 0:
+        raise ValueError("cd.validation_seed 必须是非负整数")
+    try:
+        sigma = float(config.get("validation_sigma", 0.5))
+        threshold = float(config.get("validation_occupancy_threshold", 0.5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("CD validation sigma/threshold 必须是有限数") from exc
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("cd.validation_sigma 必须为正有限数")
+    if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
+        raise ValueError("cd.validation_occupancy_threshold 必须严格位于 (0,1)")
+    return {
+        "protocol": CD_VALIDATION_PROTOCOL,
+        "split": CD_VALIDATION_SPLIT,
+        "selector": CD_VALIDATION_SELECTOR,
+        "seed": seed,
+        "sigma": sigma,
+        "occupancy_threshold": threshold,
+        "noise_identity": "sha256_sample_id_seed_v1",
+        "threshold_candidates": list(
+            validate_threshold_candidates(
+                config.get(
+                    "validation_threshold_candidates",
+                    DEFAULT_THRESHOLD_CANDIDATES,
+                )
+            )
+        ),
+    }
+
+
+def assert_cd_validation_checkpoint_protocol(
+    checkpoint: Dict[str, Any],
+    *,
+    current_config: Dict[str, Any],
+    require_formal: bool,
+) -> Optional[Dict[str, Any]]:
+    """验证 CD resume 的 online/EMA 选择协议并返回可恢复状态。"""
+    saved = checkpoint.get("cd_validation") if isinstance(checkpoint, dict) else None
+    if saved is None:
+        if require_formal:
+            raise ValueError("formal CD checkpoint 缺少 cd_validation")
+        return None
+    if not isinstance(saved, dict):
+        raise ValueError("CD checkpoint cd_validation 必须是字典")
+    for field in (
+        "protocol",
+        "split",
+        "selector",
+        "noise_identity",
+        "seed",
+    ):
+        if saved.get(field) != current_config.get(field):
+            raise ValueError(
+                f"CD checkpoint validation {field} 与当前配置不一致"
+            )
+    for field in ("sigma", "occupancy_threshold"):
+        try:
+            saved_value = float(saved[field])
+            current_value = float(current_config[field])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"CD checkpoint validation {field} 必须是有限数"
+            ) from exc
+        if (
+            not math.isfinite(saved_value)
+            or not math.isclose(
+                saved_value,
+                current_value,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                f"CD checkpoint validation {field} 与当前配置不一致"
+            )
+    metrics = saved.get("metrics")
+    if not isinstance(metrics, dict) or set(metrics) != {
+        "model_state_dict",
+        "ema_model_state_dict",
+    }:
+        raise ValueError("CD checkpoint validation metrics 权重源集合不完整")
+    selected_source = select_cd_deployment_weight_source(
+        metrics["model_state_dict"],
+        metrics["ema_model_state_dict"],
+    )
+    if (
+        saved.get("selected_source") != selected_source
+        or checkpoint.get("deployment_weight_source") != selected_source
+    ):
+        raise ValueError("CD checkpoint validation 选择结果与部署权重不一致")
+    best_metrics = saved.get("best_selected_metrics")
+    _validated_cd_validation_metrics(best_metrics, source="best selected")
+    if require_formal:
+        validate_checkpoint_threshold_sweep(
+            checkpoint,
+            expected_stage="cd",
+            expected_weight_source=selected_source,
+            expected_candidates=current_config["threshold_candidates"],
+        )
+    return {
+        "metrics": {
+            key: dict(value)
+            for key, value in metrics.items()
+        },
+        "selected_source": selected_source,
+        "best_selected_metrics": dict(best_metrics),
+    }
+
+
+def resolve_cd_observed_masks(
+    observed_mask: Optional[torch.Tensor],
+    target: torch.Tensor,
+    latent: torch.Tensor,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """校验 persisted mask，并生成 voxel/latent 两级 observed domain。"""
+    if observed_mask is None:
+        return None, None
+    mask = torch.as_tensor(observed_mask, device=target.device)
+    if mask.ndim == 4:
+        mask = mask.unsqueeze(1)
+    if (
+        target.ndim != 5
+        or latent.ndim != 5
+        or mask.ndim != 5
+        or mask.shape[1] != 1
+        or mask.shape[0] != target.shape[0]
+        or tuple(mask.shape[-3:]) != tuple(target.shape[-3:])
+    ):
+        raise ValueError("CD observed_mask 必须与 target 的 B/Z/X/Y 一致")
+    if not torch.isfinite(mask).all():
+        raise ValueError("CD observed_mask 必须全部为有限数")
+    if not torch.logical_or(mask == 0, mask == 1).all():
+        raise ValueError("CD observed_mask 必须是严格 0/1")
+    voxel_observed = mask.bool() | (target[:, 0:1] > 0.5)
+    latent_observed = F.adaptive_max_pool3d(
+        voxel_observed.float(),
+        output_size=latent.shape[-3:],
+    ).bool()
+    if not latent_observed.any():
+        raise ValueError("CD observed domain 为空")
+    return voxel_observed, latent_observed
+
+
+def assert_cd_ema_update_protocol(
+    checkpoint: Dict[str, Any],
+    *,
+    require_formal: bool,
+) -> None:
+    """拒绝以 parameters-only EMA 轨迹恢复正式 CD 训练。"""
+    saved_protocol = checkpoint.get("ema_update_protocol")
+    if require_formal and saved_protocol != CD_EMA_UPDATE_PROTOCOL:
+        raise ValueError(
+            "formal CD checkpoint EMA update protocol 不匹配："
+            f"checkpoint={saved_protocol!r}, "
+            f"current={CD_EMA_UPDATE_PROTOCOL!r}"
+        )
+    if (
+        saved_protocol is not None
+        and saved_protocol != CD_EMA_UPDATE_PROTOCOL
+    ):
+        raise ValueError(
+            "CD checkpoint EMA update protocol 不匹配："
+            f"checkpoint={saved_protocol!r}, "
+            f"current={CD_EMA_UPDATE_PROTOCOL!r}"
+        )
 
 
 def safe_torch_load(path, map_location, *, allow_legacy_pickle=False):
@@ -206,7 +449,7 @@ def resolve_cd_radar_normalization(
     data_grid_config,
     allow_legacy_radar_units=False,
 ):
-    """在 CD 输出目录创建前校验配置 artifact 与教师 LDM 完全一致。"""
+    """在 CD 输出目录创建前校验配置 artifact 与初始化 LDM 完全一致。"""
     if type(allow_legacy_radar_units) is not bool:
         raise RadarNormalizationError("allow_legacy_radar_units 必须是 bool")
     has_embedded = isinstance(ldm_checkpoint, dict) and (
@@ -221,21 +464,21 @@ def resolve_cd_radar_normalization(
         return None, ""
     if configured_spec is None or not configured_sha256:
         raise RadarNormalizationError("正式 CD 缺少配置 Radar normalization")
-    teacher_spec, teacher_sha256 = radar_normalization_from_checkpoint(
+    initialization_spec, initialization_sha256 = radar_normalization_from_checkpoint(
         ldm_checkpoint,
         target_size=data_grid_config.get("target_size"),
         source_pc_range=data_grid_config.get("source_pc_range"),
         model_pc_range=data_grid_config.get("model_pc_range"),
-        context="CD teacher LDM checkpoint",
+        context="CD initialization LDM checkpoint",
     )
     assert_same_radar_normalization(
         configured_spec,
         configured_sha256,
-        teacher_spec,
-        teacher_sha256,
-        context="CD teacher/config",
+        initialization_spec,
+        initialization_sha256,
+        context="CD initialization/config",
     )
-    return teacher_spec, teacher_sha256
+    return initialization_spec, initialization_sha256
 
 
 def create_vae_from_config(config: Optional[Dict[str, Any]] = None) -> VAE3D:
@@ -436,7 +679,7 @@ def _trainer_distributed_context(trainer) -> DistributedContext:
 
 class ConsistencyDistillationTrainer:
     """
-    LDM 初始化的 EMA consistency 训练器
+    LDM 初始化的 EMA consistency 训练器（类名仅保留历史 API 兼容）
     
     流程：
     1. 加载预训练 LDM 作为一次性初始化来源
@@ -462,6 +705,11 @@ class ConsistencyDistillationTrainer:
         self.allow_legacy_radar_units = self.config.get(
             "allow_legacy_radar_units", False
         )
+        self.require_persisted_observed_mask = bool(
+            self.config.get("require_persisted_observed_mask", False)
+        )
+        self.validation_config = resolve_cd_validation_config(self.config)
+        self.consistency_config = resolve_cd_consistency_config(self.config)
         self.checkpoint_protocol = resolve_training_checkpoint_protocol(
             self.config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
         )
@@ -482,24 +730,27 @@ class ConsistencyDistillationTrainer:
             if configured_selection is not None
             else None
         )
-        teacher_checkpoint = safe_torch_load(ldm_ckpt_path, map_location="cpu")
+        initialization_checkpoint = safe_torch_load(
+            ldm_ckpt_path,
+            map_location="cpu",
+        )
         if not self.allow_legacy_radar_units:
             assert_checkpoint_training_identity(
-                teacher_checkpoint,
+                initialization_checkpoint,
                 expected_stage="ldm",
                 checkpoint_protocol=self.checkpoint_protocol,
                 data_protocol=self.data_protocol,
             )
         self.radar_normalization, self.radar_normalization_sha256 = (
             resolve_cd_radar_normalization(
-                teacher_checkpoint,
+                initialization_checkpoint,
                 self.config.get("radar_normalization"),
                 self.config.get("radar_normalization_sha256", ""),
                 data_grid_config=self.data_grid_config,
                 allow_legacy_radar_units=self.allow_legacy_radar_units,
             )
         )
-        self._preloaded_ldm_checkpoint = teacher_checkpoint
+        self._preloaded_ldm_checkpoint = initialization_checkpoint
         resume_path = self.config.get('resume_path')
         if resume_path and os.path.exists(resume_path):
             resume_checkpoint = safe_torch_load(resume_path, map_location="cpu")
@@ -532,6 +783,11 @@ class ConsistencyDistillationTrainer:
         # 初始化训练状态
         self.start_epoch = 1
         self.best_loss = float('inf')
+        self.best_val_iou = float('-inf')
+        self.best_val_loss = float('inf')
+        self.last_validation_metrics = None
+        self.last_validation_threshold_sweeps = None
+        self.deployment_weight_source = None
         self.is_resumed = False
         self.model_config = dict(self.config.get("ldm", {}) or self.config.get("model", {}) or {})
         self.model_config.setdefault("latent_dim", int(vae.latent_dim))
@@ -571,6 +827,10 @@ class ConsistencyDistillationTrainer:
         self.cd_model = create_cd_model(
             self.use_multimodal, self.model_config
         ).to(self.device)
+        self.cd_model = prepare_model_for_distributed(
+            self.cd_model,
+            self.distributed,
+        )
         
         # 创建 EMA 目标模型
         self.cd_model_ema = self._create_ema_model(self.cd_model)
@@ -594,12 +854,22 @@ class ConsistencyDistillationTrainer:
         
         # Denoiser
         self.denoiser = KarrasDenoiser(
+            # 当前 CD 直接输出 x0；sigma_data 不参与该 train_step 的预条件公式。
             sigma_data=0.5,
-            sigma_max=80.0,
-            sigma_min=0.002,
+            sigma_max=self.consistency_config["sigma_max"],
+            sigma_min=self.consistency_config["sigma_min"],
+            rho=self.consistency_config["rho"],
             loss_norm='l2',
             device=self.device,
         )
+        if not (
+            self.denoiser.sigma_min
+            <= self.validation_config["sigma"]
+            <= self.denoiser.sigma_max
+        ):
+            raise ValueError(
+                "cd.validation_sigma 必须位于训练 sigma 范围内"
+            )
         
         # 禁用混合精度（避免 FP16/FP32 类型不匹配）
         self.use_amp = False
@@ -669,6 +939,10 @@ class ConsistencyDistillationTrainer:
             bool(getattr(model, "is_multimodal", False)),
             self.model_config,
         ).to(self.device)
+        ema_model = prepare_model_for_distributed(
+            ema_model,
+            self.distributed,
+        )
         
         sys.stdout = old_stdout
         
@@ -732,6 +1006,29 @@ class ConsistencyDistillationTrainer:
             allow_legacy_radar_units=self.allow_legacy_radar_units,
             context="CD resume checkpoint",
         )
+        assert_cd_ema_update_protocol(
+            ckpt,
+            require_formal=(
+                self.use_multimodal and self.radar_normalization is not None
+            ),
+        )
+        saved_consistency_config = ckpt.get("consistency_training_config")
+        if saved_consistency_config is None:
+            if self.use_multimodal and self.radar_normalization is not None:
+                raise ValueError("formal CD resume 缺少 consistency training config")
+        else:
+            saved_consistency_config = validate_cd_consistency_receipt(
+                saved_consistency_config
+            )
+            if saved_consistency_config != self.consistency_config:
+                raise ValueError("CD resume consistency training config 不一致")
+        restored_validation = assert_cd_validation_checkpoint_protocol(
+            ckpt,
+            current_config=self.validation_config,
+            require_formal=(
+                self.use_multimodal and self.radar_normalization is not None
+            ),
+        )
         expected_effective_batch = self.config.get(
             "expected_effective_global_batch_size"
         )
@@ -754,6 +1051,17 @@ class ConsistencyDistillationTrainer:
         # 加载训练状态
         self.start_epoch = ckpt.get('epoch', 0) + 1
         self.best_loss = ckpt.get('best_loss', ckpt.get('loss', float('inf')))
+        if restored_validation is not None:
+            self.last_validation_metrics = restored_validation["metrics"]
+            self.deployment_weight_source = restored_validation[
+                "selected_source"
+            ]
+            best_loss, best_iou = _validated_cd_validation_metrics(
+                restored_validation["best_selected_metrics"],
+                source="best selected",
+            )
+            self.best_val_loss = best_loss
+            self.best_val_iou = best_iou
         
         if self.distributed.is_main_process:
             print(f"Resumed from epoch {self.start_epoch - 1}, best loss: {self.best_loss:.4f}")
@@ -778,13 +1086,40 @@ class ConsistencyDistillationTrainer:
                 print("Initialized CD model and EMA target from LDM checkpoint")
     
     def _update_ema(self, ema_rate: float = 0.999):
-        """更新 EMA 模型"""
+        """按具名状态更新 EMA 参数、浮点 buffer 和整数计数器。"""
+        if (
+            isinstance(ema_rate, bool)
+            or not isinstance(ema_rate, (int, float))
+            or not 0.0 <= float(ema_rate) <= 1.0
+        ):
+            raise ValueError(f"ema_rate 必须位于 [0,1]，实际为 {ema_rate!r}")
+        source_model = unwrap_model(self.cd_model)
+        source_parameters = dict(source_model.named_parameters())
+        ema_parameters = dict(self.cd_model_ema.named_parameters())
+        source_buffers = dict(source_model.named_buffers())
+        ema_buffers = dict(self.cd_model_ema.named_buffers())
+        if source_parameters.keys() != ema_parameters.keys():
+            raise RuntimeError("CD online/EMA parameter 名称不一致")
+        if source_buffers.keys() != ema_buffers.keys():
+            raise RuntimeError("CD online/EMA buffer 名称不一致")
+
         with torch.no_grad():
-            for src_param, ema_param in zip(
-                unwrap_model(self.cd_model).parameters(),
-                self.cd_model_ema.parameters()
-            ):
-                ema_param.mul_(ema_rate).add_(src_param.data, alpha=1 - ema_rate)
+            for name, source in source_parameters.items():
+                target = ema_parameters[name]
+                if source.shape != target.shape or source.dtype != target.dtype:
+                    raise RuntimeError(f"CD online/EMA parameter {name!r} 结构不一致")
+                target.mul_(ema_rate).add_(source.detach(), alpha=1 - ema_rate)
+            for name, source in source_buffers.items():
+                target = ema_buffers[name]
+                if source.shape != target.shape or source.dtype != target.dtype:
+                    raise RuntimeError(f"CD online/EMA buffer {name!r} 结构不一致")
+                if torch.is_floating_point(target) or torch.is_complex(target):
+                    target.mul_(ema_rate).add_(
+                        source.detach(),
+                        alpha=1 - ema_rate,
+                    )
+                else:
+                    target.copy_(source.detach())
     
     @torch.no_grad()
     def _euler_solver(
@@ -812,7 +1147,7 @@ class ConsistencyDistillationTrainer:
             meta_dict=meta_dict,
         )
         
-        # NOTE: 这里使用显式 Euler，对应一致性蒸馏中的教师推进步骤。
+        # NOTE: 这里使用显式 Euler 推进 CD EMA 目标，不存在冻结 LDM 教师。
         # NOTE: 常微分方程（ODE）形式：dx/dt = (x - denoised) / t。
         d = (x_t - denoised) / t.view(-1, 1, 1, 1, 1)
         
@@ -826,18 +1161,20 @@ class ConsistencyDistillationTrainer:
         self,
         z_target: torch.Tensor,
         z_cond: Optional[torch.Tensor],
-        num_scales: int = 40,
+        num_scales: Optional[int] = None,
         radar_voxel: Optional[torch.Tensor] = None,
         meta_dict: Optional[Dict[str, Any]] = None,
     ) -> float:
         """
-        单个训练步骤（Consistency Distillation）
+        单个 LDM-initialized EMA consistency 训练步骤
         
         核心思想：
         1. 学生模型：从 x(t_n) 直接一步预测去噪后的结果
-        2. 教师模型：从 x(t_n) 用 ODE solver 推进到 t_{n+1}，再预测去噪结果
-        3. 让学生的一步预测接近教师的多步结果
+        2. CD EMA 目标：从 x(t_n) 用 Euler 推进到 t_{n+1} 后预测
+        3. 让 online CD 一步预测接近持续更新的 EMA 目标
         """
+        if num_scales is None:
+            num_scales = self.consistency_config["num_scales"]
         batch_size = z_target.shape[0]
         device = z_target.device
         
@@ -889,7 +1226,7 @@ class ConsistencyDistillationTrainer:
             )
             
             # EMA 目标在 t_{n+1} 的预测
-            teacher_denoised = call_cd_denoiser(
+            target_denoised = call_cd_denoiser(
                 self.cd_model_ema,
                 x_t_next,
                 z_cond,
@@ -899,7 +1236,7 @@ class ConsistencyDistillationTrainer:
             )
         
         # NOTE: 一致性目标：CD 一步输出逼近 CD EMA 推进后的输出。
-        loss = F.mse_loss(student_denoised, teacher_denoised)
+        loss = F.mse_loss(student_denoised, target_denoised)
         
         return loss
     
@@ -907,7 +1244,7 @@ class ConsistencyDistillationTrainer:
         self,
         epoch: int,
         train_loader: DataLoader,
-        num_scales: int = 40,
+        num_scales: Optional[int] = None,
         grad_accum_steps: int = 8,
     ) -> float:
         """训练一个 epoch"""
@@ -957,7 +1294,7 @@ class ConsistencyDistillationTrainer:
                 self.optimizer.zero_grad()
                 
                 # 更新 EMA 模型
-                self._update_ema(ema_rate=0.999)
+                self._update_ema(ema_rate=self.consistency_config["ema_rate"])
             
             total_loss += loss.item() * grad_accum_steps
             pbar.set_postfix({'loss': f'{loss.item() * grad_accum_steps:.6f}'})
@@ -971,7 +1308,7 @@ class ConsistencyDistillationTrainer:
             torch.nn.utils.clip_grad_norm_(self.cd_model.parameters(), 1.0)
             self.optimizer.step()
             self.optimizer.zero_grad()
-            self._update_ema(ema_rate=0.999)
+            self._update_ema(ema_rate=self.consistency_config["ema_rate"])
         
         totals = reduce_named_sums(
             {"loss": total_loss, "batch_count": len(train_loader)},
@@ -981,8 +1318,229 @@ class ConsistencyDistillationTrainer:
             raise RuntimeError("CD 全局训练 DataLoader 为空")
         return totals["loss"] / totals["batch_count"]
 
+    @torch.no_grad()
+    def _validate_model(
+        self,
+        model: nn.Module,
+        val_loader: DataLoader,
+    ) -> Tuple[Dict[str, float], list]:
+        """在相同固定噪声上计算单个 CD 权重源的 observed-domain 指标。"""
+        distributed = _trainer_distributed_context(self)
+        was_training = model.training
+        model.eval()
+        latent_squared_error = 0.0
+        latent_element_count = 0
+        intersection = 0
+        union = 0
+        threshold_counts = {
+            key: 0
+            for key in threshold_sweep_batch_counts(
+                torch.zeros(1, 1, 1, 1, 1),
+                torch.zeros(1, 1, 1, 1, 1),
+                torch.ones(1, 1, 1, 1, 1, dtype=torch.bool),
+                self.validation_config["threshold_candidates"],
+            )
+        }
+        try:
+            for batch in val_loader:
+                target, radar, meta_dict = unpack_cd_batch(batch)
+                target = target.to(self.device, non_blocking=True)
+                radar = radar.to(self.device, non_blocking=True)
+                meta_dict = move_meta_to_device(meta_dict, self.device)
+                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                if (
+                    raw_observed_mask is None
+                    and self.require_persisted_observed_mask
+                ):
+                    raise RuntimeError(
+                        "formal CD validation batch 缺少 persisted "
+                        "occupancy_observed_mask"
+                    )
+                z_target, z_cond = encode_cd_training_latents(
+                    self.vae,
+                    target,
+                    radar,
+                    meta_dict,
+                )
+                voxel_observed, latent_observed = resolve_cd_observed_masks(
+                    raw_observed_mask,
+                    target,
+                    z_target,
+                )
+                sigma = torch.full(
+                    (z_target.shape[0],),
+                    self.validation_config["sigma"],
+                    device=z_target.device,
+                    dtype=z_target.dtype,
+                )
+                sample_ids = meta_dict.get("sample_id")
+                if sample_ids is None:
+                    generator = torch.Generator(device=z_target.device)
+                    generator.manual_seed(self.validation_config["seed"])
+                    noise = torch.randn(
+                        z_target.shape,
+                        generator=generator,
+                        device=z_target.device,
+                        dtype=z_target.dtype,
+                    )
+                else:
+                    noise = deterministic_noise_from_sample_ids(
+                        z_target,
+                        sample_ids,
+                        seed=self.validation_config["seed"],
+                    )
+                noised = z_target + noise * sigma.view(-1, 1, 1, 1, 1)
+                denoised = call_cd_denoiser(
+                    model,
+                    noised,
+                    z_cond,
+                    sigma,
+                    radar_voxel=radar,
+                    meta_dict=meta_dict,
+                )
+                latent_error = torch.square(
+                    denoised.float() - z_target.float()
+                )
+                if latent_observed is None:
+                    latent_squared_error += float(latent_error.sum().item())
+                    latent_element_count += latent_error.numel()
+                else:
+                    expanded = latent_observed.expand_as(latent_error)
+                    latent_squared_error += float(
+                        latent_error[expanded].sum().item()
+                    )
+                    latent_element_count += int(expanded.sum().item())
+
+                decoded = self.vae.decode(denoised)
+                probability = decoded[:, 0:1]
+                occupancy_activation = getattr(
+                    self.vae,
+                    "occupancy_activation",
+                    "raw",
+                )
+                if occupancy_activation == "sigmoid":
+                    probability = torch.sigmoid(probability)
+                elif occupancy_activation != "raw":
+                    raise ValueError(
+                        "CD validation 不支持的 occupancy activation: "
+                        f"{occupancy_activation!r}"
+                    )
+                prediction = (
+                    probability
+                    >= self.validation_config["occupancy_threshold"]
+                )
+                truth = target[:, 0:1] >= 0.5
+                if voxel_observed is not None:
+                    prediction = prediction & voxel_observed
+                    truth = truth & voxel_observed
+                intersection += int((prediction & truth).sum().item())
+                union += int((prediction | truth).sum().item())
+                batch_threshold_counts = threshold_sweep_batch_counts(
+                    probability,
+                    target[:, 0:1],
+                    voxel_observed,
+                    self.validation_config["threshold_candidates"],
+                )
+                for name, value in batch_threshold_counts.items():
+                    threshold_counts[name] += value
+        finally:
+            model.train(was_training)
+
+        reduced = reduce_named_sums(
+            {
+                "latent_squared_error": latent_squared_error,
+                "latent_element_count": latent_element_count,
+                "intersection": intersection,
+                "union": union,
+                **threshold_counts,
+            },
+            distributed,
+        )
+        if reduced["latent_element_count"] == 0:
+            raise RuntimeError("CD validation 没有可计算的 latent 元素")
+        metrics = {
+            "denoising_latent_loss": (
+                reduced["latent_squared_error"]
+                / reduced["latent_element_count"]
+            ),
+            "denoising_occupancy_iou": (
+                reduced["intersection"] / max(reduced["union"], 1)
+            ),
+        }
+        sweep = threshold_sweep_metrics(
+            reduced,
+            self.validation_config["threshold_candidates"],
+        )
+        return metrics, sweep
+
+    @torch.no_grad()
+    def validate(self, val_loader: DataLoader) -> Dict[str, Dict[str, float]]:
+        """用同一 validation 样本和噪声比较 online 与 EMA 权重。"""
+        if len(val_loader) == 0 and not _trainer_distributed_context(self).initialized:
+            raise RuntimeError("CD validation DataLoader 为空")
+        online_metrics, online_sweep = self._validate_model(
+            self.cd_model,
+            val_loader,
+        )
+        ema_metrics, ema_sweep = self._validate_model(
+            self.cd_model_ema,
+            val_loader,
+        )
+        metrics = {
+            "model_state_dict": online_metrics,
+            "ema_model_state_dict": ema_metrics,
+        }
+        self.last_validation_threshold_sweeps = {
+            "model_state_dict": online_sweep,
+            "ema_model_state_dict": ema_sweep,
+        }
+        self.last_validation_metrics = metrics
+        self.deployment_weight_source = select_cd_deployment_weight_source(
+            metrics["model_state_dict"],
+            metrics["ema_model_state_dict"],
+        )
+        return metrics
+
     def _checkpoint_payload(self, epoch: int, loss: float, best_loss: float) -> Dict[str, Any]:
         """构造带完整网格和父 checkpoint hash 的正式 CD checkpoint。"""
+        formal_checkpoint = bool(
+            self.use_multimodal and self.radar_normalization is not None
+        )
+        validation_metrics = getattr(self, "last_validation_metrics", None)
+        deployment_weight_source = getattr(
+            self,
+            "deployment_weight_source",
+            None,
+        )
+        if formal_checkpoint:
+            if not isinstance(validation_metrics, dict):
+                raise ValueError("formal CD checkpoint 缺少 online/EMA validation metrics")
+            expected_source = select_cd_deployment_weight_source(
+                validation_metrics.get("model_state_dict"),
+                validation_metrics.get("ema_model_state_dict"),
+            )
+            if deployment_weight_source != expected_source:
+                raise ValueError(
+                    "formal CD deployment_weight_source 与 validation 选优结果不一致"
+                )
+            if not (
+                math.isfinite(getattr(self, "best_val_loss", float("inf")))
+                and math.isfinite(getattr(self, "best_val_iou", float("-inf")))
+            ):
+                raise ValueError("formal CD checkpoint 缺少历史最佳 validation 指标")
+            threshold_sweeps = getattr(
+                self,
+                "last_validation_threshold_sweeps",
+                None,
+            )
+            if (
+                not isinstance(threshold_sweeps, dict)
+                or set(threshold_sweeps) != {
+                    "model_state_dict",
+                    "ema_model_state_dict",
+                }
+            ):
+                raise ValueError("formal CD checkpoint 缺少 online/EMA threshold sweep")
         payload = {
             "epoch": epoch,
             "loss": loss,
@@ -1006,11 +1564,52 @@ class ConsistencyDistillationTrainer:
             "vae_checkpoint_sha256": self.vae_checkpoint_sha256,
             "ldm_checkpoint_sha256": self.ldm_checkpoint_sha256,
             "model_family": "multimodal" if self.use_multimodal else "legacy",
-            "training_semantics": "ldm_initialized_ema_consistency_v1",
+            "training_semantics": CD_TRAINING_SEMANTICS,
             "ldm_role": "initialization_checkpoint",
             "consistency_target_source": "cd_model_ema",
+            "denoising_parameterization": CD_DENOISING_PARAMETERIZATION,
+            "consistency_training_config": dict(
+                getattr(
+                    self,
+                    "consistency_config",
+                    resolve_cd_consistency_config({}),
+                )
+            ),
+            "ema_update_protocol": CD_EMA_UPDATE_PROTOCOL,
             "data_protocol": dict(self.data_protocol),
         }
+        if validation_metrics is not None:
+            payload["deployment_weight_source"] = deployment_weight_source
+            payload["cd_validation"] = {
+                **dict(getattr(self, "validation_config", {}) or {}),
+                "protocol": CD_VALIDATION_PROTOCOL,
+                "selector": CD_VALIDATION_SELECTOR,
+                "selected_source": deployment_weight_source,
+                "metrics": {
+                    key: dict(value)
+                    for key, value in validation_metrics.items()
+                },
+                "best_selected_metrics": {
+                    "denoising_latent_loss": float(self.best_val_loss),
+                    "denoising_occupancy_iou": float(self.best_val_iou),
+                },
+            }
+            if formal_checkpoint:
+                payload["occupancy_threshold_validation"] = {
+                    "protocol": THRESHOLD_SWEEP_PROTOCOL,
+                    "split": self.validation_config["split"],
+                    "observation_domain": "persisted_observed_mask_v1",
+                    "deployment_weight_source": deployment_weight_source,
+                    "candidate_thresholds": list(
+                        self.validation_config["threshold_candidates"]
+                    ),
+                    "metrics_by_threshold": [
+                        dict(record)
+                        for record in threshold_sweeps[
+                            deployment_weight_source
+                        ]
+                    ],
+                }
         if getattr(self, "stage_training_selection", None) is not None:
             payload["stage_training_selection"] = dict(
                 self.stage_training_selection
@@ -1025,6 +1624,7 @@ class ConsistencyDistillationTrainer:
     def train(
         self,
         train_loader: DataLoader,
+        val_loader: Optional[DataLoader] = None,
         num_epochs: int = 100,
         save_every: int = 10,
         grad_accum_steps: int = 8,
@@ -1050,6 +1650,11 @@ class ConsistencyDistillationTrainer:
             train_dataset_size=train_dataset_size,
         )
         estimated_total_steps = num_epochs * len(train_loader)
+        formal_training = bool(
+            self.use_multimodal and self.radar_normalization is not None
+        )
+        if formal_training and val_loader is None:
+            raise ValueError("formal CD 训练必须提供独立 validation DataLoader")
         
         msg = "="*70 + "\n"
         msg += f"Starting CD Training\n"
@@ -1075,6 +1680,11 @@ class ConsistencyDistillationTrainer:
             epoch_start = time.time()
             loss = self.train_epoch(epoch, train_loader, grad_accum_steps=grad_accum_steps)
             epoch_time = time.time() - epoch_start
+            validation_metrics = (
+                self.validate(val_loader)
+                if val_loader is not None
+                else None
+            )
             
             # 记录日志
             msg = f"\n[Epoch {epoch}/{num_epochs}] Loss: {loss:.4f} | LR: {self.optimizer.param_groups[0]['lr']:.2e} | Time: {epoch_time:.1f}s"
@@ -1084,8 +1694,27 @@ class ConsistencyDistillationTrainer:
                 self._log_metrics(epoch, loss, epoch_time)
             
             # 保存最佳模型
-            improved = loss < self.best_loss
-            if improved:
+            train_improved = loss < self.best_loss
+            improved = train_improved
+            if validation_metrics is not None:
+                selected_metrics = validation_metrics[
+                    self.deployment_weight_source
+                ]
+                current_loss, current_iou = _validated_cd_validation_metrics(
+                    selected_metrics,
+                    source="selected",
+                )
+                improved = (
+                    current_iou > self.best_val_iou
+                    or (
+                        current_iou == self.best_val_iou
+                        and current_loss < self.best_val_loss
+                    )
+                )
+                if improved:
+                    self.best_val_iou = current_iou
+                    self.best_val_loss = current_loss
+            if train_improved:
                 self.best_loss = loss
             if distributed.is_main_process and improved:
                 best_ckpt = os.path.join(self.save_dir, "cd_best.pt")
@@ -1112,8 +1741,15 @@ class ConsistencyDistillationTrainer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Consistency Distillation Training")
-    parser.add_argument("--ldm_ckpt", type=str, required=True, help="LDM checkpoint path")
+    parser = argparse.ArgumentParser(
+        description="LDM-initialized EMA consistency training"
+    )
+    parser.add_argument(
+        "--ldm_ckpt",
+        type=str,
+        required=True,
+        help="LDM initialization checkpoint path",
+    )
     parser.add_argument("--vae_ckpt", type=str, required=True, help="VAE checkpoint path")
     parser.add_argument("--config", type=str, default="", help="Optional unified YAML config")
     parser.add_argument("--dataset_dir", type=str, default="./Data/NTU4DRadLM_Pre")
@@ -1195,6 +1831,8 @@ def main():
             checkpoint_protocol=checkpoint_protocol,
         )
     train_frame_ids_by_scene = None
+    validation_frame_ids_by_scene = None
+    stage_training_selection = None
     split_artifact_sha256 = None
     if formal_training:
         if not split_artifact_path:
@@ -1211,11 +1849,51 @@ def main():
             split_artifact,
             "train",
         )
+        validation_frame_ids_by_scene = split_frame_ids_by_scene(
+            split_artifact,
+            "validation",
+        )
         if checkpoint_protocol == FORMAL_MINI_CHECKPOINT_PROTOCOL:
             train_frame_ids_by_scene = limit_frame_ids_by_scene(
                 train_frame_ids_by_scene,
                 data_protocol["mini_selection"]["train_frames_per_scene"],
                 partition="train",
+            )
+            validation_frame_ids_by_scene = limit_frame_ids_by_scene(
+                validation_frame_ids_by_scene,
+                data_protocol["mini_selection"]["validation_frames_per_scene"],
+                partition="validation",
+            )
+        else:
+            train_limit = cd_config.get("train_frames_per_epoch", 0)
+            validation_limit = cd_config.get(
+                "validation_frames_per_epoch",
+                0,
+            )
+            for name, value in (
+                ("cd.train_frames_per_epoch", train_limit),
+                ("cd.validation_frames_per_epoch", validation_limit),
+            ):
+                if type(value) is not int or value < 0:
+                    raise ValueError(f"{name} 必须是非负整数")
+            if train_limit > 0:
+                train_frame_ids_by_scene = limit_frame_ids_by_scene(
+                    train_frame_ids_by_scene,
+                    train_limit,
+                    partition="cd train",
+                )
+            if validation_limit > 0:
+                validation_frame_ids_by_scene = limit_frame_ids_by_scene(
+                    validation_frame_ids_by_scene,
+                    validation_limit,
+                    partition="cd validation",
+                )
+            stage_training_selection = build_formal_stage_training_selection(
+                stage="cd",
+                train_frame_ids_by_scene=train_frame_ids_by_scene,
+                validation_frame_ids_by_scene=validation_frame_ids_by_scene,
+                configured_train_frames_per_scene=train_limit,
+                configured_validation_frames_per_scene=validation_limit,
             )
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
     ldm_config.setdefault("fusion_voxel_shape", list(target_size))
@@ -1306,6 +1984,52 @@ def main():
         pin_memory=False,
         collate_fn=collate_voxel_samples,
     )
+    val_loader = None
+    if formal_training:
+        validation_dataset = NTU4DRadLM_VoxelDataset(
+            root_dir=dataset_dir,
+            split='train',
+            return_path=True,
+            use_augmentation=False,
+            target_size=target_size,
+            source_pc_range=source_pc_range,
+            model_pc_range=model_pc_range,
+            radar_normalization=radar_normalization,
+            radar_normalization_sha256=radar_normalization_sha256,
+            allow_legacy_radar_units=args.allow_legacy_radar_units,
+            scene_names=scene_names,
+            calibration_dir=data_config.get("calibration_dir"),
+            require_real_ir=bool(data_config.get("require_real_ir", False)),
+            require_real_calibration=bool(
+                data_config.get("require_real_calibration", False)
+            ),
+            require_persisted_observed_mask=bool(
+                data_config.get("require_persisted_observed_mask", False)
+            ),
+            require_radar_statistics=bool(
+                data_config.get("require_radar_statistics", False)
+            ),
+            frame_ids_by_scene=validation_frame_ids_by_scene,
+            voxel_coordinate_frame=data_config.get(
+                "voxel_coordinate_frame", "lidar"
+            ),
+        )
+        validation_sampler = None
+        if distributed.initialized:
+            validation_sampler = DistributedEvalSampler(
+                validation_dataset,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+            )
+        val_loader = DataLoader(
+            validation_dataset,
+            batch_size=int(data_config.get("batch_size", args.batch_size)),
+            shuffle=False,
+            sampler=validation_sampler,
+            num_workers=int(data_config.get("num_workers", 4)),
+            pin_memory=False,
+            collate_fn=collate_voxel_samples,
+        )
     
     cd_save_dir = cd_config.get("save_dir", args.save_dir)
 
@@ -1335,19 +2059,54 @@ def main():
             'allow_legacy_radar_units': args.allow_legacy_radar_units,
             'checkpoint_protocol': checkpoint_protocol,
             'data_protocol': data_protocol,
+            'stage_training_selection': stage_training_selection,
             'distributed_context': distributed,
             'expected_effective_global_batch_size': (
                 runtime_batch_plan.effective_global_batch_size
             ),
+            'require_persisted_observed_mask': bool(
+                data_config.get("require_persisted_observed_mask", False)
+            ),
+            'validation_seed': cd_config.get('validation_seed', 42),
+            'validation_sigma': cd_config.get('validation_sigma', 0.5),
+            'validation_occupancy_threshold': cd_config.get(
+                'validation_occupancy_threshold', 0.5
+            ),
+            'training_semantics': cd_config.get(
+                'training_semantics', CD_TRAINING_SEMANTICS
+            ),
+            'num_scales': cd_config.get('num_scales', 40),
+            'ema_rate': cd_config.get('ema_rate', 0.999),
+            'sigma_min': cd_config.get('sigma_min', 0.002),
+            'sigma_max': cd_config.get('sigma_max', 80.0),
+            'rho': cd_config.get('rho', 7.0),
         },
     )
     
     trainer.train(
         train_loader,
+        val_loader,
         num_epochs=int(cd_config.get("epochs", args.num_epochs)),
         save_every=int(cd_config.get("save_every", 10)),
         grad_accum_steps=int(opt_config.get("gradient_accumulation_steps", args.grad_accum_steps)),
     )
+    if (
+        distributed.is_main_process
+        and checkpoint_protocol == FORMAL_CHECKPOINT_PROTOCOL
+    ):
+        best_checkpoint_path = os.path.join(cd_save_dir, "cd_best.pt")
+        best_checkpoint = safe_torch_load(
+            best_checkpoint_path,
+            map_location="cpu",
+        )
+        threshold_artifact = build_threshold_artifact(
+            best_checkpoint,
+            checkpoint_path=best_checkpoint_path,
+        )
+        write_threshold_artifact(
+            os.path.join(cd_save_dir, "occupancy_threshold.json"),
+            threshold_artifact,
+        )
     
     if distributed.is_main_process:
         print("Training completed!")

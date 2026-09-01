@@ -51,12 +51,13 @@ vae:
   out_channels: 4
   latent_dim: 4
   kl_weight: 1.0e-6
-  # Sparse occupancy needs stronger positive-voxel supervision than plain MSE.
-  occupied_weight: 8.0
-  empty_weight: 1.0
-  channel_weights: [4.0, 0.2, 0.5, 0.2]
-  false_positive_weight: 4.0
-  occupancy_mass_weight: 1.0
+  # formal VAE 使用稀疏 BCE+Dice；legacy MSE 专用权重由模型 preset 保留，
+  # 不在正式 YAML 中暴露为看似有效的训练旋钮。
+  occupancy_loss_type: "bce_dice"
+  occupancy_bce_weight: 1.0
+  occupancy_dice_weight: 1.0
+  occupancy_pos_weight_cap: 128.0
+  continuous_recon_weight: 1.0
   # Training parameters
   # 正式默认值；0 帧表示使用对应 temporal partition 的全部帧。
   epochs: 20
@@ -82,6 +83,7 @@ ldm:
   validation_seed: 42
   validation_sigma: 0.5
   validation_occupancy_threshold: 0.5
+  validation_threshold_candidates: [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
   decoded_loss_weight: 0.05
   decoded_false_positive_weight: 0.10
   decoded_mass_weight: 0.05
@@ -96,25 +98,25 @@ ldm:
   save_every: 10 # 每 N 个时期保存检查点
   save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/ldm"
 
-# --- CD蒸馏配置 ---
+# --- LDM 初始化的 EMA consistency 配置 ---
 cd:
-  # 兼容字段名：该 LDM checkpoint 只初始化 CD/EMA，不作为持续冻结教师。
-  teacher_model_path: "" # LDM初始化检查点路径
-  # EMA一致性训练参数
-  training_mode: "consistency_distillation"
-  target_ema_mode: "fixed"
-  start_ema: 0.95
-  scale_mode: "fixed"
-  start_scales: 40
-  end_scales: 40
-
-  distill_steps_per_iter: 50000
-  loss_norm: "l2" # l1 / l2 / lpips
+  initialization_model_path: "" # LDM 只用于初始化 CD/EMA
+  teacher_model_path: "" # legacy 配置别名；新配置保持为空
+  training_semantics: "ldm_initialized_ema_consistency_v1"
+  num_scales: 40
+  ema_rate: 0.999
+  sigma_min: 0.002
+  sigma_max: 80.0
+  rho: 7.0
   # Training parameters
   epochs: 20
   train_frames_per_epoch: 3210
-  # CD 暂无逐 epoch 验证循环；该值仍固定留出集身份，供 checkpoint 审计。
+  # 每轮在固定 validation suffix 上以相同噪声比较 online/EMA。
   validation_frames_per_epoch: 774
+  validation_seed: 42
+  validation_sigma: 0.5
+  validation_occupancy_threshold: 0.5
+  validation_threshold_candidates: [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
   lr: 5.0e-5
   save_every: 10 # Save checkpoint every N epochs
   save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/cd"
@@ -131,8 +133,8 @@ optimization:
 hardware:
   device: "cuda"
   # 正式服务器默认使用2卡；单次运行可用 CUDA_DEVICES 覆盖，例如 0,1,2,3。
+  # 实际 num_gpus/world_size 由 launcher 对该列表严格解析后写入运行时配置。
   cuda_devices: "0,1"
-  num_gpus: 4 # 兼容旧配置读取；launcher 以 cuda_devices 的实际列表为准。
 
 # --- 日志记录配置 ---
 logging:

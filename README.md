@@ -93,7 +93,7 @@ conda run --no-capture-output -n Radar-Diffusion bash \
   diffusion_consistency_radar/launch/train_unified.sh ldm
 ```
 
-蒸馏 CD：
+LDM 初始化的 EMA consistency CD：
 
 ```bash
 conda run --no-capture-output -n Radar-Diffusion bash \
@@ -152,7 +152,9 @@ bash diffusion_consistency_radar/launch/inference_cd.sh
 - CD：`Result/inference_results/<scene>_formal_p1_04_full120_86p8_v1_cd_1step_deploy/`
 - 运行协议：`inference_run.json`、`inference_runtime.csv`；正式 `inference_run.json`
   同时逐帧绑定 prediction voxel 与 observed mask 的文件名、SHA-256、CZXY shape
-  和 dtype，严格地图入口不接受缺少任一内容收据的旧推理目录
+  和 dtype。prediction artifact v2 还声明 ch0 是 `[0,1]` occupancy probability，
+  ch1--3 仅为非地图辅助重建；严格地图以外部 observed mask 为权威边界，不接受
+  缺少任一内容收据或仍使用 artifact v1 的旧推理目录
 - 预测产物：`*_voxel.npy`、`*_pcl.npy` 和可用的 `*_uncertainty.npy`
 
 如果你想直接调用 Python 入口：
@@ -177,6 +179,12 @@ python diffusion_consistency_radar/scripts/inference.py \
 ```bash
 bash diffusion_consistency_radar/launch/evaluate_inference.sh ldm
 ```
+
+该入口是唯一正式评价入口：它验证 inference metadata、validation threshold
+artifact、prediction/observed 内容收据与帧配对，并在外部权威 observed mask 内
+统一计算预测/target 指标；`evaluation_summary.json` 使用
+`formal_saved_prediction_observed_domain_evaluation_v1`。原始 LiDAR Chamfer
+仅作为未裁剪的辅助诊断参考，不列入 `formal_metrics`。
 
 ### 4. 诊断与对比
 
@@ -205,7 +213,7 @@ python diffusion_consistency_radar/scripts/diagnose_generation_quality.py \
 - `diagnosis_metrics.csv`
 - `diagnosis_report.md`
 
-Radar / LiDAR 结果图像对比：
+Legacy diagnostic-only Radar / LiDAR 结果图像对比：
 
 ```bash
 bash diffusion_consistency_radar/launch/compare.sh
@@ -217,7 +225,7 @@ bash diffusion_consistency_radar/launch/compare.sh
 python diffusion_consistency_radar/scripts/sweep_occ_threshold.py --help
 ```
 
-点云指标评估：
+Legacy diagnostic-only 点云指标（仅按同名 `.npy` 配对，不验证正式协议）：
 
 ```bash
 python diffusion_consistency_radar/scripts/evaluate.py \
@@ -284,6 +292,28 @@ resume。8 GB RTX 4070 Laptop 只建议执行预检和短时 CPU/接口验证，
 2--4 GPU NCCL 训练验证，服务器正式长训前仍需先执行预检和短时多卡 smoke。
 这里的帧数表示每场景每轮选择的唯一 frame 数；DDP 为保持各 rank 迭代步数一致，训练
 sampler 可能补齐少量重复访问，补齐数量会独立写入 checkpoint，不会伪装成新的唯一帧。
+
+### Formal v3 预处理边界
+
+`NTU4DRadLM_pre_processing/preprocess-v3.sh` 是独立的未来正式入口，不会覆盖 v2
+Raw、training、deployment 或 normalization 输出。它在解包前强制读取
+`RADAR_FIELD_SCHEMA`，并校验 schema 引用的权威 evidence 内容；随后要求每个场景具有
+complete extraction receipt，最终生成 `formal_data_v3`。v3 checkpoint data identity
+还绑定逐字段 finite statistics、实际 PointCloud layout、field schema、receipt 和 Doppler
+物理方向。
+
+当前没有 Radar 消息字段单位及 Doppler 正方向的权威材料时，不要运行或手写伪造 v3
+schema；继续使用已经验收的 formal-v2 服务器数据和训练入口。v2 默认配置、已有 artifact
+及 checkpoint 链保持兼容。取得权威材料后才可在全新数据根显式运行：
+
+```bash
+RADAR_FIELD_SCHEMA=/absolute/path/radar_field_schema.json \
+CONDA_ENV=Radar-Diffusion \
+bash NTU4DRadLM_pre_processing/preprocess-v3.sh
+```
+
+该命令会执行全量解包和预处理，耗时且占用大量磁盘；本次代码验证只覆盖 fail-closed、
+协议、接口和临时目录单元测试，没有实际运行这条长链。
 
 ## Mini Test
 
@@ -352,6 +382,8 @@ VAE/LDM 会逐 epoch 使用 100 帧 validation；当前 CD 训练器只消费 40
 ## 已知说明
 
 - 当前主流程是离线训练和离线推理，不包含 ROS 实时闭环
+- `streaming_map_update.py` 也是离线文件回放；严格数据合同通过不代表 ROS1/PX4 机载避障已实现
+- 严格地图使用 body/LiDAR 锚定 rolling window；只有提供精确逐帧 `local_trajectory_frames_v1` artifact 时才启用轨迹走廊查询，否则仅做当前位姿原点查询
 - `launch/` 目录下只应视为正式入口；快速实验请放在 `test/`
 - `.npy`、`.npz`、训练结果和推理结果默认不会纳入 Git 跟踪
 - 某些历史脚本名或旧文档中提到的入口，已经不再是当前推荐路径

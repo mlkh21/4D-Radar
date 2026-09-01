@@ -16,7 +16,19 @@ from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 
+try:
+    from diffusion_consistency_radar.prediction_artifact_protocol import (
+        GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+    )
+except ImportError:  # 兼容 streaming 脚本把包目录加入 sys.path 的直接执行方式。
+    from prediction_artifact_protocol import (  # type: ignore
+        GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+    )
+
 EPS = 1e-6
+LEGACY_MULTICHANNEL_EVIDENCE_SEMANTICS = "legacy_multichannel_voxel"
+TRAJECTORY_CORRIDOR_QUERY_PROTOCOL = "three_state_trajectory_corridor_v1"
+MAX_TRAJECTORY_QUERY_SAMPLES = 100000
 
 
 def compute_safety_distance_m(
@@ -62,6 +74,7 @@ class GridMapConfig:
     radar_reliability: float = 0.75
     infrared_reliability: float = 0.65
     speed_m_s: float = 50.0
+    rolling_enabled: bool = False
     # 模型 evidence 可小于地图范围；范围外地图单元保持初始 unknown。
     evidence_pc_range: Optional[Tuple[float, float, float, float, float, float]] = None
 
@@ -89,6 +102,8 @@ class GridMapConfig:
             or not np.all(resolutions > 0.0)
         ):
             raise ValueError("地图范围与分辨率必须是有效有限数")
+        if type(self.rolling_enabled) is not bool:
+            raise ValueError("rolling_enabled 必须是 bool")
         if self.evidence_pc_range is None:
             evidence_range = map_range
         else:
@@ -97,9 +112,10 @@ class GridMapConfig:
                 raise ValueError("evidence_pc_range 必须包含 6 个有限数")
             if not np.all(evidence_range[3:] > evidence_range[:3]):
                 raise ValueError("evidence_pc_range 上下界无效")
-            if not np.allclose(evidence_range[:3], map_range[:3], atol=1e-9, rtol=0.0):
-                raise ValueError("当前地图协议要求 evidence 与 map 使用相同最小边界")
-            if np.any(evidence_range[3:] > map_range[3:] + 1e-9):
+            if (
+                np.any(evidence_range[:3] < map_range[:3] - 1e-9)
+                or np.any(evidence_range[3:] > map_range[3:] + 1e-9)
+            ):
                 raise ValueError("evidence_pc_range 必须完全位于地图范围内")
         self.evidence_pc_range = tuple(float(value) for value in evidence_range)
         # Faster flight leaves fewer frames inside the same local volume, so the
@@ -215,8 +231,120 @@ class SlidingProbabilisticGridMap:
         self.last_pose_contract = "identity_legacy"
         self.last_body_pose_available = False
         self._has_voxel_update = False
+        self.rolling_protocol = (
+            "body_anchored_integer_voxel_roll_v1"
+            if self.cfg.rolling_enabled
+            else "disabled_legacy_fixed_bounds"
+        )
+        self._rolling_relative_min = np.asarray(
+            [self.cfg.x_min, self.cfg.y_min, self.cfg.z_min],
+            dtype=np.float64,
+        )
+        self._rolling_span = np.asarray(
+            [
+                self.cfg.x_max - self.cfg.x_min,
+                self.cfg.y_max - self.cfg.y_min,
+                self.cfg.z_max - self.cfg.z_min,
+            ],
+            dtype=np.float64,
+        )
+        self.rolling_recenter_count = 0
+        self.last_recenter_shift_cells = np.zeros(3, dtype=np.int64)
+        self.last_rolling_anchor_local = np.full(3, np.nan, dtype=np.float64)
         self.history: Deque[Dict[str, np.ndarray]] = deque(maxlen=self.cfg.window_size)
         self.ds_fuser = DSEvidenceFusion()
+
+    @staticmethod
+    def _shift_grid_with_fill(
+        array: np.ndarray,
+        shift_cells: np.ndarray,
+        fill_value: float,
+    ) -> np.ndarray:
+        """按 map bounds 的正向移动平移数组，禁止 `np.roll` 回卷旧状态。"""
+        source = np.asarray(array)
+        axes = min(source.ndim, 3)
+        shift = np.asarray(shift_cells[:axes], dtype=np.int64)
+        if any(abs(int(value)) >= source.shape[axis] for axis, value in enumerate(shift)):
+            return np.full_like(source, fill_value)
+        source_slices = [slice(None)] * source.ndim
+        destination_slices = [slice(None)] * source.ndim
+        for axis, value in enumerate(shift):
+            cells = int(value)
+            if cells > 0:
+                source_slices[axis] = slice(cells, None)
+                destination_slices[axis] = slice(None, -cells)
+            elif cells < 0:
+                source_slices[axis] = slice(None, cells)
+                destination_slices[axis] = slice(-cells, None)
+        shifted = np.full_like(source, fill_value)
+        shifted[tuple(destination_slices)] = source[tuple(source_slices)]
+        return shifted
+
+    def _recenter_rolling_window(self, anchor_local_xyz: np.ndarray) -> None:
+        """把局部窗口按整数体素锚定到当前 body/LiDAR 原点。"""
+        anchor = np.asarray(anchor_local_xyz, dtype=np.float64)
+        if anchor.shape != (3,) or not np.all(np.isfinite(anchor)):
+            raise ValueError("rolling anchor 必须是三个有限 local 坐标")
+        self.last_rolling_anchor_local = anchor.copy()
+        if not self.cfg.rolling_enabled:
+            self.last_recenter_shift_cells = np.zeros(3, dtype=np.int64)
+            return
+        current_min = np.asarray(
+            [self.cfg.x_min, self.cfg.y_min, self.cfg.z_min],
+            dtype=np.float64,
+        )
+        resolution = np.asarray(
+            [self.cfg.x_resolution, self.cfg.y_resolution, self.cfg.z_resolution],
+            dtype=np.float64,
+        )
+        desired_min = anchor + self._rolling_relative_min
+        shift_cells = np.rint((desired_min - current_min) / resolution).astype(
+            np.int64
+        )
+        self.last_recenter_shift_cells = shift_cells.copy()
+        if not np.any(shift_cells):
+            return
+
+        for name, fill_value in (
+            ("occ_prob", 0.5),
+            ("belief", 0.0),
+            ("plausibility", 1.0),
+            ("unknown_mass", 1.0),
+            ("occ_prob_layers", 0.5),
+            ("belief_layers", 0.0),
+            ("plausibility_layers", 1.0),
+            ("unknown_mass_layers", 1.0),
+            ("dem_mean", np.nan),
+            ("dem_var", np.nan),
+        ):
+            setattr(
+                self,
+                name,
+                self._shift_grid_with_fill(
+                    getattr(self, name),
+                    shift_cells,
+                    fill_value,
+                ),
+            )
+        for name, fill_value in (
+            ("dynamic_occ_prob_layers", 0.5),
+            ("dynamic_belief_layers", 0.0),
+            ("dynamic_plausibility_layers", 1.0),
+            ("dynamic_unknown_mass_layers", 1.0),
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(
+                    self,
+                    name,
+                    self._shift_grid_with_fill(value, shift_cells, fill_value),
+                )
+        new_min = current_min + shift_cells.astype(np.float64) * resolution
+        self.cfg.x_min, self.cfg.y_min, self.cfg.z_min = new_min.tolist()
+        new_max = new_min + self._rolling_span
+        self.cfg.x_max, self.cfg.y_max, self.cfg.z_max = new_max.tolist()
+        self.rolling_recenter_count += 1
+        self.history.clear()
 
     def _time_decay(self, timestamp: float) -> None:
         dt = max(0.0, float(timestamp) - float(self.last_timestamp))
@@ -409,9 +537,12 @@ class SlidingProbabilisticGridMap:
         observed_mask: Optional[np.ndarray],
         voxel_shape: Tuple[int, int, int],
         occupied_layers: np.ndarray,
+        authoritative: bool = False,
     ) -> np.ndarray:
-        """把 observed mask 解析为三维层；二维 mask 显式广播到所有高度。"""
+        """解析三维 observed 域；权威 mask 不允许被模型预测扩张。"""
         if observed_mask is None:
+            if authoritative:
+                raise ValueError("authoritative observed mask 不能为空")
             observed = occupied_layers > 0.0
         else:
             mask = np.asarray(observed_mask, dtype=np.float32)
@@ -428,7 +559,8 @@ class SlidingProbabilisticGridMap:
                     "observed_mask 必须是 (X,Y) 或 (X,Y,Z)，"
                     f"当前为 {mask.shape}，voxel={voxel_shape}"
                 )
-            observed = observed | (occupied_layers > 0.0)
+            if not authoritative:
+                observed = observed | (occupied_layers > 0.0)
         return observed.astype(np.float32)
 
     def _body_to_local_mapping(
@@ -453,9 +585,18 @@ class SlidingProbabilisticGridMap:
             candidate_indices,
             voxel_shape,
         )
-        x = self.cfg.x_min + (source_x.astype(np.float64) + 0.5) * self.cfg.x_resolution
-        y = self.cfg.y_min + (source_y.astype(np.float64) + 0.5) * self.cfg.y_resolution
-        z = self.cfg.z_min + (source_z.astype(np.float64) + 0.5) * self.cfg.z_resolution
+        evidence_range = self.cfg.evidence_pc_range
+        source_resolution = np.asarray(
+            [
+                (evidence_range[3] - evidence_range[0]) / voxel_shape[0],
+                (evidence_range[4] - evidence_range[1]) / voxel_shape[1],
+                (evidence_range[5] - evidence_range[2]) / voxel_shape[2],
+            ],
+            dtype=np.float64,
+        )
+        x = evidence_range[0] + (source_x.astype(np.float64) + 0.5) * source_resolution[0]
+        y = evidence_range[1] + (source_y.astype(np.float64) + 0.5) * source_resolution[1]
+        z = evidence_range[2] + (source_z.astype(np.float64) + 0.5) * source_resolution[2]
         centers = np.stack(
             [x, y, z, np.ones(candidate_indices.size, dtype=np.float64)],
             axis=0,
@@ -733,29 +874,47 @@ class SlidingProbabilisticGridMap:
         odom_cov: Optional[np.ndarray] = None,
         model_uncertainty: Optional[np.ndarray] = None,
         calib_confidence: float = 1.0,
+        use_legacy_voxel_doppler_variance: bool = True,
     ) -> np.ndarray:
         base = self.cfg.infrared_reliability if sensor == "infrared" else self.cfg.radar_reliability
         nx = voxel_xyzc.shape[0]
-        x_centers = self.cfg.x_min + (np.arange(nx, dtype=np.float32) + 0.5) * self.cfg.x_resolution
+        evidence_range = self.cfg.evidence_pc_range
+        x_centers = evidence_range[0] + (
+            np.arange(nx, dtype=np.float32) + 0.5
+        ) * ((evidence_range[3] - evidence_range[0]) / max(nx, 1))
         max_range = max(
-            self.cfg.evidence_pc_range[3] - self.cfg.evidence_pc_range[0],
+            evidence_range[3] - evidence_range[0],
             EPS,
         )
         speed_scale = float(np.clip(self.cfg.speed_m_s / 50.0, 0.7, 1.4))
         range_conf = np.clip(
-            1.0 - 0.65 * speed_scale * ((x_centers - self.cfg.x_min) / max_range),
+            1.0 - 0.65 * speed_scale * ((x_centers - evidence_range[0]) / max_range),
             0.18,
             1.0,
         )[:, np.newaxis]
-        variance_conf = 1.0 / (1.0 + self._doppler_variance_bev(voxel_xyzc) / 10.0)
+        # 只有显式 legacy/raw voxel 兼容路径允许把 ch3 解释为 Radar 方差。
+        doppler_variance = (
+            self._doppler_variance_bev(voxel_xyzc)
+            if use_legacy_voxel_doppler_variance
+            else np.zeros(voxel_xyzc.shape[:2], dtype=np.float32)
+        )
+        variance_conf = 1.0 / (1.0 + doppler_variance / 10.0)
         model_unc = self._uncertainty_to_bev(model_uncertainty, voxel_xyzc.shape[:2])
         model_conf = 1.0 / (1.0 + model_unc / 5.0)
         odom_conf = self._odom_confidence(odom_cov)
         calib_conf = float(np.clip(calib_confidence, 0.02, 1.0))
         return np.clip(base * range_conf * variance_conf * model_conf * odom_conf * calib_conf, 0.02, 1.0).astype(np.float32)
 
-    def _update_dem_from_voxel(self, voxel_xyzc: np.ndarray, model_uncertainty: Optional[np.ndarray] = None) -> None:
-        occ3d = np.clip(voxel_xyzc[..., 0], 0.0, 1.0)
+    def _update_dem_from_voxel(
+        self,
+        voxel_xyzc: np.ndarray,
+        observed_layers: np.ndarray,
+    ) -> None:
+        """以 observed occupancy 的 Z 分布更新 DEM，方差单位固定为 m^2。"""
+        observed = np.asarray(observed_layers, dtype=np.float32)
+        if observed.shape != voxel_xyzc.shape[:3] or not np.all(np.isfinite(observed)):
+            raise ValueError("DEM observed_layers 必须是有限且与 voxel XYZ 同形的数组")
+        occ3d = np.clip(voxel_xyzc[..., 0], 0.0, 1.0) * (observed > 0.5)
         z_bins = occ3d.shape[2]
         z_values = self.cfg.z_min + (np.arange(z_bins, dtype=np.float32) + 0.5) * self.cfg.z_resolution
 
@@ -767,8 +926,6 @@ class SlidingProbabilisticGridMap:
         z_mean = (occ3d * z_values[np.newaxis, np.newaxis, :]).sum(axis=2) / np.maximum(occ_sum, EPS)
         z_second = (occ3d * (z_values[np.newaxis, np.newaxis, :] ** 2)).sum(axis=2) / np.maximum(occ_sum, EPS)
         z_var = np.maximum(0.0, z_second - z_mean ** 2)
-        z_var = z_var + self._doppler_variance_bev(voxel_xyzc)
-        z_var = z_var + self._uncertainty_to_bev(model_uncertainty, voxel_xyzc.shape[:2])
 
         prev_valid = ~np.isnan(self.dem_mean)
         blend_w = np.clip(self.belief, 0.1, 0.95)
@@ -796,6 +953,8 @@ class SlidingProbabilisticGridMap:
         T_local_voxel: Optional[np.ndarray] = None,
         dynamic_probability: Optional[np.ndarray] = None,
         dynamic_observed_mask: Optional[np.ndarray] = None,
+        observed_mask_authoritative: bool = False,
+        evidence_semantics: str = LEGACY_MULTICHANNEL_EVIDENCE_SEMANTICS,
     ) -> None:
         """把 voxel 系 evidence 经 ``body`` 变换到 ``local`` 后更新地图。
 
@@ -813,6 +972,21 @@ class SlidingProbabilisticGridMap:
             )
         if not np.all(np.isfinite(voxel_xyzc)):
             raise ValueError("voxel_xyzc 必须全部为有限数")
+        evidence_semantics = str(evidence_semantics).strip()
+        if evidence_semantics not in {
+            LEGACY_MULTICHANNEL_EVIDENCE_SEMANTICS,
+            GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+        }:
+            raise ValueError(f"未知 evidence_semantics: {evidence_semantics}")
+        generated_prediction = (
+            evidence_semantics == GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS
+        )
+        if generated_prediction:
+            occupancy = voxel_xyzc[..., 0]
+            if np.any(occupancy < 0.0) or np.any(occupancy > 1.0):
+                raise ValueError("generated occupancy probability 必须位于 [0,1]")
+            if not observed_mask_authoritative or observed_mask is None:
+                raise ValueError("generated prediction 必须使用外部 authoritative observed mask")
 
         # 所有外部输入必须在时间衰减或证据融合前完成校验，失败时地图无副作用。
         validated_timestamp = self._validated_timestamp(timestamp)
@@ -864,6 +1038,7 @@ class SlidingProbabilisticGridMap:
             observed_mask,
             voxel_shape=voxel_shape,
             occupied_layers=source_occ_layers,
+            authoritative=bool(observed_mask_authoritative),
         )
         static_source_occ_layers = source_occ_layers.copy()
         mapping_mask = source_observed_layers
@@ -874,12 +1049,19 @@ class SlidingProbabilisticGridMap:
                 1.0 - dynamic_probability[dynamic_cells]
             )
             mapping_mask = np.maximum(source_observed_layers, dynamic_observed)
+        rolling_anchor = (
+            validated_local_voxel[:3, 3]
+            if pose_contract == "direct_local_voxel"
+            else validated_body_pose[:3, 3]
+        )
+        self._recenter_rolling_window(rolling_anchor)
         source_reliability_bev = self.observation_reliability_map(
             voxel_xyzc,
             sensor=sensor,
             odom_cov=odom_cov,
             model_uncertainty=model_uncertainty,
             calib_confidence=calib_confidence,
+            use_legacy_voxel_doppler_variance=not generated_prediction,
         )
         source_reliability_layers = (
             source_reliability_bev[..., np.newaxis] * source_observed_layers
@@ -901,15 +1083,8 @@ class SlidingProbabilisticGridMap:
             source_indices,
             destination_indices,
         )
-        source_uncertainty_bev = self._uncertainty_to_bev(
-            model_uncertainty,
-            voxel_xyzc.shape[:2],
-        )
-        warped_uncertainty_layers = self._scatter_layer_max(
-            np.broadcast_to(
-                source_uncertainty_bev[..., np.newaxis],
-                voxel_xyzc.shape[:3],
-            ),
+        warped_source_observed_layers = self._scatter_layer_max(
+            source_observed_layers,
             source_indices,
             destination_indices,
         )
@@ -952,7 +1127,7 @@ class SlidingProbabilisticGridMap:
             )
         self._update_dem_from_voxel(
             warped_voxel,
-            model_uncertainty=np.max(warped_uncertainty_layers, axis=2),
+            observed_layers=warped_source_observed_layers,
         )
         self.last_timestamp = validated_timestamp
         self.last_T_local_body = validated_body_pose.copy()
@@ -982,6 +1157,7 @@ class SlidingProbabilisticGridMap:
         if self._has_voxel_update and value < float(self.last_timestamp):
             raise ValueError("IR timestamp 不得早于最近 voxel timestamp")
         validated_pose = self._validated_pose(T_local_body)
+        self._recenter_rolling_window(validated_pose[:3, 3])
         warped_bev, warped_observed = self._warp_bev_to_local(
             np.clip(bev, 0.0, 1.0),
             validated_pose,
@@ -1031,6 +1207,28 @@ class SlidingProbabilisticGridMap:
                 dtype=np.uint8,
             ),
             "last_timestamp": np.asarray(self.last_timestamp, dtype=np.float64),
+            "rolling_enabled": np.asarray(
+                self.cfg.rolling_enabled,
+                dtype=np.uint8,
+            ),
+            "rolling_protocol": np.asarray(self.rolling_protocol),
+            "rolling_recenter_count": np.asarray(
+                self.rolling_recenter_count,
+                dtype=np.int64,
+            ),
+            "last_recenter_shift_cells": self.last_recenter_shift_cells.copy(),
+            "last_rolling_anchor_local": self.last_rolling_anchor_local.copy(),
+            "map_pc_range_local": np.asarray(
+                [
+                    self.cfg.x_min,
+                    self.cfg.y_min,
+                    self.cfg.z_min,
+                    self.cfg.x_max,
+                    self.cfg.y_max,
+                    self.cfg.z_max,
+                ],
+                dtype=np.float64,
+            ),
             "dynamic_layer_enabled": np.asarray(
                 self.dynamic_occ_prob_layers is not None,
                 dtype=np.uint8,
@@ -1322,6 +1520,175 @@ class LazyLocalMapQuery:
             0.0 if not np.isfinite(min_dist) else uncertainty,
             observed_domain_unknown_mass_max=unknown_max,
         )
+
+    def query_trajectory_corridor(
+        self,
+        waypoints_local_xyz,
+        corridor_radius_m: float,
+        sample_spacing_m: float,
+        speed_m_s: float,
+        reaction_time_s: float,
+        brake_deceleration_m_s2: float,
+        safety_margin_m: float,
+        max_unknown_mass: float = 0.5,
+    ) -> Dict[str, object]:
+        """沿 local-frame 折线检查制动距离内的三态安全走廊。
+
+        每个采样点使用既有三态三维查询；采样间距不大于走廊半径，
+        同时将实际查询半径保守扩大半个采样间距，避免在相邻采样球
+        中点留下未检查缝隙。轨迹长度不足制动
+        距离时，即使已有路段全部 clear 也必须 fail-closed 为 unknown。
+        """
+        try:
+            waypoints = np.asarray(waypoints_local_xyz, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("waypoints_local_xyz 必须是有限数值数组") from exc
+        if (
+            waypoints.ndim != 2
+            or waypoints.shape[0] < 2
+            or waypoints.shape[1] != 3
+            or not np.all(np.isfinite(waypoints))
+        ):
+            raise ValueError("waypoints_local_xyz 必须是至少两个有限 local XYZ 点")
+
+        query_parameters = np.asarray(
+            [corridor_radius_m, sample_spacing_m, max_unknown_mass],
+            dtype=np.float64,
+        )
+        if (
+            not np.all(np.isfinite(query_parameters))
+            or float(corridor_radius_m) <= 0.0
+            or float(sample_spacing_m) <= 0.0
+            or float(max_unknown_mass) < 0.0
+            or float(max_unknown_mass) > 1.0
+        ):
+            raise ValueError("走廊半径/采样间距必须为有限正数，unknown 阈值必须位于 [0,1]")
+
+        segment_lengths = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+        keep = np.concatenate(
+            [np.asarray([True]), segment_lengths > EPS],
+            axis=0,
+        )
+        waypoints = waypoints[keep]
+        if waypoints.shape[0] < 2:
+            raise ValueError("轨迹至少需要两个不同的 local XYZ 点")
+        segment_vectors = np.diff(waypoints, axis=0)
+        segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+        cumulative_lengths = np.concatenate(
+            [np.asarray([0.0], dtype=np.float64), np.cumsum(segment_lengths)]
+        )
+        trajectory_horizon = float(cumulative_lengths[-1])
+        safety_distance = compute_safety_distance_m(
+            speed_m_s,
+            reaction_time_s,
+            brake_deceleration_m_s2,
+            safety_margin_m,
+        )
+        evaluated_horizon = min(trajectory_horizon, safety_distance)
+        effective_spacing = min(float(sample_spacing_m), float(corridor_radius_m))
+        # 对中心线最近采样点的弧长误差最大是半个 spacing；
+        # 用三角不等式做保守膨胀，确保整个连续走廊被覆盖。
+        effective_query_radius = float(corridor_radius_m) + 0.5 * effective_spacing
+        arc_lengths = np.arange(
+            0.0,
+            evaluated_horizon,
+            effective_spacing,
+            dtype=np.float64,
+        )
+        if arc_lengths.size == 0 or not np.isclose(
+            arc_lengths[-1], evaluated_horizon, atol=EPS, rtol=0.0
+        ):
+            arc_lengths = np.concatenate(
+                [arc_lengths, np.asarray([evaluated_horizon], dtype=np.float64)]
+            )
+        if arc_lengths.size > MAX_TRAJECTORY_QUERY_SAMPLES:
+            raise ValueError(
+                f"轨迹查询需要 {arc_lengths.size} 个采样点，"
+                f"超过上限 {MAX_TRAJECTORY_QUERY_SAMPLES}"
+            )
+
+        def interpolate(arc_length: float) -> np.ndarray:
+            segment_index = int(
+                np.searchsorted(cumulative_lengths[1:], arc_length, side="right")
+            )
+            segment_index = min(segment_index, segment_lengths.size - 1)
+            offset = float(arc_length - cumulative_lengths[segment_index])
+            ratio = float(np.clip(offset / segment_lengths[segment_index], 0.0, 1.0))
+            return waypoints[segment_index] + ratio * segment_vectors[segment_index]
+
+        minimum_obstacle_distance = float("inf")
+        maximum_uncertainty = 0.0
+        for sample_index, arc_length in enumerate(arc_lengths.tolist()):
+            point = interpolate(float(arc_length))
+            proximity = self.query_proximity(
+                x_m=float(point[0]),
+                y_m=float(point[1]),
+                z_m=float(point[2]),
+                search_radius=effective_query_radius,
+                speed_m_s=0.0,
+                reaction_time_s=0.0,
+                brake_deceleration_m_s2=1.0,
+                safety_margin_m=effective_query_radius,
+                max_unknown_mass=float(max_unknown_mass),
+            )
+            minimum_obstacle_distance = min(
+                minimum_obstacle_distance,
+                float(proximity["distance"]),
+            )
+            maximum_uncertainty = max(
+                maximum_uncertainty,
+                float(proximity["uncertainty"]),
+            )
+            if proximity["state"] != "clear":
+                return {
+                    "protocol": TRAJECTORY_CORRIDOR_QUERY_PROTOCOL,
+                    "state": str(proximity["state"]),
+                    "reason": f"corridor_{proximity['reason']}",
+                    "distance": float(proximity["distance"]),
+                    "uncertainty": float(proximity["uncertainty"]),
+                    "safety_distance_m": float(safety_distance),
+                    "trajectory_horizon_m": trajectory_horizon,
+                    "evaluated_horizon_m": float(evaluated_horizon),
+                    "corridor_radius_m": float(corridor_radius_m),
+                    "requested_sample_spacing_m": float(sample_spacing_m),
+                    "effective_sample_spacing_m": effective_spacing,
+                    "effective_query_radius_m": effective_query_radius,
+                    "sample_count": int(arc_lengths.size),
+                    "first_risk_sample_index": int(sample_index),
+                    "first_risk_arc_length_m": float(arc_length),
+                    "first_risk_point_local_m": point.astype(float).tolist(),
+                    "is_risky": 1.0,
+                }
+
+        common_result = {
+            "protocol": TRAJECTORY_CORRIDOR_QUERY_PROTOCOL,
+            "distance": float(minimum_obstacle_distance),
+            "uncertainty": float(maximum_uncertainty),
+            "safety_distance_m": float(safety_distance),
+            "trajectory_horizon_m": trajectory_horizon,
+            "evaluated_horizon_m": float(evaluated_horizon),
+            "corridor_radius_m": float(corridor_radius_m),
+            "requested_sample_spacing_m": float(sample_spacing_m),
+            "effective_sample_spacing_m": effective_spacing,
+            "effective_query_radius_m": effective_query_radius,
+            "sample_count": int(arc_lengths.size),
+            "first_risk_sample_index": None,
+            "first_risk_arc_length_m": None,
+            "first_risk_point_local_m": None,
+        }
+        if trajectory_horizon + EPS < safety_distance:
+            return {
+                **common_result,
+                "state": "unknown",
+                "reason": "trajectory_horizon_below_safety_distance",
+                "is_risky": 1.0,
+            }
+        return {
+            **common_result,
+            "state": "clear",
+            "reason": "trajectory_corridor_observed_clear",
+            "is_risky": 0.0,
+        }
 
 
 def load_sparse_voxel_npz(path: str) -> np.ndarray:

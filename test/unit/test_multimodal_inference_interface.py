@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -683,6 +684,87 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
             OptimizedUNetModel,
         )
 
+    def test_formal_cd_uses_checkpoint_selected_deployment_weights(self):
+        from diffusion_consistency_radar.scripts import inference
+
+        online = {"weight": torch.tensor([1.0])}
+        ema = {"weight": torch.tensor([2.0])}
+        checkpoint = {
+            "checkpoint_protocol": "formal_chain_v2",
+            "stage": "cd",
+            "model_state_dict": online,
+            "ema_model_state_dict": ema,
+            "deployment_weight_source": "ema_model_state_dict",
+            "cd_validation": {
+                "protocol": "cd_online_ema_denoising_validation_v1",
+                "selected_source": "ema_model_state_dict",
+            },
+        }
+
+        state, source = inference.resolve_inference_state_dict(
+            checkpoint,
+            model_type="cd",
+        )
+        self.assertIs(state, ema)
+        self.assertEqual(source, "ema_model_state_dict")
+
+        del checkpoint["deployment_weight_source"]
+        with self.assertRaisesRegex(ValueError, "deployment_weight_source"):
+            inference.resolve_inference_state_dict(checkpoint, model_type="cd")
+
+    def test_cd_sampling_uses_checkpoint_consistency_receipt(self):
+        from diffusion_consistency_radar.scripts import inference
+
+        generator = inference.RadarGenerator.__new__(inference.RadarGenerator)
+        generator.model_type = "cd"
+        generator.checkpoint_protocol = "formal_chain_v2"
+        generator.model_checkpoint_metadata = {
+            "consistency_training_config": {
+                "protocol": "ema_consistency_training_config_v1",
+                "training_semantics": "ldm_initialized_ema_consistency_v1",
+                "denoising_parameterization": "direct_x0_sigma_conditioned_v1",
+                "consistency_target_source": "cd_model_ema",
+                "loss": "mse",
+                "num_scales": 12,
+                "ema_rate": 0.98,
+                "sigma_min": 0.01,
+                "sigma_max": 12.0,
+                "rho": 5.0,
+            }
+        }
+
+        resolved = generator._resolve_sampling_consistency_config()
+
+        self.assertEqual(resolved["num_scales"], 12)
+        self.assertEqual(resolved["sigma_min"], 0.01)
+        self.assertEqual(resolved["sigma_max"], 12.0)
+        self.assertEqual(resolved["rho"], 5.0)
+
+    def test_formal_cd_sampling_rejects_missing_consistency_receipt(self):
+        from diffusion_consistency_radar.scripts import inference
+
+        generator = inference.RadarGenerator.__new__(inference.RadarGenerator)
+        generator.model_type = "cd"
+        generator.checkpoint_protocol = "formal_chain_v2"
+        generator.model_checkpoint_metadata = {}
+
+        with self.assertRaisesRegex(
+            inference.CheckpointChainError,
+            "consistency_training_config",
+        ):
+            generator._resolve_sampling_consistency_config()
+
+    def test_legacy_cd_without_selection_keeps_online_fallback(self):
+        from diffusion_consistency_radar.scripts import inference
+
+        online = {"weight": torch.tensor([1.0])}
+        state, source = inference.resolve_inference_state_dict(
+            {"model_state_dict": online},
+            model_type="cd",
+        )
+        self.assertIs(state, online)
+        self.assertEqual(source, "model_state_dict")
+
     def test_strict_multimodal_load_rejects_sparse_compatible_subset(self):
         from diffusion_consistency_radar.scripts import inference
 
@@ -902,6 +984,7 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
             model_type="ldm",
             steps=40,
             sampler="heun",
+            seed=42,
             require_real_ir=True,
         )
         generator = SimpleNamespace(model=SimpleNamespace(is_multimodal=True))
@@ -909,6 +992,11 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
         generator.radar_normalization_sha256 = "b" * 64
         generator.allow_legacy_radar_units = False
         generator.checkpoint_protocol = "formal_chain_v2"
+        generator.occupancy_threshold_artifact = {
+            "protocol": "occupancy_threshold_validation_artifact_v1",
+            "selected_threshold": 0.35,
+        }
+        generator.occupancy_threshold_artifact_sha256 = "f" * 64
         generator.radar_observed_identity = {
             "radar_origin_lidar_m": [0.0, 0.0, 0.0],
             "radar_to_lidar_sha256": "e" * 64,
@@ -974,6 +1062,8 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
         self.assertEqual(metadata["target_size"], [2, 4, 5])
         self.assertEqual(metadata["voxel_size"], [10.0, 4.0, 8.0])
         self.assertEqual(metadata["frame_count"], 2)
+        self.assertEqual(metadata["seed"], 42)
+        self.assertEqual(metadata["sampling_seed_protocol"], "fixed_global_seed_v1")
         self.assertTrue(metadata["model_is_multimodal"])
         self.assertTrue(metadata["require_real_ir"])
         self.assertEqual(metadata["radar_normalization"], self._radar_normalization())
@@ -991,10 +1081,24 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
         self.assertEqual(metadata["observed_mask"]["observed_voxels"], 16)
         self.assertEqual(
             metadata["prediction_voxel"]["protocol"],
-            "generated_voxel_artifact_v1",
+            "generated_voxel_artifact_v2",
         )
         self.assertEqual(metadata["prediction_voxel"]["frame_count"], 2)
         self.assertEqual(metadata["prediction_voxel"]["layout"], "czxy")
+        self.assertEqual(
+            metadata["prediction_voxel"]["mapping_contract"],
+            {
+                "protocol": "generated_occupancy_mapping_input_v1",
+                "evidence_semantics": "generated_occupancy_probability_v1",
+                "occupancy_channel": 0,
+                "occupancy_semantics": "probability",
+                "occupancy_range": [0.0, 1.0],
+                "observed_domain": "external_authoritative_mask",
+                "auxiliary_channels_consumed": False,
+                "dem_height_source": "observed_occupancy_z_distribution",
+                "dem_variance_unit": "m^2",
+            },
+        )
 
     def test_formal_inference_metadata_requires_prediction_voxel_receipt(self):
         """正式推理不能只绑定 observed mask 而遗漏实际 prediction 内容。"""
@@ -1009,6 +1113,7 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
             model_type="ldm",
             steps=40,
             sampler="heun",
+            seed=42,
             require_real_ir=True,
         )
         generator = SimpleNamespace(model=SimpleNamespace(is_multimodal=True))
@@ -1183,6 +1288,58 @@ class MultimodalInferenceInterfaceTest(unittest.TestCase):
         self.assertEqual(tuple(generated.shape), (1, 4, 32, 128, 128))
         self.assertEqual(generator.model.last_ir_shape, (1, 3, 480, 640))
         self.assertEqual(generator.model.last_t_shape, (1, 3))
+
+    def test_multimodal_internal_type_error_is_not_retried_as_legacy(self):
+        """forward 内部异常不得被误判为旧签名并执行第二次。"""
+        from diffusion_consistency_radar.scripts import inference
+
+        class BrokenModel(torch.nn.Module):
+            is_multimodal = True
+
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward(
+                self,
+                radar_voxel,
+                ir_img,
+                r_mat,
+                t_vec,
+                k_mat,
+                timesteps,
+                noised_latent=None,
+                return_uncertainty=False,
+            ):
+                self.calls += 1
+                raise TypeError("internal tensor contract failed")
+
+        generator = inference.RadarGenerator.__new__(inference.RadarGenerator)
+        generator.model = BrokenModel()
+        tensor = torch.zeros(1, 1, 1, 1, 1)
+        meta = {
+            "ir_img": torch.zeros(1, 3, 2, 2),
+            "r_mat": torch.eye(3).unsqueeze(0),
+            "t_vec": torch.zeros(1, 3),
+            "k_mat": torch.eye(3).unsqueeze(0),
+        }
+
+        with self.assertRaisesRegex(TypeError, "internal tensor contract failed"):
+            generator._call_multimodal_model(
+                tensor,
+                meta,
+                torch.ones(1),
+                tensor,
+            )
+        self.assertEqual(generator.model.calls, 1)
+
+    def test_karras_sample_history_default_is_not_shared(self):
+        from diffusion_consistency_radar.cm.karras_diffusion import karras_sample
+
+        parameter = inspect.signature(karras_sample).parameters[
+            "last_sample_result_list"
+        ]
+        self.assertIsNone(parameter.default)
 
 
 if __name__ == "__main__":

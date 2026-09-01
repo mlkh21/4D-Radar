@@ -1,5 +1,13 @@
 # Progress
 
+## 2026-08-29：完成审查修复阶段 1
+
+- 更新 `diffusion_consistency_radar/config/default_config.yaml`：删除静态 `num_gpus`，保留 `cuda_devices` 作为默认设备唯一来源；运行时 GPU 数仍由 launcher 严格派生。
+- 从 formal YAML 删除五个仅作用于 legacy MSE 的 VAE 参数，显式加入当前生效的 BCE+Dice 参数。
+- 更新 `test/unit/test_formal_training_yaml_defaults.py`，覆盖两卡默认、无静态 GPU 数、active loss 字段和 legacy-only 字段缺席合同。
+- 运行 65 项短回归全部通过：formal YAML 5、VAE sparse loss 20、VAE checkpoint 26、distributed protocol 14；未启动正式训练。
+- 进入阶段 2：LDM persisted observed-mask 监督与验证合同。
+
 ## 2026-07-13：完成列级损失计划 Task3 runner
 
 - RED：完整 `test/unit/test_mini_train_script.py` 首次运行 78 项中 18 failed、1 error，确认缺失 env/YAML/runner；新增真实接口 smoke 后再次因 generic 非空目录交接得到 1 个预期失败。
@@ -1863,3 +1871,83 @@ test/unit/test_interactive_inference_compare.py` passed.
 - launcher 运行时 override 同步记录实际 `cuda_devices/num_gpus/world_size`，DDP batch 仍由共享安全计划解析，不由 YAML 帧数旁路。
 - 新增 5 项 YAML/覆盖/选择测试；通过 launcher/DDP 37 项、VAE checkpoint 26 项、LDM validation 5 项及 CD 入口回归。shell 语法、Python 3.8 模块导入和 diff 空白检查纳入收尾。
 - 真实 `PREFLIGHT_ONLY=1` 在 `Radar-Diffusion` Conda 环境中通过全部 4013 帧只读数据门禁，未创建 override、checkpoint 或训练结果，也未启动 GPU forward/backward。
+## 2026-08-29：阶段 2 完成
+
+- 完成 LDM observed-mask 数学层、trainer 传参、formal fail-closed、验证指标和 checkpoint 协议改造。
+- `test_ldm_observed_supervision.py`：6/6 PASS。
+- `test_ldm_vertical_structure_loss.py`：83/83 PASS。
+- `py_compile` 通过；未运行长训练、完整预处理或全量推理。
+
+## 2026-08-29：阶段 3 完成
+
+- 完成 DDP SyncBatchNorm、normalization checkpoint 协议、CD EMA parameters/buffers 和 formal resume 门禁。
+- DDP、CD、多模态 CD、VAE/LDM checkpoint、LDM validation、formal YAML 短测试均通过。
+- 未运行双卡长训练；当前验证边界是结构/状态合同测试，服务器首次正式训练仍需以 preflight 加短 smoke 确认 NCCL/SyncBatchNorm 运行环境。
+
+## 2026-08-29：阶段 4C 完成
+
+- 已完成 CD validation 数据链、online/EMA 确定性 observed-domain 选优、checkpoint/resume 协议和推理部署权重解析。
+- CD entrypoint、多模态 CD、推理接口 40 项、默认 YAML、Python 静态编译及 `git diff --check` 均通过。
+- 未运行训练、GPU forward、完整推理或覆盖历史 checkpoint；下一步处理绑定 checkpoint 的 validation-only threshold artifact。
+
+## 2026-08-29：阶段 4 完成
+
+- 完成固定 seed/CUDA 同步计时、observed-mask evaluator、CD online/EMA 部署选优和 validation-only threshold artifact 全链。
+- 聚焦回归通过：artifact 3 项、formal inference 13 项、runtime 4 项、multimodal inference 40 项、LDM validation 5 项、VAE/LDM checkpoint 26 项及 CD 两组接口；shell/Python 静态检查和 diff 空白检查通过。
+- 未启动正式训练或推理；旧 checkpoint 没有 threshold sweep，不能直接生成新 formal artifact，需要按新代码重新训练对应 LDM/CD 阶段。
+
+## 2026-08-29：阶段 5 完成
+
+- 已完成 prediction artifact v2、formal authoritative observed、prediction-only 地图消费和 DEM 单位合同改造。
+- 概率地图 50/50、经验位姿合同 6/6、推理接口 40/40 PASS；覆盖 mask 外 0.9 概率保持 unknown、合法收据中的超域概率 fail closed，以及辅助通道不改变 belief/DEM。
+- 未运行训练、GPU 推理或全场景地图回放；新协议行为目前由小数组、临时目录和接口测试证明。
+
+## 2026-08-30：阶段 6 完成
+
+- 完成 body/LiDAR 锚定的整体素 rolling window，拆分固定 source evidence range 和动态 destination local bounds，并收据化最终范围/移动次数。
+- 完成逐帧 local trajectory artifact、制动距离内三态走廊查询、首个风险点 CSV 字段与 artifact/records SHA-256 收据。
+- 正式/经验协议分别升为 v5/v3，`map_run.json` 明确仅离线回放，不再将严格数据合同误声称为机载避障 formal。
+- 回归通过：概率地图 54/54、经验位姿 6/6，相关 Python 编译与 `git diff --check` 通过。未运行训练、GPU 推理、全量地图回放或 ROS/PX4。
+
+## 2026-08-30：阶段 7A 完成
+
+- 完成 Radar 分字段 finite 聚合、float64 防溢出、statistics v2 稀疏存储及 dataset/launcher payload-policy 一致性检查。
+- 保留 v1 读取和现有 formal-v2 预检兼容；新生成帧固定写入 v2，未改写任何既有预处理数据或 artifact。
+- 回归通过：Radar statistics 7/7、VAE/checkpoint 26/26，相关 Python 编译、launcher shell 语法和 `git diff --check` 均通过；未运行全量预处理或训练。
+
+## 2026-08-30：阶段 7B 完成
+
+- 完成 strict field semantics artifact、权威 evidence 内容校验、解包 layout/semantics 交叉绑定、PointCloud v1 sidecar、NaN 缺失值和 Doppler 正方向补偿。
+- 预处理 CLI/policy/manifest 已绑定 schema 与 layout SHA；现有 velocity-none v2 保持兼容，fixed/recorded 未验证语义时 fail-closed。
+- 回归通过：字段 schema 8/8、运动协议 9/9、Radar statistics 7/7、airborne Doppler 定点 2/2，以及相关 Python 编译和 `git diff --check`。未读取真实 bag、未运行全量预处理或训练。
+
+## 2026-08-30：阶段 7C 完成
+
+- 完成逐场景 extraction receipt、逐帧/逐 bag 失败传播、关键模态即时与最终门禁，以及跨帧 PointCloud layout 漂移拒绝。
+- 回归通过：pointcloud/receipt 11/11、timestamp alignment 8/8，相关 Python 编译与 `git diff --check`；全部输出仅在临时目录，未读取真实 bag 或改写数据集。
+
+## 2026-08-30：阶段 7D 与阶段 7完成
+
+- 发布独立 `formal_data_v3` validator/builder/loader，绑定 statistics-v2、field schema/layout、extraction receipt 和 Radar 物理合同；训练 Python 与 launcher 在 v3 时强制逐字段 statistics-v2，v2 保持 v1/v2 兼容。
+- 预处理 policy 接入 complete receipt 和 verified schema 身份；新增 fresh `preprocess-v3.sh`，在创建输出前校验 schema evidence，并拒绝覆盖 v2 或任意已有输出。
+- 回归通过：temporal/formal-data 7/7、checkpoint chain 14/14、VAE/checkpoint 27/27、field/schema/receipt 12/12、motion 9/9，以及 shell/Python 静态检查和 `git diff --check`。仅运行缺 schema 的前置失败和临时目录短测，未执行全量解包、预处理或训练。
+
+## 2026-08-30：阶段 8A--8C 完成
+
+- 已完成 Dataset 单帧合同、未实现参数 fail-fast、Karras history 隔离和多模态 forward 的签名能力分派；不再用运行时 `TypeError` 猜测接口。
+- 已把 CD 对外语义收敛为“LDM initialization + CD EMA consistency”，保留空的 `teacher_model_path` legacy 别名用于迁移冲突检查，删除默认/mini 配置中的无效蒸馏旋钮。
+- 新增共享 CD training/sampling receipt；checkpoint 保存和恢复、正式 chain preflight、CD inference 都消费同一份 sigma/rho/EMA/scale 身份。
+- 短回归通过：Dataset 16/16、多模态推理 42/42、checkpoint chain 14/14、CD entrypoint，以及相关 Python/shell 语法检查。未启动训练、GPU forward、完整推理或数据预处理。
+
+## 2026-08-30：阶段 8D 核心完成
+
+- 已修复 saved evaluator 的 observed mask“只验证不消费”，并发布正式 evaluation protocol、正式指标集合、指标域和 aggregation 收据。
+- 已把 legacy 点云评价/图像对比/质量诊断与唯一正式 saved-prediction evaluator 明确分流，`compare.sh` 同时移除本机绝对路径隐形依赖。
+- 回归通过：formal inference evaluator 15/15、task metrics 4/4、formal YAML 5/5、mini launcher 21/21、checkpoint 15/15、多模态 inference 44/44 与 CD entrypoint；Python/shell 静态检查和 `git diff --check` 通过。
+- 未运行训练、GPU 推理或全量评价；下一步只做阶段 8 跨模块最终短回归与工作树审查。
+
+## 2026-08-30：阶段 8 与顺序修复计划完成
+
+- 阶段 8 最终跨模块回归通过：Dataset 16/16、checkpoint chain 15/15、多模态 inference 44/44、formal evaluator 15/15、task metrics 4/4、formal YAML 5/5、mini launcher 21/21，以及 CD training 两组接口测试。
+- 本阶段涉及的 Python 模块均通过 `py_compile`，8 个 shell 入口通过 `bash -n`，`git diff --check` 通过。
+- 八阶段代码修改计划至此全部完成。没有启动长训练、GPU 推理、全量预处理或全量评价，也没有删除/覆盖数据集、checkpoint、训练日志和实验结果。

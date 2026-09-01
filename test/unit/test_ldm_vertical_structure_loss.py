@@ -17,6 +17,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from diffusion_consistency_radar.scripts.unified_train import (
+    LDM_OBSERVATION_SUPERVISION_PROTOCOL,
     LDM_METRICS_HEADER,
     LDM_LOSS_COMPONENT_NAMES,
     OptimizedLDMTrainer,
@@ -1615,8 +1616,18 @@ class LDMTrainerUtilityTest(unittest.TestCase):
             self.assertEqual(metadata["decoded_column_temperature"], 1.0)
             self.assertFalse(metadata["decoded_column_curriculum_enabled"])
             self.assertEqual(metadata["curriculum_total_epochs"], 200)
+            self.assertEqual(
+                metadata["observation_supervision_protocol"],
+                LDM_OBSERVATION_SUPERVISION_PROTOCOL,
+            )
             self.assertNotIn("effective_column_positive_weight", metadata)
             self.assertNotIn("effective_column_negative_weight", metadata)
+
+            checkpoint = trainer._checkpoint_payload(1, 0.5, 0.5)
+            self.assertEqual(
+                checkpoint["observation_supervision_protocol"],
+                LDM_OBSERVATION_SUPERVISION_PROTOCOL,
+            )
 
     def test_v11_curriculum_is_epoch_deterministic_and_self_describing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1832,6 +1843,7 @@ class LDMTrainerUtilityTest(unittest.TestCase):
             )
             trainer.model.unet_3d = TinyDenoiser()
             target = torch.zeros(1, 1, 1, 1, 1)
+            observed_mask = torch.ones_like(target[:, 0:1])
             loss_components = {
                 name: torch.zeros((), requires_grad=True)
                 for name in LDM_LOSS_COMPONENT_NAMES
@@ -1841,13 +1853,73 @@ class LDMTrainerUtilityTest(unittest.TestCase):
                 "diffusion_consistency_radar.scripts.unified_train.compute_ldm_loss_components",
                 return_value=(trainer.model.unet_3d.anchor.square(), loss_components),
             ) as compute_loss:
-                trainer.train_epoch(1, [(target, target.clone())])
+                trainer.train_epoch(
+                    1,
+                    [
+                        (
+                            target,
+                            target.clone(),
+                            {"occupancy_observed_mask": observed_mask},
+                        )
+                    ],
+                )
 
             self.assertEqual(trainer.last_effective_column_weights, (0.03, 0.0))
             self.assertEqual(compute_loss.call_count, 1)
             call_kwargs = compute_loss.call_args.kwargs
             self.assertEqual(call_kwargs["decoded_column_positive_weight"], 0.03)
             self.assertEqual(call_kwargs["decoded_column_negative_weight"], 0.0)
+            self.assertTrue(
+                torch.equal(call_kwargs["observed_mask"], observed_mask)
+            )
+
+    def test_formal_train_epoch_rejects_missing_persisted_observed_mask(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trainer = self._make_trainer(temp_dir)
+            trainer.require_persisted_observed_mask = True
+            target = torch.zeros(1, 1, 1, 1, 1)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "缺少 persisted occupancy_observed_mask",
+            ):
+                trainer.train_epoch(1, [(target, target.clone())])
+
+    def test_validation_ignores_unknown_voxels_in_latent_and_iou(self):
+        class FixedDenoiser(torch.nn.Module):
+            def __init__(self, denoised):
+                super().__init__()
+                self.register_buffer("denoised", denoised)
+
+            def forward(self, _model_input, _sigmas):
+                return self.denoised
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trainer = self._make_trainer(temp_dir)
+            trainer.require_persisted_observed_mask = True
+            target = torch.tensor([[[[[1.0, 0.0]]]]])
+            observed_mask = torch.tensor([[[[[1.0, 0.0]]]]])
+            # 第二个 latent/voxel 位于 unknown 域，故意制造极大误差和假阳性。
+            denoised = torch.tensor([[[[[1.0, 10.0]]]]])
+            trainer.model.unet_3d = FixedDenoiser(denoised)
+            trainer.vae.decode = mock.Mock(side_effect=lambda latent: latent)
+
+            with mock.patch(
+                "diffusion_consistency_radar.scripts.unified_train.encode_ldm_training_latents",
+                return_value=(target.clone(), torch.zeros_like(target)),
+            ):
+                metrics = trainer.validate(
+                    [
+                        (
+                            target,
+                            target.clone(),
+                            {"occupancy_observed_mask": observed_mask},
+                        )
+                    ]
+                )
+
+            self.assertEqual(metrics["denoising_latent_loss"], 0.0)
+            self.assertEqual(metrics["denoising_occupancy_iou"], 1.0)
 
     def test_metrics_header_and_row_include_effective_column_weights_before_lr(self):
         positive_name = "effective_column_positive_weight"

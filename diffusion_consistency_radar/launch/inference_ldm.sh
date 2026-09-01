@@ -14,11 +14,12 @@ PROTOCOL_TAG="${PROTOCOL_TAG:-formal_v2_80m_86p8_v1}"
 RESULTS_DIR="${ROOT_DIR}/Result/train_results/${PROTOCOL_TAG}"
 VAE_CKPT="${RESULTS_DIR}/vae/vae_best.pt"
 LDM_CKPT="${RESULTS_DIR}/ldm/ldm_best.pt"
+THRESHOLD_ARTIFACT="${LDM_THRESHOLD_ARTIFACT:-${RESULTS_DIR}/ldm/occupancy_threshold.json}"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Deploy_formal_v2_80m_86p8_v1}"
 CALIBRATION_DIR="${CALIBRATION_DIR:-${ROOT_DIR}/Data/config}"
 TRAIN_DURATION_SECONDS="${TRAIN_DURATION_SECONDS:--1}"
-OCC_THRESHOLD="${OCC_THRESHOLD:-0.05}"
+INFERENCE_SEED="${INFERENCE_SEED:-42}"
 
 if [ ! -f "${VAE_CKPT}" ]; then
     echo "错误: VAE 模型不存在: ${VAE_CKPT}"
@@ -27,6 +28,10 @@ fi
 
 if [ ! -f "${LDM_CKPT}" ]; then
     echo "错误: LDM 模型不存在: ${LDM_CKPT}"
+    exit 1
+fi
+if [ ! -f "${THRESHOLD_ARTIFACT}" ]; then
+    echo "错误: LDM validation threshold artifact 不存在: ${THRESHOLD_ARTIFACT}"
     exit 1
 fi
 
@@ -89,7 +94,8 @@ for SCENE in "${TEST_SCENES[@]}"; do
         --steps 40 \
         --sampler heun \
         --train_duration_seconds "${TRAIN_DURATION_SECONDS}" \
-        --occ_threshold "${OCC_THRESHOLD}" \
+        --threshold_artifact "${THRESHOLD_ARTIFACT}" \
+        --seed "${INFERENCE_SEED}" \
         --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
         --deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}" \
         --calibration_dir "${CALIBRATION_DIR}" \

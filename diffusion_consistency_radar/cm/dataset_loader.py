@@ -42,12 +42,14 @@ except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加�
 try:
     from ..radar_statistics import (
         RADAR_STATISTICS_PROTOCOL,
+        SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
         load_sparse_radar_voxel,
         validate_sparse_radar_statistics,
     )
 except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加入 sys.path 的旧脚本
     from radar_statistics import (  # type: ignore
         RADAR_STATISTICS_PROTOCOL,
+        SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
         load_sparse_radar_voxel,
         validate_sparse_radar_statistics,
     )
@@ -620,18 +622,19 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                  require_radar_statistics=False,
                  frame_ids_by_scene=None,
                  voxel_coordinate_frame="lidar"):
-        """
-        工业闭环重构版：完美支持独立场景内部时序滑窗、动态几何参数分发的多模态数据迭代器
-        """
+        """加载单帧 Radar/IR 条件及 LiDAR 离线监督合同。"""
         self.root_dir = root_dir
-        self.transform = transform
         self.return_path = return_path
-        self.alignment_size = alignment_size
+        if transform is not None:
+            raise ValueError("Dataset transform 参数未实现；请使用显式 augmentation")
+        if alignment_size != 32:
+            raise ValueError("Dataset alignment_size 参数未实现且只能保留默认值 32")
+        if isinstance(sequence_length, bool) or int(sequence_length) != 1:
+            raise ValueError("当前模型没有时序融合，sequence_length 必须严格为 1")
         # 样本包含显式 observed mask 路径，避免正式训练运行时重建监督域。
-        self.samples = []  # (radar_seq, target, ir, scene, lidar, observed_mask)
+        self.samples = []  # (radar, target, ir, scene, lidar, observed_mask)
         self.scene_policies: Dict[str, dict] = {}
         self.split = split
-        self.seq_len = max(1, int(sequence_length))
         self.require_real_ir = bool(require_real_ir)
         self.require_real_calibration = bool(require_real_calibration)
         self.require_persisted_observed_mask = bool(
@@ -707,7 +710,6 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             )
             self.radar_normalization_protocol = RADAR_NORMALIZATION_PROTOCOL
             self.legacy_radar_units = False
-        self.ir_dir = os.path.join(root_dir, "ir_image")
         self.calibration_provider = CalibrationProvider(
             root_dir,
             calibration_dir=calibration_dir,
@@ -715,8 +717,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             voxel_coordinate_frame=self.voxel_coordinate_frame,
         )
 
-        # 统一标定外参参数常驻（规避写死常量造成的域泄漏）
-        self.default_K = torch.from_numpy(DEFAULT_THERMAL_K.copy()).float()
+        # mock 外参只服务显式 legacy 诊断；formal 路径由 CalibrationProvider fail-closed。
         self.R_cam_to_lidar = torch.tensor([[0.012, -0.999, -0.015], [0.024, -0.015, 0.999], [-0.999, -0.012, 0.024]], dtype=torch.float32)
         self.T_cam_to_lidar = torch.zeros(3, dtype=torch.float32)
 
@@ -814,7 +815,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             )
             if (
                 self.require_radar_statistics
-                and policy_statistics_protocol != RADAR_STATISTICS_PROTOCOL
+                and policy_statistics_protocol not in SUPPORTED_RADAR_STATISTICS_PROTOCOLS
             ):
                 raise ValueError(
                     f"场景 {scene} Radar statistics policy 缺失或协议不匹配"
@@ -825,16 +826,9 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 
             files = sorted([f for f in os.listdir(radar_voxel_dir) if f.endswith('.npy') or f.endswith('.npz')])
 
-            # 强制在独立场景内部执行滑窗，绝对禁止跨场景边界缝合
-            if len(files) < self.seq_len:
-                continue
-
-            for i in range(len(files) - self.seq_len + 1):
-                # 收集连续 T 帧雷达路径组
-                radar_seq_paths = [os.path.join(radar_voxel_dir, files[i + t]) for t in range(self.seq_len)]
-
-                # 对应当前最终切片截面时刻 (t) 的真值标签路径
-                target_f = files[i + self.seq_len - 1]
+            for target_f in files:
+                # 当前模型是严格单帧条件；文件名相同即为当前监督时刻。
+                radar_path = os.path.join(radar_voxel_dir, target_f)
                 target_frame_id = os.path.splitext(target_f)[0]
                 if (
                     self.frame_ids_by_scene is not None
@@ -884,27 +878,24 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 
                 if os.path.exists(target_path):
                     if self.require_radar_statistics:
-                        for radar_path in radar_seq_paths:
-                            if not radar_path.endswith(".npz"):
-                                raise ValueError(
-                                    "正式 Radar statistics 只支持稀疏 NPZ: "
-                                    f"{radar_path}"
-                                )
-                            if radar_path not in self.radar_statistics_by_path:
-                                summary = validate_sparse_radar_statistics(radar_path)
-                                self.radar_statistics_by_path[radar_path] = {
-                                    **summary,
-                                    "frame_id": os.path.splitext(
-                                        os.path.basename(radar_path)
-                                    )[0],
-                                    "reference": (
-                                        "pre_augmentation_persisted_radar_voxel"
-                                    ),
-                                    "model_consumed": False,
-                                }
+                        if not radar_path.endswith(".npz"):
+                            raise ValueError(
+                                "正式 Radar statistics 只支持稀疏 NPZ: "
+                                f"{radar_path}"
+                            )
+                        if radar_path not in self.radar_statistics_by_path:
+                            summary = validate_sparse_radar_statistics(radar_path)
+                            self.radar_statistics_by_path[radar_path] = {
+                                **summary,
+                                "frame_id": target_frame_id,
+                                "reference": (
+                                    "pre_augmentation_persisted_radar_voxel"
+                                ),
+                                "model_consumed": False,
+                            }
                     self.samples.append(
                         (
-                            radar_seq_paths,
+                            radar_path,
                             target_path,
                             ir_path,
                             scene,
@@ -924,7 +915,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                         f"missing={missing}, extra={extra}"
                     )
 
-        print(f"Found {len(self.samples)} temporal sliding-window samples for {split}.")
+        print(f"Found {len(self.samples)} single-frame samples for {split}.")
 
     def __len__(self):
         return len(self.samples)
@@ -957,7 +948,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 
     def __getitem__(self, idx):
         (
-            radar_seq_paths,
+            radar_path,
             target_path,
             ir_path,
             scene,
@@ -1022,47 +1013,52 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         )
         observed_mask_tensor = (observed_mask_tensor > 0.5).float()
 
-        # 2. 时序雷达滑窗包流式解析重采样
-        radar_seq_tensors = []
+        # 2. 加载与监督时刻同名的单帧 Radar 条件。
         radar_statistics = []
-        statistics_declared = (
-            self.scene_policies.get(scene, {}).get("radar_statistics_protocol")
-            == RADAR_STATISTICS_PROTOCOL
+        declared_statistics_protocol = self.scene_policies.get(scene, {}).get(
+            "radar_statistics_protocol"
         )
-        for path in radar_seq_paths:
-            if path.endswith('.npz'):
-                if self.require_radar_statistics or statistics_declared:
-                    radar_voxel, summary = load_sparse_radar_voxel(
-                        path,
-                        require_statistics=True,
-                    )
-                    radar_statistics.append(
-                        {
-                            **summary,
-                            "frame_id": os.path.splitext(os.path.basename(path))[0],
-                            # 摘要描述磁盘中的原始稀疏体素，不随数据增强变换。
-                            "reference": "pre_augmentation_persisted_radar_voxel",
-                            # 当前模型仍只消费原四通道 Radar tensor。
-                            "model_consumed": False,
-                        }
-                    )
-                else:
-                    radar_voxel = load_sparse_voxel(path)
-            else:
-                if self.require_radar_statistics or statistics_declared:
+        statistics_declared = (
+            declared_statistics_protocol in SUPPORTED_RADAR_STATISTICS_PROTOCOLS
+        )
+        if radar_path.endswith('.npz'):
+            if self.require_radar_statistics or statistics_declared:
+                radar_voxel, summary = load_sparse_radar_voxel(
+                    radar_path,
+                    require_statistics=True,
+                )
+                radar_statistics.append(
+                    {
+                        **summary,
+                        "frame_id": os.path.splitext(os.path.basename(radar_path))[0],
+                        # 摘要描述磁盘中的原始稀疏体素，不随数据增强变换。
+                        "reference": "pre_augmentation_persisted_radar_voxel",
+                        # 当前模型仍只消费原四通道 Radar tensor。
+                        "model_consumed": False,
+                    }
+                )
+                if summary["protocol"] != declared_statistics_protocol:
                     raise ValueError(
-                        f"Radar statistics policy 不允许稠密 NPY: {path}"
+                        f"Radar statistics payload={summary['protocol']!r} 与 "
+                        f"policy={declared_statistics_protocol!r} 不一致: {radar_path}"
                     )
-                radar_voxel = np.load(path).astype(np.float32)
+            else:
+                radar_voxel = load_sparse_voxel(radar_path)
+        else:
+            if self.require_radar_statistics or statistics_declared:
+                raise ValueError(
+                    f"Radar statistics policy 不允许稠密 NPY: {radar_path}"
+                )
+            radar_voxel = np.load(radar_path).astype(np.float32)
 
-            r_tensor = torch.from_numpy(radar_voxel).permute(3, 2, 0, 1)
-            r_tensor = crop_voxel_channels_to_pc_range(
-                r_tensor, self.source_pc_range, self.model_pc_range
-            )
-            r_tensor = resize_radar_voxel_channels(r_tensor, self.target_size)
-            radar_seq_tensors.append(r_tensor)
-
-        radar_tensor = radar_seq_tensors[-1]
+        radar_tensor = torch.from_numpy(radar_voxel).permute(3, 2, 0, 1)
+        radar_tensor = crop_voxel_channels_to_pc_range(
+            radar_tensor, self.source_pc_range, self.model_pc_range
+        )
+        radar_tensor = resize_radar_voxel_channels(
+            radar_tensor,
+            self.target_size,
+        )
 
         # 3. 加载共享 thermal 标定，并按同一 K/D/S 协议准备红外图像
         r_mat, t_vec, k_mat, calib_meta = self._get_calibration()
@@ -1148,9 +1144,9 @@ if __name__ == "__main__":
     if len(ds) > 0:
         sample = ds[0]
         t, r, m, p = sample
-        print(f"成功恢复闭环! 加载时序滑窗样本 0。")
+        print(f"成功加载单帧样本 0。")
         print(f"目标真值 (GT) 形状 [C, Z, H, W]: {t.shape}")
-        print(f"时序雷达条件包 形状 [T, C, Z, H, W]: {r.shape}")
+        print(f"单帧雷达条件形状 [C, Z, H, W]: {r.shape}")
         print(f"红外相片矩阵 形状 [C, H_img, W_img]: {m['ir_img'].shape}")
     else:
         print("错误: 数据集为空。请检查 dataset_path。")

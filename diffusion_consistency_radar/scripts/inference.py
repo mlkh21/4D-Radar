@@ -6,7 +6,7 @@
 
 import argparse
 import csv
-import hashlib
+import inspect
 import json
 import os
 import sys
@@ -110,6 +110,31 @@ except ImportError:
     )
 
 try:
+    from diffusion_consistency_radar.cd_training_protocol import (
+        resolve_cd_consistency_config,
+        validate_cd_consistency_receipt,
+    )
+except ImportError:
+    from cd_training_protocol import (
+        resolve_cd_consistency_config,
+        validate_cd_consistency_receipt,
+    )
+
+try:
+    from diffusion_consistency_radar.cd_validation_protocol import (
+        CD_VALIDATION_PROTOCOL,
+    )
+except ImportError:
+    from cd_validation_protocol import CD_VALIDATION_PROTOCOL
+
+try:
+    from diffusion_consistency_radar.occupancy_threshold_artifact import (
+        load_threshold_artifact,
+    )
+except ImportError:
+    from occupancy_threshold_artifact import load_threshold_artifact
+
+try:
     from diffusion_consistency_radar.dataset_manifest import (
         sha256_file,
     )
@@ -129,6 +154,19 @@ try:
     )
 except ImportError:
     from prediction_artifact_protocol import build_prediction_voxel_metadata
+
+try:
+    from diffusion_consistency_radar.observed_artifact_protocol import (
+        RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL,
+        build_observed_mask_metadata,
+        observed_mask_records_digest as _observed_mask_records_digest,
+    )
+except ImportError:
+    from observed_artifact_protocol import (
+        RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL,
+        build_observed_mask_metadata,
+        observed_mask_records_digest as _observed_mask_records_digest,
+    )
 
 try:
     from scipy.spatial import cKDTree
@@ -169,9 +207,6 @@ RUNTIME_FIELDS = [
     "empty_frame_rate",
 ]
 
-RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL = "radar_endpoint_ray_visibility_v1"
-
-
 def _uses_legacy_evaluation(args) -> bool:
     """判断是否显式启用了兼容的生成时真值评价分支。"""
     return bool(
@@ -200,77 +235,6 @@ def resolve_effective_voxel_size(voxel_size, pc_range, target_size):
         (float(pc_range[4]) - float(pc_range[1])) / max(y_size, 1),
         (float(pc_range[5]) - float(pc_range[2])) / max(z_size, 1),
     ]
-
-
-def _observed_mask_records_digest(records) -> str:
-    """按帧顺序绑定 deployment observed mask 的内容身份。"""
-    digest = hashlib.sha256()
-    for record in records:
-        digest.update(str(record["frame_id"]).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(record["file"]).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(record["sha256"]).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(int(record["observed_voxels"])).encode("ascii"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
-def build_observed_mask_metadata(records, identity=None):
-    """构造可由地图入口逐帧重算的 Radar 射线 observed 合同。"""
-    normalized = []
-    seen = set()
-    for record in records:
-        frame_id = str(record.get("frame_id", ""))
-        file_name = str(record.get("file", ""))
-        file_sha256 = str(record.get("sha256", ""))
-        observed_voxels = int(record.get("observed_voxels", -1))
-        if (
-            not frame_id
-            or frame_id in seen
-            or os.path.basename(file_name) != file_name
-            or not file_name.endswith("_observed_mask.npy")
-            or len(file_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in file_sha256)
-            or observed_voxels < 0
-        ):
-            raise ValueError("observed mask 记录格式无效或 frame 重复")
-        seen.add(frame_id)
-        normalized.append(
-            {
-                "frame_id": frame_id,
-                "file": file_name,
-                "sha256": file_sha256,
-                "observed_voxels": observed_voxels,
-            }
-        )
-    metadata = {
-        "protocol": RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL,
-        "coordinate_frame": "lidar",
-        "source": "radar_endpoint_rays",
-        "ir_frustum_marks_free_space": False,
-        "frame_count": len(normalized),
-        "observed_voxels": sum(record["observed_voxels"] for record in normalized),
-        "files_sha256": _observed_mask_records_digest(normalized),
-        "records": normalized,
-    }
-    if identity is not None:
-        origin = np.asarray(identity.get("radar_origin_lidar_m"), dtype=np.float64)
-        calibration_sha256 = str(identity.get("radar_to_lidar_sha256", ""))
-        if (
-            origin.shape != (3,)
-            or not np.all(np.isfinite(origin))
-            or len(calibration_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in calibration_sha256
-            )
-        ):
-            raise ValueError("Radar observed identity 的原点或标定 SHA-256 无效")
-        metadata["radar_origin_lidar_m"] = origin.astype(float).tolist()
-        metadata["radar_to_lidar_sha256"] = calibration_sha256
-    return metadata
 
 
 def build_inference_run_metadata(
@@ -315,6 +279,30 @@ def build_inference_run_metadata(
             raise ValueError(
                 "正式 observed mask 的 Radar→LiDAR 标定必须与 deployment identity 一致"
             )
+    resolved_seed = validate_inference_seed(
+        int(getattr(args, "seed", -1)),
+        require_formal=bool(args.require_real_ir),
+    )
+    runtime_device = torch.device(getattr(generator, "device", "cpu"))
+    threshold_artifact = getattr(
+        generator,
+        "occupancy_threshold_artifact",
+        None,
+    )
+    threshold_artifact_sha256 = getattr(
+        generator,
+        "occupancy_threshold_artifact_sha256",
+        None,
+    )
+    formal_threshold_required = (
+        getattr(generator, "checkpoint_protocol", None)
+        == FORMAL_CHECKPOINT_PROTOCOL
+    )
+    if formal_threshold_required and (
+        not isinstance(threshold_artifact, dict)
+        or not threshold_artifact_sha256
+    ):
+        raise ValueError("正式 deployment inference 缺少 validation threshold artifact")
     return {
         "stage": "deployment_generation",
         "target_size": [int(value) for value in args.target_size],
@@ -326,9 +314,32 @@ def build_inference_run_metadata(
             args.target_size,
         ),
         "occ_threshold": float(args.occ_threshold),
+        "occ_threshold_source": (
+            "validation_artifact"
+            if threshold_artifact is not None
+            else "legacy_cli_or_default"
+        ),
+        "occupancy_threshold_artifact": threshold_artifact,
+        "occupancy_threshold_artifact_sha256": threshold_artifact_sha256,
         "model_type": str(args.model_type),
+        "deployment_weight_source": getattr(
+            generator,
+            "deployment_weight_source",
+            "model_state_dict",
+        ),
         "steps": int(args.steps),
         "sampler": str(args.sampler),
+        "seed": resolved_seed,
+        "sampling_seed_protocol": (
+            "fixed_global_seed_v1"
+            if resolved_seed >= 0
+            else "legacy_unfixed_seed_v0"
+        ),
+        "timing_protocol": (
+            "cuda_synchronized_perf_counter_v1"
+            if runtime_device.type == "cuda"
+            else "cpu_perf_counter_v1"
+        ),
         "model_is_multimodal": bool(
             getattr(generator.model, "is_multimodal", False)
         ),
@@ -560,10 +571,100 @@ def _compatible_state_dict(model, state_dict):
     }
 
 
-def resolve_generation_model_config(checkpoint, fallback_latent_dim=None):
+def resolve_inference_state_dict(checkpoint, *, model_type):
+    """解析实际部署权重；正式 CD 必须使用验证阶段写入的显式选择。"""
+    checkpoint_dict = checkpoint if isinstance(checkpoint, dict) else {}
+    if str(model_type) != "cd":
+        if "model_state_dict" in checkpoint_dict:
+            return checkpoint_dict["model_state_dict"], "model_state_dict"
+        return checkpoint, "raw_state_dict"
+
+    is_formal_cd = bool(
+        checkpoint_dict.get("stage") == "cd"
+        and checkpoint_dict.get("checkpoint_protocol")
+        in {FORMAL_CHECKPOINT_PROTOCOL, FORMAL_MINI_CHECKPOINT_PROTOCOL}
+    )
+    source = checkpoint_dict.get("deployment_weight_source")
+    if source is None:
+        if is_formal_cd:
+            raise ValueError(
+                "formal CD checkpoint 缺少 deployment_weight_source，"
+                "无法确认 online/EMA 部署权重"
+            )
+        source = "model_state_dict"
+    if is_formal_cd:
+        validation = checkpoint_dict.get("cd_validation")
+        if (
+            not isinstance(validation, dict)
+            or validation.get("protocol") != CD_VALIDATION_PROTOCOL
+            or validation.get("selected_source") != source
+        ):
+            raise ValueError(
+                "formal CD checkpoint 的 cd_validation 与 "
+                "deployment_weight_source 不一致"
+            )
+    if source not in {"model_state_dict", "ema_model_state_dict"}:
+        raise ValueError(f"不支持的 deployment_weight_source: {source!r}")
+    state_dict = checkpoint_dict.get(source)
+    if not isinstance(state_dict, dict) or not state_dict:
+        raise ValueError(f"checkpoint 缺少有效的 {source}")
+    return state_dict, source
+
+
+def resolve_inference_occupancy_threshold(args, generator) -> float:
+    """正式模式只接受绑定当前生成 checkpoint 的 validation artifact。"""
+    artifact_path = str(getattr(args, "threshold_artifact", "") or "").strip()
+    cli_threshold = getattr(args, "occ_threshold", None)
+    require_formal = bool(
+        getattr(args, "require_real_ir", False)
+        and not getattr(args, "allow_formal_mini_checkpoint", False)
+    )
+    if artifact_path and cli_threshold is not None:
+        raise ValueError("--threshold_artifact 与 --occ_threshold 不能同时使用")
+    if require_formal and cli_threshold is not None:
+        raise ValueError("正式 inference 禁止自由 --occ_threshold")
+    if require_formal and not artifact_path:
+        raise ValueError("正式 inference 必须提供 --threshold_artifact")
+
+    if artifact_path:
+        artifact, artifact_sha256 = load_threshold_artifact(
+            artifact_path,
+            checkpoint_path=args.model_ckpt,
+            expected_stage=args.model_type,
+            expected_weight_source=getattr(
+                generator,
+                "deployment_weight_source",
+                "model_state_dict",
+            ),
+        )
+        if artifact.get("checkpoint_protocol") != getattr(
+            generator,
+            "checkpoint_protocol",
+            None,
+        ):
+            raise ValueError("threshold artifact checkpoint protocol 不匹配")
+        generator.occupancy_threshold_artifact = artifact
+        generator.occupancy_threshold_artifact_sha256 = artifact_sha256
+        return float(artifact["selected_threshold"])
+
+    resolved = 0.1 if cli_threshold is None else float(cli_threshold)
+    if not np.isfinite(resolved) or not 0.0 < resolved < 1.0:
+        raise ValueError("occ_threshold 必须是 (0,1) 内有限数")
+    generator.occupancy_threshold_artifact = None
+    generator.occupancy_threshold_artifact_sha256 = None
+    return resolved
+
+
+def resolve_generation_model_config(
+    checkpoint,
+    fallback_latent_dim=None,
+    *,
+    state_dict=None,
+):
     """优先读取生成模型元数据，旧 checkpoint 从首尾卷积 shape 推导。"""
     checkpoint_dict = checkpoint if isinstance(checkpoint, dict) else {}
-    state_dict = checkpoint_dict.get("model_state_dict", checkpoint)
+    if state_dict is None:
+        state_dict = checkpoint_dict.get("model_state_dict", checkpoint)
     metadata_config = checkpoint_dict.get("model_config") or {}
     latent_dim = checkpoint_dict.get("latent_dim", metadata_config.get("latent_dim"))
     in_channels = metadata_config.get("in_channels")
@@ -929,17 +1030,36 @@ class RadarGenerator:
         self.model = self._load_model(model_path)
         self.model.eval()
         self.last_uncertainty = None
-        
-        # NOTE: 复用训练时一致的噪声调度参数。
+
+        # NOTE: CD 必须消费 checkpoint 中与训练一致的噪声调度；legacy LDM 保持旧默认。
+        consistency_config = self._resolve_sampling_consistency_config()
         self.denoiser = KarrasDenoiser(
             sigma_data=0.5,
-            sigma_max=80.0,
-            sigma_min=0.002,
+            sigma_max=consistency_config["sigma_max"],
+            sigma_min=consistency_config["sigma_min"],
             loss_norm='l2',
             device=self.device,
         )
+        self.denoiser.rho = consistency_config["rho"]
         
         print("Models loaded successfully!")
+
+    def _resolve_sampling_consistency_config(self):
+        """解析部署采样配置；正式 CD 缺收据时 fail-closed。"""
+        checkpoint = self.model_checkpoint_metadata or {}
+        receipt = checkpoint.get("consistency_training_config")
+        if self.model_type != "cd":
+            return resolve_cd_consistency_config({})
+        if receipt is not None:
+            return validate_cd_consistency_receipt(receipt)
+        if self.checkpoint_protocol in {
+            FORMAL_CHECKPOINT_PROTOCOL,
+            FORMAL_MINI_CHECKPOINT_PROTOCOL,
+        }:
+            raise CheckpointChainError(
+                ["正式 CD checkpoint 缺少 consistency_training_config"]
+            )
+        return resolve_cd_consistency_config({})
 
     def _load_vae(self, ckpt_path):
         """加载 VAE 模型"""
@@ -989,10 +1109,14 @@ class RadarGenerator:
             model_pc_range=self.pc_range,
             allow_legacy_radar_units=self.allow_legacy_radar_units,
         )
-        state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+        state_dict, self.deployment_weight_source = resolve_inference_state_dict(
+            ckpt,
+            model_type=getattr(self, "model_type", "ldm"),
+        )
         model_config = resolve_generation_model_config(
             ckpt,
             fallback_latent_dim=self.vae.latent_dim,
+            state_dict=state_dict,
         )
         return build_inference_model(
             state_dict,
@@ -1068,7 +1192,7 @@ class RadarGenerator:
         # NOTE: 按 sigma_max 初始化起始噪声，匹配 Karras 采样假设。
         z_T = torch.randn(z_shape, device=self.device) * self.denoiser.sigma_max
         
-        # NOTE: 一致性蒸馏（CD）模式支持一步采样，潜扩散模型（LDM）走多步求解器。
+        # NOTE: EMA consistency（历史名 CD）支持一步采样，LDM 走多步求解器。
         if self.model_type == 'cd' and steps == 1:
             z_0 = self._cd_sample(z_T, z_cond, condition_voxel, meta_dict)
         else:
@@ -1095,33 +1219,56 @@ class RadarGenerator:
         return z_0
 
     def _call_multimodal_model(self, condition_voxel, meta, sigma_batch, noised_latent):
-        kwargs = {
+        signature_cache = getattr(
+            self,
+            "_multimodal_forward_signature_cache",
+            None,
+        )
+        if signature_cache is None or signature_cache[0] is not self.model:
+            try:
+                signature = inspect.signature(self.model.forward)
+            except (TypeError, ValueError) as exc:
+                raise TypeError("无法检查多模态模型 forward 接口") from exc
+            parameters = signature.parameters
+            accepts_var_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            supported_keywords = frozenset(parameters)
+            signature_cache = (
+                self.model,
+                accepts_var_kwargs,
+                supported_keywords,
+            )
+            self._multimodal_forward_signature_cache = signature_cache
+        _, accepts_var_kwargs, supported_keywords = signature_cache
+        if not accepts_var_kwargs and "noised_latent" not in supported_keywords:
+            raise TypeError(
+                "多模态模型 forward 必须显式支持 noised_latent；"
+                "禁止运行时捕获 TypeError 猜测接口"
+            )
+
+        candidate_kwargs = {
             "noised_latent": noised_latent,
             "odom_cov_trace": meta.get("odom_cov_trace"),
             "is_mock_ir": meta.get("is_mock_ir"),
             "is_mock_calib": meta.get("is_mock_calib"),
             "return_uncertainty": True,
         }
-        try:
-            out = self.model(
-                condition_voxel,
-                meta["ir_img"],
-                meta["r_mat"],
-                meta["t_vec"],
-                meta["k_mat"],
-                sigma_batch,
-                **kwargs,
-            )
-        except TypeError:
-            out = self.model(
-                condition_voxel,
-                meta["ir_img"],
-                meta["r_mat"],
-                meta["t_vec"],
-                meta["k_mat"],
-                sigma_batch,
-                noised_latent=noised_latent,
-            )
+        kwargs = {
+            name: value
+            for name, value in candidate_kwargs.items()
+            if accepts_var_kwargs or name in supported_keywords
+        }
+        out = self.model(
+            condition_voxel,
+            meta["ir_img"],
+            meta["r_mat"],
+            meta["t_vec"],
+            meta["k_mat"],
+            sigma_batch,
+            **kwargs,
+        )
         if isinstance(out, tuple):
             denoised, uncertainty = out
             self.last_uncertainty = uncertainty
@@ -1178,7 +1325,7 @@ class RadarGenerator:
     
     def _get_sigmas(self, steps):
         """生成噪声水平调度"""
-        rho = 7.0
+        rho = self.denoiser.rho
         sigma_min = self.denoiser.sigma_min
         sigma_max = self.denoiser.sigma_max
         
@@ -1196,6 +1343,22 @@ def set_random_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def validate_inference_seed(seed: int, *, require_formal: bool) -> int:
+    """验证推理随机种子；正式运行禁止关闭固定随机性。"""
+    if type(seed) is not int or seed < -1 or seed > 2**32 - 1:
+        raise ValueError(f"seed 必须是 -1 或 [0, 2^32-1] 整数，实际为 {seed!r}")
+    if require_formal and seed < 0:
+        raise ValueError("formal inference 必须使用非负固定 seed")
+    return seed
+
+
+def synchronize_inference_device(device) -> None:
+    """CUDA wall-clock 计时边界显式等待异步 kernel 完成。"""
+    resolved = torch.device(device)
+    if resolved.type == "cuda":
+        torch.cuda.synchronize(resolved)
 
 
 def load_sparse_voxel(filename):
@@ -1566,7 +1729,10 @@ def main():
     parser.add_argument("--compare_with_lidar", action="store_true", help="Compare with raw livox point clouds")
     parser.add_argument("--compare_with_target", action="store_true",
                         help="Compare prediction and radar baseline with processed target_voxel")
-    parser.add_argument("--occ_threshold", type=float, default=0.1, help="Occupancy threshold for point cloud")
+    parser.add_argument("--occ_threshold", type=float, default=None,
+                        help="仅供 legacy 诊断的 occupancy threshold；正式模式禁止")
+    parser.add_argument("--threshold_artifact", type=str, default="",
+                        help="绑定生成 checkpoint SHA-256 的 validation threshold artifact")
     parser.add_argument("--empty_fallback_topk", type=int, default=0,
                         help="If threshold yields empty point cloud, fallback to top-k occupancy voxels (0 disables)")
     parser.add_argument("--voxel_size", type=float, nargs=3, default=None,
@@ -1579,8 +1745,8 @@ def main():
                         help="Model tensor size as [Z, X, Y] after loading/cropping")
     parser.add_argument("--train_duration_seconds", type=float, default=-1.0,
                         help="Optional training duration in seconds for experiment tracking (negative means unknown)")
-    parser.add_argument("--seed", type=int, default=-1,
-                        help="Random seed for reproducible inference (negative disables fixed seed)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducible inference (-1 only for legacy diagnostics)")
     parser.add_argument("--target_voxel_dir", type=str, default="",
                         help="Directory containing target_voxel files for offline comparison")
     parser.add_argument("--use_multimodal_meta", action="store_true",
@@ -1629,6 +1795,10 @@ def main():
         parser.error(
             "--allow_formal_mini_checkpoint requires --require_real_ir strict inputs"
         )
+    try:
+        validate_inference_seed(args.seed, require_formal=args.require_real_ir)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.seed >= 0:
         set_random_seed(args.seed)
     
@@ -1649,6 +1819,13 @@ def main():
     args.target_size = generator.target_size
     args.source_pc_range = generator.source_pc_range
     args.pc_range = generator.pc_range
+    try:
+        args.occ_threshold = resolve_inference_occupancy_threshold(
+            args,
+            generator,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     
     if args.radar_voxel_dir:
         # NOTE: 逐文件推理模式：每个 radar_voxel 输入生成一个对应输出。
@@ -1857,6 +2034,7 @@ def main():
                 else None
             )
 
+            synchronize_inference_device(generator.device)
             file_start = time.perf_counter()
 
             generated = generator.generate(
@@ -1868,6 +2046,7 @@ def main():
                 meta_dict=meta_dict,
             )
 
+            synchronize_inference_device(generator.device)
             file_infer_sec = time.perf_counter() - file_start
             total_infer_sec += file_infer_sec
             log_file.write(f"file[{i + 1}/{len(radar_files)}] {fname} infer_sec={file_infer_sec:.6f}\n")

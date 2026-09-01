@@ -12,11 +12,13 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from diffusion_consistency_radar.scripts.cd_train_optimized import (
+    ConsistencyDistillationTrainer,
     build_cd_vae_from_checkpoint,
     call_cd_denoiser,
     encode_cd_training_latents,
     has_multimodal_state_dict,
     create_cd_model,
+    resolve_cd_validation_config,
 )
 from diffusion_consistency_radar.cm.vae_3d import (
     VAE3D,
@@ -188,6 +190,71 @@ def test_multimodal_cd_encodes_only_target_but_legacy_encodes_condition():
     assert vae.inputs == [target, condition]
 
 
+class _ValidationVAE(nn.Module):
+    occupancy_activation = "raw"
+
+    def get_latent(self, value):
+        return value[:, 0:1]
+
+    def decode(self, latent):
+        return torch.cat([latent, torch.zeros_like(latent).repeat(1, 3, 1, 1, 1)], dim=1)
+
+
+class _ConstantLegacyDenoiser(nn.Module):
+    def __init__(self, value):
+        super().__init__()
+        self.value = float(value)
+
+    def forward(self, model_input, _sigma):
+        return torch.full_like(model_input[:, 0:1], self.value)
+
+
+def _validation_trainer(require_mask=True):
+    trainer = ConsistencyDistillationTrainer.__new__(
+        ConsistencyDistillationTrainer
+    )
+    trainer.device = torch.device("cpu")
+    trainer.vae = _ValidationVAE()
+    trainer.cd_model = _ConstantLegacyDenoiser(0.0)
+    trainer.cd_model_ema = _ConstantLegacyDenoiser(1.0)
+    trainer.require_persisted_observed_mask = require_mask
+    trainer.validation_config = resolve_cd_validation_config({})
+    trainer.last_validation_metrics = None
+    trainer.deployment_weight_source = None
+    return trainer
+
+
+def test_cd_validation_uses_same_fixed_noise_and_selects_ema():
+    trainer = _validation_trainer()
+    target = torch.ones(1, 4, 2, 2, 2)
+    radar = torch.zeros_like(target)
+    meta = {
+        "occupancy_observed_mask": torch.ones(1, 1, 2, 2, 2),
+        "sample_id": ["garden/000123"],
+    }
+    val_loader = [(target, radar, meta)]
+
+    first = trainer.validate(val_loader)
+    second = trainer.validate(val_loader)
+
+    assert first == second
+    assert first["model_state_dict"]["denoising_occupancy_iou"] == 0.0
+    assert first["ema_model_state_dict"]["denoising_occupancy_iou"] == 1.0
+    assert trainer.deployment_weight_source == "ema_model_state_dict"
+
+
+def test_formal_cd_validation_rejects_missing_observed_mask():
+    trainer = _validation_trainer(require_mask=True)
+    target = torch.ones(1, 4, 2, 2, 2)
+    radar = torch.zeros_like(target)
+    try:
+        trainer.validate([(target, radar, {"sample_id": ["garden/0"]})])
+    except RuntimeError as exc:
+        assert "occupancy_observed_mask" in str(exc)
+    else:
+        raise AssertionError("formal CD validation missing mask must fail")
+
+
 if __name__ == "__main__":
     test_cd_vae_checkpoint_metadata_precedes_fallback_config()
     test_cd_legacy_vae_requires_explicit_fallback()
@@ -196,4 +263,6 @@ if __name__ == "__main__":
     test_legacy_cd_denoiser_keeps_eight_channel_path()
     test_multimodal_cd_denoiser_passes_radar_ir_and_noised_latent()
     test_multimodal_cd_encodes_only_target_but_legacy_encodes_condition()
+    test_cd_validation_uses_same_fixed_noise_and_selects_ema()
+    test_formal_cd_validation_rejects_missing_observed_mask()
     print("test_multimodal_cd_training_interface passed")

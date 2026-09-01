@@ -5,7 +5,7 @@
 优化点：
 1. 统一配置系统 - 使用 YAML 配置，避免代码中硬编码参数
 2. 显存优化 - 梯度累积、检查点、稀疏处理
-3. 蒸馏流程优化 - 清晰的 LDM -> CD 蒸馏步骤
+3. CD 语义固定 - LDM 只初始化，训练目标来自持续更新的 CD EMA
 4. 模块化架构 - 易于维护和扩展
 """
 
@@ -103,7 +103,18 @@ from diffusion_consistency_radar.formal_data_protocol import (
     load_formal_data_protocol_artifact,
 )
 from diffusion_consistency_radar.observed_mask import OBSERVED_MASK_PROTOCOL
-from diffusion_consistency_radar.radar_statistics import RADAR_STATISTICS_PROTOCOL
+from diffusion_consistency_radar.radar_statistics import (
+    RADAR_STATISTICS_PROTOCOL,
+    SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
+)
+from diffusion_consistency_radar.occupancy_threshold_artifact import (
+    DEFAULT_THRESHOLD_CANDIDATES,
+    THRESHOLD_SWEEP_PROTOCOL,
+    threshold_sweep_batch_counts,
+    threshold_sweep_metrics,
+    validate_checkpoint_threshold_sweep,
+    validate_threshold_candidates,
+)
 from diffusion_consistency_radar.distributed_training import (
     DistributedContext,
     DistributedEvalSampler,
@@ -241,9 +252,21 @@ def encode_ldm_training_latents(vae, target, condition, meta_dict):
     return z_target, z_cond
 
 
+def resolve_cd_initialization_checkpoint(
+    args_ldm_ckpt: str,
+    config: "ConfigManager",
+) -> str:
+    """解析 CD 的 LDM 初始化 checkpoint；禁止把它误称为持续教师。"""
+    new_path = config.get('cd.initialization_model_path', '')
+    legacy_path = config.get('cd.teacher_model_path', '')
+    if new_path and legacy_path and new_path != legacy_path:
+        raise ValueError("CD initialization_model_path 与 legacy teacher_model_path 冲突")
+    return args_ldm_ckpt or new_path or legacy_path
+
+
 def resolve_cd_teacher_checkpoint(args_ldm_ckpt: str, config: "ConfigManager") -> str:
-    """Resolve the CD teacher checkpoint from CLI first, then YAML config."""
-    return args_ldm_ckpt or config.get('cd.teacher_model_path', '')
+    """历史 API 别名；返回值仅作为一次性 LDM 初始化 checkpoint。"""
+    return resolve_cd_initialization_checkpoint(args_ldm_ckpt, config)
 
 
 def safe_torch_load(path, map_location, *, allow_legacy_pickle=False):
@@ -394,12 +417,17 @@ def assert_formal_dataset_preflight(
     if data_protocol.get("observed_mask_protocol") != OBSERVED_MASK_PROTOCOL:
         raise RuntimeError("formal data protocol 的 observed mask protocol 不匹配")
     radar_statistics = metadata.get("radar_statistics")
+    expected_radar_statistics_protocols = (
+        {RADAR_STATISTICS_PROTOCOL}
+        if data_protocol.get("protocol") == "formal_data_v3"
+        else SUPPORTED_RADAR_STATISTICS_PROTOCOLS
+    )
     if (
         not isinstance(radar_statistics, list)
         or not radar_statistics
         or any(
             not isinstance(summary, dict)
-            or summary.get("protocol") != RADAR_STATISTICS_PROTOCOL
+            or summary.get("protocol") not in expected_radar_statistics_protocols
             for summary in radar_statistics
         )
     ):
@@ -463,14 +491,95 @@ def seed_training_run(training_seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
 
+LDM_OBSERVATION_SUPERVISION_PROTOCOL = (
+    "persisted_voxel_and_adaptive_latent_any_v1"
+)
+
+
+def resolve_ldm_observed_mask(
+    observed_mask: Optional[torch.Tensor],
+    target: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """解析 LDM 体素可观测域；legacy 无 mask 时返回 ``None``。"""
+    if observed_mask is None:
+        return None
+    if target.ndim != 5 or target.shape[1] < 1:
+        raise ValueError(
+            "target 必须是至少 1 通道的 [B,C,Z,X,Y] 张量，"
+            f"实际为 {tuple(target.shape)}"
+        )
+    mask = torch.as_tensor(observed_mask, device=target.device)
+    if mask.ndim == 4:
+        mask = mask.unsqueeze(1)
+    if mask.ndim != 5 or mask.shape[1] != 1:
+        raise ValueError(
+            "observed_mask 必须是 [B,1,Z,X,Y] 或 [B,Z,X,Y]，"
+            f"实际为 {tuple(mask.shape)}"
+        )
+    if mask.shape[0] != target.shape[0] or tuple(mask.shape[-3:]) != tuple(
+        target.shape[-3:]
+    ):
+        raise ValueError(
+            "observed_mask 的 B/Z/X/Y 必须与 target 一致，"
+            f"实际分别为 {tuple(mask.shape)} 和 {tuple(target.shape)}"
+        )
+    if not torch.isfinite(mask).all():
+        raise ValueError("observed_mask 必须全部为有限数")
+    if not torch.logical_or(mask == 0, mask == 1).all():
+        raise ValueError("observed_mask 必须是严格 0/1")
+    # LiDAR 命中体素按协议应已位于 observed mask；合并 target positive 可在
+    # 单帧持久化 mask 漏标时保护正监督，但绝不把任意正概率预测变成 observed。
+    return mask.bool() | (target[:, 0:1] > 0.5)
+
+
+def build_ldm_latent_observed_mask(
+    voxel_observed_mask: Optional[torch.Tensor],
+    latent: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """将体素 observed mask 规约为 latent 块可观测域。"""
+    if voxel_observed_mask is None:
+        return None
+    if latent.ndim != 5:
+        raise ValueError(f"latent 必须是 [B,C,D,H,W]，实际为 {tuple(latent.shape)}")
+    latent_mask = torch.nn.functional.adaptive_max_pool3d(
+        voxel_observed_mask.float(),
+        output_size=latent.shape[-3:],
+    ).bool()
+    if latent_mask.shape[0] != latent.shape[0]:
+        raise ValueError("latent observed mask 的 batch 与 latent 不一致")
+    if not latent_mask.any():
+        raise ValueError("observed domain 为空，拒绝计算 LDM 损失")
+    return latent_mask
+
+
+def _masked_tensor_mean(
+    values: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """对 bool mask 内元素求均值；``None`` 保留 legacy 全域均值。"""
+    if mask is None:
+        return values.mean()
+    expanded = mask.to(device=values.device, dtype=torch.bool)
+    if expanded.shape != values.shape:
+        expanded = expanded.expand_as(values)
+    if not expanded.any():
+        return values.sum() * 0.0
+    return values[expanded].mean()
+
+
 def micro_occupancy_metrics(
     probability: torch.Tensor,
     target: torch.Tensor,
     threshold: float = 0.5,
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, int]:
     """返回可跨 batch 累加的 occupancy 微平均计数。"""
     prediction = probability >= threshold
     truth = target >= 0.5
+    observed = resolve_ldm_observed_mask(observed_mask, target)
+    if observed is not None:
+        prediction = prediction & observed
+        truth = truth & observed
     return {
         "intersection": int(torch.logical_and(prediction, truth).sum().item()),
         "union": int(torch.logical_or(prediction, truth).sum().item()),
@@ -486,6 +595,7 @@ def decoded_occupancy_auxiliary_loss(
     reconstruction_weight: float = 1.0,
     false_positive_weight: float = 0.0,
     mass_weight: float = 0.0,
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """按 VAE occupancy 语义计算 LDM 解码辅助损失。"""
     if occupancy_activation not in {"raw", "sigmoid"}:
@@ -495,19 +605,25 @@ def decoded_occupancy_auxiliary_loss(
         decoded_occ = torch.sigmoid(decoded_occ)
     target_occ = target[:, 0:1]
     occ_mask = (target_occ > 0).float()
-    reconstruction_loss = (
-        (decoded_occ - target_occ) ** 2 * (1.0 + 7.0 * occ_mask)
-    ).mean()
+    observed = resolve_ldm_observed_mask(observed_mask, target)
+    reconstruction_loss = _masked_tensor_mean(
+        (decoded_occ - target_occ) ** 2 * (1.0 + 7.0 * occ_mask),
+        observed,
+    )
     loss = reconstruction_weight * reconstruction_loss
     if false_positive_weight > 0.0:
-        empty_mask = 1.0 - occ_mask
-        false_positive_loss = (
-            torch.relu(decoded_occ - target_occ) ** 2 * empty_mask
-        ).mean()
+        empty_mask = (target_occ <= 0.0)
+        if observed is not None:
+            empty_mask = empty_mask & observed
+        false_positive_loss = _masked_tensor_mean(
+            torch.relu(decoded_occ - target_occ) ** 2,
+            empty_mask,
+        )
         loss = loss + false_positive_weight * false_positive_loss
     if mass_weight > 0.0:
         mass_loss = torch.abs(
-            torch.relu(decoded_occ).mean() - torch.relu(target_occ).mean()
+            _masked_tensor_mean(torch.relu(decoded_occ), observed)
+            - _masked_tensor_mean(torch.relu(target_occ), observed)
         )
         loss = loss + mass_weight * mass_loss
     return loss
@@ -519,6 +635,7 @@ def decoded_vertical_structure_losses(
     occupancy_activation: str,
     column_mask: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """计算仅由目标非空 Z 列监督的可微垂直结构损失。"""
     if not math.isfinite(eps) or eps <= 0.0:
@@ -547,7 +664,15 @@ def decoded_vertical_structure_losses(
         # 兼容历史 raw occupancy/probability 语义，区间外梯度按 clamp 处理。
         decoded_occ = decoded_occ_raw.clamp(0.0, 1.0)
     target_occ = target[:, 0].clamp(0.0, 1.0).float()
-    valid_columns = target_occ.sum(dim=1) > 0
+    observed = resolve_ldm_observed_mask(observed_mask, target)
+    if observed is None:
+        observed_zxy = torch.ones_like(target_occ, dtype=torch.bool)
+    else:
+        observed_zxy = observed[:, 0]
+    decoded_occ = decoded_occ * observed_zxy.to(decoded_occ.dtype)
+    target_occ = target_occ * observed_zxy.to(target_occ.dtype)
+    observed_columns = observed_zxy.any(dim=1)
+    valid_columns = (target_occ.sum(dim=1) > 0) & observed_columns
     if column_mask is not None:
         if column_mask.ndim == 5:
             column_mask = column_mask[:, 0].bool().any(dim=1)
@@ -606,7 +731,9 @@ def decoded_vertical_structure_losses(
     top_height_loss = top_height_grid[valid_columns].mean()
 
     above_target_mask = (
-        (z_indices > target_top_indices) & valid_columns.unsqueeze(1)
+        (z_indices > target_top_indices)
+        & valid_columns.unsqueeze(1)
+        & observed_zxy
     )
     if not above_target_mask.any():
         top_overshoot_loss = graph_zero
@@ -627,9 +754,19 @@ def decoded_vertical_structure_losses(
             target_occ[:, 1:] - target_occ[:, :-1]
         )
         continuity_difference = torch.abs(pred_transitions - target_transitions)
-        vertical_continuity_loss = continuity_difference.mean(dim=1)[
-            valid_columns
-        ].mean()
+        observed_transitions = observed_zxy[:, 1:] & observed_zxy[:, :-1]
+        transition_count = observed_transitions.sum(dim=1)
+        transition_columns = valid_columns & (transition_count > 0)
+        if transition_columns.any():
+            continuity_grid = (
+                continuity_difference
+                * observed_transitions.to(continuity_difference.dtype)
+            ).sum(dim=1) / transition_count.clamp_min(1).to(
+                continuity_difference.dtype
+            )
+            vertical_continuity_loss = continuity_grid[transition_columns].mean()
+        else:
+            vertical_continuity_loss = graph_zero
 
     return {
         "height_distribution_loss": height_distribution_loss,
@@ -643,6 +780,7 @@ def decoded_density_precision_loss(
     decoded: torch.Tensor,
     target: torch.Tensor,
     occupancy_activation: str,
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """惩罚背景竖列假阳性，同时尽量保留树干/树冠所在竖列。"""
     if decoded.ndim != 5 or target.ndim != 5:
@@ -669,22 +807,20 @@ def decoded_density_precision_loss(
         # raw 兼容历史 VAE 概率输出；区间外预测按概率边界裁剪。
         decoded_occ = decoded_occ_raw.clamp(0.0, 1.0)
     target_occ = target[:, 0:1].float().clamp(0.0, 1.0)
-    target_column_has_occ = (target_occ.sum(dim=2, keepdim=True) > 0.0).float()
-    empty_column_mask = 1.0 - target_column_has_occ
+    observed = resolve_ldm_observed_mask(observed_mask, target)
+    if observed is None:
+        observed = torch.ones_like(target_occ, dtype=torch.bool)
+    target_column_has_occ = target_occ.sum(dim=2, keepdim=True) > 0.0
+    empty_observed_mask = observed & (~target_column_has_occ)
 
     # 只对 target 完全空的 (X,Y) 竖列施加强假阳性惩罚；已有障碍物的竖列
     # 交给高度分布/连续性损失塑形，避免过早压掉树干的 Z 向补全。
-    expanded_empty_column_mask = empty_column_mask.expand_as(decoded_occ)
-    empty_column_denominator = expanded_empty_column_mask.sum().clamp_min(1.0)
     if occupancy_activation == "sigmoid":
         # 对 logit 使用空类 BCE，避免高置信背景柱在 sigmoid 饱和区梯度过弱。
         false_positive_values = torch.nn.functional.softplus(decoded_occ_raw)
     else:
         false_positive_values = decoded_occ.square()
-    false_positive_loss = (
-        false_positive_values * expanded_empty_column_mask
-    ).sum() / empty_column_denominator
-    return false_positive_loss
+    return _masked_tensor_mean(false_positive_values, empty_observed_mask)
 
 
 def _validate_decoded_occupancy_inputs(
@@ -717,6 +853,7 @@ def decoded_column_balanced_losses(
     occupancy_activation: str,
     temperature: float = 1.0,
     target_threshold: float = 0.5,
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """按正负竖列分别平均 column-existence 二分类损失。"""
     _validate_decoded_occupancy_inputs(decoded, target, occupancy_activation)
@@ -745,13 +882,25 @@ def decoded_column_balanced_losses(
     else:
         voxel_logits = torch.logit(decoded_occ.clamp(1e-6, 1.0 - 1e-6))
 
-    z_size = voxel_logits.shape[2]
+    observed = resolve_ldm_observed_mask(observed_mask, target)
+    if observed is None:
+        observed = torch.ones_like(target[:, 0:1], dtype=torch.bool)
+    observed_count = observed.sum(dim=2)
+    observed_columns = observed_count > 0
+    masked_logits = voxel_logits.masked_fill(~observed, float("-inf"))
     column_logits = temperature * (
-        torch.logsumexp(voxel_logits / temperature, dim=2)
-        - math.log(z_size)
+        torch.logsumexp(masked_logits / temperature, dim=2)
+        - torch.log(observed_count.clamp_min(1).to(voxel_logits.dtype))
     )
-    positive_columns = (target[:, 0:1] >= target_threshold).any(dim=2)
-    negative_columns = ~positive_columns
+    column_logits = torch.where(
+        observed_columns,
+        column_logits,
+        torch.zeros_like(column_logits),
+    )
+    positive_columns = (
+        (target[:, 0:1] >= target_threshold).any(dim=2) & observed_columns
+    )
+    negative_columns = (~positive_columns) & observed_columns
     graph_zero = column_logits.sum() * 0.0
 
     positive_loss = (
@@ -775,6 +924,7 @@ def decoded_ir_frustum_occupancy_loss(
     target: torch.Tensor,
     occupancy_activation: str,
     frustum_mask: Optional[torch.Tensor],
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """只在 IR 视锥内的 target 正样本上强化 occupancy 召回。"""
     _validate_decoded_occupancy_inputs(decoded, target, occupancy_activation)
@@ -801,7 +951,10 @@ def decoded_ir_frustum_occupancy_loss(
             size=target_occ.shape[-3:],
             mode="nearest",
         ).bool()
+    observed = resolve_ldm_observed_mask(observed_mask, target)
     positive_mask = (target_occ > 0.0) & frustum_mask.to(target_occ.device).bool()
+    if observed is not None:
+        positive_mask = positive_mask & observed
     if not positive_mask.any():
         return graph_zero
     if occupancy_activation == "sigmoid":
@@ -819,6 +972,7 @@ def decoded_ir_frustum_negative_occupancy_loss(
     target: torch.Tensor,
     occupancy_activation: str,
     frustum_mask: Optional[torch.Tensor],
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """只在 IR 视锥内的 target 负样本上抑制 occupancy 假阳性。"""
     _validate_decoded_occupancy_inputs(decoded, target, occupancy_activation)
@@ -845,7 +999,10 @@ def decoded_ir_frustum_negative_occupancy_loss(
             size=target_occ.shape[-3:],
             mode="nearest",
         ).bool()
+    observed = resolve_ldm_observed_mask(observed_mask, target)
     negative_mask = (target_occ == 0.0) & frustum_mask.to(target_occ.device).bool()
+    if observed is not None:
+        negative_mask = negative_mask & observed
     if not negative_mask.any():
         return graph_zero
     if occupancy_activation == "sigmoid":
@@ -981,6 +1138,14 @@ def resolve_ldm_validation_config(ldm_config: Dict[str, Any]) -> Dict[str, Any]:
         "split": LDM_VALIDATION_SPLIT,
         "noise_identity": "scene_frame_sha256_v1",
         "seed": seed,
+        "threshold_candidates": list(
+            validate_threshold_candidates(
+                ldm_config.get(
+                    "validation_threshold_candidates",
+                    DEFAULT_THRESHOLD_CANDIDATES,
+                )
+            )
+        ),
         **resolved,
     }
 
@@ -1098,9 +1263,15 @@ def compute_ldm_loss_components(
     decoded_column_positive_weight: float = 0.0,
     decoded_column_negative_weight: float = 0.0,
     decoded_column_temperature: float = 1.0,
+    observed_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """汇总 LDM 主损失和解码辅助监督组件，必要时只解码一次。"""
-    latent_loss = torch.nn.functional.mse_loss(denoised, z_target)
+    voxel_observed = resolve_ldm_observed_mask(observed_mask, target)
+    latent_observed = build_ldm_latent_observed_mask(voxel_observed, z_target)
+    latent_loss = _masked_tensor_mean(
+        torch.square(denoised - z_target),
+        latent_observed,
+    )
     graph_zero = denoised.sum() * 0.0
     components = {
         "latent_loss": latent_loss,
@@ -1127,6 +1298,7 @@ def compute_ldm_loss_components(
             z_target,
             uncertainty["variance"],
             detach_residual=True,
+            spatial_mask=latent_observed,
         )
         components["uncertainty_loss"] = uncertainty_loss
         loss = loss + uncertainty_loss_weight * uncertainty_loss
@@ -1163,6 +1335,7 @@ def compute_ldm_loss_components(
                 reconstruction_weight=decoded_loss_weight,
                 false_positive_weight=decoded_false_positive_weight,
                 mass_weight=decoded_mass_weight,
+                observed_mask=voxel_observed,
             )
             components["decoded_occupancy_loss"] = decoded_occ_loss
             loss = loss + decoded_occ_loss
@@ -1176,6 +1349,7 @@ def compute_ldm_loss_components(
                 decoded,
                 target,
                 occupancy_activation=occupancy_activation,
+                observed_mask=voxel_observed,
             )
             height_loss = structure_losses["height_distribution_loss"]
             top_loss = structure_losses["top_height_loss"]
@@ -1194,6 +1368,7 @@ def compute_ldm_loss_components(
                 decoded,
                 target,
                 occupancy_activation=occupancy_activation,
+                observed_mask=voxel_observed,
             )
             components["decoded_density_loss"] = density_loss
             loss = loss + decoded_density_weight * density_loss
@@ -1203,6 +1378,7 @@ def compute_ldm_loss_components(
                 target,
                 occupancy_activation=occupancy_activation,
                 frustum_mask=ir_frustum_mask,
+                observed_mask=voxel_observed,
             )
             components["ir_frustum_occupancy_loss"] = ir_occ_loss
             loss = loss + decoded_ir_frustum_occupancy_weight * ir_occ_loss
@@ -1212,6 +1388,7 @@ def compute_ldm_loss_components(
                 target,
                 occupancy_activation=occupancy_activation,
                 frustum_mask=ir_frustum_mask,
+                observed_mask=voxel_observed,
             )
             components["ir_frustum_negative_loss"] = ir_negative_loss
             loss = loss + decoded_ir_frustum_negative_weight * ir_negative_loss
@@ -1221,6 +1398,7 @@ def compute_ldm_loss_components(
                 target,
                 occupancy_activation=occupancy_activation,
                 column_mask=ir_frustum_mask,
+                observed_mask=voxel_observed,
             )
             ir_top_loss = ir_structure_losses["top_height_loss"]
             components["ir_frustum_top_height_loss"] = ir_top_loss
@@ -1234,6 +1412,7 @@ def compute_ldm_loss_components(
                 target,
                 occupancy_activation=occupancy_activation,
                 temperature=decoded_column_temperature,
+                observed_mask=voxel_observed,
             )
             column_positive_loss = column_losses["positive_loss"]
             column_negative_loss = column_losses["negative_loss"]
@@ -2050,6 +2229,12 @@ class OptimizedLDMTrainer:
         self.ldm_config = ldm_config
         self.validation_config = resolve_ldm_validation_config(ldm_config)
         self.validation_selector = LDM_VALIDATION_SELECTOR
+        self.observation_supervision_protocol = (
+            LDM_OBSERVATION_SUPERVISION_PROTOCOL
+        )
+        self.require_persisted_observed_mask = bool(
+            config.get("data.require_persisted_observed_mask", False)
+        )
         self.checkpoint_protocol = resolve_training_checkpoint_protocol(
             config.get("data.checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
         )
@@ -2279,6 +2464,7 @@ class OptimizedLDMTrainer:
         self.best_val_iou = float('-inf')
         self.best_val_loss = float('inf')
         self.last_validation_metrics = None
+        self.last_validation_threshold_sweep = None
         self.is_resumed = False
         self.last_effective_column_weights = (
             self.decoded_column_positive_weight,
@@ -2332,6 +2518,9 @@ class OptimizedLDMTrainer:
             "decoded_column_negative_weight": self.decoded_column_negative_weight,
             "decoded_column_temperature": self.decoded_column_temperature,
             "uncertainty_loss_weight": self.uncertainty_loss_weight,
+            "observation_supervision_protocol": (
+                self.observation_supervision_protocol
+            ),
         }
         if epoch is not None:
             effective_positive, effective_negative = self._column_weights_for_epoch(epoch)
@@ -2403,6 +2592,33 @@ class OptimizedLDMTrainer:
                 ),
             )
         saved_loss_config = ckpt.get('ldm_loss_config', {})
+        current_observation_protocol = getattr(
+            self,
+            "observation_supervision_protocol",
+            LDM_OBSERVATION_SUPERVISION_PROTOCOL,
+        )
+        saved_observation_protocol = (
+            saved_loss_config.get("observation_supervision_protocol")
+            if isinstance(saved_loss_config, dict)
+            else None
+        )
+        if self.radar_normalization is not None and saved_observation_protocol != (
+            current_observation_protocol
+        ):
+            raise ValueError(
+                "formal LDM checkpoint observation supervision protocol 不匹配："
+                f"checkpoint={saved_observation_protocol!r}, "
+                f"current={current_observation_protocol!r}"
+            )
+        if (
+            saved_observation_protocol is not None
+            and saved_observation_protocol != current_observation_protocol
+        ):
+            raise ValueError(
+                "checkpoint observation supervision protocol 不匹配："
+                f"checkpoint={saved_observation_protocol!r}, "
+                f"current={current_observation_protocol!r}"
+            )
         curriculum_fields = (
             "decoded_column_curriculum_enabled",
             "curriculum_total_epochs",
@@ -2543,6 +2759,12 @@ class OptimizedLDMTrainer:
                     f"checkpoint LDM validation {field} 与当前配置不一致："
                     f"checkpoint={raw!r}, current={self.validation_config[field]!r}"
                 )
+        if saved.get("threshold_candidates") != self.validation_config[
+            "threshold_candidates"
+        ]:
+            raise ValueError(
+                "checkpoint LDM validation threshold_candidates 与当前配置不一致"
+            )
 
         current_metrics = _validated_ldm_validation_metrics(saved.get("current"))
         best_metrics = _validated_ldm_validation_metrics(saved.get("best"))
@@ -2553,6 +2775,18 @@ class OptimizedLDMTrainer:
         self.last_validation_metrics = current_metrics
         self.best_val_iou = best_metrics["denoising_occupancy_iou"]
         self.best_val_loss = best_metrics["denoising_latent_loss"]
+        threshold_validation = checkpoint.get("occupancy_threshold_validation")
+        if self.radar_normalization is not None or threshold_validation is not None:
+            threshold_validation = validate_checkpoint_threshold_sweep(
+                checkpoint,
+                expected_stage="ldm",
+                expected_weight_source="model_state_dict",
+                expected_candidates=self.validation_config["threshold_candidates"],
+            )
+            self.last_validation_threshold_sweep = [
+                dict(record)
+                for record in threshold_validation.get("metrics_by_threshold", [])
+            ]
     
     def _log_metrics(
         self,
@@ -2616,6 +2850,15 @@ class OptimizedLDMTrainer:
             target = target.to(self.device)
             cond = cond.to(self.device)
             meta_dict = move_meta_to_device(meta_dict, self.device)
+            observed_mask = meta_dict.get("occupancy_observed_mask")
+            if observed_mask is None and getattr(
+                self,
+                "require_persisted_observed_mask",
+                False,
+            ):
+                raise RuntimeError(
+                    "formal LDM batch 缺少 persisted occupancy_observed_mask"
+                )
             if "is_mock_ir" in meta_dict:
                 total_meta["mock_ir_ratio"] += float(torch.as_tensor(meta_dict["is_mock_ir"]).float().mean().item())
             if "is_mock_calib" in meta_dict:
@@ -2705,6 +2948,7 @@ class OptimizedLDMTrainer:
                     decoded_column_positive_weight=effective_positive_weight,
                     decoded_column_negative_weight=effective_negative_weight,
                     decoded_column_temperature=self.decoded_column_temperature,
+                    observed_mask=observed_mask,
                 )
                 scaled_loss = loss / self.memory_opt.grad_accum_steps
             
@@ -2829,6 +3073,11 @@ class OptimizedLDMTrainer:
             "target_positive": 0,
             "predicted_positive": 0,
         }
+        threshold_counts = {
+            f"threshold_{index:03d}_{name}": 0
+            for index in range(len(self.validation_config["threshold_candidates"]))
+            for name in ("tp", "fp", "fn")
+        }
         validation_model = unwrap_model(self.model)
         try:
             for batch in val_loader:
@@ -2836,6 +3085,23 @@ class OptimizedLDMTrainer:
                 target = target.to(self.device, non_blocking=True)
                 cond = cond.to(self.device, non_blocking=True)
                 meta_dict = move_meta_to_device(meta_dict, self.device)
+                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                if (
+                    raw_observed_mask is None
+                    and getattr(
+                        self,
+                        "require_persisted_observed_mask",
+                        False,
+                    )
+                ):
+                    raise RuntimeError(
+                        "formal LDM validation batch 缺少 persisted "
+                        "occupancy_observed_mask"
+                    )
+                voxel_observed = resolve_ldm_observed_mask(
+                    raw_observed_mask,
+                    target,
+                )
                 z_target, z_cond = encode_ldm_training_latents(
                     self.vae,
                     target,
@@ -2900,10 +3166,26 @@ class OptimizedLDMTrainer:
 
                     decoded = self.vae.decode(denoised)
 
-                latent_squared_error += float(
-                    torch.square(denoised.float() - z_target.float()).sum().item()
+                latent_observed = build_ldm_latent_observed_mask(
+                    voxel_observed,
+                    z_target,
                 )
-                latent_element_count += z_target.numel()
+                latent_error = torch.square(
+                    denoised.float() - z_target.float()
+                )
+                if latent_observed is None:
+                    latent_squared_error += float(latent_error.sum().item())
+                    latent_element_count += z_target.numel()
+                else:
+                    expanded_latent_observed = latent_observed.expand_as(
+                        latent_error
+                    )
+                    latent_squared_error += float(
+                        latent_error[expanded_latent_observed].sum().item()
+                    )
+                    latent_element_count += int(
+                        expanded_latent_observed.sum().item()
+                    )
                 decoded_occupancy = decoded[:, 0:1]
                 if self.occupancy_activation == "sigmoid":
                     decoded_occupancy = torch.sigmoid(decoded_occupancy)
@@ -2911,9 +3193,18 @@ class OptimizedLDMTrainer:
                     decoded_occupancy,
                     target[:, 0:1],
                     threshold=self.validation_config["occupancy_threshold"],
+                    observed_mask=voxel_observed,
                 )
                 for name, value in batch_counts.items():
                     occupancy_counts[name] += value
+                batch_threshold_counts = threshold_sweep_batch_counts(
+                    decoded_occupancy,
+                    target[:, 0:1],
+                    voxel_observed,
+                    self.validation_config["threshold_candidates"],
+                )
+                for name, value in batch_threshold_counts.items():
+                    threshold_counts[name] += value
         finally:
             self.model.train(was_training)
 
@@ -2922,11 +3213,16 @@ class OptimizedLDMTrainer:
                 "latent_squared_error": latent_squared_error,
                 "latent_element_count": latent_element_count,
                 **occupancy_counts,
+                **threshold_counts,
             },
             distributed,
         )
         if reduced["latent_element_count"] == 0:
             raise RuntimeError("LDM 验证集没有可计算的 latent 元素")
+        self.last_validation_threshold_sweep = threshold_sweep_metrics(
+            reduced,
+            self.validation_config["threshold_candidates"],
+        )
         return _validated_ldm_validation_metrics({
             "denoising_latent_loss": (
                 reduced["latent_squared_error"]
@@ -2961,6 +3257,11 @@ class OptimizedLDMTrainer:
         """构造带完整网格和父 VAE hash 的正式 LDM checkpoint。"""
         if self.radar_normalization is not None and self.last_validation_metrics is None:
             raise RuntimeError("正式 LDM checkpoint 保存前必须完成独立验证")
+        if (
+            self.radar_normalization is not None
+            and not getattr(self, "last_validation_threshold_sweep", None)
+        ):
+            raise RuntimeError("正式 LDM checkpoint 保存前必须完成 threshold sweep")
         payload = {
             "epoch": epoch,
             "step": self.global_step,
@@ -2972,6 +3273,13 @@ class OptimizedLDMTrainer:
             "latent_dim": self.latent_dim,
             "model_config": dict(self.model_config),
             "ldm_loss_config": self._ldm_loss_config(epoch=epoch),
+            "observation_supervision_protocol": (
+                getattr(
+                    self,
+                    "observation_supervision_protocol",
+                    LDM_OBSERVATION_SUPERVISION_PROTOCOL,
+                )
+            ),
             "checkpoint_protocol": (
                 getattr(
                     self,
@@ -3003,6 +3311,24 @@ class OptimizedLDMTrainer:
                     "denoising_occupancy_iou": float(self.best_val_iou),
                 },
             }
+            if self.radar_normalization is not None:
+                payload["occupancy_threshold_validation"] = {
+                    "protocol": THRESHOLD_SWEEP_PROTOCOL,
+                    "split": self.validation_config["split"],
+                    "observation_domain": "persisted_observed_mask_v1",
+                    "deployment_weight_source": "model_state_dict",
+                    "candidate_thresholds": list(
+                        self.validation_config["threshold_candidates"]
+                    ),
+                    "metrics_by_threshold": [
+                        dict(record)
+                        for record in getattr(
+                            self,
+                            "last_validation_threshold_sweep",
+                            (),
+                        )
+                    ],
+                }
         if self.radar_normalization is not None:
             payload["radar_normalization"] = dict(self.radar_normalization)
             payload["radar_normalization_sha256"] = self.radar_normalization_sha256
@@ -3483,9 +3809,12 @@ def main():
     elif args.mode == "cd":
         if not args.vae_ckpt:
             raise ValueError("Must provide --vae_ckpt for CD training")
-        ldm_ckpt = resolve_cd_teacher_checkpoint(args.ldm_ckpt, config)
+        ldm_ckpt = resolve_cd_initialization_checkpoint(args.ldm_ckpt, config)
         if not ldm_ckpt:
-            raise ValueError("Must provide --ldm_ckpt or set cd.teacher_model_path for CD training")
+            raise ValueError(
+                "Must provide --ldm_ckpt or set cd.initialization_model_path "
+                "for CD initialization"
+            )
 
         vae_type = config.get('vae.config_type', 'ultra_lightweight')
         ckpt = safe_torch_load(args.vae_ckpt, map_location='cpu')
@@ -3531,10 +3860,27 @@ def main():
                 'expected_effective_global_batch_size': (
                     runtime_batch_plan.effective_global_batch_size
                 ),
+                'require_persisted_observed_mask': bool(
+                    data_config.get("require_persisted_observed_mask", False)
+                ),
+                'validation_seed': cd_cfg.get('validation_seed', 42),
+                'validation_sigma': cd_cfg.get('validation_sigma', 0.5),
+                'validation_occupancy_threshold': cd_cfg.get(
+                    'validation_occupancy_threshold', 0.5
+                ),
+                'training_semantics': cd_cfg.get(
+                    'training_semantics', 'ldm_initialized_ema_consistency_v1'
+                ),
+                'num_scales': cd_cfg.get('num_scales', 40),
+                'ema_rate': cd_cfg.get('ema_rate', 0.999),
+                'sigma_min': cd_cfg.get('sigma_min', 0.002),
+                'sigma_max': cd_cfg.get('sigma_max', 80.0),
+                'rho': cd_cfg.get('rho', 7.0),
             },
         )
         trainer.train(
             train_loader,
+            val_loader,
             num_epochs=cd_cfg.get('epochs', 100),
             save_every=cd_cfg.get('save_every', 10),
             grad_accum_steps=opt_cfg.get('gradient_accumulation_steps', 8),

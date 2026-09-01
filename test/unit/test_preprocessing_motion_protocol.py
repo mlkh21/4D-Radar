@@ -121,8 +121,15 @@ class PreprocessingMotionProtocolTest(unittest.TestCase):
         script_path = os.path.join(ROOT, "NTU4DRadLM_pre_processing", "preprocess.sh")
         with open(script_path, "r", encoding="utf-8") as handle:
             script = handle.read()
-        self.assertIn('VELOCITY_MODE="${VELOCITY_MODE:-none}"', script)
-        self.assertIn('--velocity_mode "$VELOCITY_MODE"', script)
+        uses_safe_environment_default = (
+            'VELOCITY_MODE="${VELOCITY_MODE:-none}"' in script
+            and '--velocity_mode "$VELOCITY_MODE"' in script
+        )
+        uses_explicit_safe_value = "--velocity_mode none" in script
+        self.assertTrue(
+            uses_safe_environment_default or uses_explicit_safe_value,
+            "预处理脚本必须显式使用 velocity_mode=none 作为安全默认值",
+        )
 
     def test_preprocessing_script_help_works_when_executed_by_file_path(self):
         script_path = os.path.join(
@@ -138,6 +145,9 @@ class PreprocessingMotionProtocolTest(unittest.TestCase):
             text=True,
         )
         self.assertIn("--velocity_mode", completed.stdout)
+        self.assertIn("--radar_field_schema", completed.stdout)
+        self.assertIn("--require_verified_radar_field_schema", completed.stdout)
+        self.assertIn("--require_complete_extraction_receipt", completed.stdout)
 
 
 if __name__ == "__main__":

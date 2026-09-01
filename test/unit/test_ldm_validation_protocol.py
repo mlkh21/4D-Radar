@@ -19,7 +19,24 @@ from diffusion_consistency_radar.scripts.unified_train import (
     LDM_VALIDATION_SELECTOR,
     OptimizedLDMTrainer,
     ldm_validation_is_improved,
+    resolve_ldm_validation_config,
 )
+
+
+def _perfect_threshold_sweep(validation_config):
+    return [
+        {
+            "threshold": threshold,
+            "tp": 1,
+            "fp": 0,
+            "fn": 0,
+            "iou": 1.0,
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+        }
+        for threshold in validation_config["threshold_candidates"]
+    ]
 
 
 class LDMValidationProtocolTest(unittest.TestCase):
@@ -78,14 +95,7 @@ class LDMValidationProtocolTest(unittest.TestCase):
         trainer._ldm_loss_config = lambda epoch: {"epoch": epoch}
         trainer.radar_normalization = {"protocol": "radar_normalization_v1"}
         trainer.radar_normalization_sha256 = "b" * 64
-        trainer.validation_config = {
-            "protocol": LDM_VALIDATION_PROTOCOL,
-            "split": "temporal_block_validation_suffix",
-            "noise_identity": "scene_frame_sha256_v1",
-            "seed": 42,
-            "sigma": 0.5,
-            "occupancy_threshold": 0.5,
-        }
+        trainer.validation_config = resolve_ldm_validation_config({})
         trainer.validation_selector = LDM_VALIDATION_SELECTOR
         trainer.best_val_iou = 0.6
         trainer.best_val_loss = 0.3
@@ -93,6 +103,9 @@ class LDMValidationProtocolTest(unittest.TestCase):
             "denoising_latent_loss": 0.35,
             "denoising_occupancy_iou": 0.55,
         }
+        trainer.last_validation_threshold_sweep = _perfect_threshold_sweep(
+            trainer.validation_config
+        )
 
         payload = trainer._checkpoint_payload(epoch=2, loss=0.1, best_loss=0.1)
 
@@ -130,13 +143,7 @@ class LDMValidationProtocolTest(unittest.TestCase):
         trainer.device = torch.device("cpu")
         trainer.memory_opt = mock.Mock(use_amp=False)
         trainer.occupancy_activation = "raw"
-        trainer.validation_config = {
-            "protocol": LDM_VALIDATION_PROTOCOL,
-            "split": "temporal_block_validation_suffix",
-            "seed": 42,
-            "sigma": 0.5,
-            "occupancy_threshold": 0.5,
-        }
+        trainer.validation_config = resolve_ldm_validation_config({})
         val_loader = [(
             torch.ones(1, 1, 1, 2, 2),
             torch.zeros(1, 1, 1, 2, 2),
@@ -161,13 +168,7 @@ class LDMValidationProtocolTest(unittest.TestCase):
         trainer.radar_normalization = None
         trainer.radar_normalization_sha256 = ""
         trainer.allow_legacy_radar_units = True
-        trainer.validation_config = {
-            "protocol": LDM_VALIDATION_PROTOCOL,
-            "split": "temporal_block_validation_suffix",
-            "seed": 42,
-            "sigma": 0.5,
-            "occupancy_threshold": 0.5,
-        }
+        trainer.validation_config = resolve_ldm_validation_config({})
         trainer.validation_selector = LDM_VALIDATION_SELECTOR
         trainer.last_validation_metrics = None
         trainer.best_val_iou = float("-inf")

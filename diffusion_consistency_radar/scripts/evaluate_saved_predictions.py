@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""离线评价部署阶段已保存的预测体素，不加载或重跑生成模型。"""
+"""正式离线评价已保存预测；指标在权威 observed 域内计算。"""
 
 import argparse
 import csv
@@ -31,6 +31,11 @@ from diffusion_consistency_radar.cm.evaluation_metrics import (  # noqa: E402
     occupancy_prf,
     uncertainty_calibration_metrics,
 )
+from diffusion_consistency_radar.dataset_manifest import sha256_file  # noqa: E402
+from diffusion_consistency_radar.observed_artifact_protocol import (  # noqa: E402
+    RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL,
+    observed_mask_records_digest as _observed_mask_records_digest,
+)
 
 try:
     from scipy.spatial import cKDTree
@@ -41,6 +46,7 @@ except Exception:
 PREDICTION_PATTERN = re.compile(r"^(\d+)_voxel\.npy$")
 UNCERTAINTY_PATTERN = re.compile(r"^(\d+)_uncertainty\.npy$")
 POINTCLOUD_PATTERN = re.compile(r"^(\d+)_pcl\.npy$")
+OBSERVED_MASK_PATTERN = re.compile(r"^(\d+)_observed_mask\.npy$")
 SOURCE_PATTERN = re.compile(r"^(\d+)\.(npy|npz)$")
 ALLOWED_AUXILIARY_FILES = {
     "inference_run.json",
@@ -49,12 +55,37 @@ ALLOWED_AUXILIARY_FILES = {
     "inference_runtime.log",
 }
 
+FORMAL_SAVED_EVALUATION_PROTOCOL = (
+    "formal_saved_prediction_observed_domain_evaluation_v1"
+)
+DIAGNOSTIC_SAVED_EVALUATION_PROTOCOL = "saved_prediction_diagnostic_evaluation_v1"
+FORMAL_METRIC_FIELDS = (
+    "pred_point_count",
+    "target_point_count",
+    "pred_target_chamfer",
+    "pred_target_count_ratio",
+    "pred_target_dx",
+    "pred_target_dy",
+    "pred_target_dz",
+    "near_precision",
+    "near_recall",
+    "near_bev_iou",
+    "near_nn_mean",
+    "near_match_ratio_2",
+    "uncertainty_ece",
+    "uncertainty_brier",
+    "uncertainty_nll",
+    "uncertainty_error_corr",
+)
+
 FRAME_FIELDS = [
     "frame_id",
     "pred_file",
     "radar_file",
     "target_file",
     "lidar_file",
+    "observed_mask_file",
+    "observed_voxels",
     "effective_occ_threshold",
     "target_threshold",
     "pred_point_count",
@@ -172,6 +203,27 @@ def _resolve_parameters(
     metadata_threshold = metadata.get("occ_threshold")
     if occ_threshold is None and metadata_threshold is None:
         raise ValueError("metadata 缺少 occ_threshold，且未提供显式 override")
+    formal_run = metadata.get("formal_protocol") is True
+    if formal_run and occ_threshold is not None:
+        raise ValueError("正式评价禁止 threshold CLI override")
+    if formal_run:
+        threshold_artifact = metadata.get("occupancy_threshold_artifact")
+        threshold_artifact_sha256 = metadata.get(
+            "occupancy_threshold_artifact_sha256"
+        )
+        if (
+            not isinstance(threshold_artifact, dict)
+            or threshold_artifact.get("protocol")
+            != "occupancy_threshold_validation_artifact_v1"
+            or metadata.get("occ_threshold_source") != "validation_artifact"
+            or not isinstance(threshold_artifact_sha256, str)
+            or len(threshold_artifact_sha256) != 64
+        ):
+            raise ValueError("正式评价缺少完整 validation threshold artifact 合同")
+        if float(threshold_artifact.get("selected_threshold")) != float(
+            metadata_threshold
+        ):
+            raise ValueError("正式评价阈值与 validation artifact 不一致")
     resolved_threshold = (
         float(occ_threshold)
         if occ_threshold is not None
@@ -179,7 +231,11 @@ def _resolve_parameters(
     )
     if not np.isfinite(resolved_threshold):
         raise ValueError(f"occ_threshold 含非有限值: {resolved_threshold}")
-    threshold_source = "cli_override" if occ_threshold is not None else "run_metadata"
+    threshold_source = (
+        "validation_artifact"
+        if formal_run
+        else ("cli_override" if occ_threshold is not None else "run_metadata")
+    )
 
     for axis in range(3):
         if resolved_source_range[axis] >= resolved_source_range[axis + 3]:
@@ -214,6 +270,7 @@ def _resolve_parameters(
     return {
         "metadata": metadata,
         "metadata_path": metadata_path if metadata else "",
+        "formal_run": formal_run,
         "target_size": resolved_target_size,
         "source_pc_range": resolved_source_range,
         "model_pc_range": resolved_model_range,
@@ -229,13 +286,17 @@ def _resolve_parameters(
     }
 
 
-def _discover_prediction_frames(folder: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+def _discover_prediction_frames(
+    folder: str,
+) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
     predictions: Dict[str, str] = {}
     uncertainties: Dict[str, str] = {}
+    observed_masks: Dict[str, str] = {}
     for name in sorted(os.listdir(folder)):
         path = os.path.join(folder, name)
         pred_match = PREDICTION_PATTERN.fullmatch(name)
         uncertainty_match = UNCERTAINTY_PATTERN.fullmatch(name)
+        observed_match = OBSERVED_MASK_PATTERN.fullmatch(name)
         if pred_match:
             frame_id = pred_match.group(1)
             _require_regular_file(path, "prediction voxel")
@@ -244,6 +305,10 @@ def _discover_prediction_frames(folder: str) -> Tuple[Dict[str, str], Dict[str, 
             frame_id = uncertainty_match.group(1)
             _require_regular_file(path, "uncertainty")
             uncertainties[frame_id] = path
+        elif observed_match:
+            frame_id = observed_match.group(1)
+            _require_regular_file(path, "observed mask")
+            observed_masks[frame_id] = path
         elif POINTCLOUD_PATTERN.fullmatch(name) or name in ALLOWED_AUXILIARY_FILES:
             continue
         else:
@@ -253,7 +318,88 @@ def _discover_prediction_frames(folder: str) -> Tuple[Dict[str, str], Dict[str, 
     unknown_uncertainty = sorted(set(uncertainties) - set(predictions))
     if unknown_uncertainty:
         raise ValueError(f"uncertainty 存在未知帧: {unknown_uncertainty}")
-    return predictions, uncertainties
+    unknown_observed = sorted(set(observed_masks) - set(predictions))
+    if unknown_observed:
+        raise ValueError(f"observed mask 存在未知 frame: {unknown_observed}")
+    return predictions, uncertainties, observed_masks
+
+
+def _validate_observed_mask_contract(
+    observed_masks: Dict[str, str],
+    metadata: dict,
+    predictions: Dict[str, str],
+    target_size: Sequence[int],
+) -> Optional[dict]:
+    """校验 inference_run 声明与逐帧 Radar observed mask 内容一致。"""
+    contract = metadata.get("observed_mask")
+    require_formal = bool(
+        metadata.get("formal_protocol") is True or metadata.get("require_real_ir")
+    )
+    if contract is None:
+        if observed_masks:
+            raise ValueError("observed mask 文件缺少 inference_run metadata 绑定")
+        if require_formal:
+            raise ValueError("formal inference metadata 缺少 observed mask 合同")
+        return None
+    if not isinstance(contract, dict):
+        raise ValueError("observed mask metadata 必须是 object")
+    if contract.get("protocol") != RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL:
+        raise ValueError("observed mask protocol 不匹配")
+    records = contract.get("records")
+    if not isinstance(records, list):
+        raise ValueError("observed mask metadata 缺少 records")
+    if int(contract.get("frame_count", -1)) != len(records):
+        raise ValueError("observed mask frame_count 与 records 不一致")
+
+    normalized_records = []
+    record_ids = set()
+    total_observed = 0
+    expected_shape = tuple(int(value) for value in target_size)
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("observed mask record 必须是 object")
+        frame_id = str(record.get("frame_id", ""))
+        file_name = str(record.get("file", ""))
+        if frame_id in record_ids or file_name != f"{frame_id}_observed_mask.npy":
+            raise ValueError("observed mask record frame/file 无效或重复")
+        record_ids.add(frame_id)
+        path = observed_masks.get(frame_id)
+        if path is None or os.path.basename(path) != file_name:
+            raise ValueError(f"observed mask frame 缺失: {frame_id}")
+        array = _load_array(path)
+        if array.ndim != 3 or tuple(array.shape) != expected_shape:
+            raise ValueError(
+                f"observed mask shape 必须为 {expected_shape}: {path} -> {array.shape}"
+            )
+        if not np.logical_or(array == 0, array == 1).all():
+            raise ValueError(f"observed mask 必须严格为 0/1: {path}")
+        actual_sha256 = sha256_file(path)
+        actual_count = int(np.count_nonzero(array))
+        if require_formal and actual_count <= 0:
+            raise ValueError(f"正式 observed mask 不得为空域: {path}")
+        if str(record.get("sha256", "")) != actual_sha256:
+            raise ValueError(f"observed mask SHA-256 不匹配: {path}")
+        if int(record.get("observed_voxels", -1)) != actual_count:
+            raise ValueError(f"observed mask voxel count 不匹配: {path}")
+        normalized_records.append(
+            {
+                "frame_id": frame_id,
+                "file": file_name,
+                "sha256": actual_sha256,
+                "observed_voxels": actual_count,
+            }
+        )
+        total_observed += actual_count
+
+    if record_ids != set(predictions) or set(observed_masks) != set(predictions):
+        raise ValueError("observed mask frame 集合与 prediction 不一致")
+    if int(contract.get("observed_voxels", -1)) != total_observed:
+        raise ValueError("observed mask 总 voxel count 不一致")
+    if contract.get("files_sha256") != _observed_mask_records_digest(
+        normalized_records
+    ):
+        raise ValueError("observed mask records digest 不匹配")
+    return contract
 
 
 def _discover_source_frames(folder: str, label: str) -> Dict[str, str]:
@@ -473,7 +619,15 @@ def evaluate_saved_predictions(
         model_pc_range,
         target_size,
     )
-    predictions, uncertainties = _discover_prediction_frames(pred_voxel_dir)
+    predictions, uncertainties, observed_masks = _discover_prediction_frames(
+        pred_voxel_dir
+    )
+    observed_contract = _validate_observed_mask_contract(
+        observed_masks,
+        resolved["metadata"],
+        predictions,
+        resolved["target_size"],
+    )
     radar_frames = _discover_source_frames(radar_voxel_dir, "radar")
     target_frames = _discover_source_frames(target_voxel_dir, "target")
     all_frame_ids = sorted(predictions)
@@ -526,6 +680,8 @@ def evaluate_saved_predictions(
                     f"uncertainty shape 必须可压缩为 3D: "
                     f"{uncertainties[frame_id]} -> {uncertainty.shape}"
                 )
+        if frame_id in observed_masks:
+            _load_array(observed_masks[frame_id])
 
     os.makedirs(output_dir, exist_ok=True)
     rows: List[dict] = []
@@ -545,20 +701,37 @@ def evaluate_saved_predictions(
             resolved["model_pc_range"],
             is_target=True,
         )
+        if frame_id in observed_masks:
+            observed_domain = _load_array(observed_masks[frame_id]).squeeze() > 0.5
+            if observed_domain.shape != tuple(resolved["target_size"]):
+                raise ValueError(
+                    f"observed mask shape 与 target_size 不一致: {frame_id} -> "
+                    f"{observed_domain.shape}"
+                )
+        else:
+            observed_domain = np.ones(tuple(resolved["target_size"]), dtype=bool)
+
+        # NOTE: ch0 是唯一 occupancy 通道；正式点云/占用指标只消费权威 observed 域。
+        pred_for_metrics = pred.copy()
+        radar_for_metrics = radar.copy()
+        target_for_metrics = target.copy()
+        pred_for_metrics[0] = np.where(observed_domain, pred[0], 0.0)
+        radar_for_metrics[0] = np.where(observed_domain, radar[0], 0.0)
+        target_for_metrics[0] = np.where(observed_domain, target[0], 0.0)
         pred_points = _voxel_czxy_to_points(
-            pred,
+            pred_for_metrics,
             resolved["model_pc_range"],
             resolved["occ_threshold"],
             resolved["voxel_size"],
         )
         radar_points = _voxel_czxy_to_points(
-            radar,
+            radar_for_metrics,
             resolved["model_pc_range"],
             resolved["occ_threshold"],
             resolved["voxel_size"],
         )
         target_points = _voxel_czxy_to_points(
-            target,
+            target_for_metrics,
             resolved["model_pc_range"],
             target_threshold,
             resolved["voxel_size"],
@@ -595,6 +768,16 @@ def evaluate_saved_predictions(
             "radar_file": os.path.basename(radar_frames[frame_id]),
             "target_file": os.path.basename(target_frames[frame_id]),
             "lidar_file": os.path.basename(lidar_path) if lidar_path else "",
+            "observed_mask_file": (
+                os.path.basename(observed_masks[frame_id])
+                if frame_id in observed_masks
+                else ""
+            ),
+            "observed_voxels": (
+                int(np.count_nonzero(_load_array(observed_masks[frame_id])))
+                if frame_id in observed_masks
+                else ""
+            ),
             "effective_occ_threshold": float(resolved["occ_threshold"]),
             "target_threshold": float(target_threshold),
             "pred_point_count": int(pred_points.shape[0]),
@@ -634,6 +817,7 @@ def evaluate_saved_predictions(
                 (target[0] > float(target_threshold)).astype(np.float32),
                 uncertainty,
                 occ_threshold=float(resolved["occ_threshold"]),
+                observed_mask=observed_domain,
             )
             for field in (
                 "uncertainty_ece",
@@ -661,15 +845,46 @@ def evaluate_saved_predictions(
             "radar_file",
             "target_file",
             "lidar_file",
+            "observed_mask_file",
         }
     ]
+    aggregate_metrics = {
+        f"mean_{field}": _finite_mean(rows, field)
+        for field in aggregate_fields
+    }
     summary = {
+        "protocol": (
+            FORMAL_SAVED_EVALUATION_PROTOCOL
+            if resolved["formal_run"]
+            else DIAGNOSTIC_SAVED_EVALUATION_PROTOCOL
+        ),
+        "formal_protocol": bool(resolved["formal_run"]),
         "stage": "offline_evaluation",
         "prediction_unchanged": True,
+        "occupancy_metric_domain": (
+            "external_authoritative_observed_mask"
+            if observed_contract
+            else "full_grid_diagnostic"
+        ),
+        "metric_aggregation": "finite_per_frame_macro_mean_v1",
+        "auxiliary_metric_domain": {
+            "radar_baseline": "same_authoritative_observed_mask",
+            "raw_lidar_chamfer": "unmasked_raw_lidar_diagnostic_reference",
+        },
         "frame_count": len(frame_ids),
         "prediction_frame_count": len(all_frame_ids),
+        "observed_mask_protocol": (
+            observed_contract.get("protocol") if observed_contract else None
+        ),
+        "observed_mask_frame_count": (
+            int(observed_contract["frame_count"]) if observed_contract else 0
+        ),
         "selected_frame_ids": list(frame_ids),
         "occ_threshold": float(resolved["occ_threshold"]),
+        "occ_threshold_source": resolved["parameter_sources"]["occ_threshold"],
+        "occupancy_threshold_artifact_sha256": resolved["metadata"].get(
+            "occupancy_threshold_artifact_sha256"
+        ),
         "target_threshold": float(target_threshold),
         "target_size": [int(value) for value in resolved["target_size"]],
         "source_pc_range": [float(value) for value in resolved["source_pc_range"]],
@@ -688,10 +903,15 @@ def evaluate_saved_predictions(
         "lidar_index_file": (
             os.path.abspath(lidar_index_file) if lidar_index_file else ""
         ),
-        "metrics": {
-            f"mean_{field}": _finite_mean(rows, field)
-            for field in aggregate_fields
-        },
+        "formal_metrics": (
+            {
+                f"mean_{field}": aggregate_metrics[f"mean_{field}"]
+                for field in FORMAL_METRIC_FIELDS
+            }
+            if resolved["formal_run"]
+            else {}
+        ),
+        "metrics": aggregate_metrics,
     }
     _write_json_atomic(
         os.path.join(output_dir, "evaluation_summary.json"),

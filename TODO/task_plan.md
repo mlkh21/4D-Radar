@@ -16,6 +16,19 @@
 
 ## Current Phase
 
+- [x] 2026-08-29 审查问题顺序修复
+  - [x] 阶段 1：统一 formal GPU 配置来源并移除 YAML 中无效的 legacy-MSE VAE 旋钮
+  - [x] 阶段 2：将 persisted observed mask 接入 LDM 训练、decoded loss、验证指标和 latent 合同
+  - [x] 阶段 3：修复多卡 IR normalization 与 CD EMA buffers
+  - [x] 阶段 4：闭合推理权重、阈值 artifact、saved evaluator、seed 与 CUDA 计时
+  - [x] 阶段 5：修复概率地图 observed 和 prediction/Radar 通道合同
+  - [x] 阶段 6：实现 rolling map、轨迹走廊查询和 ROS 接口边界
+  - [x] 阶段 7：建立 finite/schema/failure receipt 的新预处理协议
+  - [x] 阶段 8：清理时序、异常、入口、算法命名和正式指标
+    - [x] 8A：拒绝未实现的 sequence/transform/alignment 参数并收敛单帧 Dataset 合同
+    - [x] 8B：修复 Karras 可变默认值与推理 TypeError 异常吞噬
+    - [x] 8C：显式化 LDM initialization + EMA consistency 训练语义及真实生效配置
+    - [x] 8D：标记 formal/legacy 入口并统一正式 saved-prediction 指标协议
 - [x] Recover prior context from chat log and project files
 - [x] Inspect existing alignment utilities and outputs
 - [x] Implement missing shared visibility / nearest-neighbor / BEV IoU evaluation
@@ -596,3 +609,23 @@
 - [x] 固化阶段实际帧选择 hash/count，并让 VAE/LDM/CD 同阶段 resume 严格校验
 - [x] 完成真实零训练 preflight、单元/协议/静态回归和 README 使用说明
 - [ ] 在服务器执行 2--4 GPU 短时 NCCL smoke；通过后再由用户显式启动正式长训练
+## 2026-08-29：顺序修复阶段状态
+
+1. [已完成] GPU/YAML 单一配置源与 formal VAE 生效参数。
+2. [已完成] LDM persisted observed-mask 的训练、损失、验证与 checkpoint 合同。
+3. [已完成] 多卡 IR normalization 与 CD EMA parameter/buffer 一致性。
+4. [已完成] 推理、阈值 artifact、evaluator、随机种子和 CUDA 计时。
+   - [x] CD online/EMA 使用正式 validation split 选优，并把部署权重来源纳入 checkpoint/resume/inference 合同。
+   - [x] 构建 validation-only threshold artifact，绑定 checkpoint SHA；formal inference 禁止自由 CLI 阈值。
+5. [已完成] 概率地图 prediction channel、observed 权威边界和 DEM 单位合同。
+6. [已完成] 滚动地图、轨迹走廊和 ROS 边界。
+7. [已完成] formal v3 预处理协议与失败收据。
+   - [x] 7A：逐字段 finite Radar 聚合与 statistics v2，保留 v1 读取兼容。
+   - [x] 7B：原始 Radar 字段、单位、坐标系和 Doppler 正方向 schema。
+   - [x] 7C：rosbag 逐帧失败收据与关键模态 fail-closed 门禁。
+   - [x] 7D：独立 formal-v3 数据协议、预处理入口与训练门禁。
+8. [已完成] 工程清理和指标统一。
+   - [x] Dataset 单帧合同与无效参数 fail-fast。
+   - [x] Karras history 默认值和多模态 forward 异常边界。
+   - [x] CD initialization/EMA consistency 语义、配置、checkpoint 和推理采样合同。
+   - [x] formal/legacy 入口标签与正式 saved-prediction 指标协议收尾。

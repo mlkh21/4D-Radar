@@ -144,6 +144,36 @@ conda run -n Radar-Diffusion python \
 voxel 与 observed mask 哈希。旧推理目录缺少 `prediction_voxel` 内容收据，必须
 重新推理生成 metadata；不得手工补写 JSON 或删除 267 个 uncovered 文件绕过门禁。
 
+新 prediction artifact 协议为 `generated_voxel_artifact_v2`：地图只消费 ch0
+occupancy probability，并要求其位于 `[0,1]`；ch1--3 不得解释为 Radar 方差或
+DEM 高度不确定性。formal/经验地图都把逐层 observed mask 作为权威域，mask 外的
+正预测继续保持 unknown。`map_run.json` 会记录 prediction mapping contract，以及
+DEM mean 为米、DEM variance 为平方米的单位合同。
+
+严格/经验地图现使用随 body/LiDAR 原点移动的整体素 rolling
+window；`--map_pc_range` 在这两种模式中表示锚点相对窗口，
+`map_run.json` 同时记录最终 local bounds。需要轨迹走廊时，可额外传入：
+
+```json
+{
+  "protocol": "local_trajectory_frames_v1",
+  "coordinate_frame": "local",
+  "frame_count": 1,
+  "records": [
+    {
+      "frame_id": "000001",
+      "waypoints_local_m": [[1.0, 0.0, 0.0], [20.0, 0.0, 0.0]]
+    }
+  ]
+}
+```
+
+使用 `--trajectory_file <JSON> --trajectory_corridor_radius_m <m>
+--trajectory_sample_spacing_m <m>` 启用走廊查询。artifact 的帧集和顺序必须与实际
+消费帧完全一致，轨迹不足制动距离或走廊包含 unknown 均返回风险。
+该脚本仍仅产生 NPZ/JSON/CSV 离线 artifact；ROS1 node/service/action、PX4 bridge
+和在线时延验收尚未实现，因此 formal/empirical 输出均不得声称为机载避障正式结果。
+
 雷达轴约定诊断：
 
 ```bash

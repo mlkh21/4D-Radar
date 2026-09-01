@@ -9,8 +9,23 @@ import numpy as np
 import sensor_msgs.point_cloud2 as pc2
 import glob
 import re
+import sys
 import cv2
 from tqdm import tqdm  # ──► 新增引用：工业级流式进度条组件
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from diffusion_consistency_radar.extraction_receipt import (
+    CRITICAL_EXTRACTION_TOPICS,
+    finalize_extraction_receipt,
+    mark_bag_processed,
+    new_extraction_receipt,
+    record_extraction_failure,
+    record_extraction_success,
+    write_extraction_receipt_atomic,
+)
 
 if __package__:
     # 作为项目模块调用时使用相对路径，避免同名脚本遮蔽命名空间包。
@@ -26,7 +41,6 @@ NOTE: 该脚本会把多分卷 bag 按场景归并到统一目录，并按 topic
 
 # NOTE: 优先尝试导入 Livox 自定义消息类型；失败时回退到通用点云解析。
 try:
-    import sys
     # 根据 ws_livox 工作空间路径，添加正确的 Python 包路径
     sys.path.append('/home/ps/zxj_workspace/src/ws_livox/devel/lib/python3/dist-packages')
     from livox_ros_driver.msg import CustomMsg
@@ -64,11 +78,51 @@ def _resolve_pointcloud_field(field_names, aliases):
 def _write_pointcloud_schema(save_dir, schema):
     """原子写入点云列协议，避免中断时留下半截 JSON。"""
     schema_path = os.path.join(save_dir, POINTCLOUD_SCHEMA_FILENAME)
+    if os.path.isfile(schema_path) and not os.path.islink(schema_path):
+        with open(schema_path, "r", encoding="utf-8") as handle:
+            existing = json.load(handle)
+        stable_existing = {
+            key: value for key, value in existing.items() if key != "shape"
+        }
+        stable_current = {
+            key: value for key, value in schema.items() if key != "shape"
+        }
+        if stable_existing != stable_current:
+            raise ValueError("同一输出目录的 PointCloud 字段 layout 发生漂移")
+        return
+    if os.path.lexists(schema_path):
+        raise ValueError("pointcloud schema 路径必须是普通文件或不存在")
     temp_path = schema_path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(schema, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
     os.replace(temp_path, schema_path)
+
+
+def _build_pointcloud_layout_schema(source_field_names, field_mapping):
+    """构建只证明列布局、不声明物理单位或符号的解包收据。"""
+    selected_fields = [
+        field_mapping[name]
+        for name in POINTCLOUD_COLUMNS
+        if field_mapping[name] is not None
+    ]
+    return {
+        "schema_version": 1,
+        "storage_format": "npy",
+        "columns": list(POINTCLOUD_COLUMNS),
+        "column_indices": {
+            name: index for index, name in enumerate(POINTCLOUD_COLUMNS)
+        },
+        "source_fields": list(source_field_names),
+        "selected_fields": selected_fields,
+        "field_mapping": field_mapping,
+        "missing_fields": [
+            name for name in ("intensity", "doppler")
+            if field_mapping[name] is None
+        ],
+        "physical_semantics_status": "unverified_layout_only",
+        "missing_value_encoding": "nan",
+    }
 
 
 def _read_pointcloud2_fixed_columns(msg):
@@ -105,7 +159,7 @@ def _read_pointcloud2_fixed_columns(msg):
 
     points = []
     for raw_point in pc2.read_points(
-        msg, field_names=selected_fields, skip_nans=True
+        msg, field_names=selected_fields, skip_nans=False
     ):
         values = list(raw_point)
         if len(values) != len(selected_fields):
@@ -113,25 +167,16 @@ def _read_pointcloud2_fixed_columns(msg):
                 "PointCloud2.read_points 返回列数与请求字段不一致: "
                 f"expected={len(selected_fields)}, got={len(values)}"
             )
-        point = np.zeros(len(POINTCLOUD_COLUMNS), dtype=np.float32)
+        # XYZ 必须存在；两个可选物理字段缺失时写 NaN，使下游 finite-count
+        # 能区分“真实零测量”和“消息根本没有该字段”。
+        point = np.full(len(POINTCLOUD_COLUMNS), np.nan, dtype=np.float32)
         for column_index, column_name in enumerate(POINTCLOUD_COLUMNS):
             source_name = field_mapping[column_name]
             if source_name is not None:
                 point[column_index] = float(values[selected_indices[column_name]])
         points.append(point.tolist())
 
-    schema = {
-        "schema_version": 1,
-        "storage_format": "npy",
-        "columns": list(POINTCLOUD_COLUMNS),
-        "column_indices": {name: index for index, name in enumerate(POINTCLOUD_COLUMNS)},
-        "source_fields": source_field_names,
-        "selected_fields": selected_fields,
-        "field_mapping": field_mapping,
-        "missing_fields": [
-            name for name in ("intensity", "doppler") if field_mapping[name] is None
-        ],
-    }
+    schema = _build_pointcloud_layout_schema(source_field_names, field_mapping)
     return points, schema
 
 
@@ -171,233 +216,303 @@ def save_pointcloud(msg, save_dir, timestamp):
     Livox: [x, y, z, reflectivity]
     Radar (PointCloud v1/PointCloud2): [x, y, z, intensity, doppler]
     """
-    try:
-        points_list = []
-        schema = None
+    points_list = []
+    schema = None
 
-        # NOTE: 1) Livox CustomMsg
-        # 结构: x, y, z, reflectivity, tag, line
-        if 'CustomMsg' in str(type(msg)) or 'livox_ros_driver' in str(type(msg)): # 只要名字匹配就尝试处理,不依赖 LIVOX_AVAILABLE
-            for p in msg.points:
-                # 保存 x, y, z, reflectivity
-                points_list.append([p.x, p.y, p.z, float(p.reflectivity)])
+    # NOTE: 1) Livox CustomMsg
+    # 结构: x, y, z, reflectivity, tag, line
+    if 'CustomMsg' in str(type(msg)) or 'livox_ros_driver' in str(type(msg)): # 只要名字匹配就尝试处理,不依赖 LIVOX_AVAILABLE
+        for p in msg.points:
+            # 保存 x, y, z, reflectivity
+            points_list.append([p.x, p.y, p.z, float(p.reflectivity)])
 
-        # NOTE: 2) 标准 PointCloud2
-        elif hasattr(msg, 'width'): # Duck typing for PointCloud2
-            points_list, schema = _read_pointcloud2_fixed_columns(msg)
+    # NOTE: 2) 标准 PointCloud2
+    elif hasattr(msg, 'width'): # Duck typing for PointCloud2
+        points_list, schema = _read_pointcloud2_fixed_columns(msg)
 
-        # NOTE: 3) 标准 PointCloud (v1) - 常见于 4D Radar
-        # 结构: points[], channels[name, values[]]
-        elif hasattr(msg, 'points') and msg.points and hasattr(msg.points[0], 'x'):
-            # 提取 channels 数据
-            channel_map = {}
-            for channel in msg.channels:
-                channel_map[channel.name.lower()] = channel.values
+    # NOTE: 3) 标准 PointCloud (v1) - 常见于 4D Radar
+    # 结构: points[], channels[name, values[]]
+    elif hasattr(msg, 'points') and msg.points and hasattr(msg.points[0], 'x'):
+        channel_map = {
+            str(channel.name): channel.values for channel in msg.channels
+        }
+        channel_names = list(channel_map)
+        intensity_field = _resolve_pointcloud_field(
+            channel_names,
+            _INTENSITY_FIELD_ALIASES,
+        )
+        doppler_field = _resolve_pointcloud_field(
+            channel_names,
+            _DOPPLER_FIELD_ALIASES,
+        )
+        intensities = (
+            channel_map[intensity_field]
+            if intensity_field is not None
+            else None
+        )
+        velocities = (
+            channel_map[doppler_field]
+            if doppler_field is not None
+            else None
+        )
+        schema = _build_pointcloud_layout_schema(
+            ["x", "y", "z"] + channel_names,
+            {
+                "x": "x",
+                "y": "y",
+                "z": "z",
+                "intensity": intensity_field,
+                "doppler": doppler_field,
+            },
+        )
 
-            # 查找强度和速度对应的 channel
-            # 常见名: intensity, power, rcs, snr
-            # 常见名: velocity, doppler, v_r
+        for i, point in enumerate(msg.points):
+            inten = intensities[i] if intensities is not None else np.nan
+            vel = velocities[i] if velocities is not None else np.nan
+            points_list.append(
+                [point.x, point.y, point.z, float(inten), float(vel)]
+            )
 
-            intensities = None
-            velocities = None
+    else:
+        raise ValueError(f"Unknown pointcloud type: {type(msg)} at {timestamp}")
 
-            for key in channel_map:
-                if any(k in key for k in ['intensity', 'power', 'rcs', 'snr']):
-                    intensities = channel_map[key]
-                if any(k in key for k in ['velocity', 'doppler', 'v_r']):
-                    velocities = channel_map[key]
+    if not points_list:
+        raise ValueError(f"点云帧为空: {timestamp}")
 
-            num_points = len(msg.points)
-            for i in range(num_points):
-                p = msg.points[i]
-                # 默认值
-                inten = intensities[i] if intensities else 0.0
-                vel = velocities[i] if velocities else 0.0
+    pc_np = np.array(points_list, dtype=np.float32)
 
-                points_list.append([p.x, p.y, p.z, float(inten), float(vel)])
+    if schema is not None:
+        schema["shape"] = [int(size) for size in pc_np.shape]
+        schema["dtype"] = str(pc_np.dtype)
+        _write_pointcloud_schema(save_dir, schema)
 
-        # FIXME: 4) 未识别点云类型当前仅打印并跳过，可能导致该帧数据缺失。
-        else:
-            print(f"[Warning] Unknown pointcloud type: {type(msg)} at {timestamp}")
-            return
-
-        if not points_list:
-            return
-
-        pc_np = np.array(points_list, dtype=np.float32)
-
-        # 保存为 .npy
-        filename_npy = os.path.join(save_dir, f"{timestamp:.6f}.npy")
-        np.save(filename_npy, pc_np)
-
-        if schema is not None:
-            schema["shape"] = [int(size) for size in pc_np.shape]
-            schema["dtype"] = str(pc_np.dtype)
-            _write_pointcloud_schema(save_dir, schema)
-
-        # 可选：同时保存一份仅含 XYZ 的 PCD 用于可视化预览
-        # pcd = o3d.geometry.PointCloud()
-        # pcd.points = o3d.utility.Vector3dVector(pc_np[:, :3])
-        # filename_pcd = os.path.join(save_dir, f"{timestamp:.6f}.pcd")
-        # o3d.io.write_point_cloud(filename_pcd, pcd)
-
-    except Exception as e:
-        # 打印错误信息
-        print(f"[Error] Failed to save pointcloud at {timestamp}: {e}")
-        pass
-
+    # layout 稳定性通过后再发布帧文件，避免漂移帧留下无收据 NPY。
+    filename_npy = os.path.join(save_dir, f"{timestamp:.6f}.npy")
+    np.save(filename_npy, pc_np)
+    return filename_npy
 
 def save_compressed_image(msg, save_dir, timestamp):
-    try:
-        data_np = np.frombuffer(msg.data, dtype=np.uint8)
-        img = cv2.imdecode(data_np, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            print(f"[Warning] Failed to decode image at {timestamp}")
-            return
-        filename = os.path.join(save_dir, f"{timestamp:.6f}.png")
-        cv2.imwrite(filename, img)
-    except Exception as e:
-        print(f"[Error] Failed to save image at {timestamp}: {e}")
-        pass
+    data_np = np.frombuffer(msg.data, dtype=np.uint8)
+    img = cv2.imdecode(data_np, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Failed to decode image at {timestamp}")
+    filename = os.path.join(save_dir, f"{timestamp:.6f}.png")
+    if not cv2.imwrite(filename, img):
+        raise OSError(f"Failed to write image at {timestamp}: {filename}")
+    return filename
+
+def _message_to_csv_row(msg, timestamp, timestamp_source):
+    """把非点云 ROS 消息转换为标准库 CSV 可写的扁平记录。"""
+    data_row = {"timestamp": timestamp, "timestamp_source": timestamp_source}
+    if hasattr(msg, "header"):
+        data_row["seq"] = msg.header.seq
+    for attr in getattr(msg, "__slots__", dir(msg)):
+        if attr.startswith("_") or attr == "header":
+            continue
+        try:
+            value = getattr(msg, attr)
+            if all(hasattr(value, key) for key in ("x", "y", "z")):
+                data_row[f"{attr}_x"] = value.x
+                data_row[f"{attr}_y"] = value.y
+                data_row[f"{attr}_z"] = value.z
+                if hasattr(value, "w"):
+                    data_row[f"{attr}_w"] = value.w
+            elif isinstance(value, (list, tuple, np.ndarray)):
+                data_row[attr] = str(list(value))
+            elif isinstance(value, (int, float, str, bool)):
+                data_row[attr] = value
+            elif not callable(value):
+                data_row[attr] = str(value).replace("\n", " ")
+        except Exception:
+            # 单个可选属性不可序列化时不影响整条非关键消息。
+            continue
+    return data_row
+
 
 def process_ntu_dataset(input_root, output_root):
-    # NOTE: 1) 递归查找所有 .bag 文件。
+    """按场景解包 bag，并以关键模态逐帧收据 fail-closed。"""
     search_pattern = os.path.join(input_root, "**", "*.bag")
-    bag_files = glob.glob(search_pattern, recursive=True)
-    bag_files.sort()
-
+    bag_files = sorted(glob.glob(search_pattern, recursive=True))
     if not bag_files:
         print(f"No .bag files found in {input_root}")
         return
 
+    expected_bags_by_scene = {}
+    for bag_path in bag_files:
+        expected_bags_by_scene.setdefault(get_scene_name(bag_path), []).append(
+            os.path.basename(bag_path)
+        )
+    receipts = {
+        scene: new_extraction_receipt(scene, expected_bags)
+        for scene, expected_bags in expected_bags_by_scene.items()
+    }
+
     print(f"Found {len(bag_files)} bag files. Starting processing...")
     print(f"Output Root: {output_root}\n")
-
-    # ──► 核心重构：建立【外层进度条】，监控总体包文件的处理进度
     outer_pbar = tqdm(bag_files, desc="总体包解包进度", unit="bag")
 
-    # NOTE: 2) 遍历处理每个 Bag，并把同场景分卷归并到统一输出目录。
-    for i, bag_path in enumerate(outer_pbar):
-        # 确定该 bag 属于哪个场景 (loop1, carpark, etc.)
+    for bag_path in outer_pbar:
         scene_name = get_scene_name(bag_path)
-
-        # 构建最终输出路径: ./output/loop1/
         scene_output_dir = os.path.join(output_root, scene_name)
+        receipt_path = os.path.join(scene_output_dir, "extraction_receipt.json")
+        receipt = receipts[scene_name]
         bag_filename = os.path.basename(bag_path)
-
-        # 通过外参控制台实时刷新当前激活的文件描述
         outer_pbar.set_description(f"正在处理: {bag_filename}")
 
         try:
             bag = rosbag.Bag(bag_path)
-        except Exception as e:
+        except Exception as exc:
+            record_extraction_failure(
+                receipt,
+                bag=bag_filename,
+                topic="__bag__",
+                timestamp=None,
+                timestamp_source=None,
+                error=exc,
+                critical=True,
+            )
+            write_extraction_receipt_atomic(receipt_path, receipt)
             raise RuntimeError(
                 f"无法打开 rosbag 分卷，拒绝继续生成不完整场景: {bag_path}"
-            ) from e
+            ) from exc
 
-        info = bag.get_type_and_topic_info()
-        csv_buffers = {} # 用于缓存非点云数据
+        csv_buffers = {}
+        try:
+            info = bag.get_type_and_topic_info()
+            pbar_desc = f"  └─ 帧提取流 ({bag_filename[:15]}...)"
+            inner_pbar = tqdm(
+                bag.read_messages(),
+                desc=pbar_desc,
+                unit="msg",
+                leave=False,
+            )
+            for topic, msg, bag_time in inner_pbar:
+                if topic not in info.topics:
+                    continue
+                topic_key = _topic_key(topic)
+                if topic_key not in ALLOWED_TOPICS:
+                    continue
 
-        # ──► 核心重构：建立【内层流式进度条】，动态显示每一包数据解压吞吐速度
-        # 采用 leave=False 确保当前 bag 处理完后，内层进度条自动清除，不污染屏幕
-        pbar_desc = f"  └─ 帧提取流 ({bag_filename[:15]}...)"
-        inner_pbar = tqdm(bag.read_messages(), desc=pbar_desc, unit="msg", leave=False)
+                timestamp = None
+                timestamp_source = None
+                try:
+                    receipt_timestamp = bag_time.to_sec()
+                    timestamp, timestamp_source = preferred_message_timestamp(
+                        msg,
+                        receipt_timestamp,
+                    )
+                    msg_type = info.topics[topic].msg_type
+                    topic_dir = os.path.join(
+                        scene_output_dir,
+                        topic.strip("/").replace("/", "_"),
+                    )
+                    if "PointCloud" in msg_type or "CustomMsg" in msg_type:
+                        os.makedirs(topic_dir, exist_ok=True)
+                        save_pointcloud(msg, topic_dir, timestamp)
+                        record_extraction_success(receipt, topic_key)
+                    elif "CompressedImage" in msg_type:
+                        os.makedirs(topic_dir, exist_ok=True)
+                        save_compressed_image(msg, topic_dir, timestamp)
+                        record_extraction_success(receipt, topic_key)
+                    else:
+                        csv_buffers.setdefault(topic, []).append(
+                            _message_to_csv_row(
+                                msg,
+                                timestamp,
+                                timestamp_source,
+                            )
+                        )
+                except Exception as exc:
+                    critical = topic_key in CRITICAL_EXTRACTION_TOPICS
+                    record_extraction_failure(
+                        receipt,
+                        bag=bag_filename,
+                        topic=topic_key,
+                        timestamp=timestamp,
+                        timestamp_source=timestamp_source,
+                        error=exc,
+                        critical=critical,
+                    )
+                    write_extraction_receipt_atomic(receipt_path, receipt)
+                    if critical:
+                        raise RuntimeError(
+                            "关键模态帧解包失败，拒绝继续生成不完整场景: "
+                            f"scene={scene_name}, topic={topic_key}, bag={bag_filename}"
+                        ) from exc
+        except Exception as exc:
+            if receipt["status"] != "failed":
+                record_extraction_failure(
+                    receipt,
+                    bag=bag_filename,
+                    topic="__bag__",
+                    timestamp=None,
+                    timestamp_source=None,
+                    error=exc,
+                    critical=True,
+                )
+                write_extraction_receipt_atomic(receipt_path, receipt)
+            raise
+        finally:
+            try:
+                bag.close()
+            except Exception as exc:
+                record_extraction_failure(
+                    receipt,
+                    bag=bag_filename,
+                    topic="__bag__",
+                    timestamp=None,
+                    timestamp_source=None,
+                    error=exc,
+                    critical=True,
+                )
+                write_extraction_receipt_atomic(receipt_path, receipt)
+                raise RuntimeError(
+                    f"关闭 rosbag 分卷失败，场景完整性未知: {bag_path}"
+                ) from exc
 
-        for topic, msg, t in inner_pbar:
-            if topic not in info.topics:
-                continue
-
-            topic_key = _topic_key(topic)
-            if topic_key not in ALLOWED_TOPICS:
-                continue
-
-            msg_type = info.topics[topic].msg_type
-            # 优先使用消息头时间戳，只有消息头缺失/无效时才使用 bag 接收时间。
-            # 这样不同传感器的硬件采样时刻不会被 ROS bag 写入时刻覆盖。
-            receipt_timestamp = t.to_sec()
-            timestamp, timestamp_source = preferred_message_timestamp(msg, receipt_timestamp)
-
-            # 准备话题对应的子文件夹名，例如 /livox/lidar -> livox_lidar
-            topic_clean = topic.strip('/').replace('/', '_')
-            topic_dir = os.path.join(scene_output_dir, topic_clean)
-
-            # A. 处理点云 (LiDAR & Radar)
-            if 'PointCloud' in msg_type or 'CustomMsg' in msg_type:
-                os.makedirs(topic_dir, exist_ok=True)
-                save_pointcloud(msg, topic_dir, timestamp)
-
-            # A2. 处理压缩图像
-            elif 'CompressedImage' in msg_type:
-                os.makedirs(topic_dir, exist_ok=True)
-                save_compressed_image(msg, topic_dir, timestamp)
-
-            # B. 处理其他数据 (IMU, GPS, etc.) -> 存 CSV
-            else:
-                if topic not in csv_buffers:
-                    csv_buffers[topic] = []
-
-                data_row = {'timestamp': timestamp, 'timestamp_source': timestamp_source}
-
-                if hasattr(msg, 'header'):
-                    data_row['seq'] = msg.header.seq
-
-                # 使用 __slots__ 获取真实数据字段，避免获取到方法(method)
-                # 如果没有 __slots__ (极少数情况)，回退到 dir()
-                slots = getattr(msg, '__slots__', dir(msg))
-
-                for attr in slots:
-                    if attr.startswith('_') or attr == 'header':
-                        continue
-
-                    try:
-                        val = getattr(msg, attr)
-
-                        # 1. 处理嵌套的几何消息 (Vector3, Quaternion) -> 扁平化展开
-                        # 检查是否具有 x, y, z 属性
-                        if all(hasattr(val, k) for k in ['x', 'y', 'z']):
-                            data_row[f"{attr}_x"] = val.x
-                            data_row[f"{attr}_y"] = val.y
-                            data_row[f"{attr}_z"] = val.z
-                            if hasattr(val, 'w'): # Quaternion
-                                data_row[f"{attr}_w"] = val.w
-
-                        # 2. 处理列表/数组 (Covariance) -> 转字符串，避免多列混乱
-                        elif isinstance(val, (list, tuple, np.ndarray)):
-                            data_row[attr] = str(list(val))
-
-                        # 3. 处理基本类型
-                        elif isinstance(val, (int, float, str, bool)):
-                            data_row[attr] = val
-
-                        # 4. 其他情况 (转字符串)
-                        else:
-                            # 过滤掉方法(method)
-                            if not callable(val):
-                                data_row[attr] = str(val).replace('\n', ' ')
-
-                    except Exception as e:
-                        # print(f"[Warning] Failed to read attribute {attr} on {topic_clean}: {e}")
-                        pass
-
-                csv_buffers[topic].append(data_row)
-
-        bag.close()
-
-        # NOTE: C. 保存 CSV 数据
-        # 为了防止不同分卷覆盖同名 csv，在 csv 文件名中加上分卷标识
-        # 例如: vectornav_imu/data_loop1_2022-06-03_0.csv
         bag_base_name = os.path.splitext(bag_filename)[0]
-
         for topic, data_list in csv_buffers.items():
-            if not data_list: continue
+            if not data_list:
+                continue
+            topic_key = _topic_key(topic)
+            try:
+                topic_dir = os.path.join(
+                    scene_output_dir,
+                    topic.strip("/").replace("/", "_"),
+                )
+                os.makedirs(topic_dir, exist_ok=True)
+                _write_csv_records(
+                    os.path.join(topic_dir, f"data_{bag_base_name}.csv"),
+                    data_list,
+                )
+                for _ in data_list:
+                    record_extraction_success(receipt, topic_key)
+            except Exception as exc:
+                record_extraction_failure(
+                    receipt,
+                    bag=bag_filename,
+                    topic=topic_key,
+                    timestamp=None,
+                    timestamp_source=None,
+                    error=exc,
+                    critical=False,
+                )
 
-            topic_clean = topic.strip('/').replace('/', '_')
-            topic_dir = os.path.join(scene_output_dir, topic_clean)
-            os.makedirs(topic_dir, exist_ok=True)
+        mark_bag_processed(receipt, bag_filename)
+        write_extraction_receipt_atomic(receipt_path, receipt)
 
-            csv_filename = f"data_{bag_base_name}.csv"
-            _write_csv_records(os.path.join(topic_dir, csv_filename), data_list)
-
+    failed_scenes = []
+    for scene_name, receipt in receipts.items():
+        if not finalize_extraction_receipt(receipt):
+            failed_scenes.append(scene_name)
+        write_extraction_receipt_atomic(
+            os.path.join(output_root, scene_name, "extraction_receipt.json"),
+            receipt,
+        )
+    if failed_scenes:
+        raise RuntimeError(
+            "关键模态解包不完整，拒绝报告成功: " + ", ".join(failed_scenes)
+        )
     print("\nAll extraction tasks completed successfully!")
 
 if __name__ == "__main__":

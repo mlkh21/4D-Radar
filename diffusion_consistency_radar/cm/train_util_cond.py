@@ -1,3 +1,5 @@
+"""Legacy/reference teacher/progressive-distillation 训练循环，非当前正式入口。"""
+
 import copy
 import functools
 import os

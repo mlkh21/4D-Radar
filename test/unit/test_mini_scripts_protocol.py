@@ -77,6 +77,31 @@ class MiniScriptsProtocolTest(unittest.TestCase):
         self.assertIn('ln -s "${SRC_IR_PATH}"', script)
         self.assertIn('preprocess_policy.json', script)
 
+    def test_mini_cd_config_uses_active_ema_consistency_fields(self):
+        script = self._read("test/mini-test/train_minimal.sh")
+
+        for token in (
+            "'initialization_model_path'",
+            "'training_semantics'",
+            "'num_scales'",
+            "'ema_rate'",
+            "'sigma_min'",
+            "'sigma_max'",
+            "'rho'",
+        ):
+            self.assertIn(token, script)
+        for unused_token in (
+            "'training_mode'",
+            "'target_ema_mode'",
+            "'start_ema'",
+            "'scale_mode'",
+            "'start_scales'",
+            "'end_scales'",
+            "'distill_steps_per_iter'",
+            "'loss_norm'",
+        ):
+            self.assertNotIn(unused_token, script)
+
     def test_inference_script_accepts_matching_data_and_result_roots(self):
         script = self._read("test/mini-test/inference_minimal.sh")
 

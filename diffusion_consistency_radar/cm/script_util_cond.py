@@ -1,3 +1,5 @@
+"""Legacy/reference consistency-model 参数工厂；正式训练入口不消费这些默认值。"""
+
 import argparse # 导入参数解析库，用于处理命令行参数
 
 from .karras_diffusion import KarrasDenoiser # 导入 Karras 扩散过程类（核心算法）

@@ -46,7 +46,7 @@ DEFAULT_EMPTY_FALLBACK_TOPK=$(echo "${INFER_DEFAULTS}" | sed -n '2p')
 
 MAX_INFER_FILES="${MAX_INFER_FILES:-${DEFAULT_MAX_INFER_FILES}}"
 EMPTY_FALLBACK_TOPK="${EMPTY_FALLBACK_TOPK:-${DEFAULT_EMPTY_FALLBACK_TOPK}}"
-OCC_THRESHOLD="${OCC_THRESHOLD:-0.05}"
+INFERENCE_SEED="${INFERENCE_SEED:-42}"
 
 echo "=========================================="
 echo "4D Radar 推理"
@@ -54,12 +54,21 @@ echo "=========================================="
 echo "default config: ${DEFAULT_CONFIG}"
 echo "max files per scene: ${MAX_INFER_FILES} (0 means all)"
 echo "empty fallback top-k: ${EMPTY_FALLBACK_TOPK} (0 means disabled)"
-echo "occ threshold: ${OCC_THRESHOLD}"
+echo "occ threshold: validation artifact"
 
 # 检查模型是否存在
 VAE_CKPT="${RESULTS_DIR}/vae/vae_best.pt"
 LDM_CKPT="${RESULTS_DIR}/ldm/ldm_best.pt"
 CD_CKPT="${RESULTS_DIR}/cd/cd_best.pt"
+LDM_THRESHOLD_ARTIFACT="${LDM_THRESHOLD_ARTIFACT:-${RESULTS_DIR}/ldm/occupancy_threshold.json}"
+CD_THRESHOLD_ARTIFACT="${CD_THRESHOLD_ARTIFACT:-${RESULTS_DIR}/cd/occupancy_threshold.json}"
+
+for ARTIFACT in "${LDM_THRESHOLD_ARTIFACT}" "${CD_THRESHOLD_ARTIFACT}"; do
+    if [ ! -f "${ARTIFACT}" ]; then
+        echo "错误: validation threshold artifact 不存在: ${ARTIFACT}"
+        exit 1
+    fi
+done
 
 echo "校验正式 VAE/LDM/CD checkpoint 链"
 python "${CHECKPOINT_CHAIN_SCRIPT}" validate \
@@ -128,7 +137,8 @@ if [ "$RUN_LDM" = true ]; then
             --deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}" \
             --calibration_dir "${CALIBRATION_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
-            --occ_threshold "${OCC_THRESHOLD}" \
+            --threshold_artifact "${LDM_THRESHOLD_ARTIFACT}" \
+            --seed "${INFERENCE_SEED}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --require_real_ir \
             --save_voxel \
@@ -163,7 +173,8 @@ if [ "$RUN_CD" = true ]; then
             --deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}" \
             --calibration_dir "${CALIBRATION_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
-            --occ_threshold "${OCC_THRESHOLD}" \
+            --threshold_artifact "${CD_THRESHOLD_ARTIFACT}" \
+            --seed "${INFERENCE_SEED}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --require_real_ir \
             --save_voxel \
@@ -196,7 +207,8 @@ if [ "$RUN_CD" = true ]; then
             --deployment_scene_dir "${PREPROCESSED_ROOT}/${SCENE}" \
             --calibration_dir "${CALIBRATION_DIR}" \
             --max_files "${MAX_INFER_FILES}" \
-            --occ_threshold "${OCC_THRESHOLD}" \
+            --threshold_artifact "${CD_THRESHOLD_ARTIFACT}" \
+            --seed "${INFERENCE_SEED}" \
             --empty_fallback_topk "${EMPTY_FALLBACK_TOPK}" \
             --require_real_ir \
             --save_voxel \

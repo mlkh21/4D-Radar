@@ -189,6 +189,22 @@ class CheckpointChainProtocolTest(unittest.TestCase):
                 "data_grid_config": grid,
                 "vae_checkpoint_sha256": cd_vae_hash,
                 "ldm_checkpoint_sha256": sha256_file(ldm_path),
+                "training_semantics": "ldm_initialized_ema_consistency_v1",
+                "ldm_role": "initialization_checkpoint",
+                "consistency_target_source": "cd_model_ema",
+                "denoising_parameterization": "direct_x0_sigma_conditioned_v1",
+                "consistency_training_config": {
+                    "protocol": "ema_consistency_training_config_v1",
+                    "training_semantics": "ldm_initialized_ema_consistency_v1",
+                    "denoising_parameterization": "direct_x0_sigma_conditioned_v1",
+                    "consistency_target_source": "cd_model_ema",
+                    "loss": "mse",
+                    "num_scales": 40,
+                    "ema_rate": 0.999,
+                    "sigma_min": 0.002,
+                    "sigma_max": 80.0,
+                    "rho": 7.0,
+                },
         }
         if missing_data_protocol_stage != "cd":
             cd_payload["data_protocol"] = self._data_protocol()
@@ -223,6 +239,31 @@ class CheckpointChainProtocolTest(unittest.TestCase):
         self.assertEqual(len(report["sha256"]), 3)
         self.assertEqual(report["radar_normalization_protocol"], "radar_normalization_v1")
         self.assertEqual(report["radar_normalization_sha256"], "b" * 64)
+        self.assertEqual(
+            report["cd_consistency_training_config"]["protocol"],
+            "ema_consistency_training_config_v1",
+        )
+
+    def test_formal_cd_requires_consistency_training_receipt(self):
+        from diffusion_consistency_radar.checkpoint_chain import (
+            CheckpointChainError,
+            validate_formal_checkpoint_chain,
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            paths = self._write_chain(root)
+            cd_payload = torch.load(
+                paths[2],
+                map_location="cpu",
+                weights_only=True,
+            )
+            del cd_payload["consistency_training_config"]
+            torch.save(cd_payload, paths[2])
+            with self.assertRaisesRegex(
+                CheckpointChainError,
+                "consistency_training_config",
+            ):
+                validate_formal_checkpoint_chain(*paths)
 
     def test_training_protocol_resolver_accepts_only_formal_or_isolated_mini(self):
         from diffusion_consistency_radar.checkpoint_chain import (

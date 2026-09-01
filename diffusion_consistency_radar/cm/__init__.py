@@ -89,7 +89,7 @@ from .vae_3d import (
 # NOTE: 扩散过程
 from .karras_diffusion import KarrasDenoiser
 
-# NOTE: 工具函数
+# NOTE: Legacy/reference consistency-model 工具；当前正式 trainer 不消费其默认值。
 from .script_util_cond import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,

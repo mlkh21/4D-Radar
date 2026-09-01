@@ -55,6 +55,12 @@ class FormalInferenceProtocolTest(unittest.TestCase):
             target[index, index, index, 3] = 1.0
             np.save(os.path.join(radar_dir, f"{frame_id}.npy"), radar)
             np.save(os.path.join(target_dir, f"{frame_id}.npy"), target)
+            observed = np.ones((2, 2, 2), dtype=np.uint8)
+            observed_path = os.path.join(
+                pred_dir,
+                f"{frame_id}_observed_mask.npy",
+            )
+            np.save(observed_path, observed)
 
         np.save(
             os.path.join(lidar_dir, "lidar_000.npy"),
@@ -75,13 +81,49 @@ class FormalInferenceProtocolTest(unittest.TestCase):
             "model_pc_range": [0, 0, 0, 2, 2, 2],
             "voxel_size": [1, 1, 1],
             "occ_threshold": 0.5,
+            "occ_threshold_source": "validation_artifact",
+            "occupancy_threshold_artifact_sha256": "f" * 64,
+            "occupancy_threshold_artifact": {
+                "protocol": "occupancy_threshold_validation_artifact_v1",
+                "selection_rule": "max_iou_then_max_recall_then_lower_threshold_v1",
+                "selected_threshold": 0.5,
+                "selected_metrics": {
+                    "threshold": 0.5,
+                    "iou": 0.8,
+                    "recall": 0.9,
+                },
+                "metrics_by_threshold": [
+                    {"threshold": 0.5, "iou": 0.8, "recall": 0.9}
+                ],
+            },
             "model_type": "ldm",
             "steps": 40,
             "sampler": "heun",
             "model_is_multimodal": True,
             "require_real_ir": True,
+            "formal_protocol": True,
             "frame_count": 2,
         }
+        from diffusion_consistency_radar.scripts.inference import (
+            build_observed_mask_metadata,
+        )
+
+        metadata["observed_mask"] = build_observed_mask_metadata(
+            [
+                {
+                    "frame_id": f"{index:06d}",
+                    "file": f"{index:06d}_observed_mask.npy",
+                    "sha256": self._file_hash(
+                        os.path.join(
+                            pred_dir,
+                            f"{index:06d}_observed_mask.npy",
+                        )
+                    ),
+                    "observed_voxels": 8,
+                }
+                for index in range(2)
+            ]
+        )
         metadata_path = os.path.join(pred_dir, "inference_run.json")
         with open(metadata_path, "w", encoding="utf-8") as handle:
             json.dump(metadata, handle)
@@ -125,8 +167,24 @@ class FormalInferenceProtocolTest(unittest.TestCase):
             hashes_after = [self._file_hash(path) for path in pred_paths]
             self.assertEqual(hashes_before, hashes_after)
             self.assertEqual(summary["stage"], "offline_evaluation")
+            self.assertEqual(
+                summary["protocol"],
+                "formal_saved_prediction_observed_domain_evaluation_v1",
+            )
+            self.assertTrue(summary["formal_protocol"])
+            self.assertEqual(
+                summary["occupancy_metric_domain"],
+                "external_authoritative_observed_mask",
+            )
+            self.assertIn("mean_near_bev_iou", summary["formal_metrics"])
+            self.assertNotIn("mean_raw_lidar_chamfer", summary["formal_metrics"])
             self.assertTrue(summary["prediction_unchanged"])
             self.assertEqual(summary["frame_count"], 2)
+            self.assertEqual(
+                summary["observed_mask_protocol"],
+                "radar_endpoint_ray_visibility_v1",
+            )
+            self.assertEqual(summary["observed_mask_frame_count"], 2)
             self.assertEqual(
                 summary["model_pc_range"],
                 [0.0, 0.0, 0.0, 2.0, 2.0, 2.0],
@@ -147,6 +205,90 @@ class FormalInferenceProtocolTest(unittest.TestCase):
             self.assertEqual(rows[0]["lidar_file"], "lidar_001.npy")
             self.assertEqual(rows[1]["lidar_file"], "lidar_000.npy")
             self.assertEqual(float(rows[0]["pred_target_chamfer"]), 0.0)
+            self.assertEqual(rows[0]["observed_mask_file"], "000000_observed_mask.npy")
+            self.assertEqual(int(rows[0]["observed_voxels"]), 8)
+
+    def test_formal_metrics_ignore_prediction_outside_authoritative_observed_domain(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths = self._write_fixture(root)
+            pred_path = os.path.join(paths["pred"], "000000_voxel.npy")
+            pred = np.load(pred_path, allow_pickle=False)
+            pred[0, 1, 0, 0] = 0.99
+            np.save(pred_path, pred)
+
+            observed_path = os.path.join(
+                paths["pred"], "000000_observed_mask.npy"
+            )
+            observed = np.load(observed_path, allow_pickle=False)
+            observed[1, 0, 0] = 0
+            np.save(observed_path, observed)
+
+            with open(paths["metadata"], "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            from diffusion_consistency_radar.scripts.inference import (
+                build_observed_mask_metadata,
+            )
+
+            metadata["observed_mask"] = build_observed_mask_metadata(
+                [
+                    {
+                        "frame_id": f"{index:06d}",
+                        "file": f"{index:06d}_observed_mask.npy",
+                        "sha256": self._file_hash(
+                            os.path.join(
+                                paths["pred"],
+                                f"{index:06d}_observed_mask.npy",
+                            )
+                        ),
+                        "observed_voxels": 7 if index == 0 else 8,
+                    }
+                    for index in range(2)
+                ]
+            )
+            with open(paths["metadata"], "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle)
+
+            output_dir = os.path.join(root, "evaluation_observed")
+            self._evaluate(paths, output_dir)
+            with open(
+                os.path.join(output_dir, "evaluation_frames.csv"),
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(int(rows[0]["pred_point_count"]), 1)
+            self.assertEqual(float(rows[0]["near_precision"]), 1.0)
+
+    def test_legacy_pointcloud_evaluator_is_explicitly_diagnostic_only(self):
+        text = self._read_project_file(
+            "diffusion_consistency_radar/scripts/evaluate.py"
+        )
+        self.assertIn("diagnostic-only", text)
+        self.assertIn('"formal_protocol": False', text)
+        self.assertIn("launch/evaluate_inference.sh", text)
+
+    def test_evaluator_rejects_observed_mask_content_or_frame_mismatch(self):
+        for mutation in ("content", "extra_frame"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as root:
+                paths = self._write_fixture(root)
+                if mutation == "content":
+                    np.save(
+                        os.path.join(paths["pred"], "000001_observed_mask.npy"),
+                        np.zeros((2, 2, 2), dtype=np.uint8),
+                    )
+                else:
+                    np.save(
+                        os.path.join(paths["pred"], "000002_observed_mask.npy"),
+                        np.ones((2, 2, 2), dtype=np.uint8),
+                    )
+
+                output_dir = os.path.join(root, "evaluation")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "observed|SHA|frame|帧",
+                ):
+                    self._evaluate(paths, output_dir)
+                self.assertFalse(os.path.exists(output_dir))
 
     def test_evaluator_rejects_nonempty_output_before_writing(self):
         with tempfile.TemporaryDirectory() as root:
@@ -187,6 +329,14 @@ class FormalInferenceProtocolTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "occ_threshold"):
                 self._evaluate(paths, output_dir)
 
+            self.assertFalse(os.path.exists(output_dir))
+
+    def test_formal_evaluator_rejects_threshold_cli_override(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths = self._write_fixture(root)
+            output_dir = os.path.join(root, "evaluation")
+            with self.assertRaisesRegex(ValueError, "threshold.*override|阈值"):
+                self._evaluate(paths, output_dir, occ_threshold=0.4)
             self.assertFalse(os.path.exists(output_dir))
 
     def test_voxel_points_use_recorded_voxel_size(self):

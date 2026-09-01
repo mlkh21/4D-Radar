@@ -1,4 +1,5 @@
 #!/bin/bash
+# Legacy diagnostic-only 生成质量入口；不生成正式 evaluation summary。
 set -euo pipefail
 
 # 获取脚本所在目录和项目根目录
@@ -16,6 +17,7 @@ TARGET_VOXEL_DIR="${ROOT_DIR}/Data/NTU4DRadLM_Pre/${SCENE}/target_voxel"
 PRED_DIR="${ROOT_DIR}/Result/inference_results/${SCENE}_${METHOD}"
 OUTPUT_DIR="${ROOT_DIR}/Result/diagnosis_results/${SCENE}_${METHOD}"
 
+echo "警告: diagnose.sh 仅用于 legacy diagnostic，不是正式评价入口。"
 echo "开始仿真结果诊断分析..."
 echo "预测数据目录: ${PRED_DIR}"
 echo "输出结果目录: ${OUTPUT_DIR}"

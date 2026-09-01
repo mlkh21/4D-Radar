@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""文件功能：定义 Radar point-count/Doppler-validity 稀疏统计存储合同。"""
+"""文件功能：定义 Radar 分字段 finite-count 稀疏统计存储合同。"""
 
 import os
 from typing import Dict, Mapping, Optional, Tuple
@@ -7,13 +7,18 @@ from typing import Dict, Mapping, Optional, Tuple
 import numpy as np
 
 
-RADAR_STATISTICS_PROTOCOL = "radar_point_count_doppler_validity_v1"
+RADAR_STATISTICS_PROTOCOL_V1 = "radar_point_count_doppler_validity_v1"
+RADAR_STATISTICS_PROTOCOL = "radar_point_count_field_validity_v2"
+SUPPORTED_RADAR_STATISTICS_PROTOCOLS = frozenset(
+    {RADAR_STATISTICS_PROTOCOL_V1, RADAR_STATISTICS_PROTOCOL}
+)
 _BASE_KEYS = {"coords", "features", "shape"}
-_STATISTICS_KEYS = {
+_STATISTICS_KEYS_V1 = {
     "radar_statistics_protocol",
     "point_count",
     "doppler_valid_count",
 }
+_STATISTICS_KEYS_V2 = _STATISTICS_KEYS_V1 | {"intensity_valid_count"}
 
 
 def _validate_sparse_base(
@@ -63,15 +68,24 @@ def _validate_statistics(
     *,
     coords: np.ndarray,
     point_count: np.ndarray,
+    intensity_valid_count: Optional[np.ndarray],
     doppler_valid_count: np.ndarray,
     protocol: object,
     path: str,
 ) -> Dict[str, object]:
     """验证与 coords 一一对齐的无符号计数，并生成审计摘要。"""
     protocol_array = np.asarray(protocol)
-    if protocol_array.shape != () or str(protocol_array.item()) != RADAR_STATISTICS_PROTOCOL:
+    if protocol_array.shape != ():
+        raise ValueError(f"Radar statistics protocol 不匹配: {path}")
+    protocol_name = str(protocol_array.item())
+    if protocol_name not in SUPPORTED_RADAR_STATISTICS_PROTOCOLS:
         raise ValueError(f"Radar statistics protocol 不匹配: {path}")
     point_array = np.asarray(point_count)
+    intensity_array = (
+        np.asarray(intensity_valid_count)
+        if intensity_valid_count is not None
+        else None
+    )
     valid_array = np.asarray(doppler_valid_count)
     expected_shape = (coords.shape[0],)
     if point_array.shape != expected_shape or point_array.dtype != np.dtype(np.uint32):
@@ -80,12 +94,28 @@ def _validate_statistics(
         raise ValueError(
             f"Radar statistics doppler_valid_count 必须是与 coords 对齐的 uint32: {path}"
         )
+    if protocol_name == RADAR_STATISTICS_PROTOCOL:
+        if (
+            intensity_array is None
+            or intensity_array.shape != expected_shape
+            or intensity_array.dtype != np.dtype(np.uint32)
+        ):
+            raise ValueError(
+                "Radar statistics intensity_valid_count 必须是与 coords "
+                f"对齐的 uint32: {path}"
+            )
+    elif intensity_array is not None:
+        raise ValueError(f"Radar statistics v1 不允许 intensity_valid_count: {path}")
     if np.any(point_array == 0):
         raise ValueError(f"Radar statistics occupied point count 必须大于 0: {path}")
     if np.any(valid_array > point_array):
         raise ValueError(f"Radar statistics Doppler valid count 不得超过 point count: {path}")
-    return {
-        "protocol": RADAR_STATISTICS_PROTOCOL,
+    if intensity_array is not None and np.any(intensity_array > point_array):
+        raise ValueError(
+            f"Radar statistics intensity valid count 不得超过 point count: {path}"
+        )
+    summary = {
+        "protocol": protocol_name,
         "occupied_voxels": int(coords.shape[0]),
         "total_point_count": int(point_array.astype(np.uint64).sum()),
         "total_doppler_valid_count": int(valid_array.astype(np.uint64).sum()),
@@ -93,6 +123,21 @@ def _validate_statistics(
         "doppler_multi_sample_voxels": int(np.count_nonzero(valid_array >= 2)),
         "doppler_missing_voxels": int(np.count_nonzero(valid_array == 0)),
     }
+    if intensity_array is not None:
+        summary.update(
+            {
+                "total_intensity_valid_count": int(
+                    intensity_array.astype(np.uint64).sum()
+                ),
+                "intensity_multi_sample_voxels": int(
+                    np.count_nonzero(intensity_array >= 2)
+                ),
+                "intensity_missing_voxels": int(
+                    np.count_nonzero(intensity_array == 0)
+                ),
+            }
+        )
+    return summary
 
 
 def save_sparse_radar_voxel(
@@ -110,7 +155,12 @@ def save_sparse_radar_voxel(
     occupied = voxel[..., 0] > 0.0
     coords = np.column_stack(np.where(occupied)).astype(np.int32, copy=False)
     features = voxel[occupied].astype(np.float32, copy=False)
-    expected_keys = {"protocol", "coords", "point_count", "doppler_valid_count"}
+    protocol = statistics.get("protocol") if isinstance(statistics, Mapping) else None
+    expected_keys = (
+        {"protocol", "coords", "point_count", "intensity_valid_count", "doppler_valid_count"}
+        if protocol == RADAR_STATISTICS_PROTOCOL
+        else {"protocol", "coords", "point_count", "doppler_valid_count"}
+    )
     if not isinstance(statistics, Mapping) or set(statistics) != expected_keys:
         raise ValueError(f"Radar statistics 字段必须精确为 {sorted(expected_keys)}")
     statistics_coords = np.asarray(statistics["coords"])
@@ -122,23 +172,34 @@ def save_sparse_radar_voxel(
     summary = _validate_statistics(
         coords=coords,
         point_count=np.asarray(statistics["point_count"]),
+        intensity_valid_count=(
+            np.asarray(statistics["intensity_valid_count"])
+            if "intensity_valid_count" in statistics
+            else None
+        ),
         doppler_valid_count=np.asarray(statistics["doppler_valid_count"]),
         protocol=statistics["protocol"],
         path=output_path,
     )
     if summary["occupied_voxels"] != int(np.count_nonzero(occupied)):
         raise ValueError("Radar statistics occupied voxel 数量不一致")
+    output = {
+        "coords": coords,
+        "features": features,
+        "shape": np.asarray(voxel.shape, dtype=np.int64),
+        "radar_statistics_protocol": np.asarray(str(statistics["protocol"])),
+        "point_count": np.asarray(statistics["point_count"], dtype=np.uint32),
+        "doppler_valid_count": np.asarray(
+            statistics["doppler_valid_count"], dtype=np.uint32
+        ),
+    }
+    if "intensity_valid_count" in statistics:
+        output["intensity_valid_count"] = np.asarray(
+            statistics["intensity_valid_count"], dtype=np.uint32
+        )
     np.savez_compressed(
         output_path,
-        coords=coords,
-        features=features,
-        shape=np.asarray(voxel.shape, dtype=np.int64),
-        radar_statistics_protocol=np.asarray(RADAR_STATISTICS_PROTOCOL),
-        point_count=np.asarray(statistics["point_count"], dtype=np.uint32),
-        doppler_valid_count=np.asarray(
-            statistics["doppler_valid_count"],
-            dtype=np.uint32,
-        ),
+        **output,
     )
 
 
@@ -164,10 +225,21 @@ def _read_sparse_radar_payload(
             coords = np.asarray(payload["coords"])
             features = np.asarray(payload["features"])
             shape = np.asarray(payload["shape"])
-            has_statistics = _STATISTICS_KEYS.issubset(keys)
+            has_protocol = "radar_statistics_protocol" in keys
+            protocol_name = (
+                str(np.asarray(payload["radar_statistics_protocol"]).item())
+                if has_protocol
+                else None
+            )
+            expected_statistics_keys = (
+                _STATISTICS_KEYS_V2
+                if protocol_name == RADAR_STATISTICS_PROTOCOL
+                else _STATISTICS_KEYS_V1
+            )
+            has_statistics = has_protocol and expected_statistics_keys.issubset(keys)
             if require_statistics and not has_statistics:
                 raise ValueError(f"Radar statistics 缺失: {input_path}")
-            if has_statistics and keys != _BASE_KEYS | _STATISTICS_KEYS:
+            if has_statistics and keys != _BASE_KEYS | expected_statistics_keys:
                 raise ValueError(f"Radar statistics NPZ 含未绑定字段: {input_path}")
             if not has_statistics and keys != _BASE_KEYS:
                 raise ValueError(f"Radar legacy NPZ 含不完整 statistics 字段: {input_path}")
@@ -182,6 +254,11 @@ def _read_sparse_radar_payload(
                 summary = _validate_statistics(
                     coords=normalized_coords,
                     point_count=np.asarray(payload["point_count"]),
+                    intensity_valid_count=(
+                        np.asarray(payload["intensity_valid_count"])
+                        if "intensity_valid_count" in payload
+                        else None
+                    ),
                     doppler_valid_count=np.asarray(payload["doppler_valid_count"]),
                     protocol=payload["radar_statistics_protocol"],
                     path=input_path,

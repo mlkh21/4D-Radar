@@ -19,7 +19,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from diffusion_consistency_radar.prediction_artifact_protocol import (
-    prediction_voxel_records_digest,
+    build_prediction_voxel_metadata,
 )
 
 
@@ -359,16 +359,9 @@ class EmpiricalLidarPoseContractTest(unittest.TestCase):
                 "files_sha256": _observed_mask_records_digest(records),
                 "records": records,
             },
-            "prediction_voxel": {
-                "protocol": "generated_voxel_artifact_v1",
-                "coordinate_frame": "lidar",
-                "layout": "czxy",
-                "frame_count": 2,
-                "records_sha256": prediction_voxel_records_digest(
-                    prediction_records
-                ),
-                "records": prediction_records,
-            },
+            "prediction_voxel": build_prediction_voxel_metadata(
+                prediction_records
+            ),
         }
         run_path = os.path.join(root, "inference_run.json")
         _write_json(run_path, run)
@@ -418,15 +411,26 @@ class EmpiricalLidarPoseContractTest(unittest.TestCase):
                 main()
 
             with np.load(os.path.join(output_dir, "map_final.npz")) as snapshot:
-                self.assertGreater(float(snapshot["occ_prob_layers"][3, 0, 0]), 0.5)
+                # 直接 LiDAR pose 为 x=3m，rolling 窗口因此从 3m 开始；
+                # 源占用体素中心 x=0.5m 应落在新窗口索引 0。
+                self.assertGreater(float(snapshot["occ_prob_layers"][0, 0, 0]), 0.5)
                 self.assertEqual(str(snapshot["last_pose_contract"]), "direct_local_voxel")
                 self.assertEqual(int(snapshot["last_body_pose_available"]), 0)
+                self.assertEqual(int(snapshot["rolling_enabled"]), 1)
+                np.testing.assert_allclose(
+                    snapshot["map_pc_range_local"],
+                    [3.0, 0.0, 0.0, 11.0, 1.0, 1.0],
+                )
             with open(os.path.join(output_dir, "map_run.json"), "r", encoding="utf-8") as handle:
                 run = json.load(handle)
             self.assertFalse(run["formal_mapping"])
             self.assertTrue(run["offline_empirical_mapping"])
             self.assertFalse(run["airborne_formal"])
             self.assertFalse(run["avoidance_formal"])
+            self.assertEqual(
+                run["protocol"],
+                "pose_aware_layered_map_offline_empirical_v3",
+            )
             self.assertEqual(run["runtime_contract_status"], "offline_empirical_fail_closed")
             self.assertEqual(run["pose_mode"], "empirical_lidar_to_local")
             self.assertEqual(run["pose_direction"], "lidar_to_local")

@@ -1,5 +1,12 @@
 # Findings
 
+## 2026-08-29 审查修复阶段 1：formal 配置唯一来源
+
+- `train_unified.sh` 只从 YAML 读取 `hardware.cuda_devices`，并在解析 1--4 个唯一设备后把派生的 `num_gpus/world_size/effective_global_batch_size` 写入本次 override；默认 YAML 中静态 `num_gpus: 4` 是矛盾兼容字段，不是实际 launcher 来源。
+- formal VAE preset 使用 `bce_dice`；原 YAML 的 `occupied_weight/empty_weight/channel_weights/false_positive_weight/occupancy_mass_weight` 只作用于 `legacy_mse`，修改它们不会改变当前正式训练损失。
+- 默认 YAML 已改为显式声明 active BCE、Dice、positive cap 和 continuous reconstruction 权重；legacy 参数仍保留在模型 preset/checkpoint 构造路径，旧 checkpoint 兼容性不变。
+- 该阶段不改变监督 target、observed mask、体素数量或当前 BCE+Dice 数值，只消除无效调参入口和 GPU 配置歧义。
+
 ## 2026-07-13 v10 Task3 列级损失实验入口
 - `train_minimal.sh` 的 YAML argv 契约可在末尾追加三项而不改变既有 31 项顺序；列正/负权重默认均为 `0.0`，temperature 默认 `1.0`。
 - v10 A/B 仅改变列负样本权重（A=`0.01`、B=`0.02`），列正样本权重均为 `0.02`；旧 `decoded_density_weight` 在 v10 固定为 `0.0`。
@@ -1888,3 +1895,93 @@ far too small to explain the previous screen/full metric divergence.
 - DDP 训练为保持各 rank 等长，可能对上述唯一 train 帧补齐少量重复访问；补齐量仍由 `distributed_training` 单独记录。validation 不补齐，CD 的 validation 数当前只固定留出身份，不代表存在逐 epoch CD 验证指标。
 - 真实 Conda preflight 已只读核对 garden 4013 帧 manifest/Radar statistics、normalization SHA 和 formal data protocol，输出确认默认 20/20/20、3210/774；未生成训练配置或启动训练。
 - 本项不改变 target、observed mask、四通道输入、模型结构、loss 或指标公式；每帧仍为 `32×128×128=524288` 个空间体素。缩小帧数只改变每轮唯一样本覆盖和 checkpoint 训练身份。
+## 2026-08-29：顺序修复阶段 2（LDM observed-mask）
+
+- 问题确认存在：此前 VAE/CD 使用 `occupancy_observed_mask`，但 LDM latent、decoded auxiliary 与 validation 指标仍可能把未观测体素当空体素监督。
+- 现已将 persisted voxel mask 沿 batch metadata 传入 LDM；latent mask 由 voxel mask 自适应最大池化生成，即 latent 块内任一体素可观测才参与监督。
+- decoded occupancy、false-positive、mass、height、overshoot、continuity、density、column 和 IR frustum 损失均只消费 observed 域；LiDAR 正体素仍强制合并进 observed 域。
+- 监督信号影响：unknown 体素不再提供负监督；有效监督体素数量会减少，但 target 正体素不减少。验证 IoU 同样只统计 observed 域，因此不能与旧版全体素 IoU 直接横向比较。
+- checkpoint 新增 `persisted_voxel_and_adaptive_latent_any_v1` 协议；formal checkpoint 恢复时要求协议一致，legacy 无 mask 路径保持原全域行为。
+
+## 2026-08-29：顺序修复阶段 3（多卡 normalization / CD EMA）
+
+- 问题确认存在：IR ResNet/fallback 均含 BatchNorm，而 DDP 的 `broadcast_buffers=false` 无法让 forward 后的本地 running statistics 保持一致；只打开 buffer broadcast 不能解决该问题。
+- 多卡模型现在于 DDP/optimizer 前转换为 SyncBatchNorm，checkpoint 记录 `sync_batchnorm_v1`；单卡模型不转换且 state_dict 键保持兼容。
+- CD EMA 不再按无名 parameters zip 更新，而是校验具名 parameters/buffers；浮点 buffer 采用相同 EMA 率，整数 counter 直接复制。
+- 此变更不改变数据、监督体素数量或指标定义，但会改变多卡 IR 特征统计与 CD EMA 权重轨迹；旧多卡 BN checkpoint 和旧 formal CD EMA checkpoint 不允许静默续训，应从可信 LDM checkpoint 重新开始相应阶段。
+
+## 2026-08-29：顺序修复阶段 4C（CD online/EMA 验证选优）
+
+- 问题确认存在：CD checkpoint 同时保存 online/EMA，但推理此前固定读取 online；统一入口未把现成 validation loader 交给 CD，独立入口也没有 validation loader。
+- 两个训练入口现在都使用正式 temporal validation suffix；DDP validation 不补齐、不重复。online/EMA 在同一 sample-id 固定噪声与 sigma 上比较 observed-domain occupancy IoU 和 latent MSE，IoU 优先、loss 次优、完全并列选 EMA。
+- checkpoint 记录 validation protocol、配置、两套当前指标、历史最佳指标及 `deployment_weight_source`；formal resume 和 inference 均 fail-closed 核对，legacy checkpoint 仍明确回退 online。
+- 指标影响：新增的是 CD checkpoint 选优指标，只统计 persisted observed domain，不能与旧全网格指标直接比较；不改变训练 target、单帧 524288 个空间体素、CD consistency loss 或模型结构。
+
+## 2026-08-29：顺序修复阶段 4D（validation threshold artifact）
+
+- 问题确认存在：正式 launcher 默认阈值 0.05、CLI 默认 0.1，均未绑定 validation 或 checkpoint；saved evaluator 还允许正式结果被 CLI 阈值二次改写。
+- LDM/CD validation 现在对固定候选阈值累计 persisted observed-domain TP/FP/FN；按 micro IoU、recall、较低阈值顺序选择。best checkpoint 保存 sweep，训练结束后生成绑定 checkpoint SHA/stage/部署权重源的独立 `occupancy_threshold.json`。
+- formal inference 必须使用 artifact，launcher 不再暴露 `OCC_THRESHOLD`；run metadata 和 evaluator summary 均保留 artifact 内容/SHA，formal evaluator 拒绝 CLI override。mini/legacy 诊断仍可使用原阈值兼容路径，但不能标为 formal。
+- 影响边界：只改变 occupancy 二值化阈值的来源与审计方式，不改变连续预测 voxel、target、模型结构或每帧体素数；新正式阈值指标只统计 observed domain，旧手工阈值报告不能直接冒充新协议结果。
+
+## 2026-08-29：顺序修复阶段 5（概率地图 prediction / observed / DEM 合同）
+
+- 问题确认存在：正式地图消费 inference prediction，却把第 4 个生成通道当作原始 Radar Doppler variance；显式 observed mask 又与任意正预测取并集，DEM 还把该通道直接加到高度方差。
+- prediction artifact 升级为 v2，明确 ch0 是 `[0,1]` occupancy probability，ch1--3 是非地图辅助重建；formal/经验地图只消费 ch0，并在创建输出目录前校验 schema、哈希、shape、dtype、finite 与概率范围。
+- formal/经验地图将外部逐层 observed mask 作为权威域，mask 外正预测不再扩张 observed，也不进入 free/occupied 融合或 DEM 高度统计。legacy 无 mask 路径保留 occupied-only 兼容行为。
+- DEM 只由 observed occupancy 的 Z 分布计算，高度均值单位为 m、方差单位为 m^2；Doppler variance 和 generic model uncertainty 不再跨量纲叠加。该改动不改变模型、target 或每帧体素总数，但会减少地图实际消费的 unknown 体素，并改变旧 DEM variance 数值，旧新地图指标不可直接混用。
+- 正式 map protocol 升为 `pose_aware_layered_map_v4`，经验协议升为 `pose_aware_layered_map_offline_empirical_v2`；旧 inference artifact v1 必须重新推理，不能手工伪造升级。
+
+## 2026-08-30：顺序修复阶段 6（rolling / trajectory / ROS 边界）
+
+- 问题确认存在：旧 `SlidingProbabilisticGridMap` 只有时间 history，没有随 body/LiDAR 位置移动的空间窗口；source evidence 范围与 destination map bounds 还共用同一组坐标。
+- 严格地图现使用 `body_anchored_integer_voxel_roll_v1`：`map_pc_range` 是锚点相对窗口，source evidence 始终按固定 `pc_range` 投影；旧 local 状态按整体素无回卷搬移，新暴露区域显式恢复 unknown/NaN DEM。
+- 新增 `local_trajectory_frames_v1` artifact 和 `three_state_trajectory_corridor_v1` 查询。artifact 必须精确覆盖当次消费帧、使用 local XYZ 有限非零长折线；轨迹视界不足制动距离或走廊出现 unknown 均 fail-closed。
+- 离散查询对实际半径使用 `corridor_radius + effective_spacing/2` 保守膨胀，避免相邻采样点中间留下风险漏检缝隙；代价是边界附近更容易返回 unknown，不会把风险误判为 clear。
+- 正式 map protocol 升为 `pose_aware_layered_map_v5`，经验升为 `pose_aware_layered_map_offline_empirical_v3`。当前入口仍是离线文件回放，因此 `airborne_formal=false`、`avoidance_formal=false`；ROS1 node/publisher/service/action、PX4 bridge 和在线时延验证均明确记为未实现。
+- 本项不改训练 target、observed mask、loss、模型结构、单帧体素数或训练/验证指标定义；只改变离线地图的空间持久化、安全查询和部署声明。
+
+## 2026-08-30：顺序修复阶段 7A（Radar finite 聚合）
+
+- 问题确认存在：旧聚合会让 intensity/Doppler 的 NaN/Inf 进入累加，并错误使用 occupied point 总数作为各字段分母；多个极大但有限的 float32 还会在求和/平方时溢出。
+- 新统计协议 `radar_point_count_field_validity_v2` 对 occupied point、finite intensity、finite Doppler 分别计数；强度均值和 Doppler 均值/方差仅消费对应字段的 finite 样本，并使用 float64 中间累加。
+- 稀疏 NPZ 新增与 coords 对齐的 `intensity_valid_count`，scene policy 与逐帧 payload 必须同协议。旧 v1 NPZ/formal-v2 数据继续可读和预检，只有后续 formal-v3 才会强制 v2，避免破坏服务器现有训练数据。
+- 影响边界：有限输入帧的 occupied voxel 数量不变；非有限 XYZ 点不再形成体素，字段缺失样本不再稀释有效均值。Radar ch1/ch2/ch3 数值和后续 normalization/训练指标可能变化，因此必须生成新数据根与 normalization，不能覆盖或冒充旧 artifact。
+
+## 2026-08-30：顺序修复阶段 7B（Radar 原始字段物理 schema）
+
+- 问题确认存在：解包会把 intensity/reflectivity/power/rcs/snr 和多种 Doppler 别名压成固定列，但旧 sidecar 不记录单位、物理量、坐标系或正方向；PointCloud v1 甚至没有 sidecar。当前 raw garden/loop3 也无 layout 文件，不能反推权威语义。
+- 新增 `radar_raw_field_semantics_v1`：固定 XYZ 单位/坐标系、return quantity/unit、Doppler `m/s`/sensor-relative/正方向，并要求 verified schema 引用同目录权威 evidence 文件；loader 重算 evidence SHA-256，拒绝符号链接和路径越界。
+- 解包 sidecar 继续只证明 layout，显式标记 `unverified_layout_only`；缺 return/Doppler 改写 NaN，PointCloud2 与 PointCloud v1 都生成 sidecar。预处理会交叉核对 layout source field 与 semantics artifact，防止只靠手写 schema 假绑定。
+- ego-motion 补偿不再固定假设符号：toward 使用 `raw - ego_radial`，away 使用 `raw + ego_radial`。fixed/recorded 模式没有 verified schema 会在输出创建前拒绝；velocity none 的现有 formal-v2 仍可运行。
+- 没有权威材料时只能保留 unverified/velocity-none 诊断链，不能发布 formal-v3 或声称 Doppler 已物理补偿。改动不改变网格尺寸或模型结构；重新解包的缺字段点仍保留 occupied XYZ，但 ch1/ch2/ch3 与统计/normalization/训练指标可能改变。
+
+## 2026-08-30：顺序修复阶段 7C（rosbag 解包失败收据）
+
+- 问题确认存在：点云和图像保存函数捕获全部异常后 `pass`，未知/空点云、图像解码/写盘失败都可能被上层误报为成功；bag 元数据/遍历/关闭异常也没有逐场景证据。
+- 新增 `rosbag_extraction_receipt_v1`，原子记录 expected/processed bag、逐 topic 成功落盘数、逐条失败的 bag/topic/timestamp/source/error/critical，以及 Radar/LiDAR/IR 派生状态。
+- Radar、LiDAR、thermal 任一帧失败立即写 failed receipt 并终止；遍历结束仍要求三种关键模态各至少一帧成功。bag 打开/元数据/遍历/关闭失败也作为 `__bag__` critical failure，非关键 CSV 失败保留记录但不伪装成关键模态失败。
+- 同一目录 PointCloud layout 的稳定字段跨帧必须一致；字段漂移在 NPY 发布前拒绝并进入失败收据。该项不改变成功帧的监督、体素或模型；它可能减少过去被静默接受的不完整数据集帧/场景，因此旧新训练样本数和指标不可直接等同。
+
+## 2026-08-30：顺序修复阶段 7D（独立 formal-data-v3）
+
+- 现有服务器 `formal_chain_v2 + formal_data_v2` 继续受支持；没有原地升级 checkpoint chain，也没有覆盖 v2 数据。`formal_data_v3` 作为独立 data identity 进入 checkpoint，天然阻止 v2/v3 续训混用。
+- v3 精确绑定 statistics-v2、verified Radar field schema、实际 PointCloud layout、complete extraction receipt 及共享 return/Doppler 物理合同。training manifest 仍保持既有精确 provenance 集合，上述身份由已纳入 manifest content hash 的 preprocess policy 携带。
+- 新 `preprocess-v3.sh` 使用动态项目根和全新的 Raw/Pre/Deploy/normalization 名称，拒绝覆盖；在解包或创建输出前先验证 schema 引用的权威 evidence，预处理再强制 schema/layout 交叉核对和 complete receipt。
+- 没有权威字段材料时 v3 会在解包前失败，不能靠填写 JSON 伪造；服务器现阶段应继续训练已验收的 v2 数据。v3 不改变 target、observed mask、网格 `32×128×128` 或模型结构，但 finite 聚合/字段解释会改变 Radar ch1--3、normalization 和后续指标，必须从新数据根重新训练。
+
+## 2026-08-30：顺序修复阶段 8A--8C（工程接口与 CD 语义）
+
+- Dataset 的 `sequence_length>1` 过去只增加 Radar 滑窗读取，模型始终仅消费最后一帧；`transform` 和非默认 `alignment_size` 也未生效。现保留参数名用于迁移报错，但非单帧/非默认值均 fail-fast，正式单帧 target、observed mask 和每帧 `32×128×128` 体素不变。
+- Karras 采样历史的可变默认 list 会跨调用共享；推理又通过捕获整个模型 forward 的 `TypeError` 猜测旧接口，可能吞掉模型内部错误。现改为每次独立 history，并在调用前按签名选择 kwargs，forward 只执行一次。
+- 当前 CD 不是持续冻结 LDM teacher 的蒸馏：LDM 只初始化 online/EMA 两个 CD 模型，训练 target 来自 CD EMA。旧 YAML 中 `training_mode/start_scales/distill_steps/loss_norm` 未进入当前 trainer，已替换为真实生效的 `num_scales/ema_rate/sigma_min/sigma_max/rho`。
+- 新共享 `ema_consistency_training_config_v1` 同时约束训练、resume、正式 checkpoint chain 和 CD 推理采样；正式 CD 缺收据或值漂移会拒绝，避免 YAML 已改而推理仍固定使用 `80/0.002/7`。
+- 这些改动不改变监督 target、observed 体素数量或指标公式；会改变自定义 CD 噪声配置下的训练/采样轨迹，因此旧新 CD checkpoint 不应混用或静默续训。
+
+## 2026-08-30：顺序修复阶段 8D（正式评价与 diagnostic 边界）
+
+- 问题确认存在：正式 saved evaluator 虽严格验证 observed-mask artifact，却未把 mask 应用于 pred/Radar/target 点云和 uncertainty calibration；mask 外 unknown 会进入点数、Chamfer、BEV/PRF 和校准指标。
+- `formal_saved_prediction_observed_domain_evaluation_v1` 现统一在外部权威 observed mask 内计算预测/target 与 Radar baseline 指标，summary 明确使用逐帧有限值 macro mean；mask 外正预测反例证明不再增加正式预测点数或 false positive。
+- 原始 LiDAR 点云不能从体素 observed mask 无损裁剪，其 Chamfer 保留为 `unmasked_raw_lidar_diagnostic_reference`，不进入 `formal_metrics`；完整 `metrics` 字段仅为旧消费者兼容。
+- `scripts/evaluate.py` 的同名 NPY 点云配对、`compare.sh` 图像对比和 `diagnose.sh` 固定阈值检查均明确标为 legacy diagnostic-only；唯一正式入口是 `launch/evaluate_inference.sh`。
+- 该改动不改变训练 target、模型、每帧体素数或已保存 prediction；正式评价有效体素数减少为 observed 域，故新旧指标不可直接比较，旧评价目录需要在 fresh 输出目录重新运行 evaluator。

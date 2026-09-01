@@ -37,16 +37,29 @@ def uncertainty_calibration_metrics(
     uncertainty: np.ndarray,
     occ_threshold: float = 0.5,
     n_bins: int = 10,
+    observed_mask: np.ndarray = None,
 ) -> Dict[str, float]:
-    """Measure whether predicted variance identifies occupancy errors."""
+    """Measure whether predicted variance identifies occupancy errors.
+
+    ``observed_mask`` 非空时只统计权威可观测体素，避免 unknown 区域被当作
+    true negative 稀释校准误差。
+    """
     pred = np.asarray(pred_occ, dtype=np.float32).squeeze()
     target = np.asarray(target_occ, dtype=np.float32).squeeze()
     if pred.shape != target.shape or pred.ndim != 3:
         raise ValueError(f"Expected matching 3D occupancy arrays, got {pred.shape} and {target.shape}")
     variance = _resize_nearest(uncertainty, pred.shape)
     variance = np.nan_to_num(np.clip(variance, 0.0, 50.0), nan=50.0)
+    if observed_mask is None:
+        domain = np.ones(pred.shape, dtype=bool)
+    else:
+        domain = _resize_nearest(observed_mask, pred.shape) > 0.5
+        if not np.any(domain):
+            raise ValueError("observed_mask 不得为空域")
     error_probability = variance / (1.0 + variance)
     binary_error = ((pred > float(occ_threshold)) != (target > float(occ_threshold))).astype(np.float32)
+    error_probability = error_probability[domain]
+    binary_error = binary_error[domain]
 
     eps = 1e-6
     brier = float(np.mean((error_probability - binary_error) ** 2))

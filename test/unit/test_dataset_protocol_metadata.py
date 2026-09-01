@@ -99,6 +99,32 @@ class DatasetProtocolMetadataTest(unittest.TestCase):
         self.assertEqual(meta["radar_normalization_protocol"], "legacy_identity")
         self.assertEqual(meta["radar_normalization_sha256"], "")
 
+    def test_dataset_rejects_ineffective_temporal_and_transform_arguments(self):
+        """未实现的参数不得继续被静默接受为已生效功能。"""
+        from diffusion_consistency_radar.cm.dataset_loader import (
+            NTU4DRadLM_VoxelDataset,
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(ValueError, "sequence_length.*1"):
+                NTU4DRadLM_VoxelDataset(
+                    root,
+                    sequence_length=2,
+                    allow_legacy_radar_units=True,
+                )
+            with self.assertRaisesRegex(ValueError, "transform.*未实现"):
+                NTU4DRadLM_VoxelDataset(
+                    root,
+                    transform=lambda value: value,
+                    allow_legacy_radar_units=True,
+                )
+            with self.assertRaisesRegex(ValueError, "alignment_size.*未实现"):
+                NTU4DRadLM_VoxelDataset(
+                    root,
+                    alignment_size=16,
+                    allow_legacy_radar_units=True,
+                )
+
     def test_dataset_normalizes_after_physical_augmentation_and_records_hash(self):
         """已知 m/s shift 应先施加，再由冻结 scale 转成网络量纲。"""
         from diffusion_consistency_radar.cm.dataset_loader import (

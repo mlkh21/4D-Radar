@@ -19,13 +19,33 @@ from diffusion_consistency_radar.radar_normalization import (
     assert_same_radar_normalization,
     radar_normalization_from_checkpoint,
 )
+from diffusion_consistency_radar.extraction_receipt import (
+    EXTRACTION_RECEIPT_PROTOCOL,
+)
+from diffusion_consistency_radar.radar_field_schema import (
+    RADAR_DOPPLER_POSITIVE_DIRECTIONS,
+    RADAR_FIELD_SCHEMA_PROTOCOL,
+)
+from diffusion_consistency_radar.radar_statistics import (
+    RADAR_STATISTICS_PROTOCOL,
+)
+from diffusion_consistency_radar.cd_training_protocol import (
+    CD_DENOISING_PARAMETERIZATION,
+    CD_TRAINING_SEMANTICS,
+    validate_cd_consistency_receipt,
+)
 
 
 FORMAL_CHECKPOINT_PROTOCOL = "formal_chain_v2"
 FORMAL_MINI_CHECKPOINT_PROTOCOL = "formal_mini_chain_v2"
 LEGACY_FORMAL_CHECKPOINT_PROTOCOL = "formal_chain_v1"
 LEGACY_FORMAL_MINI_CHECKPOINT_PROTOCOL = "formal_mini_chain_v1"
-FORMAL_DATA_PROTOCOL = "formal_data_v2"
+FORMAL_DATA_PROTOCOL_V2 = "formal_data_v2"
+FORMAL_DATA_PROTOCOL_V3 = "formal_data_v3"
+FORMAL_DATA_PROTOCOL = FORMAL_DATA_PROTOCOL_V2
+SUPPORTED_FORMAL_DATA_PROTOCOLS = frozenset(
+    {FORMAL_DATA_PROTOCOL_V2, FORMAL_DATA_PROTOCOL_V3}
+)
 FORMAL_MINI_SELECTION_PROTOCOL = "formal_mini_selection_v1"
 FORMAL_STAGE_SELECTION_PROTOCOL = "formal_stage_selection_v1"
 _TRAINING_CHECKPOINT_PROTOCOLS = {
@@ -352,9 +372,11 @@ def validate_checkpoint_data_protocol(
         if errors is None:
             raise CheckpointChainError(own_errors)
         return None
-    if value.get("protocol") != FORMAL_DATA_PROTOCOL:
+    protocol = value.get("protocol")
+    if protocol not in SUPPORTED_FORMAL_DATA_PROTOCOLS:
         own_errors.append(
-            f"{stage}.data_protocol.protocol 必须为 {FORMAL_DATA_PROTOCOL!r}"
+            f"{stage}.data_protocol.protocol 必须为 "
+            f"{sorted(SUPPORTED_FORMAL_DATA_PROTOCOLS)}"
         )
     _validate_hash_mapping(
         value.get("dataset_manifest_sha256"),
@@ -399,6 +421,105 @@ def validate_checkpoint_data_protocol(
             f"{stage}.data_protocol.radar_ir_sync_sha256",
             own_errors,
         )
+    if protocol == FORMAL_DATA_PROTOCOL_V3:
+        base_keys = {
+            "protocol",
+            "dataset_manifest_sha256",
+            "split_artifact_sha256",
+            "target_policy_sha256",
+            "observed_mask_sha256",
+            "observed_mask_protocol",
+            "calibration_sha256",
+            "radar_ir_sync_sha256",
+            "preprocessing_protocol",
+            "radar_statistics_protocol",
+            "radar_field_schema_protocol",
+            "radar_field_schema_sha256",
+            "radar_pointcloud_layout_sha256",
+            "extraction_receipt_protocol",
+            "extraction_receipt_sha256",
+            "radar_input_contract",
+        }
+        allowed_keys = base_keys | ({"mini_selection"} if "mini_selection" in value else set())
+        if set(value) != allowed_keys:
+            own_errors.append(
+                f"{stage}.data_protocol formal_data_v3 顶层字段必须精确为 "
+                f"{sorted(allowed_keys)}"
+            )
+        if value.get("preprocessing_protocol") != "formal_preprocessing_v3":
+            own_errors.append(
+                f"{stage}.data_protocol.preprocessing_protocol 不匹配"
+            )
+        if value.get("radar_statistics_protocol") != RADAR_STATISTICS_PROTOCOL:
+            own_errors.append(
+                f"{stage}.data_protocol.radar_statistics_protocol 必须为 "
+                f"{RADAR_STATISTICS_PROTOCOL!r}"
+            )
+        if value.get("radar_field_schema_protocol") != RADAR_FIELD_SCHEMA_PROTOCOL:
+            own_errors.append(
+                f"{stage}.data_protocol.radar_field_schema_protocol 不匹配"
+            )
+        if value.get("extraction_receipt_protocol") != EXTRACTION_RECEIPT_PROTOCOL:
+            own_errors.append(
+                f"{stage}.data_protocol.extraction_receipt_protocol 不匹配"
+            )
+        for name in (
+            "radar_field_schema_sha256",
+            "radar_pointcloud_layout_sha256",
+            "extraction_receipt_sha256",
+        ):
+            _validate_hash_mapping(
+                value.get(name),
+                f"{stage}.data_protocol.{name}",
+                own_errors,
+            )
+        radar_contract = value.get("radar_input_contract")
+        if not isinstance(radar_contract, Mapping) or set(radar_contract) != {
+            "return_strength",
+            "doppler",
+        }:
+            own_errors.append(
+                f"{stage}.data_protocol.radar_input_contract 字段不匹配"
+            )
+        else:
+            return_contract = radar_contract.get("return_strength")
+            if not isinstance(return_contract, Mapping) or set(return_contract) != {
+                "quantity",
+                "unit",
+            }:
+                own_errors.append(
+                    f"{stage}.data_protocol.radar_input_contract.return_strength 无效"
+                )
+            elif any(
+                not isinstance(return_contract.get(name), str)
+                or not return_contract.get(name)
+                for name in ("quantity", "unit")
+            ):
+                own_errors.append(
+                    f"{stage}.data_protocol Radar return quantity/unit 必须非空"
+                )
+            doppler_contract = radar_contract.get("doppler")
+            if not isinstance(doppler_contract, Mapping) or set(doppler_contract) != {
+                "quantity",
+                "unit",
+                "reference",
+                "positive_direction",
+            }:
+                own_errors.append(
+                    f"{stage}.data_protocol.radar_input_contract.doppler 无效"
+                )
+            else:
+                if doppler_contract.get("quantity") != "radial_velocity":
+                    own_errors.append(f"{stage}.data_protocol Doppler quantity 不匹配")
+                if doppler_contract.get("unit") != "m/s":
+                    own_errors.append(f"{stage}.data_protocol Doppler unit 必须为 m/s")
+                if doppler_contract.get("reference") != "sensor_relative":
+                    own_errors.append(f"{stage}.data_protocol Doppler reference 不匹配")
+                if (
+                    doppler_contract.get("positive_direction")
+                    not in RADAR_DOPPLER_POSITIVE_DIRECTIONS
+                ):
+                    own_errors.append(f"{stage}.data_protocol Doppler 正方向不匹配")
     if "mini_selection" in value:
         _validate_formal_mini_selection(
             value.get("mini_selection"),
@@ -732,6 +853,31 @@ def validate_formal_checkpoint_chain(
                 ldm_hash = checkpoint.get("ldm_checkpoint_sha256")
                 if ldm_hash != report["sha256"].get("ldm"):
                     errors.append("cd.ldm_checkpoint_sha256 与 LDM 文件 hash 不匹配")
+                if protocol == FORMAL_CHECKPOINT_PROTOCOL:
+                    if checkpoint.get("training_semantics") != CD_TRAINING_SEMANTICS:
+                        errors.append(
+                            f"cd.training_semantics 必须为 {CD_TRAINING_SEMANTICS!r}"
+                        )
+                    if checkpoint.get("ldm_role") != "initialization_checkpoint":
+                        errors.append("cd.ldm_role 必须为 'initialization_checkpoint'")
+                    if checkpoint.get("consistency_target_source") != "cd_model_ema":
+                        errors.append("cd.consistency_target_source 必须为 'cd_model_ema'")
+                    if (
+                        checkpoint.get("denoising_parameterization")
+                        != CD_DENOISING_PARAMETERIZATION
+                    ):
+                        errors.append(
+                            "cd.denoising_parameterization 必须为 "
+                            f"{CD_DENOISING_PARAMETERIZATION!r}"
+                        )
+                    try:
+                        report["cd_consistency_training_config"] = (
+                            validate_cd_consistency_receipt(
+                                checkpoint.get("consistency_training_config")
+                            )
+                        )
+                    except ValueError as exc:
+                        errors.append(f"cd.{exc}")
 
     if "ldm" in radar_normalizations and "cd" in radar_normalizations:
         ldm_spec, ldm_normalization_hash = radar_normalizations["ldm"]
@@ -783,6 +929,9 @@ __all__ = [
     "CheckpointChainError",
     "FORMAL_CHECKPOINT_PROTOCOL",
     "FORMAL_DATA_PROTOCOL",
+    "FORMAL_DATA_PROTOCOL_V2",
+    "FORMAL_DATA_PROTOCOL_V3",
+    "SUPPORTED_FORMAL_DATA_PROTOCOLS",
     "FORMAL_MINI_SELECTION_PROTOCOL",
     "FORMAL_MINI_CHECKPOINT_PROTOCOL",
     "LEGACY_FORMAL_CHECKPOINT_PROTOCOL",

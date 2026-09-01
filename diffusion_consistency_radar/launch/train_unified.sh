@@ -6,7 +6,7 @@
 # 使用方法:
 #   bash diffusion_consistency_radar/launch/train_unified.sh vae    # 训练 VAE
 #   bash diffusion_consistency_radar/launch/train_unified.sh ldm    # 训练 LDM
-#   bash diffusion_consistency_radar/launch/train_unified.sh cd     # 蒸馏 CD
+#   bash diffusion_consistency_radar/launch/train_unified.sh cd     # EMA consistency CD
 #   bash diffusion_consistency_radar/launch/train_unified.sh all    # 完整流程
 #
 # 配置文件: config/default_config.yaml
@@ -257,12 +257,12 @@ for SCENE in "${TRAIN_SCENES[@]}"; do
 done
 
 if [ ! -f "${DATA_PROTOCOL_ARTIFACT}" ]; then
-    echo "错误：formal v2 data protocol artifact 不存在：${DATA_PROTOCOL_ARTIFACT}"
-    echo "需先完成范围决策、observed/split 固化和 v2 数据重建。"
+    echo "错误：formal data protocol artifact 不存在：${DATA_PROTOCOL_ARTIFACT}"
+    echo "需先完成对应 v2/v3 数据根的 observed/split 固化和协议构建。"
     exit 1
 fi
 if [ ! -f "${TEMPORAL_SPLIT_ARTIFACT}" ]; then
-    echo "错误：formal v2 temporal split artifact 不存在：${TEMPORAL_SPLIT_ARTIFACT}"
+    echo "错误：formal temporal split artifact 不存在：${TEMPORAL_SPLIT_ARTIFACT}"
     exit 1
 fi
 
@@ -329,6 +329,7 @@ from diffusion_consistency_radar.formal_data_protocol import (
 )
 from diffusion_consistency_radar.radar_statistics import (
     RADAR_STATISTICS_PROTOCOL,
+    SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
     validate_sparse_radar_statistics,
 )
 
@@ -337,6 +338,8 @@ checked_frames = 0
 occupied_voxels = 0
 point_count = 0
 doppler_valid_count = 0
+intensity_valid_count = 0
+scene_statistics_protocols = {}
 for scene in scenes:
     scene_dir = os.path.join(dataset_dir, scene)
     manifest = validate_scene_manifest(
@@ -347,8 +350,10 @@ for scene in scenes:
     policy_path = os.path.join(scene_dir, "preprocess_policy.json")
     with open(policy_path, "r", encoding="utf-8") as handle:
         policy = json.load(handle)
-    if policy.get("radar_statistics_protocol") != RADAR_STATISTICS_PROTOCOL:
+    scene_protocol = policy.get("radar_statistics_protocol")
+    if scene_protocol not in SUPPORTED_RADAR_STATISTICS_PROTOCOLS:
         raise RuntimeError(f"场景 {scene!r} Radar statistics policy 协议不匹配")
+    scene_statistics_protocols[scene] = scene_protocol
     if policy.get("radar_statistics_model_consumed") is not False:
         raise RuntimeError(
             f"场景 {scene!r} 必须声明 radar_statistics_model_consumed=false"
@@ -362,10 +367,15 @@ for scene in scenes:
             raise RuntimeError(f"场景 {scene!r} Radar manifest path 无效")
         radar_path = os.path.join(scene_dir, relative_path)
         summary = validate_sparse_radar_statistics(radar_path)
+        if summary["protocol"] != scene_protocol:
+            raise RuntimeError(
+                f"场景 {scene!r} Radar statistics payload 与 policy 协议不一致"
+            )
         checked_frames += 1
         occupied_voxels += int(summary["occupied_voxels"])
         point_count += int(summary["total_point_count"])
         doppler_valid_count += int(summary["total_doppler_valid_count"])
+        intensity_valid_count += int(summary.get("total_intensity_valid_count", 0))
 
 _protocol, protocol_sha256 = load_formal_data_protocol_artifact(
     protocol_path,
@@ -374,17 +384,24 @@ _protocol, protocol_sha256 = load_formal_data_protocol_artifact(
     split_artifact_path=split_path,
     stage="vae",
 )
+if _protocol["protocol"] == "formal_data_v3" and any(
+    protocol != RADAR_STATISTICS_PROTOCOL
+    for protocol in scene_statistics_protocols.values()
+):
+    raise RuntimeError("formal_data_v3 只允许 Radar statistics finite-count v2")
 print(
     json.dumps(
         {
             "status": "Radar statistics 预检通过",
-            "protocol": RADAR_STATISTICS_PROTOCOL,
+            "protocols_by_scene": scene_statistics_protocols,
             "scenes": scenes,
             "checked_frames": checked_frames,
             "occupied_voxels": occupied_voxels,
             "total_point_count": point_count,
             "total_doppler_valid_count": doppler_valid_count,
+            "total_intensity_valid_count": intensity_valid_count,
             "formal_data_protocol_sha256": protocol_sha256,
+            "formal_data_protocol": _protocol["protocol"],
             "model_consumed": False,
         },
         ensure_ascii=False,
@@ -560,6 +577,19 @@ launch_training_stage() {
         "$@"
 }
 
+build_stage_threshold_artifact() {
+    local stage="$1"
+    local checkpoint_path="${RESULTS_DIR}/${stage}/${stage}_best.pt"
+    local artifact_path="${RESULTS_DIR}/${stage}/occupancy_threshold.json"
+    if [ ! -f "${checkpoint_path}" ]; then
+        echo "Error: ${stage} best checkpoint not found after training: ${checkpoint_path}"
+        exit 1
+    fi
+    python "${SCRIPT_DIR}/build_occupancy_threshold_artifact.py" \
+        --checkpoint "${checkpoint_path}" \
+        --output "${artifact_path}"
+}
+
 case "$MODE" in
     vae)
         echo "=========================================="
@@ -597,11 +627,12 @@ case "$MODE" in
             --config "${CONFIG_PATH}" \
             --vae_ckpt "${VAE_CKPT}" \
             "${RESUME_ARGS[@]}"
+        build_stage_threshold_artifact ldm
         ;;
         
     cd)
         echo "=========================================="
-        echo "Stage 3: Consistency Distillation"
+        echo "Stage 3: LDM-initialized EMA Consistency"
         echo "=========================================="
         
         VAE_CKPT="${RESULTS_DIR}/vae/vae_best.pt"
@@ -627,6 +658,7 @@ case "$MODE" in
             --vae_ckpt "${VAE_CKPT}" \
             --ldm_ckpt "${LDM_CKPT}" \
             "${RESUME_ARGS[@]}"
+        build_stage_threshold_artifact cd
         ;;
         
     all)

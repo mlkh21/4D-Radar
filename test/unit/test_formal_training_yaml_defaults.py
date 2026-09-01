@@ -47,11 +47,26 @@ class FormalTrainingYamlDefaultsTest(unittest.TestCase):
         with open(path, "r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle)
 
-        self.assertEqual(config["hardware"]["cuda_devices"], "0,1,2,3")
+        self.assertEqual(config["hardware"]["cuda_devices"], "0,1")
+        self.assertNotIn("num_gpus", config["hardware"])
         self.assertEqual(
             config["data"]["radar_normalization_sha256"],
             "11f59d84cc186c39256c112154faf458ec9ead5fec9b08b997abd5058b68e97c",
         )
+        self.assertEqual(config["vae"]["occupancy_loss_type"], "bce_dice")
+        self.assertEqual(config["vae"]["occupancy_bce_weight"], 1.0)
+        self.assertEqual(config["vae"]["occupancy_dice_weight"], 1.0)
+        self.assertEqual(config["vae"]["occupancy_pos_weight_cap"], 128.0)
+        self.assertEqual(config["vae"]["continuous_recon_weight"], 1.0)
+        for legacy_only_key in (
+            "occupied_weight",
+            "empty_weight",
+            "channel_weights",
+            "false_positive_weight",
+            "occupancy_mass_weight",
+        ):
+            with self.subTest(legacy_only_key=legacy_only_key):
+                self.assertNotIn(legacy_only_key, config["vae"])
         for stage in ("vae", "ldm", "cd"):
             with self.subTest(stage=stage):
                 self.assertEqual(config[stage]["epochs"], 20)
@@ -59,6 +74,31 @@ class FormalTrainingYamlDefaultsTest(unittest.TestCase):
                 self.assertEqual(
                     config[stage]["validation_frames_per_epoch"], 774
                 )
+        self.assertEqual(config["cd"]["initialization_model_path"], "")
+        self.assertEqual(config["cd"]["teacher_model_path"], "")
+        self.assertEqual(
+            config["cd"]["training_semantics"],
+            "ldm_initialized_ema_consistency_v1",
+        )
+        for key, expected in (
+            ("num_scales", 40),
+            ("ema_rate", 0.999),
+            ("sigma_min", 0.002),
+            ("sigma_max", 80.0),
+            ("rho", 7.0),
+        ):
+            self.assertEqual(config["cd"][key], expected)
+        for unused_key in (
+            "training_mode",
+            "target_ema_mode",
+            "start_ema",
+            "scale_mode",
+            "start_scales",
+            "end_scales",
+            "distill_steps_per_iter",
+            "loss_norm",
+        ):
+            self.assertNotIn(unused_key, config["cd"])
 
     def test_stage_selection_hashes_actual_ordered_frame_ids(self):
         selection = build_formal_stage_training_selection(

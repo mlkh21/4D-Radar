@@ -1,12 +1,55 @@
 # -*- coding: utf-8 -*-
-"""文件功能：统一正式 inference prediction voxel 的记录格式与摘要算法。"""
+"""文件功能：统一正式 inference prediction voxel 的通道、记录与地图消费合同。"""
 
+import copy
 import hashlib
 import os
 from typing import Dict, Iterable, List
 
 
-PREDICTION_VOXEL_PROTOCOL = "generated_voxel_artifact_v1"
+PREDICTION_VOXEL_PROTOCOL = "generated_voxel_artifact_v2"
+PREDICTION_MAPPING_PROTOCOL = "generated_occupancy_mapping_input_v1"
+GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS = "generated_occupancy_probability_v1"
+
+PREDICTION_CHANNEL_SCHEMA = [
+    {
+        "index": 0,
+        "name": "occupancy_probability",
+        "value_semantics": "probability",
+        "range": [0.0, 1.0],
+        "mapping_role": "occupancy_evidence",
+    },
+    {
+        "index": 1,
+        "name": "auxiliary_lidar_intensity_reconstruction",
+        "value_semantics": "unbounded_decoder_output",
+        "mapping_role": "not_consumed",
+    },
+    {
+        "index": 2,
+        "name": "auxiliary_radar_doppler_reconstruction",
+        "value_semantics": "unbounded_decoder_output",
+        "mapping_role": "not_consumed",
+    },
+    {
+        "index": 3,
+        "name": "auxiliary_doppler_validity_reconstruction",
+        "value_semantics": "unbounded_decoder_output",
+        "mapping_role": "not_consumed",
+    },
+]
+
+PREDICTION_MAPPING_CONTRACT = {
+    "protocol": PREDICTION_MAPPING_PROTOCOL,
+    "evidence_semantics": GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+    "occupancy_channel": 0,
+    "occupancy_semantics": "probability",
+    "occupancy_range": [0.0, 1.0],
+    "observed_domain": "external_authoritative_mask",
+    "auxiliary_channels_consumed": False,
+    "dem_height_source": "observed_occupancy_z_distribution",
+    "dem_variance_unit": "m^2",
+}
 
 
 def normalize_prediction_voxel_records(
@@ -76,11 +119,41 @@ def prediction_voxel_records_digest(records: Iterable[Dict[str, object]]) -> str
 def build_prediction_voxel_metadata(records) -> Dict[str, object]:
     """构造地图入口可逐帧重算的正式 prediction voxel 合同。"""
     normalized = normalize_prediction_voxel_records(records)
-    return {
+    metadata = {
         "protocol": PREDICTION_VOXEL_PROTOCOL,
         "coordinate_frame": "lidar",
         "layout": "czxy",
+        "channel_axis": 0,
+        "channels": copy.deepcopy(PREDICTION_CHANNEL_SCHEMA),
+        "mapping_contract": copy.deepcopy(PREDICTION_MAPPING_CONTRACT),
         "frame_count": len(normalized),
         "records_sha256": prediction_voxel_records_digest(normalized),
         "records": normalized,
     }
+    validate_prediction_voxel_metadata(metadata)
+    return metadata
+
+
+def validate_prediction_voxel_metadata(metadata: Dict[str, object]) -> None:
+    """严格验证正式 prediction 通道和地图消费身份。"""
+    if not isinstance(metadata, dict):
+        raise ValueError("prediction voxel metadata 必须是对象")
+    records = metadata.get("records")
+    if (
+        metadata.get("protocol") != PREDICTION_VOXEL_PROTOCOL
+        or metadata.get("coordinate_frame") != "lidar"
+        or metadata.get("layout") != "czxy"
+        or metadata.get("channel_axis") != 0
+        or metadata.get("channels") != PREDICTION_CHANNEL_SCHEMA
+        or metadata.get("mapping_contract") != PREDICTION_MAPPING_CONTRACT
+        or type(metadata.get("frame_count")) is not int
+        or metadata.get("frame_count") < 0
+        or not isinstance(records, list)
+        or len(records) != metadata.get("frame_count")
+    ):
+        raise ValueError("prediction voxel metadata 通道或地图消费合同不完整")
+    normalized = normalize_prediction_voxel_records(records)
+    if any(record["shape_czxy"][0] != len(PREDICTION_CHANNEL_SCHEMA) for record in normalized):
+        raise ValueError("正式 prediction voxel 必须恰好包含四个声明通道")
+    if prediction_voxel_records_digest(normalized) != metadata.get("records_sha256"):
+        raise ValueError("prediction voxel records SHA-256 不匹配")

@@ -196,12 +196,12 @@ class TimestampAlignmentProtocolTest(unittest.TestCase):
             ):
                 self.assertFalse(os.path.exists(os.path.join(scene, filename)))
 
-    def test_formal_v2_script_reextracts_header_timestamps_before_indexing(self):
+    def test_full_rebuild_script_reextracts_header_timestamps_before_indexing(self):
         """正式重建脚本必须从 bag 生成独立 Raw 候选，不能复用 receipt-time 旧目录。"""
         script_path = os.path.join(
             ROOT,
             "NTU4DRadLM_pre_processing",
-            "preprocess-v2.sh",
+            "preprocess.sh",
         )
         with open(script_path, encoding="utf-8") as handle:
             script = handle.read()
@@ -214,7 +214,7 @@ class TimestampAlignmentProtocolTest(unittest.TestCase):
         self.assertIn("--max_rejected_fraction 0.01", script)
         self.assertIn("--radar_lidar_max_delta 0.045", script)
         self.assertIn("--radar_ir_max_delta 0.025", script)
-        self.assertIn('"$RAW_ROOT/$SCENE/thermal_cam_thermal_image_compressed"', script)
+        self.assertIn('--raw_data_path "$RAW_ROOT"', script)
 
 
 if __name__ == "__main__":

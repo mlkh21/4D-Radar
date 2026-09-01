@@ -1,5 +1,10 @@
-"""
+"""Karras 噪声调度、采样及上游兼容损失实现。
+
 Based on: https://github.com/crowsonkb/k-diffusion
+
+当前正式 LDM/CD 入口只复用噪声调度与采样器；本文件中的 teacher/progressive
+distillation 损失保留为 legacy/reference API，不能据此推断 production trainer
+正在执行冻结教师蒸馏。
 """
 # NOTE: 扩散训练与采样核心实现，覆盖 CD/LDM 主要数学过程。
 import random  # NOTE: 用于随机化训练尺度与噪声注入。
@@ -575,7 +580,7 @@ def karras_sample(
     ts=None,
     prior_window_size = 20,
     prior_sample = False,
-    last_sample_result_list = [],
+    last_sample_result_list=None,
     schedule_sampler = None,
 ):
     """
@@ -601,7 +606,7 @@ def karras_sample(
         ts: 时间步列表 (用于 multistep)。
         prior_window_size: 先验窗口大小。
         prior_sample: 是否使用先验采样。
-        last_sample_result_list: 上次采样结果列表。
+        last_sample_result_list: 显式传入的跨帧采样历史；默认不跨调用共享。
         schedule_sampler: 调度采样器。
     输出:
         x_0: 生成的样本。
@@ -617,6 +622,9 @@ def karras_sample(
     if generator is None:
         # 默认随机接口直接使用 torch，避免训练/导入路径隐式初始化旧 MPI 栈。
         generator = th
+    if last_sample_result_list is None:
+        # 禁止函数默认参数持有跨调用可变状态；只有调用方显式提供列表时才共享历史。
+        last_sample_result_list = []
 
     if sampler == "progdist":
         sigmas = get_sigmas_karras(steps + 1, sigma_min, sigma_max, rho, device=device)

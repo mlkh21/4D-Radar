@@ -25,9 +25,12 @@ if PACKAGE_DIR not in sys.path:
     sys.path.insert(0, PACKAGE_DIR)
 
 from probabilistic_mapping import (  # noqa: E402
+    GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
     GridMapConfig,
+    LEGACY_MULTICHANNEL_EVIDENCE_SEMANTICS,
     LazyLocalMapQuery,
     SlidingProbabilisticGridMap,
+    TRAJECTORY_CORRIDOR_QUERY_PROTOCOL,
     load_sparse_voxel_npz,
 )
 from evaluation_metrics import occupancy_prf, voxel_to_points  # noqa: E402
@@ -39,11 +42,18 @@ from prediction_artifact_protocol import (  # noqa: E402
     PREDICTION_VOXEL_PROTOCOL,
     normalize_prediction_voxel_records,
     prediction_voxel_records_digest,
+    validate_prediction_voxel_metadata,
+)
+from observed_artifact_protocol import (  # noqa: E402
+    RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL,
+    observed_mask_records_digest as _observed_mask_records_digest,
+)
+from trajectory_artifact_protocol import (  # noqa: E402
+    load_local_trajectory_artifact,
 )
 
 
 DYNAMIC_EVIDENCE_PROTOCOL = "dynamic_occupancy_evidence_v1"
-RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL = "radar_endpoint_ray_visibility_v1"
 DYNAMIC_EVIDENCE_METADATA = "dynamic_evidence.json"
 DYNAMIC_EVIDENCE_KEYS = {
     "protocol",
@@ -463,21 +473,6 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def _observed_mask_records_digest(records) -> str:
-    """复算 inference 端逐帧 mask 收据，拒绝只信任 JSON 声明。"""
-    digest = hashlib.sha256()
-    for record in records:
-        digest.update(str(record["frame_id"]).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(record["file"]).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(record["sha256"]).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(int(record["observed_voxels"])).encode("ascii"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
 def load_formal_inference_contract(
     path: str,
     radar_file_names: List[str],
@@ -547,6 +542,10 @@ def load_formal_inference_contract(
         or prediction.get("frame_count") != payload.get("frame_count")
     ):
         raise ValueError("formal inference_run 的 frame/observed 协议不完整")
+    try:
+        validate_prediction_voxel_metadata(prediction)
+    except ValueError as exc:
+        raise ValueError(f"formal prediction voxel metadata 无效: {exc}") from exc
     records = observed.get("records")
     if not isinstance(records, list) or len(records) != payload.get("frame_count"):
         raise ValueError("formal inference_run observed records 帧数不一致")
@@ -644,6 +643,11 @@ def load_formal_inference_contract(
             or not np.all(np.isfinite(array))
         ):
             raise ValueError(f"formal prediction voxel 内容合同无效: {frame_id}")
+        occupancy = array[0]
+        if np.any(occupancy < 0.0) or np.any(occupancy > 1.0):
+            raise ValueError(
+                f"formal prediction occupancy probability 超出 [0,1]: {frame_id}"
+            )
     mask_paths = {}
     for record in selected_records:
         frame_id = record["frame_id"]
@@ -802,6 +806,8 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         or float(args.brake_deceleration_m_s2) <= 0.0
         or float(args.safety_margin_m) < 0.0
         or float(args.query_search_radius_m) <= 0.0
+        or float(args.trajectory_corridor_radius_m) <= 0.0
+        or float(args.trajectory_sample_spacing_m) <= 0.0
         or float(args.max_unknown_mass) < 0.0
         or float(args.max_unknown_mass) > 1.0
     ):
@@ -833,10 +839,10 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
     if not np.all(map_pc_range[3:] > map_pc_range[:3]):
         raise ValueError("map_pc_range 的 max 必须逐轴大于 min")
     if (
-        not np.allclose(map_pc_range[:3], pc_range[:3], atol=1e-9, rtol=0.0)
+        np.any(map_pc_range[:3] > pc_range[:3] + 1e-9)
         or np.any(map_pc_range[3:] < pc_range[3:] - 1e-9)
     ):
-        raise ValueError("pc_range 必须从相同最小边界完全位于 map_pc_range 内")
+        raise ValueError("pc_range 必须完全位于 body-relative map_pc_range 内")
     strict_mapping = bool(args.formal_mapping or offline_empirical)
     if args.formal_mapping:
         required = (
@@ -902,6 +908,7 @@ def build_config(args, first_voxel_xyzc: np.ndarray) -> GridMapConfig:
         radar_reliability=args.radar_reliability,
         infrared_reliability=args.infrared_reliability,
         speed_m_s=args.speed_m_s,
+        rolling_enabled=bool(args.formal_mapping or args.offline_empirical_mapping),
         evidence_pc_range=tuple(float(value) for value in args.pc_range),
     )
 
@@ -955,6 +962,12 @@ def main() -> None:
             "frame,timestamp,tx,ty,tz,qx,qy,qz,qw"
         ),
     )
+    parser.add_argument(
+        "--trajectory_file",
+        type=str,
+        default="",
+        help="可选逐帧 local-frame 轨迹 JSON；存在时替代原点查询",
+    )
     parser.add_argument("--uncertainty_dir", type=str, default="",
                         help="Directory containing *_uncertainty.npy files from multimodal inference")
     parser.add_argument(
@@ -994,6 +1007,8 @@ def main() -> None:
     parser.add_argument("--brake_deceleration_m_s2", type=float, default=8.0)
     parser.add_argument("--safety_margin_m", type=float, default=5.0)
     parser.add_argument("--query_search_radius_m", type=float, default=30.0)
+    parser.add_argument("--trajectory_corridor_radius_m", type=float, default=1.0)
+    parser.add_argument("--trajectory_sample_spacing_m", type=float, default=0.5)
     parser.add_argument("--max_unknown_mass", type=float, default=0.5)
     parser.add_argument("--odom_cov_trace", type=float, default=0.0)
     parser.add_argument("--calib_confidence", type=float, default=1.0)
@@ -1011,7 +1026,10 @@ def main() -> None:
         type=float,
         nargs=6,
         default=None,
-        help="局部地图范围；省略时与 pc_range 相同",
+        help=(
+            "地图窗口范围；严格模式下是 body/LiDAR 锚点相对范围，"
+            "legacy 模式下是固定 local 范围；省略时与 pc_range 相同"
+        ),
     )
     args = parser.parse_args()
     if args.map_pc_range is None:
@@ -1040,6 +1058,7 @@ def main() -> None:
         "lidar_to_body_calib",
         "pose_file",
         "empirical_pose_receipt",
+        "trajectory_file",
     ):
         file_path = getattr(args, argument_name)
         if file_path and (os.path.islink(file_path) or not os.path.isfile(file_path)):
@@ -1091,6 +1110,14 @@ def main() -> None:
             allow_receipt_bound_subset=args.offline_empirical_mapping,
         )
         observed_mask_paths = dict(formal_contract["mask_paths"])
+    trajectory_contract = None
+    trajectory_table: Dict[str, np.ndarray] = {}
+    if args.trajectory_file:
+        trajectory_contract = load_local_trajectory_artifact(
+            args.trajectory_file,
+            [_voxel_frame_key(file_name) for file_name in radar_files],
+        )
+        trajectory_table = dict(trajectory_contract["trajectory_table"])
     if args.formal_mapping:
         T_body_voxel = load_extrinsic_transform(args.lidar_to_body_calib)
         voxel_coordinate_frame = "lidar"
@@ -1178,6 +1205,9 @@ def main() -> None:
             "is_risky",
             "risk_state",
             "risk_reason",
+            "query_protocol",
+            "trajectory_sample_count",
+            "trajectory_first_risk_arc_length_m",
             "safety_distance_m",
             "speed_m_s",
             "odom_cov_trace",
@@ -1276,6 +1306,12 @@ def main() -> None:
                 observed_mask=observed_mask,
                 dynamic_probability=dynamic_probability,
                 dynamic_observed_mask=dynamic_observed,
+                observed_mask_authoritative=strict_mapping,
+                evidence_semantics=(
+                    GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS
+                    if strict_mapping
+                    else LEGACY_MULTICHANNEL_EVIDENCE_SEMANTICS
+                ),
                 **update_pose_kwargs,
             )
 
@@ -1294,18 +1330,30 @@ def main() -> None:
 
             snapshot = grid_map.snapshot()
             query.refresh(snapshot)
-            # 查询点是当前合同 pose 原点：机载模式为 body，经验模式为 LiDAR。
-            prox = query.query_proximity(
-                x_m=float(query_transform[0, 3]),
-                y_m=float(query_transform[1, 3]),
-                z_m=float(query_transform[2, 3]),
-                search_radius=args.query_search_radius_m,
-                speed_m_s=args.speed_m_s,
-                reaction_time_s=args.reaction_time_s,
-                brake_deceleration_m_s2=args.brake_deceleration_m_s2,
-                safety_margin_m=args.safety_margin_m,
-                max_unknown_mass=args.max_unknown_mass,
-            )
+            if trajectory_table:
+                prox = query.query_trajectory_corridor(
+                    trajectory_table[frame_key],
+                    corridor_radius_m=args.trajectory_corridor_radius_m,
+                    sample_spacing_m=args.trajectory_sample_spacing_m,
+                    speed_m_s=args.speed_m_s,
+                    reaction_time_s=args.reaction_time_s,
+                    brake_deceleration_m_s2=args.brake_deceleration_m_s2,
+                    safety_margin_m=args.safety_margin_m,
+                    max_unknown_mass=args.max_unknown_mass,
+                )
+            else:
+                # 无轨迹 artifact 时只能做当前 pose 原点的离线点查询。
+                prox = query.query_proximity(
+                    x_m=float(query_transform[0, 3]),
+                    y_m=float(query_transform[1, 3]),
+                    z_m=float(query_transform[2, 3]),
+                    search_radius=args.query_search_radius_m,
+                    speed_m_s=args.speed_m_s,
+                    reaction_time_s=args.reaction_time_s,
+                    brake_deceleration_m_s2=args.brake_deceleration_m_s2,
+                    safety_margin_m=args.safety_margin_m,
+                    max_unknown_mass=args.max_unknown_mass,
+                )
             obstacle_precision = ""
             obstacle_recall = ""
             false_positive_rate = ""
@@ -1351,6 +1399,16 @@ def main() -> None:
                 int(prox["is_risky"] > 0.5),
                 prox["state"],
                 prox["reason"],
+                prox.get(
+                    "protocol",
+                    "local_origin_3d_three_state_v1",
+                ),
+                prox.get("sample_count", ""),
+                (
+                    f"{float(prox['first_risk_arc_length_m']):.6f}"
+                    if prox.get("first_risk_arc_length_m") is not None
+                    else ""
+                ),
                 f"{prox['safety_distance_m']:.3f}",
                 f"{args.speed_m_s:.3f}",
                 f"{args.odom_cov_trace:.6f}",
@@ -1412,16 +1470,29 @@ def main() -> None:
         os.path.join(args.output_dir, "map_run.json"),
         {
             "protocol": (
-                "pose_aware_layered_map_offline_empirical_v1"
+                "pose_aware_layered_map_offline_empirical_v3"
                 if args.offline_empirical_mapping
-                else "pose_aware_layered_map_v3"
+                else (
+                    "pose_aware_layered_map_v5"
+                    if args.formal_mapping
+                    else "pose_aware_layered_map_v4"
+                )
             ),
             "formal_mapping": bool(args.formal_mapping),
+            "formal_mapping_scope": (
+                "offline_file_replay_data_contract_only"
+                if args.formal_mapping
+                else None
+            ),
             "offline_empirical_mapping": bool(args.offline_empirical_mapping),
-            "airborne_formal": bool(args.formal_mapping),
-            "avoidance_formal": bool(args.formal_mapping),
+            "execution_mode": "offline_file_replay",
+            "offline_data_contract_validated": bool(strict_mapping),
+            # 当前入口没有 ROS1 节点、在线时延门禁或飞控执行链，
+            # 不得因 formal 数据合同通过就声称机载/避障 formal。
+            "airborne_formal": False,
+            "avoidance_formal": False,
             "runtime_contract_status": (
-                "formal_fail_closed"
+                "offline_formal_replay_fail_closed"
                 if args.formal_mapping
                 else (
                     "offline_empirical_fail_closed"
@@ -1515,6 +1586,19 @@ def main() -> None:
                 if formal_contract is not None
                 else None
             ),
+            "prediction_mapping_contract": (
+                formal_contract["prediction"]["mapping_contract"]
+                if formal_contract is not None
+                else None
+            ),
+            "observed_mask_authoritative": bool(strict_mapping),
+            "dem_contract": {
+                "height_source": "observed_occupancy_z_distribution",
+                "mean_unit": "m",
+                "variance_unit": "m^2",
+                "prediction_auxiliary_channels_consumed": False,
+                "generic_model_uncertainty_added_to_height_variance": False,
+            },
             "consumed_prediction_voxel_files_sha256": (
                 formal_contract["selected_prediction_files_sha256"]
                 if formal_contract is not None
@@ -1532,18 +1616,107 @@ def main() -> None:
                 args.target_voxel_layout if target_paths else None
             ),
             "evidence_pc_range": [float(value) for value in args.pc_range],
-            "map_pc_range": [float(value) for value in args.map_pc_range],
+            "map_pc_range": final_snapshot["map_pc_range_local"].astype(float).tolist(),
+            "initial_map_pc_range_local": [
+                float(value) for value in args.map_pc_range
+            ],
+            "map_window_body_relative_pc_range": (
+                [float(value) for value in args.map_pc_range]
+                if cfg.rolling_enabled
+                else None
+            ),
             "map_shape_xyz": [int(value) for value in cfg.shape_xyz],
+            "rolling_map": {
+                "enabled": bool(cfg.rolling_enabled),
+                "protocol": str(final_snapshot["rolling_protocol"].item()),
+                "recenter_count": int(
+                    final_snapshot["rolling_recenter_count"].item()
+                ),
+                "last_shift_cells_xyz": final_snapshot[
+                    "last_recenter_shift_cells"
+                ].astype(int).tolist(),
+                "final_local_pc_range": final_snapshot[
+                    "map_pc_range_local"
+                ].astype(float).tolist(),
+                "body_relative_window_pc_range": (
+                    [float(value) for value in args.map_pc_range]
+                    if cfg.rolling_enabled
+                    else None
+                ),
+            },
             "occupancy_probability": "pignistic_m_occ_plus_half_unknown",
             "map_occupancy_threshold": 0.55,
             "target_occupancy_threshold": 0.1 if target_paths else None,
             "metric_frame": "local",
             "obstacle_metric_space": "bev_xy",
             "proximity_query": (
-                "lidar_origin_local_3d_three_state_v1"
-                if args.offline_empirical_mapping
-                else "body_origin_local_3d_three_state_v1"
+                TRAJECTORY_CORRIDOR_QUERY_PROTOCOL
+                if trajectory_contract is not None
+                else (
+                    "lidar_origin_local_3d_three_state_v1"
+                    if args.offline_empirical_mapping
+                    else "body_origin_local_3d_three_state_v1"
+                )
             ),
+            "trajectory_query": {
+                "protocol": (
+                    TRAJECTORY_CORRIDOR_QUERY_PROTOCOL
+                    if trajectory_contract is not None
+                    else None
+                ),
+                "artifact_consumed": trajectory_contract is not None,
+                "artifact_file": (
+                    os.path.basename(trajectory_contract["artifact_path"])
+                    if trajectory_contract is not None
+                    else None
+                ),
+                "artifact_sha256": (
+                    trajectory_contract["artifact_sha256"]
+                    if trajectory_contract is not None
+                    else None
+                ),
+                "records_sha256": (
+                    trajectory_contract["records_sha256"]
+                    if trajectory_contract is not None
+                    else None
+                ),
+                "coordinate_frame": (
+                    trajectory_contract["coordinate_frame"]
+                    if trajectory_contract is not None
+                    else None
+                ),
+                "frame_count": (
+                    trajectory_contract["frame_count"]
+                    if trajectory_contract is not None
+                    else 0
+                ),
+                "corridor_radius_m": (
+                    float(args.trajectory_corridor_radius_m)
+                    if trajectory_contract is not None
+                    else None
+                ),
+                "requested_sample_spacing_m": (
+                    float(args.trajectory_sample_spacing_m)
+                    if trajectory_contract is not None
+                    else None
+                ),
+                "offline_only": True,
+            },
+            "ros1_integration": {
+                "protocol": "offline_ros1_interface_boundary_v1",
+                "status": "not_implemented_offline_artifacts_only",
+                "node_implemented": False,
+                "publisher_implemented": False,
+                "service_implemented": False,
+                "action_implemented": False,
+                "px4_bridge_implemented": False,
+                "online_latency_validated": False,
+                "offline_artifact_outputs": [
+                    "map_final.npz",
+                    "map_run.json",
+                    "streaming_metrics.csv",
+                ],
+            },
             "risk_states": ["clear", "obstacle", "unknown"],
             "unknown_is_risky": True,
             "speed_m_s": float(args.speed_m_s),
@@ -1622,7 +1795,6 @@ def main() -> None:
     )
     print(f"Saved final map to: {os.path.join(args.output_dir, 'map_final.npz')}")
     print(f"Saved metrics to: {metric_path}")
-    # TODO: 新增ROS1发布模式，将map_final/streaming指标同步为service/action可消费接口。
 
 
 if __name__ == "__main__":

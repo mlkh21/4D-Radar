@@ -20,12 +20,17 @@ from diffusion_consistency_radar.formal_data_protocol import (  # noqa: E402
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="从 training manifests、split 和监督模态生成 formal_data_v2"
+        description="从 training manifests、split 和监督模态生成 formal_data_v2/v3"
     )
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--scene", action="append", required=True)
     parser.add_argument("--split_artifact", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--protocol_version",
+        choices=("v2", "v3"),
+        default="v2",
+    )
     return parser
 
 
@@ -36,6 +41,7 @@ def main():
         scenes=args.scene,
         split_artifact_path=args.split_artifact,
         output_path=args.output,
+        protocol_version=args.protocol_version,
     )
     _protocol, digest = load_formal_data_protocol_artifact(
         path,
@@ -49,7 +55,7 @@ def main():
             {
                 "artifact_path": path,
                 "sha256": digest,
-                "protocol": "formal_data_v2",
+                "protocol": _protocol["protocol"],
             },
             ensure_ascii=False,
             sort_keys=True,

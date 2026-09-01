@@ -30,6 +30,13 @@ from diffusion_consistency_radar.radar_statistics import (
     RADAR_STATISTICS_PROTOCOL,
     save_sparse_radar_voxel,
 )
+from diffusion_consistency_radar.radar_field_schema import (
+    load_radar_field_schema_artifact,
+    load_radar_layout_schema,
+)
+from diffusion_consistency_radar.extraction_receipt import (
+    load_extraction_receipt_artifact,
+)
 
 try:
     # 作为包导入时使用完整模块路径。
@@ -289,11 +296,52 @@ def _ensure_motion_args(args):
         "radar_to_thermal_path": RADAR_TO_THERMAL_PATH,
         "lidar_to_thermal_path": LIDAR_TO_THERMAL_PATH,
         "thermal_intrinsics_path": THERMAL_INTRINSICS_PATH,
+        "radar_field_schema": "",
+        "require_verified_radar_field_schema": False,
+        "require_complete_extraction_receipt": False,
     }
     for name, default in defaults.items():
         if not hasattr(args, name):
             setattr(args, name, default)
     return args
+
+
+def resolve_radar_field_schema(
+    path,
+    *,
+    require_verified,
+    velocity_mode,
+    layout_schema_path=None,
+):
+    """解析字段语义；Doppler 运动补偿禁止沿用未验证符号假设。"""
+    schema_path = os.fspath(path).strip() if path is not None else ""
+    if not schema_path:
+        if require_verified:
+            raise ValueError("正式预处理缺少 --radar_field_schema")
+        if velocity_mode != "none":
+            raise ValueError("启用 Radar Doppler 运动补偿前必须提供 verified field schema")
+        return None, None
+    schema, digest = load_radar_field_schema_artifact(
+        schema_path,
+        require_verified=require_verified or velocity_mode != "none",
+    )
+    if not layout_schema_path:
+        raise ValueError("Radar field schema 缺少对应 pointcloud layout sidecar")
+    load_radar_layout_schema(layout_schema_path, schema)
+    return schema, digest
+
+
+def resolve_extraction_receipt(path, *, require_complete):
+    """已有收据必须完整；formal-v3 还要求收据不得缺失。"""
+    receipt_path = os.path.abspath(os.fspath(path))
+    if not os.path.isfile(receipt_path) or os.path.islink(receipt_path):
+        if require_complete:
+            raise ValueError(f"正式预处理缺少 complete extraction receipt: {receipt_path}")
+        return None, None
+    return load_extraction_receipt_artifact(
+        receipt_path,
+        require_complete=True,
+    )
 
 def ensure_fresh_scene_output(scene_out_path):
     """仅允许向不存在或为空的普通场景目录写入，避免覆盖旧批次。"""
@@ -343,18 +391,26 @@ def transform_pcl(pcl, R, T):
     return pcl_trans
 
 
-def compensate_radar_doppler(pcl, radar_velocity):
-    """在 Radar 原点坐标系内剔除平台径向速度，避免外参平移改变射线方向。"""
+def compensate_radar_doppler(
+    pcl,
+    radar_velocity,
+    *,
+    positive_direction="toward_sensor",
+):
+    """按 schema 声明的 Doppler 正方向剔除平台径向速度。"""
     if radar_velocity is None or pcl.shape[0] == 0 or pcl.shape[1] <= 4:
         return pcl
     velocity = np.asarray(radar_velocity, dtype=np.float32)
     if velocity.shape != (3,) or not np.all(np.isfinite(velocity)):
         raise ValueError("radar_velocity 必须是三个有限数")
+    if positive_direction not in {"toward_sensor", "away_from_sensor"}:
+        raise ValueError("Doppler positive_direction 必须明确 toward/away")
     corrected = pcl.copy()
     xyz = corrected[:, :3]
     radius = np.maximum(np.linalg.norm(xyz, axis=1), 1e-6)
     ego_radial = np.sum(xyz * velocity[None, :], axis=1) / radius
-    corrected[:, 4] = corrected[:, 4] - ego_radial
+    direction_sign = -1.0 if positive_direction == "toward_sensor" else 1.0
+    corrected[:, 4] = corrected[:, 4] + direction_sign * ego_radial
     return corrected
 
 
@@ -412,6 +468,13 @@ def voxelize_pcl_airborne_optimized(
         if v_drone.shape != (3,) or not np.all(np.isfinite(v_drone)):
             raise ValueError("v_drone 必须是三个有限数")
 
+    pcl = np.asarray(pcl, dtype=np.float32)
+    if pcl.ndim != 2 or pcl.shape[1] < 3:
+        raise ValueError("pcl 必须是至少含 XYZ 三列的二维数组")
+    # 坐标非有限的点无法定义体素索引，必须在运动补偿和距离
+    # 计算前丢弃；强度/Doppler 则保留空间占用并分字段计数。
+    pcl = pcl[np.all(np.isfinite(pcl[:, :3]), axis=1)]
+
     # 1. 将非参考传感器点云移动到明确参考时刻；参考传感器的 dt 恒为 0。
     if abs(dt_sync) > 1e-6 and v_drone is not None:
         pcl = pcl.copy()
@@ -448,6 +511,7 @@ def voxelize_pcl_airborne_optimized(
             "protocol": RADAR_STATISTICS_PROTOCOL,
             "coords": np.empty((0, 3), dtype=np.int32),
             "point_count": np.empty((0,), dtype=np.uint32),
+            "intensity_valid_count": np.empty((0,), dtype=np.uint32),
             "doppler_valid_count": np.empty((0,), dtype=np.uint32),
         }
 
@@ -461,9 +525,18 @@ def voxelize_pcl_airborne_optimized(
 
     sort_order = np.argsort(flat_indices)
     flat_indices = flat_indices[sort_order]
-    features = pcl[sort_order, 3] if pcl.shape[1] > 3 else np.ones(pcl.shape[0])
+    features = (
+        pcl[sort_order, 3]
+        if pcl.shape[1] > 3
+        else np.ones(pcl.shape[0], dtype=np.float32)
+    )
+    intensity_valid = np.isfinite(features)
     has_doppler = pcl.shape[1] > 4
-    doppler = pcl[sort_order, 4] if has_doppler else np.zeros(pcl.shape[0])
+    doppler = (
+        pcl[sort_order, 4]
+        if has_doppler
+        else np.zeros(pcl.shape[0], dtype=np.float32)
+    )
     doppler_valid = (
         np.isfinite(pcl[sort_order, 4])
         if has_doppler
@@ -478,31 +551,61 @@ def voxelize_pcl_airborne_optimized(
     # 通道 0: 空间占用状态 (Occupancy Mask)
     voxel_grid[ux_idx, uy_idx, uz_idx, 0] = 1.0
     # 通道 1: 平均反射特征强度 (Mean Intensity)
-    sum_features = np.zeros(np.prod(grid_shape), dtype=np.float32)
-    np.add.at(sum_features, flat_indices, features)
-    voxel_grid[ux_idx, uy_idx, uz_idx, 1] = sum_features[unique_indices] / unique_counts
-    # 通道 2: 经解耦后的纯净多普勒均值测速 (Mean Pure Doppler)
-    sum_doppler = np.zeros(np.prod(grid_shape), dtype=np.float32)
-    np.add.at(sum_doppler, flat_indices, doppler)
-    voxel_grid[ux_idx, uy_idx, uz_idx, 2] = sum_doppler[unique_indices] / unique_counts
-    # 通道 3: 多普勒空间方差量化（直接作为不确定性协方差输入）
-    # Var = E[X^2] - (E[X])^2
-    sum_doppler_sq = np.zeros(np.prod(grid_shape), dtype=np.float32)
-    np.add.at(sum_doppler_sq, flat_indices, doppler ** 2)
-    mean_doppler_sq = sum_doppler_sq[unique_indices] / unique_counts
-
-    var_doppler = mean_doppler_sq - voxel_grid[ux_idx, uy_idx, uz_idx, 2] ** 2
-   # 截断保护，防止随机噪点方差过大导致神经网络训练时出现 NaN 异常
-    voxel_grid[ux_idx, uy_idx, uz_idx, 3] = np.clip(var_doppler, 0.0, 50.0)
-
-    if not return_statistics:
-        return voxel_grid
-    doppler_valid_accumulator = np.zeros(np.prod(grid_shape), dtype=np.uint32)
+    accumulator_size = int(np.prod(grid_shape))
+    # 使用 float64 累加，避免多个有限 float32 大值在求和时溢出。
+    sum_features = np.zeros(accumulator_size, dtype=np.float64)
+    intensity_valid_accumulator = np.zeros(accumulator_size, dtype=np.uint32)
+    np.add.at(sum_features, flat_indices, np.where(intensity_valid, features, 0.0))
+    np.add.at(
+        intensity_valid_accumulator,
+        flat_indices,
+        intensity_valid.astype(np.uint32, copy=False),
+    )
+    intensity_counts = intensity_valid_accumulator[unique_indices]
+    intensity_mean = np.zeros(unique_indices.shape[0], dtype=np.float64)
+    intensity_has_samples = intensity_counts > 0
+    intensity_mean[intensity_has_samples] = (
+        sum_features[unique_indices[intensity_has_samples]]
+        / intensity_counts[intensity_has_samples]
+    )
+    voxel_grid[ux_idx, uy_idx, uz_idx, 1] = intensity_mean
+    # 通道 2: 有限 Doppler 样本均值；是否补偿由外部 policy 审计。
+    sum_doppler = np.zeros(accumulator_size, dtype=np.float64)
+    doppler_valid_accumulator = np.zeros(accumulator_size, dtype=np.uint32)
+    finite_doppler = np.where(doppler_valid, doppler, 0.0).astype(
+        np.float64,
+        copy=False,
+    )
+    np.add.at(sum_doppler, flat_indices, finite_doppler)
     np.add.at(
         doppler_valid_accumulator,
         flat_indices,
         doppler_valid.astype(np.uint32, copy=False),
     )
+    doppler_counts = doppler_valid_accumulator[unique_indices]
+    doppler_mean = np.zeros(unique_indices.shape[0], dtype=np.float64)
+    doppler_has_samples = doppler_counts > 0
+    doppler_mean[doppler_has_samples] = (
+        sum_doppler[unique_indices[doppler_has_samples]]
+        / doppler_counts[doppler_has_samples]
+    )
+    voxel_grid[ux_idx, uy_idx, uz_idx, 2] = doppler_mean
+    # 通道 3: 有限 Doppler 样本的体素内方差。
+    # Var = E[X^2] - (E[X])^2
+    sum_doppler_sq = np.zeros(accumulator_size, dtype=np.float64)
+    np.add.at(sum_doppler_sq, flat_indices, finite_doppler ** 2)
+    mean_doppler_sq = np.zeros(unique_indices.shape[0], dtype=np.float64)
+    mean_doppler_sq[doppler_has_samples] = (
+        sum_doppler_sq[unique_indices[doppler_has_samples]]
+        / doppler_counts[doppler_has_samples]
+    )
+
+    var_doppler = mean_doppler_sq - doppler_mean ** 2
+   # 截断保护，防止随机噪点方差过大导致神经网络训练时出现 NaN 异常
+    voxel_grid[ux_idx, uy_idx, uz_idx, 3] = np.clip(var_doppler, 0.0, 50.0)
+
+    if not return_statistics:
+        return voxel_grid
     statistics = {
         "protocol": RADAR_STATISTICS_PROTOCOL,
         "coords": np.column_stack((ux_idx, uy_idx, uz_idx)).astype(
@@ -510,6 +613,7 @@ def voxelize_pcl_airborne_optimized(
             copy=False,
         ),
         "point_count": unique_counts.astype(np.uint32, copy=False),
+        "intensity_valid_count": intensity_counts.astype(np.uint32, copy=False),
         "doppler_valid_count": doppler_valid_accumulator[unique_indices].astype(
             np.uint32,
             copy=False,
@@ -552,7 +656,11 @@ def _parallel_frame_worker(task_args):
             target_frame="radar",
             radar_to_lidar_rotation=r_radar_to_lidar,
         )
-        radar_pcl = compensate_radar_doppler(radar_pcl, radar_velocity)
+        radar_pcl = compensate_radar_doppler(
+            radar_pcl,
+            radar_velocity,
+            positive_direction=args_dict["radar_doppler_positive_direction"],
+        )
 
     if args_dict["align_to"] == "lidar":
         radar_pcl = transform_pcl(radar_pcl, r_radar_to_lidar, t_radar_to_lidar)
@@ -690,6 +798,36 @@ def process_scene_task(scene_name, args, v_drone=None):
         raise ValueError(f"velocity_mode 必须是 {VELOCITY_MODES} 之一")
     if args.velocity_frame not in VELOCITY_FRAMES:
         raise ValueError(f"velocity_frame 必须是 {VELOCITY_FRAMES} 之一")
+    radar_field_schema, radar_field_schema_sha256 = resolve_radar_field_schema(
+        args.radar_field_schema,
+        require_verified=bool(args.require_verified_radar_field_schema),
+        velocity_mode=args.velocity_mode,
+        layout_schema_path=os.path.join(
+            scene_raw_path,
+            "radar_pcl",
+            "pointcloud_schema.json",
+        ),
+    )
+    radar_layout_schema_sha256 = (
+        sha256_file(
+            os.path.join(
+                scene_raw_path,
+                "radar_pcl",
+                "pointcloud_schema.json",
+            )
+        )
+        if radar_field_schema is not None
+        else None
+    )
+    extraction_receipt, extraction_receipt_sha256 = resolve_extraction_receipt(
+        os.path.join(scene_raw_path, "extraction_receipt.json"),
+        require_complete=bool(args.require_complete_extraction_receipt),
+    )
+    radar_doppler_positive_direction = (
+        radar_field_schema["fields"]["doppler"]["positive_direction"]
+        if radar_field_schema is not None
+        else None
+    )
     fixed_velocity = None
     recorded_table = None
     velocity_file_sha256 = None
@@ -741,7 +879,10 @@ def process_scene_task(scene_name, args, v_drone=None):
     min_len = min(len(radar_indices), len(lidar_indices))
     if args.max_frames > 0: min_len = min(min_len, int(args.max_frames))
 
-    args_dict = vars(args)
+    args_dict = dict(vars(args))
+    args_dict["radar_doppler_positive_direction"] = (
+        radar_doppler_positive_direction
+    )
     worker_tasks = []
     ir_sync_records = []
     for i in range(min_len):
@@ -889,6 +1030,22 @@ def process_scene_task(scene_name, args, v_drone=None):
             if args.velocity_mode != "none"
             else "none_no_velocity"
         ),
+        "radar_field_schema": radar_field_schema,
+        "radar_field_schema_sha256": radar_field_schema_sha256,
+        "radar_pointcloud_layout_sha256": radar_layout_schema_sha256,
+        "radar_field_schema_status": (
+            radar_field_schema["verification"]["status"]
+            if radar_field_schema is not None
+            else "absent_unverified"
+        ),
+        "radar_doppler_positive_direction": radar_doppler_positive_direction,
+        "extraction_receipt": extraction_receipt,
+        "extraction_receipt_sha256": extraction_receipt_sha256,
+        "extraction_receipt_status": (
+            extraction_receipt["status"]
+            if extraction_receipt is not None
+            else "absent_legacy"
+        ),
         "calibration_closure_audit": calibration_closure,
         "z_min": args.z_min,
         "x_max": args.x_max,
@@ -903,8 +1060,10 @@ def process_scene_task(scene_name, args, v_drone=None):
         "radar_statistics_storage": "radar_npz_aligned_with_coords",
         "radar_statistics_fields": {
             "point_count": "uint32_points_per_occupied_voxel",
+            "intensity_valid_count": "uint32_finite_intensity_samples_per_occupied_voxel",
             "doppler_valid_count": "uint32_finite_doppler_samples_per_occupied_voxel",
         },
+        "radar_aggregation_semantics": "per_field_finite_count_mean_and_doppler_variance_v2",
         "radar_statistics_model_consumed": False,
         "channels": {
             "0": "occupancy",
@@ -919,20 +1078,21 @@ def process_scene_task(scene_name, args, v_drone=None):
     }
     with open(os.path.join(scene_out_path, "preprocess_policy.json"), "w", encoding="utf-8") as h:
         json.dump(preprocess_policy, h, indent=2)
+    provenance_sources = {
+        "preprocess_script": os.path.abspath(__file__),
+        "radar_to_lidar": args.calib_path,
+        "radar_to_thermal": args.radar_to_thermal_path,
+        "lidar_to_thermal": args.lidar_to_thermal_path,
+        "thermal_intrinsics": args.thermal_intrinsics_path,
+        "radar_lidar_sync": radar_lidar_sync_path,
+        "radar_ir_sync": ir_sync_path,
+        "target_policy": target_policy_path,
+    }
     write_scene_manifest_atomic(
         scene_out_path,
         scene_name,
         written,
-        {
-            "preprocess_script": os.path.abspath(__file__),
-            "radar_to_lidar": args.calib_path,
-            "radar_to_thermal": args.radar_to_thermal_path,
-            "lidar_to_thermal": args.lidar_to_thermal_path,
-            "thermal_intrinsics": args.thermal_intrinsics_path,
-            "radar_lidar_sync": radar_lidar_sync_path,
-            "radar_ir_sync": ir_sync_path,
-            "target_policy": target_policy_path,
-        },
+        provenance_sources,
         profile="training",
     )
 
@@ -961,6 +1121,22 @@ if __name__ == "__main__":
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--invert_calib", action="store_true")
     parser.add_argument("--radar_z_shift", type=float, default=0.0)
+    parser.add_argument(
+        "--radar_field_schema",
+        type=str,
+        default="",
+        help="Radar 原始字段/单位/Doppler 正方向 JSON artifact",
+    )
+    parser.add_argument(
+        "--require_verified_radar_field_schema",
+        action="store_true",
+        help="要求 schema 绑定可校验权威证据；formal-v3 必须启用",
+    )
+    parser.add_argument(
+        "--require_complete_extraction_receipt",
+        action="store_true",
+        help="要求 raw 场景含 complete 的关键模态解包收据",
+    )
     parser.add_argument(
         "--align_to",
         choices=VELOCITY_FRAMES,

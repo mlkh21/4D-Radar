@@ -26,6 +26,7 @@ from diffusion_consistency_radar.cm.vae_3d import (
     resolve_checkpoint_grid_config,
 )
 from diffusion_consistency_radar.scripts.unified_train import (
+    LDM_OBSERVATION_SUPERVISION_PROTOCOL,
     LDM_VALIDATION_PROTOCOL,
     LDM_VALIDATION_SELECTOR,
     OptimizedVAETrainer,
@@ -39,7 +40,24 @@ from diffusion_consistency_radar.scripts.unified_train import (
     micro_occupancy_metrics,
     is_formal_multimodal_training,
     resolve_training_data_protocol,
+    resolve_ldm_validation_config,
 )
+
+
+def _perfect_threshold_sweep(validation_config):
+    return [
+        {
+            "threshold": threshold,
+            "tp": 1,
+            "fp": 0,
+            "fn": 0,
+            "iou": 1.0,
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+        }
+        for threshold in validation_config["threshold_candidates"]
+    ]
 from diffusion_consistency_radar.dataset_manifest import sha256_json_value
 
 
@@ -59,6 +77,35 @@ class VAECheckpointProtocolTest(unittest.TestCase):
             },
             "radar_ir_sync_sha256": {"garden": "1" * 64},
         }
+
+    @classmethod
+    def _data_protocol_v3(cls):
+        protocol = cls._data_protocol()
+        protocol.update(
+            {
+                "protocol": "formal_data_v3",
+                "preprocessing_protocol": "formal_preprocessing_v3",
+                "radar_statistics_protocol": "radar_point_count_field_validity_v2",
+                "radar_field_schema_protocol": "radar_raw_field_semantics_v1",
+                "radar_field_schema_sha256": {"garden": "2" * 64},
+                "radar_pointcloud_layout_sha256": {"garden": "3" * 64},
+                "extraction_receipt_protocol": "rosbag_extraction_receipt_v1",
+                "extraction_receipt_sha256": {"garden": "4" * 64},
+                "radar_input_contract": {
+                    "return_strength": {
+                        "quantity": "intensity",
+                        "unit": "sensor_native_linear_nonnegative",
+                    },
+                    "doppler": {
+                        "quantity": "radial_velocity",
+                        "unit": "m/s",
+                        "reference": "sensor_relative",
+                        "positive_direction": "toward_sensor",
+                    },
+                },
+            }
+        )
+        return protocol
 
     @staticmethod
     def _radar_normalization_spec():
@@ -233,6 +280,72 @@ class VAECheckpointProtocolTest(unittest.TestCase):
                     scene_names=["garden"],
                     data_protocol=protocol,
                 )
+
+    def test_formal_v3_preflight_requires_field_validity_statistics_v2(self):
+        """v3 不得把旧统计摘要误当作逐字段 finite-count 合同。"""
+        protocol = self._data_protocol_v3()
+        observed_records = [
+            {
+                "frame_id": "000000",
+                "path": "observed_mask/000000.npz",
+                "size": 1,
+                "sha256": "8" * 64,
+            }
+        ]
+        protocol["observed_mask_sha256"]["garden"] = sha256_json_value(
+            observed_records
+        )
+        manifest = {
+            "content_sha256": protocol["dataset_manifest_sha256"]["garden"],
+            "preprocessing": {
+                "provenance": {
+                    "target_policy": {
+                        "sha256": protocol["target_policy_sha256"]["garden"]
+                    },
+                    "radar_ir_sync": {
+                        "sha256": protocol["radar_ir_sync_sha256"]["garden"]
+                    },
+                    "lidar_to_thermal": {
+                        "sha256": protocol["calibration_sha256"]["lidar_to_thermal"]
+                    },
+                    "thermal_intrinsics": {
+                        "sha256": protocol["calibration_sha256"]["thermal_intrinsics"]
+                    },
+                }
+            },
+            "modalities": {"observed_mask": observed_records},
+        }
+
+        def sample(statistics_protocol):
+            return (
+                torch.zeros(1),
+                torch.zeros(1),
+                {
+                    "is_mock_ir": False,
+                    "is_mock_calib": False,
+                    "extrinsic_source_frame": "lidar",
+                    "occupancy_observed_mask_source": "persisted_lidar_ray_v1",
+                    "radar_statistics": [{"protocol": statistics_protocol}],
+                },
+            )
+
+        with mock.patch(
+            "diffusion_consistency_radar.scripts.unified_train.validate_scene_manifest",
+            return_value=manifest,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Radar statistics"):
+                assert_formal_dataset_preflight(
+                    [sample("radar_point_count_doppler_validity_v1")],
+                    dataset_root="/unused",
+                    scene_names=["garden"],
+                    data_protocol=protocol,
+                )
+            assert_formal_dataset_preflight(
+                [sample("radar_point_count_field_validity_v2")],
+                dataset_root="/unused",
+                scene_names=["garden"],
+                data_protocol=protocol,
+            )
 
     def test_lightweight_preset_keeps_historical_architecture(self):
         config = create_lightweight_vae_config()
@@ -496,20 +609,20 @@ class VAECheckpointProtocolTest(unittest.TestCase):
         trainer.radar_normalization = self._radar_normalization_spec()
         trainer.radar_normalization_sha256 = "e" * 64
         trainer.allow_legacy_radar_units = False
-        trainer.validation_config = {
-            "protocol": LDM_VALIDATION_PROTOCOL,
-            "split": "temporal_block_validation_suffix",
-            "seed": 42,
-            "sigma": 0.5,
-            "occupancy_threshold": 0.5,
-        }
+        trainer.validation_config = resolve_ldm_validation_config({})
         trainer.validation_selector = LDM_VALIDATION_SELECTOR
+        trainer.observation_supervision_protocol = (
+            LDM_OBSERVATION_SUPERVISION_PROTOCOL
+        )
         trainer.best_val_iou = 0.6
         trainer.best_val_loss = 0.3
         trainer.last_validation_metrics = {
             "denoising_latent_loss": 0.35,
             "denoising_occupancy_iou": 0.55,
         }
+        trainer.last_validation_threshold_sweep = _perfect_threshold_sweep(
+            trainer.validation_config
+        )
         trainer.data_protocol = self._data_protocol()
 
         payload = trainer._checkpoint_payload(epoch=1, loss=0.2, best_loss=0.2)
@@ -521,6 +634,10 @@ class VAECheckpointProtocolTest(unittest.TestCase):
         self.assertEqual(payload["model_config"]["fusion_voxel_shape"], [4, 8, 8])
         self.assertEqual(payload["radar_normalization"], self._radar_normalization_spec())
         self.assertEqual(payload["radar_normalization_sha256"], "e" * 64)
+        self.assertEqual(
+            payload["observation_supervision_protocol"],
+            LDM_OBSERVATION_SUPERVISION_PROTOCOL,
+        )
         self.assertEqual(
             payload["ldm_validation"]["selector"], LDM_VALIDATION_SELECTOR
         )

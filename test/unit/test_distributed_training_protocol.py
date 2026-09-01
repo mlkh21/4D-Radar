@@ -14,12 +14,14 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from diffusion_consistency_radar.distributed_training import (
+    DDP_NORMALIZATION_PROTOCOL,
     DistributedContext,
     DistributedEvalSampler,
     assert_distributed_config_compatible,
     assert_resume_distributed_compatible,
     deterministic_noise_from_sample_ids,
     distributed_checkpoint_metadata,
+    prepare_model_for_distributed,
     reduce_named_sums,
     resolve_world_batch_plan,
     unwrap_model,
@@ -106,6 +108,38 @@ class DistributedTrainingHelperTest(unittest.TestCase):
         self.assertEqual(metadata["world_size"], 3)
         self.assertEqual(metadata["effective_global_batch_size"], 18)
         self.assertEqual(metadata["train_sampler_padding"], 2)
+        self.assertEqual(
+            metadata["normalization_protocol"],
+            DDP_NORMALIZATION_PROTOCOL,
+        )
+
+    def test_multirank_preparation_converts_batchnorm_to_sync_batchnorm(self):
+        model = nn.Sequential(nn.Conv2d(3, 4, 1), nn.BatchNorm2d(4))
+        original_state_keys = tuple(model.state_dict())
+        context = DistributedContext(
+            rank=0,
+            local_rank=0,
+            world_size=2,
+            device="cpu",
+            initialized=True,
+        )
+
+        prepared = prepare_model_for_distributed(model, context)
+
+        self.assertIsInstance(prepared[1], nn.SyncBatchNorm)
+        self.assertEqual(tuple(prepared.state_dict()), original_state_keys)
+
+    def test_single_process_preparation_preserves_batchnorm(self):
+        model = nn.Sequential(nn.BatchNorm2d(4))
+
+        prepared = prepare_model_for_distributed(
+            model,
+            DistributedContext.single_process("cpu"),
+        )
+
+        self.assertIs(prepared, model)
+        self.assertIsInstance(prepared[0], nn.BatchNorm2d)
+        self.assertNotIsInstance(prepared[0], nn.SyncBatchNorm)
 
     def test_sample_identity_noise_is_partition_invariant(self):
         sample_ids = [f"frame-{index}" for index in range(7)]
@@ -143,6 +177,7 @@ class DistributedTrainingHelperTest(unittest.TestCase):
                 "protocol": "single_node_ddp_v1",
                 "world_size": 2,
                 "effective_global_batch_size": 16,
+                "normalization_protocol": DDP_NORMALIZATION_PROTOCOL,
             }
         }
         assert_resume_distributed_compatible(
@@ -153,6 +188,21 @@ class DistributedTrainingHelperTest(unittest.TestCase):
             assert_resume_distributed_compatible(
                 checkpoint,
                 expected_effective_global_batch_size=18,
+            )
+
+    def test_resume_rejects_legacy_multirank_batchnorm_state(self):
+        checkpoint = {
+            "distributed_training": {
+                "protocol": "single_node_ddp_v1",
+                "world_size": 2,
+                "effective_global_batch_size": 16,
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "normalization"):
+            assert_resume_distributed_compatible(
+                checkpoint,
+                expected_effective_global_batch_size=16,
             )
 
     def test_runtime_rejects_distributed_config_identity_drift(self):

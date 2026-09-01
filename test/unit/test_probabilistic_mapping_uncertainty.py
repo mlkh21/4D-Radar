@@ -1,3 +1,4 @@
+import csv
 import json
 import hashlib
 import os
@@ -13,7 +14,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from diffusion_consistency_radar.prediction_artifact_protocol import (
-    prediction_voxel_records_digest,
+    GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+    build_prediction_voxel_metadata,
 )
 
 
@@ -78,16 +80,9 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
                         "files_sha256": _observed_mask_records_digest([record]),
                         "records": [record],
                     },
-                    "prediction_voxel": {
-                        "protocol": "generated_voxel_artifact_v1",
-                        "coordinate_frame": "lidar",
-                        "layout": "czxy",
-                        "frame_count": 1,
-                        "records_sha256": prediction_voxel_records_digest(
-                            [prediction_record]
-                        ),
-                        "records": [prediction_record],
-                    },
+                    "prediction_voxel": build_prediction_voxel_metadata(
+                        [prediction_record]
+                    ),
                 },
                 handle,
             )
@@ -120,6 +115,48 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
             "voxel_path": voxel_path,
             "argv": argv,
         }
+
+    @staticmethod
+    def _refresh_formal_fixture_receipts(fixture):
+        """在测试主动改写内容后重建合法收据，以验证数值合同而非哈希门禁。"""
+        from diffusion_consistency_radar.scripts.streaming_map_update import (
+            _observed_mask_records_digest,
+        )
+
+        run_path = fixture["argv"][fixture["argv"].index("--inference_run") + 1]
+        with open(run_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        voxel = np.load(fixture["voxel_path"], allow_pickle=False)
+        mask = np.load(fixture["mask_path"], allow_pickle=False)
+        with open(fixture["voxel_path"], "rb") as handle:
+            voxel_sha256 = hashlib.sha256(handle.read()).hexdigest()
+        with open(fixture["mask_path"], "rb") as handle:
+            mask_sha256 = hashlib.sha256(handle.read()).hexdigest()
+        prediction_record = {
+            "frame_id": "000001",
+            "file": "000001_voxel.npy",
+            "sha256": voxel_sha256,
+            "shape_czxy": [int(value) for value in voxel.shape],
+            "dtype": str(voxel.dtype),
+        }
+        observed_record = {
+            "frame_id": "000001",
+            "file": "000001_observed_mask.npy",
+            "sha256": mask_sha256,
+            "observed_voxels": int(np.count_nonzero(mask)),
+        }
+        payload["prediction_voxel"] = build_prediction_voxel_metadata(
+            [prediction_record]
+        )
+        payload["observed_mask"]["records"] = [observed_record]
+        payload["observed_mask"]["observed_voxels"] = observed_record[
+            "observed_voxels"
+        ]
+        payload["observed_mask"]["files_sha256"] = (
+            _observed_mask_records_digest([observed_record])
+        )
+        with open(run_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
 
     def test_map_cells_beyond_model_evidence_range_remain_unknown(self):
         """0--80 m evidence 不得被拉伸到 120 m，地图远端必须保持 unknown。"""
@@ -196,6 +233,101 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
         self.assertAlmostEqual(float(snapshot["occ_prob_layers"][1, 0, 0]), 0.5, places=6)
         np.testing.assert_allclose(snapshot["last_T_local_body"], translated)
         self.assertEqual(float(snapshot["last_timestamp"]), 2.0)
+
+    @staticmethod
+    def _rolling_body_map():
+        from diffusion_consistency_radar.cm.probabilistic_mapping import (
+            GridMapConfig,
+            SlidingProbabilisticGridMap,
+        )
+
+        cfg = GridMapConfig(
+            x_min=-1,
+            x_max=3,
+            y_min=-1,
+            y_max=1,
+            z_min=-1,
+            z_max=1,
+            x_resolution=1,
+            y_resolution=1,
+            z_resolution=1,
+            evidence_pc_range=(0, -1, -1, 2, 1, 1),
+            rolling_enabled=True,
+        )
+        return SlidingProbabilisticGridMap(cfg)
+
+    def test_body_anchored_roll_preserves_local_evidence_and_source_coordinates(self):
+        """窗口移动后旧 local 证据应平移，新 evidence 仍按 body 相对坐标投影。"""
+        grid = self._rolling_body_map()
+        voxel = np.zeros((2, 2, 2, 4), dtype=np.float32)
+        observed = np.zeros((2, 2, 2), dtype=np.float32)
+        voxel[0, 0, 0, 0] = 1.0
+        observed[0, 0, 0] = 1.0
+        first_pose = np.eye(4, dtype=np.float32)
+        first_pose[0, 3] = 10.0
+
+        grid.update_from_voxel(
+            voxel,
+            timestamp=1.0,
+            observed_mask=observed,
+            observed_mask_authoritative=True,
+            evidence_semantics=GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+            T_local_body=first_pose,
+        )
+        self.assertAlmostEqual(grid.cfg.x_min, 9.0)
+        self.assertGreater(float(grid.occ_prob_layers[1, 0, 0]), 0.5)
+
+        second_pose = first_pose.copy()
+        second_pose[0, 3] = 11.0
+        grid.update_from_voxel(
+            voxel,
+            timestamp=2.0,
+            observed_mask=observed,
+            observed_mask_authoritative=True,
+            evidence_semantics=GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+            T_local_body=second_pose,
+        )
+        snapshot = grid.snapshot()
+
+        self.assertAlmostEqual(grid.cfg.x_min, 10.0)
+        self.assertGreater(float(snapshot["occ_prob_layers"][0, 0, 0]), 0.5)
+        self.assertGreater(float(snapshot["occ_prob_layers"][1, 0, 0]), 0.5)
+        self.assertAlmostEqual(float(snapshot["occ_prob_layers"][3, 0, 0]), 0.5)
+        self.assertAlmostEqual(float(snapshot["unknown_mass_layers"][3, 0, 0]), 1.0)
+        self.assertEqual(int(snapshot["rolling_recenter_count"]), 2)
+        np.testing.assert_array_equal(snapshot["last_recenter_shift_cells"], [1, 0, 0])
+
+    def test_large_body_roll_discards_out_of_window_state_as_unknown(self):
+        """移动超过整个窗口时不得用 wrap-around 把旧障碍卷到新窗口。"""
+        grid = self._rolling_body_map()
+        voxel = np.zeros((2, 2, 2, 4), dtype=np.float32)
+        observed = np.zeros((2, 2, 2), dtype=np.float32)
+        voxel[0, 0, 0, 0] = 1.0
+        observed[0, 0, 0] = 1.0
+        grid.update_from_voxel(
+            voxel,
+            timestamp=1.0,
+            observed_mask=observed,
+            observed_mask_authoritative=True,
+            evidence_semantics=GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+            T_local_body=np.eye(4, dtype=np.float32),
+        )
+
+        far_pose = np.eye(4, dtype=np.float32)
+        far_pose[0, 3] = 10.0
+        grid.update_from_voxel(
+            np.zeros_like(voxel),
+            timestamp=2.0,
+            observed_mask=np.zeros_like(observed),
+            observed_mask_authoritative=True,
+            evidence_semantics=GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+            T_local_body=far_pose,
+        )
+
+        snapshot = grid.snapshot()
+        np.testing.assert_allclose(snapshot["occ_prob_layers"], 0.5)
+        np.testing.assert_allclose(snapshot["unknown_mass_layers"], 1.0)
+        self.assertTrue(np.all(np.isnan(snapshot["dem_mean"])))
 
     def test_lidar_to_body_then_body_to_local_composes_for_evidence(self):
         """LiDAR frame evidence 必须经 LiDAR→body→local 两段变换。"""
@@ -433,7 +565,8 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
 
         self.assertTrue(np.allclose(grid.occ_prob, 0.5))
 
-    def test_high_doppler_variance_reduces_belief_and_raises_dem_variance(self):
+    def test_prediction_auxiliary_channels_do_not_change_mapping_or_dem(self):
+        """生成预测只有 ch0 可供地图消费，辅助通道不得冒充 Radar 方差。"""
         from diffusion_consistency_radar.cm.probabilistic_mapping import GridMapConfig, SlidingProbabilisticGridMap
 
         cfg = GridMapConfig(x_min=0, x_max=4, y_min=0, y_max=1, x_resolution=1, y_resolution=1, z_min=0, z_max=2, z_resolution=1)
@@ -444,14 +577,64 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
         high_voxel = np.zeros((4, 1, 2, 4), dtype=np.float32)
         low_voxel[0, 0, 1, 0] = 1.0
         high_voxel[0, 0, 1, 0] = 1.0
-        low_voxel[0, 0, 1, 3] = 0.0
-        high_voxel[0, 0, 1, 3] = 50.0
+        observed = np.zeros((4, 1, 2), dtype=np.float32)
+        observed[0, 0, 1] = 1.0
+        low_voxel[0, 0, 1, 1:] = 0.0
+        high_voxel[0, 0, 1, 1:] = (20.0, -8.0, 50.0)
 
-        low.update_from_voxel(low_voxel, timestamp=0.1)
-        high.update_from_voxel(high_voxel, timestamp=0.1)
+        common = {
+            "timestamp": 0.1,
+            "observed_mask": observed,
+            "observed_mask_authoritative": True,
+            "evidence_semantics": GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+        }
+        low.update_from_voxel(low_voxel, **common)
+        high.update_from_voxel(high_voxel, **common)
 
-        self.assertGreater(float(low.belief[0, 0]), float(high.belief[0, 0]))
-        self.assertGreater(float(high.dem_var[0, 0]), float(low.dem_var[0, 0]))
+        np.testing.assert_allclose(low.occ_prob, high.occ_prob)
+        np.testing.assert_allclose(low.belief, high.belief)
+        np.testing.assert_allclose(low.dem_mean, high.dem_mean, equal_nan=True)
+        np.testing.assert_allclose(low.dem_var, high.dem_var, equal_nan=True)
+
+    def test_authoritative_observed_mask_does_not_expand_from_prediction(self):
+        """正式地图不能让 sigmoid 正概率把 unknown 体素变成 observed。"""
+        grid = self._small_pose_map()
+        voxel = np.zeros((4, 2, 2, 4), dtype=np.float32)
+        voxel[..., 0] = 0.9
+        observed = np.zeros((4, 2, 2), dtype=np.float32)
+
+        grid.update_from_voxel(
+            voxel,
+            timestamp=1.0,
+            observed_mask=observed,
+            observed_mask_authoritative=True,
+            evidence_semantics=GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+        )
+
+        snapshot = grid.snapshot()
+        np.testing.assert_allclose(snapshot["occ_prob_layers"], 0.5)
+        np.testing.assert_allclose(snapshot["unknown_mass_layers"], 1.0)
+        self.assertTrue(np.all(np.isnan(snapshot["dem_mean"])))
+
+    def test_dem_height_distribution_uses_only_authoritative_observed_layers(self):
+        """unknown 高度层的预测不得偏移 DEM 均值或方差。"""
+        grid = self._small_pose_map()
+        voxel = np.zeros((4, 2, 2, 4), dtype=np.float32)
+        voxel[0, 0, 0, 0] = 1.0
+        voxel[0, 0, 1, 0] = 1.0
+        observed = np.zeros((4, 2, 2), dtype=np.float32)
+        observed[0, 0, 0] = 1.0
+
+        grid.update_from_voxel(
+            voxel,
+            timestamp=1.0,
+            observed_mask=observed,
+            observed_mask_authoritative=True,
+            evidence_semantics=GENERATED_OCCUPANCY_EVIDENCE_SEMANTICS,
+        )
+
+        self.assertAlmostEqual(float(grid.dem_mean[0, 0]), 0.5, places=6)
+        self.assertAlmostEqual(float(grid.dem_var[0, 0]), 0.0, places=6)
 
     def test_far_range_reliability_is_lower_and_query_uncertainty_follows_belief(self):
         from diffusion_consistency_radar.cm.probabilistic_mapping import (
@@ -569,6 +752,81 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
         self.assertGreater(obstacle["uncertainty"], 0.7)
         self.assertEqual(obstacle["is_risky"], 1.0)
 
+    def test_trajectory_corridor_is_three_state_and_requires_safety_horizon(self):
+        """轨迹查询必须检查制动距离内整条走廊，而不是只查当前位置。"""
+        from diffusion_consistency_radar.cm.probabilistic_mapping import (
+            GridMapConfig,
+            LazyLocalMapQuery,
+        )
+
+        cfg = GridMapConfig(
+            x_min=0,
+            x_max=20,
+            y_min=0,
+            y_max=5,
+            x_resolution=1,
+            y_resolution=1,
+            z_min=0,
+            z_max=3,
+            z_resolution=1,
+        )
+        query = LazyLocalMapQuery(cfg)
+        clear_snapshot = {
+            "occ_prob": np.zeros(cfg.shape_xy, dtype=np.float32),
+            "belief": np.ones(cfg.shape_xy, dtype=np.float32),
+            "unknown_mass": np.zeros(cfg.shape_xy, dtype=np.float32),
+            "occ_prob_layers": np.zeros(cfg.shape_xyz, dtype=np.float32),
+            "belief_layers": np.ones(cfg.shape_xyz, dtype=np.float32),
+            "unknown_mass_layers": np.zeros(cfg.shape_xyz, dtype=np.float32),
+        }
+        waypoints = np.asarray(
+            [[2.5, 2.5, 1.5], [12.5, 2.5, 1.5]],
+            dtype=np.float32,
+        )
+        common = {
+            "corridor_radius_m": 0.9,
+            "sample_spacing_m": 1.0,
+            "speed_m_s": 2.0,
+            "reaction_time_s": 1.0,
+            "brake_deceleration_m_s2": 2.0,
+            "safety_margin_m": 1.0,
+            "max_unknown_mass": 0.5,
+        }
+
+        query.refresh(clear_snapshot)
+        clear = query.query_trajectory_corridor(waypoints, **common)
+        self.assertEqual(clear["state"], "clear")
+        self.assertEqual(clear["protocol"], "three_state_trajectory_corridor_v1")
+        self.assertAlmostEqual(clear["safety_distance_m"], 4.0)
+        self.assertAlmostEqual(clear["effective_query_radius_m"], 1.35)
+
+        obstacle_snapshot = {
+            key: value.copy() for key, value in clear_snapshot.items()
+        }
+        obstacle_snapshot["occ_prob"][5, 2] = 0.9
+        obstacle_snapshot["belief"][5, 2] = 0.8
+        obstacle_snapshot["occ_prob_layers"][5, 2, 1] = 0.9
+        obstacle_snapshot["belief_layers"][5, 2, 1] = 0.8
+        query.refresh(obstacle_snapshot)
+        obstacle = query.query_trajectory_corridor(waypoints, **common)
+        self.assertEqual(obstacle["state"], "obstacle")
+        self.assertLessEqual(obstacle["first_risk_arc_length_m"], 4.0)
+
+        unknown_snapshot = {
+            key: value.copy() for key, value in clear_snapshot.items()
+        }
+        unknown_snapshot["unknown_mass"][4, 2] = 1.0
+        unknown_snapshot["unknown_mass_layers"][4, 2, 1] = 1.0
+        query.refresh(unknown_snapshot)
+        unknown = query.query_trajectory_corridor(waypoints, **common)
+        self.assertEqual(unknown["state"], "unknown")
+        self.assertEqual(unknown["reason"], "corridor_unknown_mass_above_threshold")
+
+        query.refresh(clear_snapshot)
+        short = query.query_trajectory_corridor(waypoints[:1].tolist() + [[5.5, 2.5, 1.5]], **common)
+        self.assertEqual(short["state"], "unknown")
+        self.assertEqual(short["reason"], "trajectory_horizon_below_safety_distance")
+
     def test_formal_streaming_requires_all_frame_contracts_before_output(self):
         """formal map 缺 mask、pose、run metadata 或外参时必须无副作用失败。"""
         from diffusion_consistency_radar.scripts.streaming_map_update import main
@@ -612,11 +870,115 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
                 encoding="utf-8",
             ) as handle:
                 metadata = json.load(handle)
-            self.assertEqual(metadata["protocol"], "pose_aware_layered_map_v3")
+            self.assertEqual(metadata["protocol"], "pose_aware_layered_map_v5")
             self.assertTrue(metadata["formal_mapping"])
+            self.assertTrue(metadata["offline_data_contract_validated"])
+            self.assertFalse(metadata["airborne_formal"])
+            self.assertFalse(metadata["avoidance_formal"])
+            self.assertEqual(metadata["execution_mode"], "offline_file_replay")
             self.assertEqual(metadata["voxel_coordinate_frame"], "lidar")
-            self.assertEqual(metadata["runtime_contract_status"], "formal_fail_closed")
+            self.assertEqual(
+                metadata["runtime_contract_status"],
+                "offline_formal_replay_fail_closed",
+            )
             self.assertTrue(metadata["unknown_is_risky"])
+            self.assertTrue(metadata["observed_mask_authoritative"])
+            self.assertEqual(
+                metadata["prediction_mapping_contract"]["occupancy_channel"],
+                0,
+            )
+            self.assertTrue(metadata["rolling_map"]["enabled"])
+            self.assertEqual(
+                metadata["rolling_map"]["protocol"],
+                "body_anchored_integer_voxel_roll_v1",
+            )
+            self.assertFalse(metadata["ros1_integration"]["node_implemented"])
+            self.assertFalse(metadata["ros1_integration"]["service_implemented"])
+            self.assertFalse(metadata["ros1_integration"]["action_implemented"])
+            self.assertFalse(metadata["ros1_integration"]["px4_bridge_implemented"])
+
+    def test_streaming_trajectory_artifact_is_preflighted_and_consumed(self):
+        """逐帧 local 轨迹必须精确覆盖消费帧，并真正替代原点查询。"""
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._write_formal_mapping_fixture(tmp)
+            trajectory_path = os.path.join(tmp, "trajectory.json")
+
+            with open(trajectory_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "protocol": "local_trajectory_frames_v1",
+                        "coordinate_frame": "local",
+                        "frame_count": 1,
+                        "records": [
+                            {
+                                "frame_id": "000002",
+                                "waypoints_local_m": [
+                                    [1.5, 0.5, 0.5],
+                                    [5.5, 0.5, 0.5],
+                                ],
+                            }
+                        ],
+                    },
+                    handle,
+                )
+            argv = fixture["argv"] + [
+                "--trajectory_file", trajectory_path,
+                "--trajectory_corridor_radius_m", "0.4",
+                "--trajectory_sample_spacing_m", "0.5",
+                "--speed_m_s", "1.0",
+                "--reaction_time_s", "0.0",
+                "--brake_deceleration_m_s2", "1.0",
+                "--safety_margin_m", "0.5",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                with self.assertRaisesRegex(ValueError, "trajectory.*frame"):
+                    main()
+            self.assertFalse(os.path.exists(fixture["output_dir"]))
+
+            with open(trajectory_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "protocol": "local_trajectory_frames_v1",
+                        "coordinate_frame": "local",
+                        "frame_count": 1,
+                        "records": [
+                            {
+                                "frame_id": "000001",
+                                "waypoints_local_m": [
+                                    [1.5, 0.5, 0.5],
+                                    [5.5, 0.5, 0.5],
+                                ],
+                            }
+                        ],
+                    },
+                    handle,
+                )
+            with mock.patch.object(sys, "argv", argv):
+                main()
+
+            with open(
+                os.path.join(fixture["output_dir"], "map_run.json"),
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                metadata = json.load(handle)
+            self.assertEqual(
+                metadata["trajectory_query"]["protocol"],
+                "three_state_trajectory_corridor_v1",
+            )
+            self.assertTrue(metadata["trajectory_query"]["artifact_consumed"])
+            with open(
+                os.path.join(fixture["output_dir"], "streaming_metrics.csv"),
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["risk_state"], "obstacle")
+            self.assertEqual(row["risk_reason"], "corridor_obstacle_within_safety_distance")
+            self.assertEqual(metadata["dem_contract"]["mean_unit"], "m")
+            self.assertEqual(metadata["dem_contract"]["variance_unit"], "m^2")
 
     def test_formal_streaming_rejects_mask_tamper_before_output(self):
         from diffusion_consistency_radar.scripts.streaming_map_update import main
@@ -642,6 +1004,51 @@ class ProbabilisticMappingUncertaintyTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "prediction voxel SHA-256"):
                     main()
             self.assertFalse(os.path.exists(fixture["output_dir"]))
+
+    def test_formal_streaming_rejects_receipted_out_of_range_occupancy(self):
+        """即使文件哈希合法，正式 ch0 也必须仍是 [0,1] 概率。"""
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._write_formal_mapping_fixture(tmp)
+            voxel = np.load(fixture["voxel_path"], allow_pickle=False)
+            voxel[0, 0, 0, 0] = 1.01
+            np.save(fixture["voxel_path"], voxel)
+            self._refresh_formal_fixture_receipts(fixture)
+            with mock.patch.object(sys, "argv", fixture["argv"]):
+                with self.assertRaisesRegex(ValueError, "occupancy probability"):
+                    main()
+            self.assertFalse(os.path.exists(fixture["output_dir"]))
+
+    def test_formal_streaming_keeps_positive_prediction_outside_mask_unknown(self):
+        """formal streaming 必须实际把 observed mask 作为权威边界传入地图。"""
+        from diffusion_consistency_radar.scripts.streaming_map_update import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._write_formal_mapping_fixture(tmp)
+            voxel = np.load(fixture["voxel_path"], allow_pickle=False)
+            voxel[0, 0, :, 0] = 0.9
+            np.save(fixture["voxel_path"], voxel)
+            mask = np.zeros((2, 1, 1), dtype=np.uint8)
+            mask[0, 0, 0] = 1
+            np.save(fixture["mask_path"], mask)
+            self._refresh_formal_fixture_receipts(fixture)
+
+            with mock.patch.object(sys, "argv", fixture["argv"]):
+                main()
+
+            with np.load(os.path.join(fixture["output_dir"], "map_final.npz")) as result:
+                self.assertGreater(float(result["occ_prob_layers"][1, 0, 0]), 0.5)
+                self.assertAlmostEqual(
+                    float(result["occ_prob_layers"][2, 0, 0]),
+                    0.5,
+                    places=6,
+                )
+                self.assertAlmostEqual(
+                    float(result["unknown_mass_layers"][2, 0, 0]),
+                    1.0,
+                    places=6,
+                )
 
     def test_formal_streaming_rejects_observed_calibration_identity_mismatch(self):
         from diffusion_consistency_radar.scripts.streaming_map_update import main

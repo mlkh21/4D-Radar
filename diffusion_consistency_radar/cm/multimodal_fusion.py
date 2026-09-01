@@ -50,15 +50,36 @@ def heteroscedastic_gaussian_nll(
     target: torch.Tensor,
     variance: torch.Tensor,
     detach_residual: bool = False,
+    spatial_mask: torch.Tensor = None,
 ) -> torch.Tensor:
-    """Gaussian NLL for a per-voxel variance prediction."""
+    """计算逐体素 Gaussian NLL，可限制到显式可观测域。"""
     residual_sq = (prediction - target).pow(2).mean(dim=1, keepdim=True)
     if detach_residual:
         residual_sq = residual_sq.detach()
     if variance.shape[-3:] != residual_sq.shape[-3:]:
         variance = F.interpolate(variance, size=residual_sq.shape[-3:], mode="trilinear", align_corners=False)
     variance = variance.clamp(1e-5, 50.0)
-    return 0.5 * (residual_sq / variance + torch.log(variance)).mean()
+    values = 0.5 * (residual_sq / variance + torch.log(variance))
+    if spatial_mask is None:
+        return values.mean()
+    mask = torch.as_tensor(spatial_mask, device=values.device)
+    if mask.ndim == 4:
+        mask = mask.unsqueeze(1)
+    if mask.ndim != 5 or mask.shape[0] != values.shape[0] or mask.shape[1] != 1:
+        raise ValueError(
+            "spatial_mask 必须是与 NLL batch 对齐的 [B,1,D,H,W]，"
+            f"实际为 {tuple(mask.shape)}"
+        )
+    if tuple(mask.shape[-3:]) != tuple(values.shape[-3:]):
+        mask = F.interpolate(
+            mask.float(),
+            size=values.shape[-3:],
+            mode="nearest",
+        )
+    mask = mask > 0.5
+    if not mask.any():
+        raise ValueError("spatial_mask observed domain 为空")
+    return values[mask].mean()
 
 
 class IR2DFeatureExtractor(nn.Module):

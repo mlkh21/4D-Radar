@@ -36,6 +36,69 @@ def _example_points(with_doppler=True):
 
 
 class RadarStatisticsProtocolTest(unittest.TestCase):
+    def test_voxelizer_uses_per_field_finite_counts(self):
+        """强度和 Doppler 中的 NaN/Inf 不得污染同体素的有效样本。"""
+        from NTU4DRadLM_pre_processing.NTU4DRadLM_pre_processing import (
+            voxelize_pcl_airborne_optimized,
+        )
+
+        points = np.asarray(
+            [
+                [0.10, 0.10, 0.10, 2.0, 3.0],
+                [0.20, 0.10, 0.10, np.nan, 5.0],
+                [0.30, 0.10, 0.10, 4.0, np.inf],
+                [np.nan, 0.10, 0.10, 10.0, 10.0],
+            ],
+            dtype=np.float32,
+        )
+        voxel, statistics = voxelize_pcl_airborne_optimized(
+            points,
+            (1.0, 1.0, 1.0),
+            (0.0, 0.0, 0.0, 1.0, 1.0, 1.0),
+            return_statistics=True,
+        )
+
+        self.assertTrue(np.isfinite(voxel).all())
+        self.assertAlmostEqual(float(voxel[0, 0, 0, 1]), 3.0)
+        self.assertAlmostEqual(float(voxel[0, 0, 0, 2]), 4.0)
+        self.assertAlmostEqual(float(voxel[0, 0, 0, 3]), 1.0)
+        np.testing.assert_array_equal(
+            statistics["point_count"],
+            np.asarray([3], dtype=np.uint32),
+        )
+        np.testing.assert_array_equal(
+            statistics["intensity_valid_count"],
+            np.asarray([2], dtype=np.uint32),
+        )
+        np.testing.assert_array_equal(
+            statistics["doppler_valid_count"],
+            np.asarray([2], dtype=np.uint32),
+        )
+
+    def test_voxelizer_finite_extremes_do_not_overflow_accumulators(self):
+        """有限 float32 输入的累加和平方不得在体素化中溢出。"""
+        from NTU4DRadLM_pre_processing.NTU4DRadLM_pre_processing import (
+            voxelize_pcl_airborne_optimized,
+        )
+
+        extreme = np.finfo(np.float32).max
+        points = np.asarray(
+            [
+                [0.10, 0.10, 0.10, extreme, extreme],
+                [0.20, 0.10, 0.10, extreme, extreme],
+            ],
+            dtype=np.float32,
+        )
+        voxel, _statistics = voxelize_pcl_airborne_optimized(
+            points,
+            (1.0, 1.0, 1.0),
+            (0.0, 0.0, 0.0, 1.0, 1.0, 1.0),
+            return_statistics=True,
+        )
+
+        self.assertTrue(np.isfinite(voxel).all())
+        self.assertEqual(float(voxel[0, 0, 0, 3]), 0.0)
+
     def test_voxelizer_preserves_four_channels_and_reports_counts(self):
         from NTU4DRadLM_pre_processing.NTU4DRadLM_pre_processing import (
             voxelize_pcl_airborne_optimized,
@@ -195,7 +258,7 @@ class RadarStatisticsProtocolTest(unittest.TestCase):
                         "source_scene": "garden",
                         "frames_written": 1,
                         "voxel_coordinate_frame": "lidar",
-                        "radar_statistics_protocol": "radar_point_count_doppler_validity_v1",
+                        "radar_statistics_protocol": "radar_point_count_field_validity_v2",
                     },
                     handle,
                 )

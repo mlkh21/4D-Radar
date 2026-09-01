@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# NOTE: 该脚本用于评估雷达点云预测结果，支持以下指标：
+# NOTE: Legacy diagnostic-only 点云工具；不是正式 saved-prediction evaluator。
+# NOTE: 该脚本用于诊断雷达点云预测结果，支持以下指标：
 # NOTE: 1) Chamfer 距离
 # NOTE: 2) Hausdorff 距离
 # NOTE: 3) Precision / Recall / F-score
@@ -16,7 +17,12 @@ from tqdm import tqdm
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate radar point cloud predictions")
+    parser = argparse.ArgumentParser(
+        description=(
+            "LEGACY DIAGNOSTIC ONLY: filename-paired point-cloud metrics; "
+            "not a formal evaluation entrypoint"
+        )
+    )
     parser.add_argument("--pred_path", type=str, required=True, help="Predicted point cloud folder")
     parser.add_argument("--gt_path", type=str, required=True, help="Ground truth point cloud folder")
     parser.add_argument("--output_path", type=str, default="./eval_results.json", help="Output json path")
@@ -108,6 +114,10 @@ def read_inference_data(pred_root: str, gt_root: str) -> List[Tuple[str, str, st
 def main():
     args = parse_args()
 
+    print(
+        "警告: scripts/evaluate.py 是 legacy diagnostic-only 工具；"
+        "正式评价请使用 launch/evaluate_inference.sh。"
+    )
     print(f"Evaluation start: pred_path={args.pred_path}, gt_path={args.gt_path}")
     pairs = read_inference_data(args.pred_path, args.gt_path)
 
@@ -174,6 +184,9 @@ def main():
     }
 
     output = {
+        "protocol": "legacy_filename_paired_pointcloud_diagnostic_v1",
+        "formal_protocol": False,
+        "diagnostic_only": True,
         "summary": summary,
         "samples": sample_results,
     }
