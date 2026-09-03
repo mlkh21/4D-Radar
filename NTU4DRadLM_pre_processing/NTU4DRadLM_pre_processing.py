@@ -23,7 +23,9 @@ if PROJECT_ROOT not in sys.path:
 from diffusion_consistency_radar.dataset_manifest import write_scene_manifest_atomic
 from diffusion_consistency_radar.observed_mask import (
     OBSERVED_MASK_PROTOCOL,
+    OBSERVED_MASK_SPATIAL_DOMAIN,
     build_lidar_observed_mask,
+    build_spatial_valid_domain,
     save_observed_mask,
 )
 from diffusion_consistency_radar.radar_statistics import (
@@ -98,29 +100,36 @@ def _init_worker_patchwork():
 # 高性能空间矩阵算子
 # ==============================================================================
 
-def _voxel_centers(shape: Sequence[int], pc_range: Sequence[float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    nx, ny, nz = shape
-    x_size = (pc_range[3] - pc_range[0]) / float(nx)
-    y_size = (pc_range[4] - pc_range[1]) / float(ny)
-    z_size = (pc_range[5] - pc_range[2]) / float(nz)
-    x = pc_range[0] + (np.arange(nx, dtype=np.float32) + 0.5) * x_size
-    y = pc_range[1] + (np.arange(ny, dtype=np.float32) + 0.5) * y_size
-    z = pc_range[2] + (np.arange(nz, dtype=np.float32) + 0.5) * z_size
-    return x, y, z
-
 def build_sensor_aware_target_vectorized(
     lidar_voxel: np.ndarray, radar_voxel: np.ndarray, pc_range: tuple,
     z_min: Optional[float], x_max: Optional[float], require_radar_visibility: bool,
     radar_visibility_radius: int, doppler_radius: int,
     visibility_mode: str = "preserve",
+    spatial_valid_domain: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     target = np.zeros_like(lidar_voxel, dtype=np.float32)
     lidar_occ = lidar_voxel[..., 0] > 0
     keep = lidar_occ.copy()
 
-    x_centers, _, z_centers = _voxel_centers(lidar_voxel.shape[:3], pc_range)
-    if z_min is not None: keep &= z_centers[None, None, :] >= float(z_min)
-    if x_max is not None: keep &= x_centers[:, None, None] <= float(x_max)
+    if spatial_valid_domain is None:
+        spatial_valid_domain = build_spatial_valid_domain(
+            lidar_voxel.shape[:3],
+            pc_range,
+            z_min=z_min,
+            x_max=x_max,
+        )
+    else:
+        spatial_valid_domain = np.asarray(spatial_valid_domain)
+        if spatial_valid_domain.shape != lidar_voxel.shape[:3]:
+            raise ValueError(
+                "spatial_valid_domain shape 与 LiDAR voxel 不匹配: "
+                f"{spatial_valid_domain.shape} != {lidar_voxel.shape[:3]}"
+            )
+        if spatial_valid_domain.dtype != np.bool_:
+            if not np.all(np.isin(spatial_valid_domain, (0, 1))):
+                raise ValueError("spatial_valid_domain 只能包含 bool 或 0/1")
+            spatial_valid_domain = spatial_valid_domain.astype(bool)
+    keep &= spatial_valid_domain
 
     radar_occ = radar_voxel[..., 0] > 0
     radar_occ_float = radar_occ.astype(np.float32)
@@ -163,6 +172,44 @@ def build_sensor_aware_target_vectorized(
         target[..., 3] = (keep & radar_occ).astype(np.float32)
 
     return target
+
+
+def build_sensor_aware_supervision(
+    lidar_voxel: np.ndarray,
+    radar_voxel: np.ndarray,
+    pc_range: tuple,
+    z_min: Optional[float],
+    x_max: Optional[float],
+    require_radar_visibility: bool,
+    radar_visibility_radius: int,
+    doppler_radius: int,
+    visibility_mode: str = "preserve",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """从同一显式任务域构建 target 和 LiDAR observed mask。"""
+    spatial_valid_domain = build_spatial_valid_domain(
+        lidar_voxel.shape[:3],
+        pc_range,
+        z_min=z_min,
+        x_max=x_max,
+    )
+    target = build_sensor_aware_target_vectorized(
+        lidar_voxel=lidar_voxel,
+        radar_voxel=radar_voxel,
+        pc_range=pc_range,
+        z_min=z_min,
+        x_max=x_max,
+        require_radar_visibility=require_radar_visibility,
+        radar_visibility_radius=radar_visibility_radius,
+        doppler_radius=doppler_radius,
+        visibility_mode=visibility_mode,
+        spatial_valid_domain=spatial_valid_domain,
+    )
+    observed = build_lidar_observed_mask(
+        lidar_voxel,
+        pc_range,
+        valid_domain=spatial_valid_domain,
+    )
+    return target, observed
 
 # ==============================================================================
 # IO 与位姿转换工具
@@ -389,6 +436,48 @@ def transform_pcl(pcl, R, T):
     pcl_trans = pcl.copy()
     pcl_trans[:, :3] = np.dot(pcl[:, :3], R.T) + T
     return pcl_trans
+
+
+def align_radar_lidar_pointclouds(
+    radar_pcl,
+    lidar_pcl,
+    *,
+    radar_point_coordinate_frame,
+    target_frame,
+    radar_to_lidar_rotation,
+    radar_to_lidar_translation,
+):
+    """按已验证的 Radar 点物理坐标系，把两种点云对齐到同一目标 frame。"""
+    if radar_point_coordinate_frame not in {"radar", "lidar"}:
+        raise ValueError(
+            f"Radar 点位于 {radar_point_coordinate_frame!r}，但当前只具备 "
+            "Radar↔LiDAR 外参；禁止把 base_link 或未知 frame 当作 radar"
+        )
+    if target_frame not in {"radar", "lidar"}:
+        raise ValueError(f"target_frame 必须是 radar 或 lidar，当前为 {target_frame!r}")
+
+    inverse_rotation = radar_to_lidar_rotation.T
+    inverse_translation = -np.dot(inverse_rotation, radar_to_lidar_translation)
+    if radar_point_coordinate_frame != target_frame:
+        if radar_point_coordinate_frame == "radar":
+            radar_pcl = transform_pcl(
+                radar_pcl,
+                radar_to_lidar_rotation,
+                radar_to_lidar_translation,
+            )
+        else:
+            radar_pcl = transform_pcl(
+                radar_pcl,
+                inverse_rotation,
+                inverse_translation,
+            )
+    if target_frame == "radar":
+        lidar_pcl = transform_pcl(
+            lidar_pcl,
+            inverse_rotation,
+            inverse_translation,
+        )
+    return radar_pcl, lidar_pcl
 
 
 def compensate_radar_doppler(
@@ -662,16 +751,14 @@ def _parallel_frame_worker(task_args):
             positive_direction=args_dict["radar_doppler_positive_direction"],
         )
 
-    if args_dict["align_to"] == "lidar":
-        radar_pcl = transform_pcl(radar_pcl, r_radar_to_lidar, t_radar_to_lidar)
-    elif args_dict["align_to"] == "radar":
-        lidar_pcl = transform_pcl(
-            lidar_pcl,
-            r_radar_to_lidar.T,
-            -np.dot(r_radar_to_lidar.T, t_radar_to_lidar),
-        )
-    else:
-        raise ValueError(f"align_to 必须是 radar 或 lidar，当前为 {args_dict['align_to']!r}")
+    radar_pcl, lidar_pcl = align_radar_lidar_pointclouds(
+        radar_pcl,
+        lidar_pcl,
+        radar_point_coordinate_frame=args_dict["radar_point_coordinate_frame"],
+        target_frame=args_dict["align_to"],
+        radar_to_lidar_rotation=r_radar_to_lidar,
+        radar_to_lidar_translation=t_radar_to_lidar,
+    )
 
     target_velocity = None
     if frame_velocity is not None:
@@ -720,17 +807,13 @@ def _parallel_frame_worker(task_args):
         dt_sync=0.0,
     )
 
-    target_voxel = build_sensor_aware_target_vectorized(
+    target_voxel, observed_mask = build_sensor_aware_supervision(
         lidar_voxel=l_voxel, radar_voxel=r_voxel, pc_range=args_dict["pc_range"],
         z_min=args_dict["z_min"], x_max=args_dict["x_max"],
         require_radar_visibility=args_dict["require_radar_visibility"],
         radar_visibility_radius=args_dict["radar_visibility_radius"],
         doppler_radius=args_dict["doppler_radius"],
         visibility_mode=args_dict["visibility_mode"],
-    )
-    observed_mask = build_lidar_observed_mask(
-        l_voxel,
-        args_dict["pc_range"],
     )
 
     # 红外帧索引和实际 delta 在主进程中预先计算并通过任务传入，
@@ -828,6 +911,19 @@ def process_scene_task(scene_name, args, v_drone=None):
         if radar_field_schema is not None
         else None
     )
+    radar_point_coordinate_frame = (
+        radar_field_schema["fields"]["xyz"].get(
+            "physical_coordinate_frame",
+            radar_field_schema["fields"]["xyz"].get("coordinate_frame"),
+        )
+        if radar_field_schema is not None
+        else "radar"
+    )
+    if radar_point_coordinate_frame not in {"radar", "lidar"}:
+        raise ValueError(
+            f"Radar 点物理坐标系 {radar_point_coordinate_frame!r} 缺少到 "
+            "Radar/LiDAR 的已验证外参，拒绝创建预处理输出"
+        )
     fixed_velocity = None
     recorded_table = None
     velocity_file_sha256 = None
@@ -883,6 +979,7 @@ def process_scene_task(scene_name, args, v_drone=None):
     args_dict["radar_doppler_positive_direction"] = (
         radar_doppler_positive_direction
     )
+    args_dict["radar_point_coordinate_frame"] = radar_point_coordinate_frame
     worker_tasks = []
     ir_sync_records = []
     for i in range(min_len):
@@ -1039,6 +1136,7 @@ def process_scene_task(scene_name, args, v_drone=None):
             else "absent_unverified"
         ),
         "radar_doppler_positive_direction": radar_doppler_positive_direction,
+        "radar_point_coordinate_frame": radar_point_coordinate_frame,
         "extraction_receipt": extraction_receipt,
         "extraction_receipt_sha256": extraction_receipt_sha256,
         "extraction_receipt_status": (
@@ -1054,7 +1152,10 @@ def process_scene_task(scene_name, args, v_drone=None):
         "radar_visibility_radius": int(args.radar_visibility_radius),
         "doppler_radius": int(args.doppler_radius),
         "observed_mask_protocol": OBSERVED_MASK_PROTOCOL,
-        "observed_mask_source": "lidar_ray_from_preprocessed_lidar_voxel",
+        "observed_mask_source": (
+            "lidar_ray_from_preprocessed_lidar_voxel_with_target_domain"
+        ),
+        "observed_mask_spatial_domain": OBSERVED_MASK_SPATIAL_DOMAIN,
         "observed_mask_pc_range": list(args.pc_range),
         "radar_statistics_protocol": RADAR_STATISTICS_PROTOCOL,
         "radar_statistics_storage": "radar_npz_aligned_with_coords",

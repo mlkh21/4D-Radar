@@ -11,11 +11,13 @@ from typing import Dict, Optional, Sequence, Tuple
 
 try:
     from ..observed_mask import (
+        PERSISTED_OBSERVED_MASK_SOURCE,
         build_lidar_observed_mask,
         load_observed_mask,
     )
 except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加入 sys.path 的旧脚本
     from observed_mask import (  # type: ignore
+        PERSISTED_OBSERVED_MASK_SOURCE,
         build_lidar_observed_mask,
         load_observed_mask,
     )
@@ -42,15 +44,21 @@ except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加�
 try:
     from ..radar_statistics import (
         RADAR_STATISTICS_PROTOCOL,
+        RADAR_RESIZE_AGGREGATION,
+        RADAR_RESIZE_AGGREGATION_V1,
         SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
         load_sparse_radar_voxel,
+        load_sparse_radar_voxel_with_statistics,
         validate_sparse_radar_statistics,
     )
 except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加入 sys.path 的旧脚本
     from radar_statistics import (  # type: ignore
         RADAR_STATISTICS_PROTOCOL,
+        RADAR_RESIZE_AGGREGATION,
+        RADAR_RESIZE_AGGREGATION_V1,
         SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
         load_sparse_radar_voxel,
+        load_sparse_radar_voxel_with_statistics,
         validate_sparse_radar_statistics,
     )
 
@@ -387,12 +395,14 @@ def resize_voxel_channels(voxel_tensor: torch.Tensor, target_size, mask_channel:
 def resize_radar_voxel_channels(
     voxel_tensor: torch.Tensor,
     target_size,
+    *,
+    statistics: Optional[Dict[str, object]] = None,
 ) -> torch.Tensor:
-    """按 occupied 权重重采样 Radar 均值与 Doppler 总方差。
+    """按字段有效计数重采样 Radar 均值与 Doppler 总方差。
 
     输入通道固定为 ``[occupancy, intensity_mean, doppler_mean,
-    doppler_variance]``。现有体素没有原始点数，因此合并使用 occupied
-    细体素等权语义；方差通过二阶矩重算，避免丢失组间均值差。
+    doppler_variance]``。statistics-v2 使用 intensity/Doppler 各自的有效
+    计数；未提供 statistics 时显式保留 legacy occupied 细体素等权语义。
     """
     if voxel_tensor.ndim != 4 or voxel_tensor.shape[0] != 4:
         raise ValueError(
@@ -410,6 +420,102 @@ def resize_radar_voxel_channels(
         raise ValueError("occupied Radar voxel 的 Doppler variance 不得为负")
 
     resized_occupancy = F.adaptive_max_pool3d(occupancy, target_size)
+    if statistics is not None:
+        expected_keys = {
+            "protocol",
+            "point_count",
+            "intensity_valid_count",
+            "doppler_valid_count",
+        }
+        if not isinstance(statistics, dict) or set(statistics) != expected_keys:
+            raise ValueError(
+                f"Radar resize statistics 字段必须精确为 {sorted(expected_keys)}"
+            )
+        if statistics.get("protocol") != RADAR_STATISTICS_PROTOCOL:
+            raise ValueError(
+                "Radar count-weighted resize 只接受 "
+                f"{RADAR_STATISTICS_PROTOCOL!r}"
+            )
+
+        resolved_counts = {}
+        spatial_shape = tuple(voxel_tensor.shape[-3:])
+        for name in (
+            "point_count",
+            "intensity_valid_count",
+            "doppler_valid_count",
+        ):
+            count = torch.as_tensor(
+                statistics[name],
+                device=voxel_tensor.device,
+            )
+            if tuple(count.shape) != spatial_shape:
+                raise ValueError(
+                    f"{name} shape 必须为 {spatial_shape}，实际为 {tuple(count.shape)}"
+                )
+            count = count.to(dtype=torch.float32)
+            if (
+                not torch.isfinite(count).all()
+                or torch.any(count < 0)
+                or not torch.equal(count, count.round())
+            ):
+                raise ValueError(f"{name} 必须是非负有限整数计数")
+            resolved_counts[name] = count.unsqueeze(0).unsqueeze(0)
+
+        point_count = resolved_counts["point_count"]
+        intensity_count = resolved_counts["intensity_valid_count"]
+        doppler_count = resolved_counts["doppler_valid_count"]
+        if torch.any(intensity_count > point_count):
+            raise ValueError("intensity_valid_count 不得超过 point_count")
+        if torch.any(doppler_count > point_count):
+            raise ValueError("doppler_valid_count 不得超过 point_count")
+        if not torch.equal(point_count > 0, occupied.bool()):
+            raise ValueError("point_count support 与 Radar occupancy 不一致")
+
+        def count_weighted_resize(
+            channel: torch.Tensor,
+            count: torch.Tensor,
+        ) -> torch.Tensor:
+            pooled_count = F.adaptive_avg_pool3d(count, target_size)
+            pooled_sum = F.adaptive_avg_pool3d(
+                channel * count,
+                target_size,
+            )
+            merged = pooled_sum / pooled_count.clamp_min(EPS)
+            return torch.where(
+                pooled_count > EPS,
+                merged,
+                torch.zeros_like(merged),
+            )
+
+        resized_intensity = count_weighted_resize(x[:, 1:2], intensity_count)
+        resized_doppler = count_weighted_resize(x[:, 2:3], doppler_count)
+        doppler_second_moment = local_variance + x[:, 2:3].square()
+        resized_second_moment = count_weighted_resize(
+            doppler_second_moment,
+            doppler_count,
+        )
+        resized_variance = (
+            resized_second_moment - resized_doppler.square()
+        ).clamp_min(0.0)
+        coarse_doppler_count = F.adaptive_avg_pool3d(
+            doppler_count,
+            target_size,
+        )
+        resized_variance = torch.where(
+            coarse_doppler_count > EPS,
+            resized_variance,
+            torch.zeros_like(resized_variance),
+        )
+        return torch.cat(
+            [
+                resized_occupancy,
+                resized_intensity,
+                resized_doppler,
+                resized_variance,
+            ],
+            dim=1,
+        ).squeeze(0)
+
     # NOTE: occupancy 与物理属性必须使用同一 adaptive 分箱。若 occupancy 用
     # max-pool、属性却用 trilinear 中心采样，稀疏点可能令 coarse voxel 已占用但
     # intensity/Doppler/variance 被错误清零。
@@ -708,7 +814,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                 radar_normalization_sha256,
                 context="Dataset Radar normalization",
             )
-            self.radar_normalization_protocol = RADAR_NORMALIZATION_PROTOCOL
+            self.radar_normalization_protocol = self.radar_normalization["protocol"]
             self.legacy_radar_units = False
         self.calibration_provider = CalibrationProvider(
             root_dir,
@@ -891,7 +997,10 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                                 "reference": (
                                     "pre_augmentation_persisted_radar_voxel"
                                 ),
-                                "model_consumed": False,
+                                "model_consumed": (
+                                    summary["protocol"]
+                                    == RADAR_STATISTICS_PROTOCOL
+                                ),
                             }
                     self.samples.append(
                         (
@@ -969,7 +1078,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                 expected_shape=target_voxel.shape[:3],
                 expected_pc_range=self.source_pc_range,
             )
-            observed_mask_source = "persisted_lidar_ray_v1"
+            observed_mask_source = PERSISTED_OBSERVED_MASK_SOURCE
         elif lidar_path:
             if lidar_path.endswith('.npz'):
                 lidar_voxel = load_sparse_voxel(lidar_path)
@@ -1015,6 +1124,7 @@ class NTU4DRadLM_VoxelDataset(Dataset):
 
         # 2. 加载与监督时刻同名的单帧 Radar 条件。
         radar_statistics = []
+        radar_resize_statistics = None
         declared_statistics_protocol = self.scene_policies.get(scene, {}).get(
             "radar_statistics_protocol"
         )
@@ -1023,18 +1133,27 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         )
         if radar_path.endswith('.npz'):
             if self.require_radar_statistics or statistics_declared:
-                radar_voxel, summary = load_sparse_radar_voxel(
-                    radar_path,
-                    require_statistics=True,
+                radar_voxel, statistics_fields, summary = (
+                    load_sparse_radar_voxel_with_statistics(radar_path)
                 )
+                statistics_consumed = (
+                    summary["protocol"] == RADAR_STATISTICS_PROTOCOL
+                )
+                if statistics_consumed:
+                    radar_resize_statistics = statistics_fields
                 radar_statistics.append(
                     {
                         **summary,
                         "frame_id": os.path.splitext(os.path.basename(radar_path))[0],
                         # 摘要描述磁盘中的原始稀疏体素，不随数据增强变换。
                         "reference": "pre_augmentation_persisted_radar_voxel",
-                        # 当前模型仍只消费原四通道 Radar tensor。
-                        "model_consumed": False,
+                        # 计数只控制 resize 聚合；模型接口仍是四通道。
+                        "model_consumed": statistics_consumed,
+                        "resize_aggregation": (
+                            RADAR_RESIZE_AGGREGATION
+                            if statistics_consumed
+                            else RADAR_RESIZE_AGGREGATION_V1
+                        ),
                     }
                 )
                 if summary["protocol"] != declared_statistics_protocol:
@@ -1055,9 +1174,27 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         radar_tensor = crop_voxel_channels_to_pc_range(
             radar_tensor, self.source_pc_range, self.model_pc_range
         )
+        if radar_resize_statistics is not None:
+            cropped_statistics = {"protocol": radar_resize_statistics["protocol"]}
+            for name in (
+                "point_count",
+                "intensity_valid_count",
+                "doppler_valid_count",
+            ):
+                count_tensor = torch.from_numpy(
+                    np.asarray(radar_resize_statistics[name])
+                ).permute(2, 0, 1).unsqueeze(0)
+                count_tensor = crop_voxel_channels_to_pc_range(
+                    count_tensor,
+                    self.source_pc_range,
+                    self.model_pc_range,
+                )
+                cropped_statistics[name] = count_tensor.squeeze(0)
+            radar_resize_statistics = cropped_statistics
         radar_tensor = resize_radar_voxel_channels(
             radar_tensor,
             self.target_size,
+            statistics=radar_resize_statistics,
         )
 
         # 3. 加载共享 thermal 标定，并按同一 K/D/S 协议准备红外图像
@@ -1073,6 +1210,20 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             )
 
         if self.radar_normalization is not None:
+            expected_resize_aggregation = (
+                RADAR_RESIZE_AGGREGATION
+                if radar_resize_statistics is not None
+                else RADAR_RESIZE_AGGREGATION_V1
+            )
+            artifact_resize_aggregation = self.radar_normalization[
+                "variance"
+            ]["aggregation"]
+            if artifact_resize_aggregation != expected_resize_aggregation:
+                raise RadarNormalizationError(
+                    "Radar normalization resize aggregation 与样本统计协议不一致: "
+                    f"artifact={artifact_resize_aggregation!r}, "
+                    f"sample={expected_resize_aggregation!r}"
+                )
             radar_tensor = apply_radar_normalization(
                 radar_tensor,
                 self.radar_normalization,

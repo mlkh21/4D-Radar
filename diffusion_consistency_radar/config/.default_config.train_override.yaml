@@ -4,7 +4,7 @@ data:
   num_workers: 4
   train_split: 0.8
   alignment_size: 32
-  use_augmentation: true
+  use_augmentation: false
   target_size:
   - 32
   - 128

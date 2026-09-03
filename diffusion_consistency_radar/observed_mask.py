@@ -6,7 +6,9 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 
 
-OBSERVED_MASK_PROTOCOL = "lidar_ray_observed_v1"
+OBSERVED_MASK_PROTOCOL = "lidar_ray_observed_target_domain_v2"
+PERSISTED_OBSERVED_MASK_SOURCE = "persisted_lidar_ray_target_domain_v2"
+OBSERVED_MASK_SPATIAL_DOMAIN = "target_z_min_x_max_voxel_centers_v1"
 
 
 def _validate_pc_range(pc_range: Sequence[float]) -> Tuple[float, ...]:
@@ -18,10 +20,63 @@ def _validate_pc_range(pc_range: Sequence[float]) -> Tuple[float, ...]:
     return bounds
 
 
+def build_spatial_valid_domain(
+    voxel_shape: Sequence[int],
+    pc_range: Sequence[float],
+    *,
+    z_min: Optional[float] = None,
+    x_max: Optional[float] = None,
+) -> np.ndarray:
+    """按体素中心构建 target/observed 共用的 ``(X,Y,Z)`` 任务域。"""
+    shape = tuple(int(value) for value in voxel_shape)
+    if len(shape) != 3 or any(value <= 0 for value in shape):
+        raise ValueError(f"voxel_shape 必须是三个正整数，当前为 {voxel_shape}")
+    bounds = _validate_pc_range(pc_range)
+    for name, value in (("z_min", z_min), ("x_max", x_max)):
+        if value is not None and not np.isfinite(float(value)):
+            raise ValueError(f"{name} 必须是有限数或 None")
+
+    x_size = (bounds[3] - bounds[0]) / float(shape[0])
+    z_size = (bounds[5] - bounds[2]) / float(shape[2])
+    x_centers = bounds[0] + (np.arange(shape[0], dtype=np.float64) + 0.5) * x_size
+    z_centers = bounds[2] + (np.arange(shape[2], dtype=np.float64) + 0.5) * z_size
+    valid_x = np.ones(shape[0], dtype=bool)
+    valid_z = np.ones(shape[2], dtype=bool)
+    if x_max is not None:
+        valid_x &= x_centers <= float(x_max)
+    if z_min is not None:
+        valid_z &= z_centers >= float(z_min)
+    return np.broadcast_to(
+        valid_x[:, np.newaxis, np.newaxis]
+        & valid_z[np.newaxis, np.newaxis, :],
+        shape,
+    ).copy()
+
+
+def _validate_spatial_valid_domain(
+    valid_domain: np.ndarray,
+    expected_shape: Sequence[int],
+) -> np.ndarray:
+    """严格验证调用方提供的共享任务域，避免静默广播或非二值输入。"""
+    domain = np.asarray(valid_domain)
+    shape = tuple(int(value) for value in expected_shape)
+    if domain.shape != shape:
+        raise ValueError(
+            f"valid_domain shape 不匹配: {domain.shape} != {shape}"
+        )
+    if domain.dtype != np.bool_:
+        if not np.all(np.isin(domain, (0, 1))):
+            raise ValueError("valid_domain 只能包含 bool 或 0/1")
+        domain = domain.astype(bool)
+    return domain
+
+
 def build_lidar_observed_mask(
     lidar_voxel: np.ndarray,
     pc_range: Sequence[float],
     ray_step_fraction: float = 0.5,
+    *,
+    valid_domain: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """从 LiDAR occupied 端点向传感器原点投射 observed mask。
 
@@ -38,6 +93,11 @@ def build_lidar_observed_mask(
     ray_step_fraction = float(ray_step_fraction)
     if not np.isfinite(ray_step_fraction) or ray_step_fraction <= 0.0:
         raise ValueError("ray_step_fraction 必须是正有限数")
+    domain = (
+        np.ones(voxel.shape[:3], dtype=bool)
+        if valid_domain is None
+        else _validate_spatial_valid_domain(valid_domain, voxel.shape[:3])
+    )
 
     observed = np.zeros(voxel.shape[:3], dtype=bool)
     occupied_coords = np.argwhere(voxel[..., 0] > 0.5)
@@ -85,6 +145,9 @@ def build_lidar_observed_mask(
         indices = indices[valid]
         if indices.size:
             observed[indices[:, 0], indices[:, 1], indices[:, 2]] = True
+    # NOTE: 域外 LiDAR 端点仍可贡献穿过任务域的 free 射线，但域外体素本身
+    # 必须保持 unknown，不能因 target 的空间裁剪被解释为明确 free。
+    observed &= domain
     return observed
 
 

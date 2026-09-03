@@ -22,7 +22,6 @@ if PROJECT_ROOT not in sys.path:
 
 from diffusion_consistency_radar.cm.dataset_loader import (  # noqa: E402
     crop_voxel_channels_to_pc_range,
-    load_sparse_voxel,
     resize_radar_voxel_channels,
 )
 from diffusion_consistency_radar.dataset_manifest import (  # noqa: E402
@@ -30,8 +29,16 @@ from diffusion_consistency_radar.dataset_manifest import (  # noqa: E402
 )
 from diffusion_consistency_radar.radar_normalization import (  # noqa: E402
     RADAR_NORMALIZATION_PROTOCOL,
+    RADAR_NORMALIZATION_PROTOCOL_V2,
     RadarNormalizationError,
     validate_radar_normalization_spec,
+)
+from diffusion_consistency_radar.radar_statistics import (  # noqa: E402
+    RADAR_RESIZE_AGGREGATION,
+    RADAR_RESIZE_AGGREGATION_V1,
+    RADAR_STATISTICS_PROTOCOL,
+    load_sparse_radar_voxel,
+    load_sparse_radar_voxel_with_statistics,
 )
 from diffusion_consistency_radar.temporal_split import (  # noqa: E402
     load_temporal_split_artifact,
@@ -78,9 +85,23 @@ def _radar_frame_paths(scene_dir: str) -> list[str]:
     return paths
 
 
-def _load_radar_tensor(path: str) -> torch.Tensor:
+def _load_radar_tensor(path: str):
+    resize_statistics = None
+    resize_aggregation = RADAR_RESIZE_AGGREGATION_V1
     if path.endswith(".npz"):
-        voxel = load_sparse_voxel(path)
+        voxel, summary = load_sparse_radar_voxel(path)
+        if summary is not None and summary["protocol"] == RADAR_STATISTICS_PROTOCOL:
+            voxel, fields, _summary = load_sparse_radar_voxel_with_statistics(path)
+            resize_statistics = {"protocol": fields["protocol"]}
+            for name in (
+                "point_count",
+                "intensity_valid_count",
+                "doppler_valid_count",
+            ):
+                resize_statistics[name] = torch.from_numpy(
+                    np.asarray(fields[name])
+                ).permute(2, 0, 1)
+            resize_aggregation = RADAR_RESIZE_AGGREGATION
     else:
         voxel = np.load(path).astype(np.float32)
     if voxel.ndim != 4 or voxel.shape[-1] != 4:
@@ -89,7 +110,11 @@ def _load_radar_tensor(path: str) -> torch.Tensor:
         )
     if not np.isfinite(voxel).all():
         raise RadarNormalizationError(f"Radar voxel 包含非有限值: {path}")
-    return torch.from_numpy(voxel).permute(3, 2, 0, 1)
+    return (
+        torch.from_numpy(voxel).permute(3, 2, 0, 1),
+        resize_statistics,
+        resize_aggregation,
+    )
 
 
 def _preflight_output(output_path: str) -> str:
@@ -147,12 +172,37 @@ def build_and_write_artifact(
     source_pc_range: Sequence[float],
     model_pc_range: Sequence[float],
     doppler_scale_mps: float,
+    intensity_transform: str = "log1p_robust_zscore",
+    intensity_quantity: str = "intensity",
+    intensity_unit: str = "sensor_native_linear_nonnegative",
     max_frames: int = 0,
     split_artifact_path: str = "",
 ) -> str:
     """验证显式训练场景，统计 occupied intensity 并原子发布 artifact。"""
     output_path = _preflight_output(output_path)
     scale_mps = _positive_scale(doppler_scale_mps)
+    if intensity_transform == "log1p_robust_zscore":
+        if (
+            intensity_quantity != "intensity"
+            or intensity_unit != "sensor_native_linear_nonnegative"
+        ):
+            raise RadarNormalizationError(
+                "log1p intensity 必须显式声明为 sensor-native linear intensity"
+            )
+        normalization_protocol = RADAR_NORMALIZATION_PROTOCOL
+    elif intensity_transform == "identity_robust_zscore":
+        if (
+            intensity_quantity != "signal_to_noise_ratio"
+            or intensity_unit != "dB"
+        ):
+            raise RadarNormalizationError(
+                "identity intensity 必须显式声明为 dB signal_to_noise_ratio"
+            )
+        normalization_protocol = RADAR_NORMALIZATION_PROTOCOL_V2
+    else:
+        raise RadarNormalizationError(
+            f"intensity_transform 不支持: {intensity_transform!r}"
+        )
     selected_scenes = _validate_scenes(scenes)
     if type(max_frames) is not int or max_frames < 0:
         raise RadarNormalizationError("max_frames 必须是非负整数")
@@ -178,6 +228,7 @@ def build_and_write_artifact(
     manifest_hashes = {}
     intensity_chunks = []
     total_frames = 0
+    resize_aggregations = set()
     for scene in selected_scenes:
         scene_dir = os.path.join(dataset_root, scene)
         manifest = validate_scene_manifest(
@@ -212,16 +263,37 @@ def build_and_write_artifact(
         if max_frames > 0:
             selected_paths = selected_paths[:max_frames]
         for path in selected_paths:
-            radar = _load_radar_tensor(path)
+            radar, resize_statistics, resize_aggregation = _load_radar_tensor(path)
             radar = crop_voxel_channels_to_pc_range(
                 radar,
                 source_pc_range,
                 model_pc_range,
             )
-            radar = resize_radar_voxel_channels(radar, target_size)
+            if resize_statistics is not None:
+                cropped_statistics = {"protocol": resize_statistics["protocol"]}
+                for name in (
+                    "point_count",
+                    "intensity_valid_count",
+                    "doppler_valid_count",
+                ):
+                    count = crop_voxel_channels_to_pc_range(
+                        resize_statistics[name].unsqueeze(0),
+                        source_pc_range,
+                        model_pc_range,
+                    )
+                    cropped_statistics[name] = count.squeeze(0)
+                resize_statistics = cropped_statistics
+            radar = resize_radar_voxel_channels(
+                radar,
+                target_size,
+                statistics=resize_statistics,
+            )
+            resize_aggregations.add(resize_aggregation)
             occupied = radar[0] > 0
             if torch.any(occupied):
-                values = torch.log1p(radar[1][occupied].clamp_min(0.0))
+                values = radar[1][occupied]
+                if intensity_transform == "log1p_robust_zscore":
+                    values = torch.log1p(values.clamp_min(0.0))
                 intensity_chunks.append(values.cpu().numpy().astype(np.float64))
             total_frames += 1
 
@@ -229,13 +301,18 @@ def build_and_write_artifact(
         raise RadarNormalizationError("没有可用于统计的训练帧")
     if not intensity_chunks:
         raise RadarNormalizationError("训练场景没有 occupied Radar voxel")
-    log_intensity = np.concatenate(intensity_chunks)
-    if log_intensity.size == 0 or not np.isfinite(log_intensity).all():
+    if len(resize_aggregations) != 1:
+        raise RadarNormalizationError(
+            "训练帧混用 Radar resize aggregation，拒绝生成 normalization"
+        )
+    resize_aggregation = next(iter(resize_aggregations))
+    transformed_intensity = np.concatenate(intensity_chunks)
+    if transformed_intensity.size == 0 or not np.isfinite(transformed_intensity).all():
         raise RadarNormalizationError("occupied intensity 统计为空或包含非有限值")
-    q25, median, q75 = np.quantile(log_intensity, [0.25, 0.5, 0.75])
-    log_iqr = float(q75 - q25)
-    if not math.isfinite(log_iqr) or log_iqr <= 0.0:
-        raise RadarNormalizationError("occupied intensity 的 log IQR 必须为正有限数")
+    q25, median, q75 = np.quantile(transformed_intensity, [0.25, 0.5, 0.75])
+    intensity_iqr = float(q75 - q25)
+    if not math.isfinite(intensity_iqr) or intensity_iqr <= 0.0:
+        raise RadarNormalizationError("occupied intensity 的 IQR 必须为正有限数")
 
     is_formal = bool(train_frame_ids_by_scene is not None and max_frames == 0)
     input_provenance = {
@@ -244,19 +321,30 @@ def build_and_write_artifact(
     if split_artifact_sha256:
         input_provenance["split_artifact_sha256"] = split_artifact_sha256
     artifact = {
-        "protocol": RADAR_NORMALIZATION_PROTOCOL,
+        "protocol": normalization_protocol,
         "formal": is_formal,
         "training_scenes": selected_scenes,
         "frame_count": total_frames,
         "target_size": [int(value) for value in target_size],
         "source_pc_range": [float(value) for value in source_pc_range],
         "model_pc_range": [float(value) for value in model_pc_range],
-        "intensity": {
-            "transform": "log1p_robust_zscore",
-            "log_median": float(median),
-            "log_iqr": log_iqr,
-            "clip": [-5.0, 5.0],
-        },
+        "intensity": (
+            {
+                "transform": "log1p_robust_zscore",
+                "log_median": float(median),
+                "log_iqr": intensity_iqr,
+                "clip": [-5.0, 5.0],
+            }
+            if normalization_protocol == RADAR_NORMALIZATION_PROTOCOL
+            else {
+                "transform": "identity_robust_zscore",
+                "quantity": intensity_quantity,
+                "unit": intensity_unit,
+                "median": float(median),
+                "iqr": intensity_iqr,
+                "clip": [-5.0, 5.0],
+            }
+        ),
         "doppler": {
             "transform": "symmetric_physical_scale",
             "scale_mps": scale_mps,
@@ -265,7 +353,7 @@ def build_and_write_artifact(
         "variance": {
             "transform": "identity",
             "unit": "m2_s2",
-            "aggregation": "occupied_voxel_equal_weight_total_variance",
+            "aggregation": resize_aggregation,
         },
         "input_provenance": input_provenance,
     }
@@ -296,6 +384,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_pc_range", nargs=6, type=float, required=True)
     parser.add_argument("--doppler_scale_mps", type=float, required=True)
     parser.add_argument(
+        "--intensity_transform",
+        choices=("log1p_robust_zscore", "identity_robust_zscore"),
+        default="log1p_robust_zscore",
+        help="正式脚本必须显式选择；默认值仅保留旧诊断入口兼容",
+    )
+    parser.add_argument("--intensity_quantity", default="intensity")
+    parser.add_argument(
+        "--intensity_unit",
+        default="sensor_native_linear_nonnegative",
+    )
+    parser.add_argument(
         "--split_artifact",
         default="",
         help="正式 artifact 必须绑定的 temporal split；仅统计其 train frame",
@@ -321,6 +420,9 @@ def main() -> None:
             source_pc_range=args.source_pc_range,
             model_pc_range=args.model_pc_range,
             doppler_scale_mps=args.doppler_scale_mps,
+            intensity_transform=args.intensity_transform,
+            intensity_quantity=args.intensity_quantity,
+            intensity_unit=args.intensity_unit,
             max_frames=args.max_frames,
             split_artifact_path=args.split_artifact,
         )

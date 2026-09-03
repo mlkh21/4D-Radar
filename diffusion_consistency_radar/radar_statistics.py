@@ -9,6 +9,8 @@ import numpy as np
 
 RADAR_STATISTICS_PROTOCOL_V1 = "radar_point_count_doppler_validity_v1"
 RADAR_STATISTICS_PROTOCOL = "radar_point_count_field_validity_v2"
+RADAR_RESIZE_AGGREGATION_V1 = "occupied_voxel_equal_weight_total_variance"
+RADAR_RESIZE_AGGREGATION = "field_valid_count_weighted_total_variance_v2"
 SUPPORTED_RADAR_STATISTICS_PROTOCOLS = frozenset(
     {RADAR_STATISTICS_PROTOCOL_V1, RADAR_STATISTICS_PROTOCOL}
 )
@@ -212,6 +214,7 @@ def _read_sparse_radar_payload(
     np.ndarray,
     np.ndarray,
     Optional[Dict[str, object]],
+    Optional[Dict[str, object]],
 ]:
     """读取并验证 NPZ，不分配全尺寸稠密体素。"""
     input_path = os.path.abspath(os.fspath(path))
@@ -249,8 +252,20 @@ def _read_sparse_radar_payload(
                 shape,
                 path=input_path,
             )
+            statistics_payload = None
             summary = None
             if has_statistics:
+                statistics_payload = {
+                    "protocol": protocol_name,
+                    "point_count": np.asarray(payload["point_count"]).copy(),
+                    "doppler_valid_count": np.asarray(
+                        payload["doppler_valid_count"]
+                    ).copy(),
+                }
+                if "intensity_valid_count" in payload:
+                    statistics_payload["intensity_valid_count"] = np.asarray(
+                        payload["intensity_valid_count"]
+                    ).copy()
                 summary = _validate_statistics(
                     coords=normalized_coords,
                     point_count=np.asarray(payload["point_count"]),
@@ -267,12 +282,18 @@ def _read_sparse_radar_payload(
         if isinstance(exc, ValueError):
             raise
         raise ValueError(f"Radar sparse voxel 无法解析: {input_path}") from exc
-    return shape_tuple, normalized_coords, features, summary
+    return (
+        shape_tuple,
+        normalized_coords,
+        features,
+        statistics_payload,
+        summary,
+    )
 
 
 def validate_sparse_radar_statistics(path: str) -> Dict[str, object]:
     """只验证统计合同并返回摘要，供 Dataset 全帧预检使用。"""
-    _shape, _coords, _features, summary = _read_sparse_radar_payload(
+    _shape, _coords, _features, _statistics, summary = _read_sparse_radar_payload(
         path,
         require_statistics=True,
     )
@@ -287,9 +308,11 @@ def load_sparse_radar_voxel(
     require_statistics: bool = False,
 ) -> Tuple[np.ndarray, Optional[Dict[str, object]]]:
     """恢复 Radar 体素；存在或要求统计时执行完整合同校验。"""
-    shape_tuple, normalized_coords, features, summary = _read_sparse_radar_payload(
-        path,
-        require_statistics=require_statistics,
+    shape_tuple, normalized_coords, features, _statistics, summary = (
+        _read_sparse_radar_payload(
+            path,
+            require_statistics=require_statistics,
+        )
     )
 
     voxel_grid = np.zeros(shape_tuple, dtype=np.float32)
@@ -300,3 +323,44 @@ def load_sparse_radar_voxel(
             normalized_coords[:, 2],
         ] = features.astype(np.float32, copy=False)
     return voxel_grid, summary
+
+
+def load_sparse_radar_voxel_with_statistics(
+    path: str,
+) -> Tuple[np.ndarray, Dict[str, object], Dict[str, object]]:
+    """恢复四通道体素及逐体素字段计数，供物理一致的 resize 使用。"""
+    (
+        shape_tuple,
+        normalized_coords,
+        features,
+        sparse_statistics,
+        summary,
+    ) = _read_sparse_radar_payload(path, require_statistics=True)
+    if sparse_statistics is None or summary is None:  # pragma: no cover
+        raise ValueError(f"Radar statistics 缺失: {path}")
+
+    voxel_grid = np.zeros(shape_tuple, dtype=np.float32)
+    if normalized_coords.shape[0] > 0:
+        voxel_grid[
+            normalized_coords[:, 0],
+            normalized_coords[:, 1],
+            normalized_coords[:, 2],
+        ] = features.astype(np.float32, copy=False)
+
+    fields: Dict[str, object] = {"protocol": sparse_statistics["protocol"]}
+    for name in (
+        "point_count",
+        "intensity_valid_count",
+        "doppler_valid_count",
+    ):
+        if name not in sparse_statistics:
+            continue
+        dense = np.zeros(shape_tuple[:3], dtype=np.uint32)
+        if normalized_coords.shape[0] > 0:
+            dense[
+                normalized_coords[:, 0],
+                normalized_coords[:, 1],
+                normalized_coords[:, 2],
+            ] = np.asarray(sparse_statistics[name], dtype=np.uint32)
+        fields[name] = dense
+    return voxel_grid, fields, summary

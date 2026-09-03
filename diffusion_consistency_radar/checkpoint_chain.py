@@ -16,6 +16,7 @@ import torch
 
 from diffusion_consistency_radar.radar_normalization import (
     RadarNormalizationError,
+    assert_radar_normalization_input_contract,
     assert_same_radar_normalization,
     radar_normalization_from_checkpoint,
 )
@@ -23,6 +24,7 @@ from diffusion_consistency_radar.extraction_receipt import (
     EXTRACTION_RECEIPT_PROTOCOL,
 )
 from diffusion_consistency_radar.radar_field_schema import (
+    LEGACY_RADAR_FIELD_SCHEMA_PROTOCOL,
     RADAR_DOPPLER_POSITIVE_DIRECTIONS,
     RADAR_FIELD_SCHEMA_PROTOCOL,
 )
@@ -32,7 +34,16 @@ from diffusion_consistency_radar.radar_statistics import (
 from diffusion_consistency_radar.cd_training_protocol import (
     CD_DENOISING_PARAMETERIZATION,
     CD_TRAINING_SEMANTICS,
+    validate_cd_collapse_diagnostics_receipt,
     validate_cd_consistency_receipt,
+)
+from diffusion_consistency_radar.deployment_validation import (
+    DEPLOYMENT_INITIAL_LATENT,
+    DEPLOYMENT_VALIDATION_NOISE_IDENTITY,
+    DEPLOYMENT_VALIDATION_PROTOCOL,
+    DEPLOYMENT_VALIDATION_SPLIT,
+    validate_deployment_metrics,
+    validate_deployment_validation_selection,
 )
 
 
@@ -42,12 +53,16 @@ LEGACY_FORMAL_CHECKPOINT_PROTOCOL = "formal_chain_v1"
 LEGACY_FORMAL_MINI_CHECKPOINT_PROTOCOL = "formal_mini_chain_v1"
 FORMAL_DATA_PROTOCOL_V2 = "formal_data_v2"
 FORMAL_DATA_PROTOCOL_V3 = "formal_data_v3"
+FORMAL_DATA_PROTOCOL_V4 = "formal_data_v4"
 FORMAL_DATA_PROTOCOL = FORMAL_DATA_PROTOCOL_V2
 SUPPORTED_FORMAL_DATA_PROTOCOLS = frozenset(
-    {FORMAL_DATA_PROTOCOL_V2, FORMAL_DATA_PROTOCOL_V3}
+    {FORMAL_DATA_PROTOCOL_V2, FORMAL_DATA_PROTOCOL_V3, FORMAL_DATA_PROTOCOL_V4}
 )
 FORMAL_MINI_SELECTION_PROTOCOL = "formal_mini_selection_v1"
 FORMAL_STAGE_SELECTION_PROTOCOL = "formal_stage_selection_v1"
+VAE_VALIDATION_PROTOCOL = "vae_deterministic_reconstruction_observed_domain_v1"
+VAE_VALIDATION_DOMAIN = "persisted_lidar_ray_target_domain_v2"
+VAE_VALIDATION_SELECTOR = "max_observed_micro_iou_v1"
 _TRAINING_CHECKPOINT_PROTOCOLS = {
     FORMAL_CHECKPOINT_PROTOCOL,
     FORMAL_MINI_CHECKPOINT_PROTOCOL,
@@ -80,6 +95,100 @@ def resolve_training_checkpoint_protocol(value: Any) -> str:
             f"{sorted(_TRAINING_CHECKPOINT_PROTOCOLS)}，实际为 {protocol!r}"
         )
     return protocol
+
+
+def build_vae_validation_receipt() -> Dict[str, Any]:
+    """构造固定的 VAE observed-domain 验证与选优身份。"""
+    return {
+        "protocol": VAE_VALIDATION_PROTOCOL,
+        "domain": VAE_VALIDATION_DOMAIN,
+        "occupancy_threshold": 0.5,
+        "selector": VAE_VALIDATION_SELECTOR,
+    }
+
+
+def validate_vae_validation_receipt(
+    value: Any,
+    *,
+    errors: list[str] | None = None,
+) -> Dict[str, Any] | None:
+    """严格校验 VAE validation receipt，拒绝沿用全网格历史指标。"""
+    own_errors = errors if errors is not None else []
+    start_count = len(own_errors)
+    expected = build_vae_validation_receipt()
+    if not isinstance(value, Mapping):
+        own_errors.append("vae.vae_validation 必须是对象")
+    elif dict(value) != expected:
+        own_errors.append(
+            "vae.vae_validation 与当前 observed-domain 验证协议不一致"
+        )
+    if errors is None and own_errors:
+        raise CheckpointChainError(own_errors)
+    if len(own_errors) != start_count:
+        return None
+    return expected
+
+
+def validate_deployment_validation_receipt(
+    value: Any,
+    *,
+    stage: str,
+    errors: list[str] | None = None,
+) -> Dict[str, Any] | None:
+    """校验 LDM/CD checkpoint 的完整部署采样选优身份。"""
+    own_errors = errors if errors is not None else []
+    start_count = len(own_errors)
+    if stage not in {"ldm", "cd"}:
+        raise ValueError("deployment validation stage 只支持 ldm/cd")
+    name = f"{stage}.{stage}_validation"
+    if not isinstance(value, Mapping):
+        own_errors.append(f"{name} 必须是对象")
+    else:
+        for field, expected in (
+            ("protocol", DEPLOYMENT_VALIDATION_PROTOCOL),
+            ("stage", stage),
+            ("split", DEPLOYMENT_VALIDATION_SPLIT),
+            ("initial_latent", DEPLOYMENT_INITIAL_LATENT),
+            ("noise_identity", DEPLOYMENT_VALIDATION_NOISE_IDENTITY),
+        ):
+            if value.get(field) != expected:
+                own_errors.append(f"{name}.{field} 与完整部署采样协议不一致")
+        steps = value.get("steps")
+        sampler = value.get("sampler")
+        if stage == "ldm":
+            if type(steps) is not int or steps < 1:
+                own_errors.append(f"{name}.steps 必须是正整数")
+            if sampler not in {"heun", "euler"}:
+                own_errors.append(f"{name}.sampler 必须是 heun/euler")
+            metric_values = (value.get("current"), value.get("best"))
+        else:
+            if steps != 1 or sampler != "one_step":
+                own_errors.append(f"{name} 必须使用 CD 一步采样")
+            metrics = value.get("metrics")
+            if not isinstance(metrics, Mapping) or set(metrics) != {
+                "model_state_dict",
+                "ema_model_state_dict",
+            }:
+                own_errors.append(f"{name}.metrics 权重源集合不完整")
+                metric_values = ()
+            else:
+                metric_values = tuple(metrics.values()) + (
+                    value.get("best_selected_metrics"),
+                )
+        for metric in metric_values:
+            try:
+                validate_deployment_metrics(metric, source=name)
+            except ValueError as exc:
+                own_errors.append(str(exc))
+        try:
+            validate_deployment_validation_selection(value.get("selection"))
+        except ValueError as exc:
+            own_errors.append(f"{name}.selection 无效: {exc}")
+    if errors is None and own_errors:
+        raise CheckpointChainError(own_errors)
+    if len(own_errors) != start_count:
+        return None
+    return dict(value)
 
 
 def build_formal_mini_selection(
@@ -421,7 +530,7 @@ def validate_checkpoint_data_protocol(
             f"{stage}.data_protocol.radar_ir_sync_sha256",
             own_errors,
         )
-    if protocol == FORMAL_DATA_PROTOCOL_V3:
+    if protocol in {FORMAL_DATA_PROTOCOL_V3, FORMAL_DATA_PROTOCOL_V4}:
         base_keys = {
             "protocol",
             "dataset_manifest_sha256",
@@ -443,10 +552,15 @@ def validate_checkpoint_data_protocol(
         allowed_keys = base_keys | ({"mini_selection"} if "mini_selection" in value else set())
         if set(value) != allowed_keys:
             own_errors.append(
-                f"{stage}.data_protocol formal_data_v3 顶层字段必须精确为 "
+                f"{stage}.data_protocol {protocol} 顶层字段必须精确为 "
                 f"{sorted(allowed_keys)}"
             )
-        if value.get("preprocessing_protocol") != "formal_preprocessing_v3":
+        expected_preprocessing_protocol = (
+            "formal_preprocessing_v3"
+            if protocol == FORMAL_DATA_PROTOCOL_V3
+            else "formal_preprocessing_v4"
+        )
+        if value.get("preprocessing_protocol") != expected_preprocessing_protocol:
             own_errors.append(
                 f"{stage}.data_protocol.preprocessing_protocol 不匹配"
             )
@@ -455,7 +569,12 @@ def validate_checkpoint_data_protocol(
                 f"{stage}.data_protocol.radar_statistics_protocol 必须为 "
                 f"{RADAR_STATISTICS_PROTOCOL!r}"
             )
-        if value.get("radar_field_schema_protocol") != RADAR_FIELD_SCHEMA_PROTOCOL:
+        expected_field_schema_protocol = (
+            LEGACY_RADAR_FIELD_SCHEMA_PROTOCOL
+            if protocol == FORMAL_DATA_PROTOCOL_V3
+            else RADAR_FIELD_SCHEMA_PROTOCOL
+        )
+        if value.get("radar_field_schema_protocol") != expected_field_schema_protocol:
             own_errors.append(
                 f"{stage}.data_protocol.radar_field_schema_protocol 不匹配"
             )
@@ -562,6 +681,11 @@ def assert_checkpoint_training_identity(
         )
     if checkpoint.get("checkpoint_protocol") != checkpoint_protocol:
         errors.append("resume checkpoint_protocol 与当前训练协议不一致")
+    if expected_stage == "vae":
+        validate_vae_validation_receipt(
+            checkpoint.get("vae_validation"),
+            errors=errors,
+        )
     if checkpoint_protocol == FORMAL_MINI_CHECKPOINT_PROTOCOL:
         current_selection = (
             data_protocol.get("mini_selection")
@@ -820,6 +944,13 @@ def validate_formal_checkpoint_chain(
                 data_protocols[stage] = validated_data_protocol
         grids[stage] = _grid_from_checkpoint(checkpoint, stage, errors)
         if stage == "vae":
+            if protocol == FORMAL_CHECKPOINT_PROTOCOL:
+                validated_validation = validate_vae_validation_receipt(
+                    checkpoint.get("vae_validation"),
+                    errors=errors,
+                )
+                if validated_validation is not None:
+                    report["vae_validation"] = validated_validation
             if (
                 "radar_normalization" in checkpoint
                 or "radar_normalization_sha256" in checkpoint
@@ -834,6 +965,14 @@ def validate_formal_checkpoint_chain(
                 report["vae_latent_dim"] = config.get("latent_dim")
         else:
             _model_grid(checkpoint, stage, grids[stage], errors)
+            if protocol == FORMAL_CHECKPOINT_PROTOCOL:
+                validated_generation = validate_deployment_validation_receipt(
+                    checkpoint.get(f"{stage}_validation"),
+                    stage=stage,
+                    errors=errors,
+                )
+                if validated_generation is not None:
+                    report[f"{stage}_validation"] = validated_generation
             try:
                 radar_normalizations[stage] = radar_normalization_from_checkpoint(
                     checkpoint,
@@ -878,6 +1017,25 @@ def validate_formal_checkpoint_chain(
                         )
                     except ValueError as exc:
                         errors.append(f"cd.{exc}")
+                    try:
+                        report["cd_collapse_diagnostics"] = (
+                            validate_cd_collapse_diagnostics_receipt(
+                                checkpoint.get("cd_collapse_diagnostics")
+                            )
+                        )
+                    except ValueError as exc:
+                        errors.append(f"cd.{exc}")
+
+    for stage in ("ldm", "cd"):
+        if stage not in radar_normalizations or stage not in data_protocols:
+            continue
+        try:
+            assert_radar_normalization_input_contract(
+                radar_normalizations[stage][0],
+                data_protocols[stage],
+            )
+        except RadarNormalizationError as exc:
+            errors.append(f"{stage}: {exc}")
 
     if "ldm" in radar_normalizations and "cd" in radar_normalizations:
         ldm_spec, ldm_normalization_hash = radar_normalizations["ldm"]
@@ -931,12 +1089,18 @@ __all__ = [
     "FORMAL_DATA_PROTOCOL",
     "FORMAL_DATA_PROTOCOL_V2",
     "FORMAL_DATA_PROTOCOL_V3",
+    "FORMAL_DATA_PROTOCOL_V4",
     "SUPPORTED_FORMAL_DATA_PROTOCOLS",
     "FORMAL_MINI_SELECTION_PROTOCOL",
+    "VAE_VALIDATION_PROTOCOL",
+    "VAE_VALIDATION_DOMAIN",
+    "VAE_VALIDATION_SELECTOR",
     "FORMAL_MINI_CHECKPOINT_PROTOCOL",
     "LEGACY_FORMAL_CHECKPOINT_PROTOCOL",
     "LEGACY_FORMAL_MINI_CHECKPOINT_PROTOCOL",
     "checkpoint_state_dict",
+    "build_vae_validation_receipt",
+    "validate_vae_validation_receipt",
     "assert_checkpoint_training_identity",
     "build_formal_mini_selection",
     "resolve_training_checkpoint_protocol",
@@ -944,4 +1108,5 @@ __all__ = [
     "sha256_file",
     "validate_formal_checkpoint_chain",
     "validate_checkpoint_data_protocol",
+    "validate_deployment_validation_receipt",
 ]

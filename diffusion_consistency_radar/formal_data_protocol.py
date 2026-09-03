@@ -12,6 +12,7 @@ from typing import Dict, Tuple
 from diffusion_consistency_radar.checkpoint_chain import (
     FORMAL_DATA_PROTOCOL,
     FORMAL_DATA_PROTOCOL_V3,
+    FORMAL_DATA_PROTOCOL_V4,
     validate_checkpoint_data_protocol,
 )
 from diffusion_consistency_radar.dataset_manifest import (
@@ -19,12 +20,16 @@ from diffusion_consistency_radar.dataset_manifest import (
     sha256_json_value,
     validate_scene_manifest,
 )
-from diffusion_consistency_radar.observed_mask import OBSERVED_MASK_PROTOCOL
+from diffusion_consistency_radar.observed_mask import (
+    OBSERVED_MASK_PROTOCOL,
+    OBSERVED_MASK_SPATIAL_DOMAIN,
+)
 from diffusion_consistency_radar.extraction_receipt import (
     EXTRACTION_RECEIPT_PROTOCOL,
     validate_extraction_receipt,
 )
 from diffusion_consistency_radar.radar_field_schema import (
+    LEGACY_RADAR_FIELD_SCHEMA_PROTOCOL,
     RADAR_FIELD_SCHEMA_PROTOCOL,
     validate_radar_field_schema,
 )
@@ -79,10 +84,15 @@ def build_formal_data_protocol(
     split_artifact_path: str,
     protocol_version: str = "v2",
 ) -> Dict[str, object]:
-    """从当前 training manifests 与唯一 split 构建 v2/v3 数据身份。"""
-    if protocol_version not in {"v2", "v3"}:
-        raise FormalDataProtocolError("protocol_version 必须为 v2 或 v3")
-    require_v3 = protocol_version == "v3"
+    """从当前 training manifests 与唯一 split 构建 v2/v3/v4 数据身份。"""
+    if protocol_version not in {"v2", "v3", "v4"}:
+        raise FormalDataProtocolError("protocol_version 必须为 v2、v3 或 v4")
+    require_radar_contract = protocol_version in {"v3", "v4"}
+    expected_field_schema_protocol = (
+        LEGACY_RADAR_FIELD_SCHEMA_PROTOCOL
+        if protocol_version == "v3"
+        else RADAR_FIELD_SCHEMA_PROTOCOL
+    )
     selected_scenes = _validate_scenes(scenes)
     dataset_root = os.path.abspath(os.fspath(dataset_dir))
     if os.path.islink(dataset_root) or not os.path.isdir(dataset_root):
@@ -124,7 +134,11 @@ def build_formal_data_protocol(
             raise FormalDataProtocolError(
                 f"场景 {scene!r} observed mask protocol 不匹配"
             )
-        if require_v3:
+        if policy.get("observed_mask_spatial_domain") != OBSERVED_MASK_SPATIAL_DOMAIN:
+            raise FormalDataProtocolError(
+                f"场景 {scene!r} observed mask spatial domain 不匹配"
+            )
+        if require_radar_contract:
             if policy.get("radar_statistics_protocol") != RADAR_STATISTICS_PROTOCOL:
                 raise FormalDataProtocolError(
                     f"场景 {scene!r} Radar statistics 必须为 v2 finite-count 协议"
@@ -139,6 +153,7 @@ def build_formal_data_protocol(
                 field_schema = validate_radar_field_schema(
                     policy.get("radar_field_schema"),
                     require_verified=True,
+                    expected_protocol=expected_field_schema_protocol,
                 )
                 validate_extraction_receipt(
                     policy.get("extraction_receipt"),
@@ -202,7 +217,13 @@ def build_formal_data_protocol(
             raise FormalDataProtocolError("训练场景的 IR 标定 SHA-256 不一致")
 
     protocol: Dict[str, object] = {
-        "protocol": FORMAL_DATA_PROTOCOL_V3 if require_v3 else FORMAL_DATA_PROTOCOL,
+        "protocol": (
+            FORMAL_DATA_PROTOCOL_V3
+            if protocol_version == "v3"
+            else FORMAL_DATA_PROTOCOL_V4
+            if protocol_version == "v4"
+            else FORMAL_DATA_PROTOCOL
+        ),
         "dataset_manifest_sha256": manifest_hashes,
         "split_artifact_sha256": split_sha256,
         "target_policy_sha256": target_policy_hashes,
@@ -211,12 +232,16 @@ def build_formal_data_protocol(
         "calibration_sha256": shared_calibration,
         "radar_ir_sync_sha256": radar_ir_sync_hashes,
     }
-    if require_v3:
+    if require_radar_contract:
         protocol.update(
             {
-                "preprocessing_protocol": "formal_preprocessing_v3",
+                "preprocessing_protocol": (
+                    "formal_preprocessing_v3"
+                    if protocol_version == "v3"
+                    else "formal_preprocessing_v4"
+                ),
                 "radar_statistics_protocol": RADAR_STATISTICS_PROTOCOL,
-                "radar_field_schema_protocol": RADAR_FIELD_SCHEMA_PROTOCOL,
+                "radar_field_schema_protocol": expected_field_schema_protocol,
                 "radar_field_schema_sha256": radar_field_schema_hashes,
                 "radar_pointcloud_layout_sha256": radar_layout_hashes,
                 "extraction_receipt_protocol": EXTRACTION_RECEIPT_PROTOCOL,
@@ -312,7 +337,13 @@ def load_formal_data_protocol_artifact(
         raise FormalDataProtocolError(f"formal data protocol 无法解析: {exc}") from exc
     validated = validate_checkpoint_data_protocol(protocol, stage=stage)
     artifact_protocol = protocol.get("protocol") if isinstance(protocol, Mapping) else None
-    protocol_version = "v3" if artifact_protocol == FORMAL_DATA_PROTOCOL_V3 else "v2"
+    protocol_version = (
+        "v3"
+        if artifact_protocol == FORMAL_DATA_PROTOCOL_V3
+        else "v4"
+        if artifact_protocol == FORMAL_DATA_PROTOCOL_V4
+        else "v2"
+    )
     expected = build_formal_data_protocol(
         dataset_dir=dataset_dir,
         scenes=scenes,

@@ -1,12 +1,13 @@
 # -- coding: utf-8 --
 """
-LDM 初始化的 EMA Consistency 训练脚本
+LDM 初始化、边界锚定的 EMA Consistency 训练脚本
 
 改进点：
 1. 清晰的训练语义 - LDM 仅初始化 CD/EMA，训练目标来自 CD EMA
-2. 显存优化 - 梯度累积、检查点、混合精度
-3. checkpoint 显式记录初始化来源和一致性目标
-4. 模块化设计 - 易于理解和维护
+2. sigma_min 硬边界与 observed-target 重建锚点排除常数零损失解
+3. 显存优化 - 梯度累积、检查点、混合精度
+4. checkpoint 显式记录初始化来源、一致性目标和防塌缩诊断
+5. 模块化设计 - 易于理解和维护
 """
 
 import sys
@@ -63,6 +64,7 @@ from diffusion_consistency_radar.checkpoint_chain import (
     safe_torch_load as safe_checkpoint_load,
     sha256_file,
     validate_checkpoint_data_protocol,
+    validate_deployment_validation_receipt,
     validate_formal_stage_training_selection,
 )
 from diffusion_consistency_radar.radar_normalization import (
@@ -76,13 +78,22 @@ from diffusion_consistency_radar.formal_data_protocol import (
     load_formal_data_protocol_artifact,
 )
 from diffusion_consistency_radar.cd_validation_protocol import (
+    CD_DENOISING_DIAGNOSTIC_PROTOCOL,
     CD_VALIDATION_PROTOCOL,
     CD_VALIDATION_SELECTOR,
     CD_VALIDATION_SPLIT,
 )
+from diffusion_consistency_radar.deployment_validation import (
+    build_deployment_validation_selection,
+    resolve_deployment_validation_config,
+    validate_deployment_metrics,
+)
 from diffusion_consistency_radar.cd_training_protocol import (
     CD_DENOISING_PARAMETERIZATION,
     CD_TRAINING_SEMANTICS,
+    apply_cd_boundary_parameterization,
+    build_cd_collapse_diagnostic,
+    build_cd_collapse_diagnostics_receipt,
     resolve_cd_consistency_config,
     validate_cd_consistency_receipt,
 )
@@ -128,21 +139,12 @@ def _validated_cd_validation_metrics(
     *,
     source: str,
 ) -> tuple:
-    """校验 CD 部署选优所依赖的 observed-domain 指标。"""
-    if not isinstance(metrics, dict):
-        raise ValueError(f"{source} CD validation metrics 必须为字典")
-    try:
-        latent_loss = float(metrics["denoising_latent_loss"])
-        occupancy_iou = float(metrics["denoising_occupancy_iou"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{source} CD validation metrics 缺少有效 loss/IoU"
-        ) from exc
-    if not math.isfinite(latent_loss) or latent_loss < 0.0:
-        raise ValueError(f"{source} denoising_latent_loss 必须为非负有限数")
-    if not math.isfinite(occupancy_iou) or not 0.0 <= occupancy_iou <= 1.0:
-        raise ValueError(f"{source} denoising_occupancy_iou 必须位于 [0, 1]")
-    return latent_loss, occupancy_iou
+    """校验 CD 部署选优所依赖的完整采样 observed-domain 指标。"""
+    resolved = validate_deployment_metrics(metrics, source=f"{source} CD")
+    return (
+        resolved["deployment_latent_loss"],
+        resolved["deployment_occupancy_iou"],
+    )
 
 
 def select_cd_deployment_weight_source(
@@ -168,7 +170,14 @@ def select_cd_deployment_weight_source(
 
 
 def resolve_cd_validation_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """解析 CD online/EMA 共用的确定性 validation 配置。"""
+    """解析决定 CD online/EMA 部署权重的完整一步采样配置。"""
+    return resolve_deployment_validation_config(config, stage="cd")
+
+
+def resolve_cd_denoising_diagnostic_config(
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """解析保留但不得参与部署选优的 target-latent 小噪声诊断。"""
     seed = config.get("validation_seed", 42)
     if type(seed) is not int or seed < 0:
         raise ValueError("cd.validation_seed 必须是非负整数")
@@ -182,9 +191,8 @@ def resolve_cd_validation_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
         raise ValueError("cd.validation_occupancy_threshold 必须严格位于 (0,1)")
     return {
-        "protocol": CD_VALIDATION_PROTOCOL,
+        "protocol": CD_DENOISING_DIAGNOSTIC_PROTOCOL,
         "split": CD_VALIDATION_SPLIT,
-        "selector": CD_VALIDATION_SELECTOR,
         "seed": seed,
         "sigma": sigma,
         "occupancy_threshold": threshold,
@@ -216,16 +224,27 @@ def assert_cd_validation_checkpoint_protocol(
         raise ValueError("CD checkpoint cd_validation 必须是字典")
     for field in (
         "protocol",
+        "stage",
         "split",
         "selector",
+        "selection_strategy",
         "noise_identity",
-        "seed",
+        "initial_latent",
+        "sampler",
     ):
         if saved.get(field) != current_config.get(field):
             raise ValueError(
                 f"CD checkpoint validation {field} 与当前配置不一致"
             )
-    for field in ("sigma", "occupancy_threshold"):
+    for field in ("seed", "steps", "frames_per_scene"):
+        if (
+            type(saved.get(field)) is not int
+            or saved.get(field) != current_config.get(field)
+        ):
+            raise ValueError(
+                f"CD checkpoint validation {field} 与当前配置不一致"
+            )
+    for field in ("sigma_min", "sigma_max", "rho", "occupancy_threshold"):
         try:
             saved_value = float(saved[field])
             current_value = float(current_config[field])
@@ -245,6 +264,16 @@ def assert_cd_validation_checkpoint_protocol(
             raise ValueError(
                 f"CD checkpoint validation {field} 与当前配置不一致"
             )
+    if saved.get("threshold_candidates") != current_config.get(
+        "threshold_candidates"
+    ):
+        raise ValueError("CD checkpoint validation threshold candidates 不一致")
+    if saved.get("threshold_selection_constraints") != current_config.get(
+        "threshold_selection_constraints"
+    ):
+        raise ValueError("CD checkpoint validation threshold selection constraints 不一致")
+    if saved.get("selection") != current_config.get("selection"):
+        raise ValueError("CD checkpoint deployment validation selection 不一致")
     metrics = saved.get("metrics")
     if not isinstance(metrics, dict) or set(metrics) != {
         "model_state_dict",
@@ -311,6 +340,61 @@ def resolve_cd_observed_masks(
     if not latent_observed.any():
         raise ValueError("CD observed domain 为空")
     return voxel_observed, latent_observed
+
+
+def _masked_latent_mse(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    observed_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """只在可信 observed latent 域计算均方误差。"""
+    if prediction.shape != target.shape:
+        raise ValueError("CD latent prediction/target shape 不一致")
+    squared_error = torch.square(prediction.float() - target.float())
+    if observed_mask is None:
+        return squared_error.mean()
+    mask = torch.as_tensor(observed_mask, device=prediction.device).bool()
+    if mask.ndim != prediction.ndim or mask.shape[0] != prediction.shape[0]:
+        raise ValueError("CD latent observed mask 维度与 prediction 不一致")
+    try:
+        expanded = mask.expand_as(squared_error)
+    except RuntimeError as exc:
+        raise ValueError("CD latent observed mask 无法广播到 prediction") from exc
+    if not expanded.any():
+        raise ValueError("CD latent observed domain 为空")
+    return squared_error[expanded].mean()
+
+
+def compute_cd_training_losses(
+    student_denoised: torch.Tensor,
+    ema_target: torch.Tensor,
+    latent_target: torch.Tensor,
+    latent_observed_mask: Optional[torch.Tensor],
+    consistency_config: Dict[str, Any],
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """组合 EMA consistency 与 observed-target 重建锚点，排除常数零损失。"""
+    resolved = validate_cd_consistency_receipt(consistency_config)
+    consistency_loss = _masked_latent_mse(
+        student_denoised,
+        ema_target,
+        latent_observed_mask,
+    )
+    reconstruction_anchor_loss = _masked_latent_mse(
+        student_denoised,
+        latent_target,
+        latent_observed_mask,
+    )
+    total_loss = (
+        resolved["consistency_loss_weight"] * consistency_loss
+        + resolved["reconstruction_anchor_weight"]
+        * reconstruction_anchor_loss
+    )
+    return total_loss, {
+        "consistency_loss": float(consistency_loss.detach().item()),
+        "reconstruction_anchor_loss": float(
+            reconstruction_anchor_loss.detach().item()
+        ),
+    }
 
 
 def assert_cd_ema_update_protocol(
@@ -642,12 +726,13 @@ def call_cd_denoiser(
     timesteps: torch.Tensor,
     radar_voxel: Optional[torch.Tensor] = None,
     meta_dict: Optional[Dict[str, Any]] = None,
+    consistency_config: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     """Call legacy or multimodal denoisers through one CD training interface."""
     base_model = unwrap_model(model)
     if getattr(base_model, "is_multimodal", False):
         if has_multimodal_meta(meta_dict) and radar_voxel is not None:
-            return model(
+            raw_output = model(
                 radar_voxel,
                 meta_dict["ir_img"],
                 meta_dict["r_mat"],
@@ -656,17 +741,29 @@ def call_cd_denoiser(
                 timesteps,
                 noised_latent=x_t,
             )
-        if z_cond is None:
-            raise ValueError("缺少 legacy multimodal CD condition latent")
-        model_input = pad_latent_input_to_sixteen_channels(torch.cat([x_t, z_cond], dim=1))
-        if model is not base_model:
-            raise RuntimeError(
-                "DDP 多模态 CD 不支持缺少 IR/标定的 legacy 旁路 batch"
+        else:
+            if z_cond is None:
+                raise ValueError("缺少 legacy multimodal CD condition latent")
+            model_input = pad_latent_input_to_sixteen_channels(
+                torch.cat([x_t, z_cond], dim=1)
             )
-        return base_model.unet_3d(model_input, timesteps)
-    if z_cond is None:
-        raise ValueError("缺少 legacy CD condition latent")
-    return model(torch.cat([x_t, z_cond], dim=1), timesteps)
+            if model is not base_model:
+                raise RuntimeError(
+                    "DDP 多模态 CD 不支持缺少 IR/标定的 legacy 旁路 batch"
+                )
+            raw_output = base_model.unet_3d(model_input, timesteps)
+    else:
+        if z_cond is None:
+            raise ValueError("缺少 legacy CD condition latent")
+        raw_output = model(torch.cat([x_t, z_cond], dim=1), timesteps)
+    if consistency_config is None:
+        return raw_output
+    return apply_cd_boundary_parameterization(
+        raw_output,
+        x_t,
+        timesteps,
+        consistency_config,
+    )
 
 
 def _trainer_distributed_context(trainer) -> DistributedContext:
@@ -709,6 +806,16 @@ class ConsistencyDistillationTrainer:
             self.config.get("require_persisted_observed_mask", False)
         )
         self.validation_config = resolve_cd_validation_config(self.config)
+        self.denoising_diagnostic_config = (
+            resolve_cd_denoising_diagnostic_config(self.config)
+        )
+        self.deployment_validation_selection = self.config.get(
+            "deployment_validation_selection"
+        )
+        if self.deployment_validation_selection is not None:
+            self.validation_config["selection"] = dict(
+                self.deployment_validation_selection
+            )
         self.consistency_config = resolve_cd_consistency_config(self.config)
         self.checkpoint_protocol = resolve_training_checkpoint_protocol(
             self.config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
@@ -740,6 +847,10 @@ class ConsistencyDistillationTrainer:
                 expected_stage="ldm",
                 checkpoint_protocol=self.checkpoint_protocol,
                 data_protocol=self.data_protocol,
+            )
+            validate_deployment_validation_receipt(
+                initialization_checkpoint.get("ldm_validation"),
+                stage="ldm",
             )
         self.radar_normalization, self.radar_normalization_sha256 = (
             resolve_cd_radar_normalization(
@@ -787,6 +898,9 @@ class ConsistencyDistillationTrainer:
         self.best_val_loss = float('inf')
         self.last_validation_metrics = None
         self.last_validation_threshold_sweeps = None
+        self.last_denoising_diagnostic_metrics = None
+        self.last_collapse_diagnostics = None
+        self.last_train_step_loss_components = None
         self.deployment_weight_source = None
         self.is_resumed = False
         self.model_config = dict(self.config.get("ldm", {}) or self.config.get("model", {}) or {})
@@ -864,7 +978,7 @@ class ConsistencyDistillationTrainer:
         )
         if not (
             self.denoiser.sigma_min
-            <= self.validation_config["sigma"]
+            <= self.denoising_diagnostic_config["sigma"]
             <= self.denoiser.sigma_max
         ):
             raise ValueError(
@@ -1029,6 +1143,19 @@ class ConsistencyDistillationTrainer:
                 self.use_multimodal and self.radar_normalization is not None
             ),
         )
+        saved_collapse_diagnostics = ckpt.get("cd_collapse_diagnostics")
+        if self.use_multimodal and self.radar_normalization is not None:
+            collapse_receipt = validate_cd_collapse_diagnostics_receipt(
+                saved_collapse_diagnostics
+            )
+            if collapse_receipt["selected_source"] != restored_validation[
+                "selected_source"
+            ]:
+                raise ValueError("CD resume 防塌缩诊断与部署权重不一致")
+        elif saved_collapse_diagnostics is not None:
+            validate_cd_collapse_diagnostics_receipt(
+                saved_collapse_diagnostics
+            )
         expected_effective_batch = self.config.get(
             "expected_effective_global_batch_size"
         )
@@ -1145,6 +1272,7 @@ class ConsistencyDistillationTrainer:
             t,
             radar_voxel=radar_voxel,
             meta_dict=meta_dict,
+            consistency_config=self.consistency_config,
         )
         
         # NOTE: 这里使用显式 Euler 推进 CD EMA 目标，不存在冻结 LDM 教师。
@@ -1164,7 +1292,8 @@ class ConsistencyDistillationTrainer:
         num_scales: Optional[int] = None,
         radar_voxel: Optional[torch.Tensor] = None,
         meta_dict: Optional[Dict[str, Any]] = None,
-    ) -> float:
+        latent_observed_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         单个 LDM-initialized EMA consistency 训练步骤
         
@@ -1172,6 +1301,7 @@ class ConsistencyDistillationTrainer:
         1. 学生模型：从 x(t_n) 直接一步预测去噪后的结果
         2. CD EMA 目标：从 x(t_n) 用 Euler 推进到 t_{n+1} 后预测
         3. 让 online CD 一步预测接近持续更新的 EMA 目标
+        4. 在 persisted observed latent 域锚定真实 target
         """
         if num_scales is None:
             num_scales = self.consistency_config["num_scales"]
@@ -1210,6 +1340,7 @@ class ConsistencyDistillationTrainer:
             t_n,
             radar_voxel=radar_voxel,
             meta_dict=meta_dict,
+            consistency_config=self.consistency_config,
         )
         
         # CD EMA 目标模型：从 x(t_n) 推进到 x(t_{n+1})，再预测。
@@ -1233,10 +1364,18 @@ class ConsistencyDistillationTrainer:
                 t_next,
                 radar_voxel=radar_voxel,
                 meta_dict=meta_dict,
+                consistency_config=self.consistency_config,
             )
         
-        # NOTE: 一致性目标：CD 一步输出逼近 CD EMA 推进后的输出。
-        loss = F.mse_loss(student_denoised, target_denoised)
+        # NOTE: 重建锚点只消费 persisted observed latent，常数输出不再是零损失解。
+        loss, components = compute_cd_training_losses(
+            student_denoised,
+            target_denoised,
+            z_target,
+            latent_observed_mask,
+            self.consistency_config,
+        )
+        self.last_train_step_loss_components = components
         
         return loss
     
@@ -1273,6 +1412,20 @@ class ConsistencyDistillationTrainer:
                     cond,
                     meta_dict,
                 )
+                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                if (
+                    raw_observed_mask is None
+                    and self.require_persisted_observed_mask
+                ):
+                    raise RuntimeError(
+                        "formal CD training batch 缺少 persisted "
+                        "occupancy_observed_mask"
+                    )
+                _, latent_observed = resolve_cd_observed_masks(
+                    raw_observed_mask,
+                    target,
+                    z_target,
+                )
             
             # 计算损失
             loss = self.train_step(
@@ -1281,6 +1434,7 @@ class ConsistencyDistillationTrainer:
                 num_scales=num_scales,
                 radar_voxel=cond,
                 meta_dict=meta_dict,
+                latent_observed_mask=latent_observed,
             )
             loss = loss / grad_accum_steps
             
@@ -1319,12 +1473,12 @@ class ConsistencyDistillationTrainer:
         return totals["loss"] / totals["batch_count"]
 
     @torch.no_grad()
-    def _validate_model(
+    def _validate_denoising_diagnostic_model(
         self,
         model: nn.Module,
         val_loader: DataLoader,
-    ) -> Tuple[Dict[str, float], list]:
-        """在相同固定噪声上计算单个 CD 权重源的 observed-domain 指标。"""
+    ) -> Dict[str, float]:
+        """计算 target-latent 小噪声诊断；结果不得参与部署选优。"""
         distributed = _trainer_distributed_context(self)
         was_training = model.training
         model.eval()
@@ -1332,15 +1486,6 @@ class ConsistencyDistillationTrainer:
         latent_element_count = 0
         intersection = 0
         union = 0
-        threshold_counts = {
-            key: 0
-            for key in threshold_sweep_batch_counts(
-                torch.zeros(1, 1, 1, 1, 1),
-                torch.zeros(1, 1, 1, 1, 1),
-                torch.ones(1, 1, 1, 1, 1, dtype=torch.bool),
-                self.validation_config["threshold_candidates"],
-            )
-        }
         try:
             for batch in val_loader:
                 target, radar, meta_dict = unpack_cd_batch(batch)
@@ -1369,14 +1514,16 @@ class ConsistencyDistillationTrainer:
                 )
                 sigma = torch.full(
                     (z_target.shape[0],),
-                    self.validation_config["sigma"],
+                    self.denoising_diagnostic_config["sigma"],
                     device=z_target.device,
                     dtype=z_target.dtype,
                 )
                 sample_ids = meta_dict.get("sample_id")
                 if sample_ids is None:
                     generator = torch.Generator(device=z_target.device)
-                    generator.manual_seed(self.validation_config["seed"])
+                    generator.manual_seed(
+                        self.denoising_diagnostic_config["seed"]
+                    )
                     noise = torch.randn(
                         z_target.shape,
                         generator=generator,
@@ -1387,7 +1534,7 @@ class ConsistencyDistillationTrainer:
                     noise = deterministic_noise_from_sample_ids(
                         z_target,
                         sample_ids,
-                        seed=self.validation_config["seed"],
+                        seed=self.denoising_diagnostic_config["seed"],
                     )
                 noised = z_target + noise * sigma.view(-1, 1, 1, 1, 1)
                 denoised = call_cd_denoiser(
@@ -1397,6 +1544,7 @@ class ConsistencyDistillationTrainer:
                     sigma,
                     radar_voxel=radar,
                     meta_dict=meta_dict,
+                    consistency_config=self.consistency_config,
                 )
                 latent_error = torch.square(
                     denoised.float() - z_target.float()
@@ -1427,7 +1575,215 @@ class ConsistencyDistillationTrainer:
                     )
                 prediction = (
                     probability
-                    >= self.validation_config["occupancy_threshold"]
+                    >= self.denoising_diagnostic_config[
+                        "occupancy_threshold"
+                    ]
+                )
+                truth = target[:, 0:1] >= 0.5
+                if voxel_observed is not None:
+                    prediction = prediction & voxel_observed
+                    truth = truth & voxel_observed
+                intersection += int((prediction & truth).sum().item())
+                union += int((prediction | truth).sum().item())
+        finally:
+            model.train(was_training)
+
+        reduced = reduce_named_sums(
+            {
+                "latent_squared_error": latent_squared_error,
+                "latent_element_count": latent_element_count,
+                "intersection": intersection,
+                "union": union,
+            },
+            distributed,
+        )
+        if reduced["latent_element_count"] == 0:
+            raise RuntimeError("CD validation 没有可计算的 latent 元素")
+        metrics = {
+            "denoising_latent_loss": (
+                reduced["latent_squared_error"]
+                / reduced["latent_element_count"]
+            ),
+            "denoising_occupancy_iou": (
+                reduced["intersection"] / max(reduced["union"], 1)
+            ),
+        }
+        return metrics
+
+    @torch.no_grad()
+    def _validate_deployment_model(
+        self,
+        model: nn.Module,
+        val_loader: DataLoader,
+    ) -> Tuple[Dict[str, float], list, Dict[str, Any]]:
+        """从 sigma_max 纯噪声一步采样，并审计常数输出和条件忽略。"""
+        distributed = _trainer_distributed_context(self)
+        was_training = model.training
+        model.eval()
+        latent_squared_error = 0.0
+        latent_element_count = 0
+        intersection = 0
+        union = 0
+        output_sum = 0.0
+        output_squared_sum = 0.0
+        output_element_count = 0
+        inter_sample_squared_error = 0.0
+        inter_sample_element_count = 0
+        inter_sample_pair_count = 0
+        condition_squared_error = 0.0
+        condition_element_count = 0
+        previous_output = None
+        threshold_counts = {
+            key: 0
+            for key in threshold_sweep_batch_counts(
+                torch.zeros(1, 1, 1, 1, 1),
+                torch.zeros(1, 1, 1, 1, 1),
+                torch.ones(1, 1, 1, 1, 1, dtype=torch.bool),
+                self.validation_config["threshold_candidates"],
+            )
+        }
+        try:
+            for batch in val_loader:
+                target, radar, meta_dict = unpack_cd_batch(batch)
+                target = target.to(self.device, non_blocking=True)
+                radar = radar.to(self.device, non_blocking=True)
+                meta_dict = move_meta_to_device(meta_dict, self.device)
+                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                if (
+                    raw_observed_mask is None
+                    and self.require_persisted_observed_mask
+                ):
+                    raise RuntimeError(
+                        "formal CD deployment validation 缺少 persisted "
+                        "occupancy_observed_mask"
+                    )
+                z_target, z_cond = encode_cd_training_latents(
+                    self.vae,
+                    target,
+                    radar,
+                    meta_dict,
+                )
+                voxel_observed, latent_observed = resolve_cd_observed_masks(
+                    raw_observed_mask,
+                    target,
+                    z_target,
+                )
+                sample_ids = meta_dict.get("sample_id")
+                if sample_ids is None:
+                    if self.radar_normalization is not None:
+                        raise RuntimeError(
+                            "formal CD deployment validation 缺少 sample_id"
+                        )
+                    generator = torch.Generator(device=z_target.device)
+                    generator.manual_seed(self.validation_config["seed"])
+                    noise = torch.randn(
+                        z_target.shape,
+                        generator=generator,
+                        device=z_target.device,
+                        dtype=z_target.dtype,
+                    )
+                else:
+                    noise = deterministic_noise_from_sample_ids(
+                        z_target,
+                        sample_ids,
+                        seed=self.validation_config["seed"],
+                    )
+                sigma = torch.full(
+                    (z_target.shape[0],),
+                    self.validation_config["sigma_max"],
+                    device=z_target.device,
+                    dtype=z_target.dtype,
+                )
+                initial_latent = noise * sigma.view(-1, 1, 1, 1, 1)
+                generated_latent = call_cd_denoiser(
+                    model,
+                    initial_latent,
+                    z_cond,
+                    sigma,
+                    radar_voxel=radar,
+                    meta_dict=meta_dict,
+                    consistency_config=self.consistency_config,
+                )
+                if has_multimodal_meta(meta_dict):
+                    ablated_meta = dict(meta_dict)
+                    ablated_meta["ir_img"] = torch.zeros_like(
+                        meta_dict["ir_img"]
+                    )
+                    ablated_latent = call_cd_denoiser(
+                        model,
+                        initial_latent,
+                        z_cond,
+                        sigma,
+                        radar_voxel=torch.zeros_like(radar),
+                        meta_dict=ablated_meta,
+                        consistency_config=self.consistency_config,
+                    )
+                else:
+                    if z_cond is None:
+                        raise RuntimeError("legacy CD 防塌缩诊断缺少 condition latent")
+                    ablated_latent = call_cd_denoiser(
+                        model,
+                        initial_latent,
+                        torch.zeros_like(z_cond),
+                        sigma,
+                        radar_voxel=radar,
+                        meta_dict=meta_dict,
+                        consistency_config=self.consistency_config,
+                    )
+
+                generated_float = generated_latent.float()
+                output_sum += float(generated_float.sum().item())
+                output_squared_sum += float(
+                    torch.square(generated_float).sum().item()
+                )
+                output_element_count += generated_float.numel()
+                condition_difference = torch.square(
+                    generated_float - ablated_latent.float()
+                )
+                condition_squared_error += float(
+                    condition_difference.sum().item()
+                )
+                condition_element_count += condition_difference.numel()
+                for sample_output in generated_float:
+                    if previous_output is not None:
+                        sample_difference = torch.square(
+                            sample_output - previous_output
+                        )
+                        inter_sample_squared_error += float(
+                            sample_difference.sum().item()
+                        )
+                        inter_sample_element_count += sample_difference.numel()
+                        inter_sample_pair_count += 1
+                    previous_output = sample_output.detach()
+                latent_error = torch.square(
+                    generated_latent.float() - z_target.float()
+                )
+                if latent_observed is None:
+                    latent_squared_error += float(latent_error.sum().item())
+                    latent_element_count += latent_error.numel()
+                else:
+                    expanded = latent_observed.expand_as(latent_error)
+                    latent_squared_error += float(
+                        latent_error[expanded].sum().item()
+                    )
+                    latent_element_count += int(expanded.sum().item())
+
+                decoded = self.vae.decode(generated_latent)
+                probability = decoded[:, 0:1]
+                occupancy_activation = getattr(
+                    self.vae,
+                    "occupancy_activation",
+                    "raw",
+                )
+                if occupancy_activation == "sigmoid":
+                    probability = torch.sigmoid(probability)
+                elif occupancy_activation != "raw":
+                    raise ValueError(
+                        "CD deployment validation 不支持 occupancy activation: "
+                        f"{occupancy_activation!r}"
+                    )
+                prediction = (
+                    probability >= self.validation_config["occupancy_threshold"]
                 )
                 truth = target[:, 0:1] >= 0.5
                 if voxel_observed is not None:
@@ -1452,39 +1808,105 @@ class ConsistencyDistillationTrainer:
                 "latent_element_count": latent_element_count,
                 "intersection": intersection,
                 "union": union,
+                "output_sum": output_sum,
+                "output_squared_sum": output_squared_sum,
+                "output_element_count": output_element_count,
+                "inter_sample_squared_error": inter_sample_squared_error,
+                "inter_sample_element_count": inter_sample_element_count,
+                "inter_sample_pair_count": inter_sample_pair_count,
+                "condition_squared_error": condition_squared_error,
+                "condition_element_count": condition_element_count,
                 **threshold_counts,
             },
             distributed,
         )
         if reduced["latent_element_count"] == 0:
-            raise RuntimeError("CD validation 没有可计算的 latent 元素")
-        metrics = {
-            "denoising_latent_loss": (
-                reduced["latent_squared_error"]
-                / reduced["latent_element_count"]
-            ),
-            "denoising_occupancy_iou": (
-                reduced["intersection"] / max(reduced["union"], 1)
-            ),
-        }
+            raise RuntimeError(
+                "CD deployment validation 没有可计算的 latent 元素"
+            )
+        metrics = validate_deployment_metrics(
+            {
+                "deployment_latent_loss": (
+                    reduced["latent_squared_error"]
+                    / reduced["latent_element_count"]
+                ),
+                "deployment_occupancy_iou": (
+                    reduced["intersection"] / max(reduced["union"], 1)
+                ),
+            },
+            source="CD",
+        )
         sweep = threshold_sweep_metrics(
             reduced,
             self.validation_config["threshold_candidates"],
         )
-        return metrics, sweep
+        if reduced["output_element_count"] == 0:
+            raise RuntimeError("CD collapse diagnostic 没有输出元素")
+        output_mean = reduced["output_sum"] / reduced["output_element_count"]
+        output_variance = max(
+            reduced["output_squared_sum"] / reduced["output_element_count"]
+            - output_mean * output_mean,
+            0.0,
+        )
+        inter_sample_mse = (
+            reduced["inter_sample_squared_error"]
+            / reduced["inter_sample_element_count"]
+            if reduced["inter_sample_element_count"] > 0
+            else None
+        )
+        if reduced["condition_element_count"] == 0:
+            raise RuntimeError("CD collapse diagnostic 没有条件消融元素")
+        collapse_diagnostic = build_cd_collapse_diagnostic(
+            output_variance=output_variance,
+            inter_sample_mse=inter_sample_mse,
+            inter_sample_pair_count=int(reduced["inter_sample_pair_count"]),
+            condition_ablation_mse=(
+                reduced["condition_squared_error"]
+                / reduced["condition_element_count"]
+            ),
+            guard_epsilon=self.consistency_config["collapse_guard_epsilon"],
+        )
+        return metrics, sweep, collapse_diagnostic
 
     @torch.no_grad()
-    def validate(self, val_loader: DataLoader) -> Dict[str, Dict[str, float]]:
-        """用同一 validation 样本和噪声比较 online 与 EMA 权重。"""
+    def validate(
+        self,
+        val_loader: DataLoader,
+        deployment_val_loader: Optional[DataLoader] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """局部去噪仅诊断；固定子集一步采样选择 online/EMA。"""
         if len(val_loader) == 0 and not _trainer_distributed_context(self).initialized:
             raise RuntimeError("CD validation DataLoader 为空")
-        online_metrics, online_sweep = self._validate_model(
+        if (
+            getattr(self, "radar_normalization", None) is not None
+            and deployment_val_loader is None
+        ):
+            raise RuntimeError(
+                "formal CD 必须提供固定 deployment validation DataLoader"
+            )
+        if deployment_val_loader is None:
+            deployment_val_loader = val_loader
+
+        online_diagnostic = self._validate_denoising_diagnostic_model(
             self.cd_model,
             val_loader,
         )
-        ema_metrics, ema_sweep = self._validate_model(
+        ema_diagnostic = self._validate_denoising_diagnostic_model(
             self.cd_model_ema,
             val_loader,
+        )
+        self.last_denoising_diagnostic_metrics = {
+            "model_state_dict": online_diagnostic,
+            "ema_model_state_dict": ema_diagnostic,
+        }
+
+        online_metrics, online_sweep, online_collapse = self._validate_deployment_model(
+            self.cd_model,
+            deployment_val_loader,
+        )
+        ema_metrics, ema_sweep, ema_collapse = self._validate_deployment_model(
+            self.cd_model_ema,
+            deployment_val_loader,
         )
         metrics = {
             "model_state_dict": online_metrics,
@@ -1495,6 +1917,10 @@ class ConsistencyDistillationTrainer:
             "ema_model_state_dict": ema_sweep,
         }
         self.last_validation_metrics = metrics
+        self.last_collapse_diagnostics = {
+            "model_state_dict": online_collapse,
+            "ema_model_state_dict": ema_collapse,
+        }
         self.deployment_weight_source = select_cd_deployment_weight_source(
             metrics["model_state_dict"],
             metrics["ema_model_state_dict"],
@@ -1541,6 +1967,16 @@ class ConsistencyDistillationTrainer:
                 }
             ):
                 raise ValueError("formal CD checkpoint 缺少 online/EMA threshold sweep")
+            if not isinstance(self.deployment_validation_selection, dict):
+                raise ValueError(
+                    "formal CD checkpoint 缺少 deployment validation selection"
+                )
+            collapse_receipt = build_cd_collapse_diagnostics_receipt(
+                selected_source=deployment_weight_source,
+                diagnostics=getattr(self, "last_collapse_diagnostics", None),
+            )
+        else:
+            collapse_receipt = None
         payload = {
             "epoch": epoch,
             "loss": loss,
@@ -1590,18 +2026,41 @@ class ConsistencyDistillationTrainer:
                     for key, value in validation_metrics.items()
                 },
                 "best_selected_metrics": {
-                    "denoising_latent_loss": float(self.best_val_loss),
-                    "denoising_occupancy_iou": float(self.best_val_iou),
+                    "deployment_latent_loss": float(self.best_val_loss),
+                    "deployment_occupancy_iou": float(self.best_val_iou),
+                },
+                "denoising_diagnostic": {
+                    **dict(self.denoising_diagnostic_config),
+                    "role": "diagnostic_only_not_deployment_selector",
+                    "metrics": {
+                        key: dict(value)
+                        for key, value in (
+                            self.last_denoising_diagnostic_metrics or {}
+                        ).items()
+                    },
                 },
             }
+            if collapse_receipt is not None:
+                payload["cd_collapse_diagnostics"] = collapse_receipt
             if formal_checkpoint:
                 payload["occupancy_threshold_validation"] = {
                     "protocol": THRESHOLD_SWEEP_PROTOCOL,
                     "split": self.validation_config["split"],
                     "observation_domain": "persisted_observed_mask_v1",
+                    "sampling_protocol": CD_VALIDATION_PROTOCOL,
+                    "deployment_validation_selection_sha256": (
+                        self.deployment_validation_selection[
+                            "selection_sha256"
+                        ]
+                    ),
                     "deployment_weight_source": deployment_weight_source,
                     "candidate_thresholds": list(
                         self.validation_config["threshold_candidates"]
+                    ),
+                    "selection_constraints": dict(
+                        self.validation_config[
+                            "threshold_selection_constraints"
+                        ]
                     ),
                     "metrics_by_threshold": [
                         dict(record)
@@ -1619,12 +2078,22 @@ class ConsistencyDistillationTrainer:
             payload["radar_normalization_sha256"] = self.radar_normalization_sha256
         if hasattr(self, "distributed_training"):
             payload["distributed_training"] = dict(self.distributed_training)
+        if formal_checkpoint:
+            validate_checkpoint_threshold_sweep(
+                payload,
+                expected_stage="cd",
+                expected_weight_source=deployment_weight_source,
+                expected_candidates=self.validation_config[
+                    "threshold_candidates"
+                ],
+            )
         return payload
     
     def train(
         self,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
+        deployment_val_loader: Optional[DataLoader] = None,
         num_epochs: int = 100,
         save_every: int = 10,
         grad_accum_steps: int = 8,
@@ -1655,6 +2124,10 @@ class ConsistencyDistillationTrainer:
         )
         if formal_training and val_loader is None:
             raise ValueError("formal CD 训练必须提供独立 validation DataLoader")
+        if formal_training and deployment_val_loader is None:
+            raise ValueError(
+                "formal CD 训练必须提供固定 deployment validation DataLoader"
+            )
         
         msg = "="*70 + "\n"
         msg += f"Starting CD Training\n"
@@ -1681,7 +2154,7 @@ class ConsistencyDistillationTrainer:
             loss = self.train_epoch(epoch, train_loader, grad_accum_steps=grad_accum_steps)
             epoch_time = time.time() - epoch_start
             validation_metrics = (
-                self.validate(val_loader)
+                self.validate(val_loader, deployment_val_loader)
                 if val_loader is not None
                 else None
             )
@@ -1832,6 +2305,8 @@ def main():
         )
     train_frame_ids_by_scene = None
     validation_frame_ids_by_scene = None
+    deployment_validation_frame_ids_by_scene = None
+    deployment_validation_selection = None
     stage_training_selection = None
     split_artifact_sha256 = None
     if formal_training:
@@ -1895,6 +2370,16 @@ def main():
                 configured_train_frames_per_scene=train_limit,
                 configured_validation_frames_per_scene=validation_limit,
             )
+        deployment_validation_config = resolve_cd_validation_config(cd_config)
+        (
+            deployment_validation_frame_ids_by_scene,
+            deployment_validation_selection,
+        ) = build_deployment_validation_selection(
+            validation_frame_ids_by_scene,
+            frames_per_scene=deployment_validation_config[
+                "frames_per_scene"
+            ],
+        )
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
     ldm_config.setdefault("fusion_voxel_shape", list(target_size))
     ldm_config.setdefault("fusion_pc_range", list(model_pc_range))
@@ -1985,6 +2470,7 @@ def main():
         collate_fn=collate_voxel_samples,
     )
     val_loader = None
+    deployment_val_loader = None
     if formal_training:
         validation_dataset = NTU4DRadLM_VoxelDataset(
             root_dir=dataset_dir,
@@ -2030,6 +2516,50 @@ def main():
             pin_memory=False,
             collate_fn=collate_voxel_samples,
         )
+        deployment_validation_dataset = NTU4DRadLM_VoxelDataset(
+            root_dir=dataset_dir,
+            split='train',
+            return_path=True,
+            use_augmentation=False,
+            target_size=target_size,
+            source_pc_range=source_pc_range,
+            model_pc_range=model_pc_range,
+            radar_normalization=radar_normalization,
+            radar_normalization_sha256=radar_normalization_sha256,
+            allow_legacy_radar_units=args.allow_legacy_radar_units,
+            scene_names=scene_names,
+            calibration_dir=data_config.get("calibration_dir"),
+            require_real_ir=bool(data_config.get("require_real_ir", False)),
+            require_real_calibration=bool(
+                data_config.get("require_real_calibration", False)
+            ),
+            require_persisted_observed_mask=bool(
+                data_config.get("require_persisted_observed_mask", False)
+            ),
+            require_radar_statistics=bool(
+                data_config.get("require_radar_statistics", False)
+            ),
+            frame_ids_by_scene=deployment_validation_frame_ids_by_scene,
+            voxel_coordinate_frame=data_config.get(
+                "voxel_coordinate_frame", "lidar"
+            ),
+        )
+        deployment_validation_sampler = None
+        if distributed.initialized:
+            deployment_validation_sampler = DistributedEvalSampler(
+                deployment_validation_dataset,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+            )
+        deployment_val_loader = DataLoader(
+            deployment_validation_dataset,
+            batch_size=int(data_config.get("batch_size", args.batch_size)),
+            shuffle=False,
+            sampler=deployment_validation_sampler,
+            num_workers=int(data_config.get("num_workers", 4)),
+            pin_memory=False,
+            collate_fn=collate_voxel_samples,
+        )
     
     cd_save_dir = cd_config.get("save_dir", args.save_dir)
 
@@ -2060,6 +2590,9 @@ def main():
             'checkpoint_protocol': checkpoint_protocol,
             'data_protocol': data_protocol,
             'stage_training_selection': stage_training_selection,
+            'deployment_validation_selection': (
+                deployment_validation_selection
+            ),
             'distributed_context': distributed,
             'expected_effective_global_batch_size': (
                 runtime_batch_plan.effective_global_batch_size
@@ -2072,6 +2605,40 @@ def main():
             'validation_occupancy_threshold': cd_config.get(
                 'validation_occupancy_threshold', 0.5
             ),
+            'validation_threshold_candidates': cd_config.get(
+                'validation_threshold_candidates',
+                DEFAULT_THRESHOLD_CANDIDATES,
+            ),
+            'deployment_validation_frames_per_scene': cd_config.get(
+                'deployment_validation_frames_per_scene', 16
+            ),
+            'deployment_validation_seed': cd_config.get(
+                'deployment_validation_seed',
+                cd_config.get('validation_seed', 42),
+            ),
+            'deployment_validation_steps': cd_config.get(
+                'deployment_validation_steps', 1
+            ),
+            'deployment_validation_sampler': cd_config.get(
+                'deployment_validation_sampler', 'one_step'
+            ),
+            'deployment_validation_occupancy_threshold': cd_config.get(
+                'deployment_validation_occupancy_threshold',
+                cd_config.get('validation_occupancy_threshold', 0.5),
+            ),
+            'deployment_validation_threshold_candidates': cd_config.get(
+                'deployment_validation_threshold_candidates',
+                cd_config.get(
+                    'validation_threshold_candidates',
+                    DEFAULT_THRESHOLD_CANDIDATES,
+                ),
+            ),
+            'deployment_validation_min_occupied_recall': cd_config.get(
+                'deployment_validation_min_occupied_recall'
+            ),
+            'deployment_validation_recall_constraint_authority': cd_config.get(
+                'deployment_validation_recall_constraint_authority', ''
+            ),
             'training_semantics': cd_config.get(
                 'training_semantics', CD_TRAINING_SEMANTICS
             ),
@@ -2080,12 +2647,22 @@ def main():
             'sigma_min': cd_config.get('sigma_min', 0.002),
             'sigma_max': cd_config.get('sigma_max', 80.0),
             'rho': cd_config.get('rho', 7.0),
+            'consistency_loss_weight': cd_config.get(
+                'consistency_loss_weight', 1.0
+            ),
+            'reconstruction_anchor_weight': cd_config.get(
+                'reconstruction_anchor_weight', 0.1
+            ),
+            'collapse_guard_epsilon': cd_config.get(
+                'collapse_guard_epsilon', 0.0
+            ),
         },
     )
     
     trainer.train(
         train_loader,
         val_loader,
+        deployment_val_loader,
         num_epochs=int(cd_config.get("epochs", args.num_epochs)),
         save_every=int(cd_config.get("save_every", 10)),
         grad_accum_steps=int(opt_config.get("gradient_accumulation_steps", args.grad_accum_steps)),

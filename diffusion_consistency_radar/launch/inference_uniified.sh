@@ -9,6 +9,7 @@ ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 INFER_SCRIPT="${PROJECT_DIR}/scripts/inference.py"
 DEPLOYMENT_VIEW_SCRIPT="${PROJECT_DIR}/scripts/build_deployment_view.py"
 CHECKPOINT_CHAIN_SCRIPT="${PROJECT_DIR}/scripts/diagnose_checkpoint_chain.py"
+INFERENCE_CONFIG_SCRIPT="${PROJECT_DIR}/scripts/resolve_inference_launcher_config.py"
 DATA_LOADING_CONFIG="${PROJECT_DIR}/config/data_loading_config.yml"
 DEFAULT_CONFIG="${PROJECT_DIR}/config/default_config.yaml"
 PROTOCOL_TAG="${PROTOCOL_TAG:-formal_v2_80m_86p8_v1}"
@@ -16,30 +17,8 @@ RESULTS_DIR="${ROOT_DIR}/Result/train_results/${PROTOCOL_TAG}"
 PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Deploy_formal_v2_80m_86p8_v1}"
 CALIBRATION_DIR="${CALIBRATION_DIR:-${ROOT_DIR}/Data/config}"
 
-INFER_DEFAULTS=$(python - "${DEFAULT_CONFIG}" <<'PY'
-import sys
-import yaml
-
-cfg_path = sys.argv[1]
-defaults = {
-    'max_infer_files': 0,
-    'empty_fallback_topk': 0,
-}
-
-try:
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f) or {}
-    infer = cfg.get('inference') or {}
-    max_files = int(infer.get('max_infer_files', 0) or 0)
-    topk = int(infer.get('empty_fallback_topk', 0) or 0)
-except Exception:
-    max_files = defaults['max_infer_files']
-    topk = defaults['empty_fallback_topk']
-
-print(max_files)
-print(topk)
-PY
-)
+INFER_DEFAULTS=$(python "${INFERENCE_CONFIG_SCRIPT}" defaults \
+    --config "${DEFAULT_CONFIG}")
 
 DEFAULT_MAX_INFER_FILES=$(echo "${INFER_DEFAULTS}" | sed -n '1p')
 DEFAULT_EMPTY_FALLBACK_TOPK=$(echo "${INFER_DEFAULTS}" | sed -n '2p')

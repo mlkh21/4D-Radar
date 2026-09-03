@@ -1,64 +1,78 @@
 #!/usr/bin/env bash
+# 文件功能：在全新目录中生成带 ROS layout、字段语义和 dB SNR normalization 的 formal-v2.1 数据链。
+
 set -euo pipefail
 
-ROOT="/home/zxj/catkin_ws/src/4D-Radar-Diffusion"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# 复用已经由 header timestamp 解包并生成严格 Radar--LiDAR 索引的 Raw；
-# 本脚本只创建新的 0--80 m 输出，不覆盖 Raw 或任何旧体素数据。
-RAW_ROOT="$ROOT/Data/NTU4DRadLM_Raw_p1_01_candidate"
-NEW_ROOT="$ROOT/Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1"
-DEPLOY_ROOT="$ROOT/Data/NTU4DRadLM_Deploy_formal_v2_80m_86p8_v1"
+CONDA_ENV="${CONDA_ENV:-Radar-Diffusion}"
+INPUT_ROOT="${INPUT_ROOT:-$ROOT/Data/NTU4DRadLM}"
+RAW_ROOT="${FORMAL_V2_RAW_ROOT:-$ROOT/Data/NTU4DRadLM_Raw_formal_v2_1_80m_86p8_db_snr_v1}"
+NEW_ROOT="${FORMAL_V2_PREPROCESSED_ROOT:-$ROOT/Data/NTU4DRadLM_Pre_formal_v2_1_80m_86p8_db_snr_v1}"
+DEPLOY_ROOT="${FORMAL_V2_DEPLOY_ROOT:-$ROOT/Data/NTU4DRadLM_Deploy_formal_v2_1_80m_86p8_db_snr_v1}"
+RADAR_FIELD_SCHEMA="${RADAR_FIELD_SCHEMA:-}"
+
 SPLIT_ARTIFACT="$NEW_ROOT/temporal_split_garden_train80_purge3s_v1.json"
-DATA_PROTOCOL_ARTIFACT="$NEW_ROOT/formal_data_protocol_garden_train80_purge3s_v1.json"
-ARTIFACT="$ROOT/diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json"
+DATA_PROTOCOL_ARTIFACT="$NEW_ROOT/formal_data_protocol_garden_train80_purge3s_v4.json"
+NORMALIZATION_ARTIFACT="${FORMAL_V2_NORMALIZATION_ARTIFACT:-$ROOT/diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_db_snr_v2.json}"
 
-DOPPLER_SCALE_MPS="86.8"
-
-# 与当前 default_config.yaml 的正式训练网格保持一致。
+DOPPLER_SCALE_MPS="${DOPPLER_SCALE_MPS:-86.8}"
 TARGET_SIZE=(32 128 128)
-SOURCE_PC_RANGE=(0 -20 -6 80 20 10)
-MODEL_PC_RANGE=(0 -20 -6 80 20 10)
+PC_RANGE=(0 -20 -6 80 20 10)
+PY=(conda run --no-capture-output -n "$CONDA_ENV" python)
 
-if [[ -e "$NEW_ROOT" ]]; then
-    echo "错误：候选数据目录已经存在，请勿直接删除：$NEW_ROOT"
+# 所有会创建输出的步骤之前完成输入、schema、标定和输出隔离门禁。
+if [[ ! -d "$INPUT_ROOT" ]]; then
+    echo "错误：原始 rosbag 数据目录不存在：$INPUT_ROOT"
     exit 1
 fi
-
-if [[ -e "$DEPLOY_ROOT" ]]; then
-    echo "错误：deployment 数据目录已经存在，请勿直接删除：$DEPLOY_ROOT"
+if [[ -z "$RADAR_FIELD_SCHEMA" || ! -f "$RADAR_FIELD_SCHEMA" ]]; then
+    echo "错误：formal-v2.1 必须通过 RADAR_FIELD_SCHEMA 指定带权威证据的普通 JSON 文件。"
     exit 1
 fi
-
-if [[ -e "$ARTIFACT" ]]; then
-    echo "错误：normalization artifact 已经存在，拒绝覆盖：$ARTIFACT"
-    exit 1
-fi
-
-if [[ ! -d "$RAW_ROOT" ]]; then
-    echo "错误：header-time Raw 不存在：$RAW_ROOT"
-    exit 1
-fi
-
-echo "当前磁盘空间："
-df -h "$ROOT"
-
-echo "步骤 1/8：验证复用的 header-time Raw 与严格索引"
-for SCENE in garden loop3; do
-    if [[ ! -d "$RAW_ROOT/$SCENE/radar_pcl" \
-        || ! -d "$RAW_ROOT/$SCENE/livox_lidar" \
-        || ! -d "$RAW_ROOT/$SCENE/thermal_cam_thermal_image_compressed" ]]; then
-        echo "错误：header-time Raw 解包不完整：$RAW_ROOT/$SCENE"
+for file in \
+    "$ROOT/Data/config/calib_radar_to_livox.txt" \
+    "$ROOT/Data/config/calib_radar_to_thermal.txt" \
+    "$ROOT/Data/config/calib_livox_to_thermal.txt" \
+    "$ROOT/Data/config/calib_cam_thermal.txt"; do
+    if [[ ! -f "$file" ]]; then
+        echo "错误：缺少标定文件：$file"
         exit 1
     fi
-    if [[ ! -f "$RAW_ROOT/$SCENE/radar_lidar_sync.csv" ]]; then
-        echo "错误：严格 Radar--LiDAR sync 不存在：$RAW_ROOT/$SCENE"
+done
+for output in \
+    "$RAW_ROOT" \
+    "$NEW_ROOT" \
+    "$DEPLOY_ROOT" \
+    "$NORMALIZATION_ARTIFACT"; do
+    if [[ -e "$output" ]]; then
+        echo "错误：发现已有输出，拒绝覆盖：$output"
         exit 1
     fi
 done
 
+"${PY[@]}" -c \
+    'import sys; from diffusion_consistency_radar.radar_field_schema import load_radar_field_schema_artifact; load_radar_field_schema_artifact(sys.argv[1], require_verified=True); print("Radar field schema v2 权威证据校验通过")' \
+    "$RADAR_FIELD_SCHEMA"
+
+echo "当前磁盘空间："
+df -h "$ROOT"
+
+echo "步骤 1/9：从原始 bag 解包并生成逐场景 ROS layout/extraction receipt"
+"${PY[@]}" NTU4DRadLM_pre_processing/unpack_rosbag.py \
+    --input "$INPUT_ROOT" \
+    --output "$RAW_ROOT"
+
+echo "步骤 2/9：生成严格 Radar--LiDAR 时间索引"
+"${PY[@]}" NTU4DRadLM_pre_processing/NTU4DRadLM_timestamp_index.py \
+    --directory "$RAW_ROOT" \
+    --radar_lidar_max_delta 0.045 \
+    --skip_unmatched \
+    --max_rejected_fraction 0.01
+
 PREPROCESS=(
-    conda run -n Radar-Diffusion python
+    "${PY[@]}"
     NTU4DRadLM_pre_processing/NTU4DRadLM_pre_processing.py
     --raw_data_path "$RAW_ROOT"
     --index_path "$RAW_ROOT"
@@ -67,12 +81,15 @@ PREPROCESS=(
     --radar_to_thermal_path "$ROOT/Data/config/calib_radar_to_thermal.txt"
     --lidar_to_thermal_path "$ROOT/Data/config/calib_livox_to_thermal.txt"
     --thermal_intrinsics_path "$ROOT/Data/config/calib_cam_thermal.txt"
+    --radar_field_schema "$RADAR_FIELD_SCHEMA"
+    --require_verified_radar_field_schema
+    --require_complete_extraction_receipt
     --align_to lidar
     --velocity_mode none
     --velocity_frame radar
     --radar_lidar_max_delta 0.045
     --radar_ir_max_delta 0.025
-    --pc_range "${SOURCE_PC_RANGE[@]}"
+    --pc_range "${PC_RANGE[@]}"
     --z_min -1.0
     --x_max 80.0
     --visibility_mode preserve
@@ -81,58 +98,53 @@ PREPROCESS=(
     --max_frames 0
 )
 
-echo "步骤 2/8：全量重建 garden（0--80 m）"
+echo "步骤 3/9：全量预处理 garden 到全新 formal-v2.1 目录"
 "${PREPROCESS[@]}" --scene garden
 
-echo "步骤 3/8：全量重建 loop3（0--80 m）"
+echo "步骤 4/9：全量预处理 loop3 到全新 formal-v2.1 目录"
 "${PREPROCESS[@]}" --scene loop3
 
-echo "步骤 4/8：验证两个场景的五模态 training manifest"
-conda run -n Radar-Diffusion python \
-    diffusion_consistency_radar/scripts/dataset_manifest.py validate \
-    --scene_dir "$NEW_ROOT/garden" \
-    --expected_scene garden \
-    --expected_profile training
+echo "步骤 5/9：验证两个场景的 training manifest"
+for scene in garden loop3; do
+    "${PY[@]}" diffusion_consistency_radar/scripts/dataset_manifest.py validate \
+        --scene_dir "$NEW_ROOT/$scene" \
+        --expected_scene "$scene" \
+        --expected_profile training
+done
 
-conda run -n Radar-Diffusion python \
-    diffusion_consistency_radar/scripts/dataset_manifest.py validate \
-    --scene_dir "$NEW_ROOT/loop3" \
-    --expected_scene loop3 \
-    --expected_profile training
-
-echo "步骤 5/8：生成唯一 garden temporal split（train 80%，purge 3 秒）"
-conda run -n Radar-Diffusion python \
-    diffusion_consistency_radar/scripts/build_temporal_split.py \
+echo "步骤 6/9：生成唯一 garden temporal split"
+"${PY[@]}" diffusion_consistency_radar/scripts/build_temporal_split.py \
     --dataset_dir "$NEW_ROOT" \
     --scene garden \
     --output "$SPLIT_ARTIFACT" \
     --train_fraction 0.8 \
     --purge_seconds 3.0
 
-echo "步骤 6/8：仅使用 split.train 生成正式 normalization artifact"
-conda run -n Radar-Diffusion python \
-    diffusion_consistency_radar/scripts/build_radar_normalization.py \
+echo "步骤 7/9：仅使用 split.train 生成 dB SNR normalization v2"
+"${PY[@]}" diffusion_consistency_radar/scripts/build_radar_normalization.py \
     --dataset_dir "$NEW_ROOT" \
     --scene garden \
-    --output "$ARTIFACT" \
+    --output "$NORMALIZATION_ARTIFACT" \
     --target_size "${TARGET_SIZE[@]}" \
-    --source_pc_range "${SOURCE_PC_RANGE[@]}" \
-    --model_pc_range "${MODEL_PC_RANGE[@]}" \
+    --source_pc_range "${PC_RANGE[@]}" \
+    --model_pc_range "${PC_RANGE[@]}" \
     --doppler_scale_mps "$DOPPLER_SCALE_MPS" \
+    --intensity_transform identity_robust_zscore \
+    --intensity_quantity signal_to_noise_ratio \
+    --intensity_unit dB \
     --split_artifact "$SPLIT_ARTIFACT" \
     --max_frames 0
 
-echo "步骤 7/8：从 manifest/split/observed/标定生成 formal data protocol"
-conda run -n Radar-Diffusion python \
-    diffusion_consistency_radar/scripts/build_formal_data_protocol.py \
+echo "步骤 8/9：生成绑定 schema v2 的 formal-data-v4 身份 artifact"
+"${PY[@]}" diffusion_consistency_radar/scripts/build_formal_data_protocol.py \
     --dataset_dir "$NEW_ROOT" \
     --scene garden \
     --split_artifact "$SPLIT_ARTIFACT" \
-    --output "$DATA_PROTOCOL_ARTIFACT"
+    --output "$DATA_PROTOCOL_ARTIFACT" \
+    --protocol_version v4
 
-echo "步骤 8/8：从 loop3 training v2 生成严格 Radar+IR deployment v3 视图"
-conda run -n Radar-Diffusion python \
-    diffusion_consistency_radar/scripts/build_deployment_view.py create \
+echo "步骤 9/9：从 loop3 training 数据生成严格 Radar+IR deployment 视图"
+"${PY[@]}" diffusion_consistency_radar/scripts/build_deployment_view.py create \
     --training_dataset_dir "$NEW_ROOT" \
     --output_dataset_dir "$DEPLOY_ROOT" \
     --calibration_dir "$ROOT/Data/config" \
@@ -141,9 +153,9 @@ conda run -n Radar-Diffusion python \
     --link_mode hardlink
 
 echo "候选数据：$NEW_ROOT"
-echo "候选 header-time Raw：$RAW_ROOT"
-echo "Normalization artifact：$ARTIFACT"
+echo "候选 Raw：$RAW_ROOT"
+echo "Normalization artifact：$NORMALIZATION_ARTIFACT"
 echo "Temporal split artifact：$SPLIT_ARTIFACT"
 echo "Formal data protocol：$DATA_PROTOCOL_ARTIFACT"
 echo "Deployment dataset：$DEPLOY_ROOT"
-echo "处理完成。暂时不要启动训练，请先检查并反馈最后三段输出。"
+echo "处理完成。暂时不要启动正式训练，请先执行 preflight 和短 smoke。"

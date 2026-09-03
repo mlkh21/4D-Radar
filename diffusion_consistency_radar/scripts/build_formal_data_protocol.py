@@ -20,7 +20,7 @@ from diffusion_consistency_radar.formal_data_protocol import (  # noqa: E402
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="从 training manifests、split 和监督模态生成 formal_data_v2/v3"
+        description="从 training manifests、split 和监督模态生成 formal_data_v2/v3/v4"
     )
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--scene", action="append", required=True)
@@ -28,7 +28,7 @@ def build_parser():
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--protocol_version",
-        choices=("v2", "v3"),
+        choices=("v2", "v3", "v4"),
         default="v2",
     )
     return parser

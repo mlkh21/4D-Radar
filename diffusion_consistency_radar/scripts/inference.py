@@ -56,6 +56,23 @@ except ImportError:
     )
 
 try:
+    from diffusion_consistency_radar.radar_statistics import (
+        RADAR_RESIZE_AGGREGATION,
+        RADAR_RESIZE_AGGREGATION_V1,
+        RADAR_STATISTICS_PROTOCOL,
+        load_sparse_radar_voxel,
+        load_sparse_radar_voxel_with_statistics,
+    )
+except ImportError:
+    from radar_statistics import (  # type: ignore
+        RADAR_RESIZE_AGGREGATION,
+        RADAR_RESIZE_AGGREGATION_V1,
+        RADAR_STATISTICS_PROTOCOL,
+        load_sparse_radar_voxel,
+        load_sparse_radar_voxel_with_statistics,
+    )
+
+try:
     from diffusion_consistency_radar.radar_normalization import (
         LEGACY_RADAR_NORMALIZATION_PROTOCOL,
         RadarNormalizationError,
@@ -99,6 +116,7 @@ try:
         FORMAL_MINI_CHECKPOINT_PROTOCOL,
         safe_torch_load as safe_checkpoint_load,
         validate_checkpoint_data_protocol,
+        validate_deployment_validation_receipt,
     )
 except ImportError:
     from checkpoint_chain import (
@@ -107,16 +125,21 @@ except ImportError:
         FORMAL_MINI_CHECKPOINT_PROTOCOL,
         safe_torch_load as safe_checkpoint_load,
         validate_checkpoint_data_protocol,
+        validate_deployment_validation_receipt,
     )
 
 try:
     from diffusion_consistency_radar.cd_training_protocol import (
+        apply_cd_boundary_parameterization,
         resolve_cd_consistency_config,
+        validate_cd_collapse_diagnostics_receipt,
         validate_cd_consistency_receipt,
     )
 except ImportError:
     from cd_training_protocol import (
+        apply_cd_boundary_parameterization,
         resolve_cd_consistency_config,
+        validate_cd_collapse_diagnostics_receipt,
         validate_cd_consistency_receipt,
     )
 
@@ -133,6 +156,14 @@ try:
     )
 except ImportError:
     from occupancy_threshold_artifact import load_threshold_artifact
+
+try:
+    from diffusion_consistency_radar.deployment_validation import (
+        karras_sigma_schedule,
+        sample_karras_ode,
+    )
+except ImportError:
+    from deployment_validation import karras_sigma_schedule, sample_karras_ode
 
 try:
     from diffusion_consistency_radar.dataset_manifest import (
@@ -574,16 +605,24 @@ def _compatible_state_dict(model, state_dict):
 def resolve_inference_state_dict(checkpoint, *, model_type):
     """解析实际部署权重；正式 CD 必须使用验证阶段写入的显式选择。"""
     checkpoint_dict = checkpoint if isinstance(checkpoint, dict) else {}
-    if str(model_type) != "cd":
+    model_type = str(model_type)
+    is_formal_generation = bool(
+        checkpoint_dict.get("stage") == model_type
+        and checkpoint_dict.get("checkpoint_protocol")
+        in {FORMAL_CHECKPOINT_PROTOCOL, FORMAL_MINI_CHECKPOINT_PROTOCOL}
+        and model_type in {"ldm", "cd"}
+    )
+    if is_formal_generation:
+        validate_deployment_validation_receipt(
+            checkpoint_dict.get(f"{model_type}_validation"),
+            stage=model_type,
+        )
+    if model_type != "cd":
         if "model_state_dict" in checkpoint_dict:
             return checkpoint_dict["model_state_dict"], "model_state_dict"
         return checkpoint, "raw_state_dict"
 
-    is_formal_cd = bool(
-        checkpoint_dict.get("stage") == "cd"
-        and checkpoint_dict.get("checkpoint_protocol")
-        in {FORMAL_CHECKPOINT_PROTOCOL, FORMAL_MINI_CHECKPOINT_PROTOCOL}
-    )
+    is_formal_cd = is_formal_generation
     source = checkpoint_dict.get("deployment_weight_source")
     if source is None:
         if is_formal_cd:
@@ -602,6 +641,13 @@ def resolve_inference_state_dict(checkpoint, *, model_type):
             raise ValueError(
                 "formal CD checkpoint 的 cd_validation 与 "
                 "deployment_weight_source 不一致"
+            )
+        collapse_receipt = validate_cd_collapse_diagnostics_receipt(
+            checkpoint_dict.get("cd_collapse_diagnostics")
+        )
+        if collapse_receipt["selected_source"] != source:
+            raise ValueError(
+                "formal CD checkpoint 的防塌缩诊断与部署权重不一致"
             )
     if source not in {"model_state_dict", "ema_model_state_dict"}:
         raise ValueError(f"不支持的 deployment_weight_source: {source!r}")
@@ -1032,15 +1078,15 @@ class RadarGenerator:
         self.last_uncertainty = None
 
         # NOTE: CD 必须消费 checkpoint 中与训练一致的噪声调度；legacy LDM 保持旧默认。
-        consistency_config = self._resolve_sampling_consistency_config()
+        self.consistency_config = self._resolve_sampling_consistency_config()
         self.denoiser = KarrasDenoiser(
             sigma_data=0.5,
-            sigma_max=consistency_config["sigma_max"],
-            sigma_min=consistency_config["sigma_min"],
+            sigma_max=self.consistency_config["sigma_max"],
+            sigma_min=self.consistency_config["sigma_min"],
             loss_norm='l2',
             device=self.device,
         )
-        self.denoiser.rho = consistency_config["rho"]
+        self.denoiser.rho = self.consistency_config["rho"]
         
         print("Models loaded successfully!")
 
@@ -1205,18 +1251,31 @@ class RadarGenerator:
     
     def _cd_sample(self, z_T, z_cond, condition_voxel=None, meta_dict=None):
         """CD 一步采样"""
+        sigma = (
+            torch.ones(z_T.shape[0], device=self.device, dtype=z_T.dtype)
+            * self.denoiser.sigma_max
+        )
         if getattr(self.model, "is_multimodal", False):
             meta = prepare_multimodal_meta(meta_dict, z_T.shape[0], self.device)
-            return self._call_multimodal_model(
+            raw_output = self._call_multimodal_model(
                 condition_voxel,
                 meta,
-                torch.ones(z_T.shape[0], device=self.device) * self.denoiser.sigma_max,
+                sigma,
                 z_T,
             )
-        model_input = torch.cat([z_T, z_cond], dim=1)
-        sigma = torch.ones(z_T.shape[0], device=self.device) * self.denoiser.sigma_max
-        z_0 = self.model(model_input, sigma)
-        return z_0
+        else:
+            model_input = torch.cat([z_T, z_cond], dim=1)
+            raw_output = self.model(model_input, sigma)
+        return apply_cd_boundary_parameterization(
+            raw_output,
+            z_T,
+            sigma,
+            getattr(
+                self,
+                "consistency_config",
+                resolve_cd_consistency_config({}),
+            ),
+        )
 
     def _call_multimodal_model(self, condition_voxel, meta, sigma_batch, noised_latent):
         signature_cache = getattr(
@@ -1278,62 +1337,51 @@ class RadarGenerator:
     
     def _ldm_sample(self, z_T, z_cond, steps, sampler, show_sampling_progress=False, condition_voxel=None, meta_dict=None):
         """LDM 多步采样 (Heun/Euler)"""
-        # NOTE: 生成单调递减的 sigma 序列，驱动 ODE 采样。
         sigmas = self._get_sigmas(steps)
-        z_t = z_T
-        
-        iterator = range(len(sigmas) - 1)
-        if show_sampling_progress:
-            iterator = tqdm(iterator, desc="Sampling")
+        progress = (
+            tqdm(total=len(sigmas) - 1, desc="Sampling")
+            if show_sampling_progress
+            else None
+        )
 
-        for i in iterator:
-            sigma_t = sigmas[i]
-            sigma_next = sigmas[i + 1]
-            
-            # NOTE: 拼接条件潜变量后预测去噪结果。
-            sigma_batch = torch.ones(z_t.shape[0], device=self.device) * sigma_t
+        def denoise(z_t, sigma_batch):
             if getattr(self.model, "is_multimodal", False):
                 meta = prepare_multimodal_meta(meta_dict, z_t.shape[0], self.device)
-                denoised = self._call_multimodal_model(condition_voxel, meta, sigma_batch, z_t)
-            else:
-                model_input = torch.cat([z_t, z_cond], dim=1)
-                denoised = self.model(model_input, sigma_batch)
-            
-            # NOTE: 常微分方程（ODE）形式导数 d = (x - denoised) / sigma。
-            d = (z_t - denoised) / sigma_t
-            
-            if sampler == 'heun' and i < len(sigmas) - 2:
-                # NOTE: 海恩（Heun）二阶法：先欧拉预测，再做一次校正。
-                z_next = z_t + d * (sigma_next - sigma_t)
-                
-                # NOTE: 在预测点重新估计导数。
-                sigma_batch_2 = torch.ones(z_t.shape[0], device=self.device) * sigma_next
-                if getattr(self.model, "is_multimodal", False):
-                    denoised_2 = self._call_multimodal_model(condition_voxel, meta, sigma_batch_2, z_next)
-                else:
-                    model_input_2 = torch.cat([z_next, z_cond], dim=1)
-                    denoised_2 = self.model(model_input_2, sigma_batch_2)
-                d_2 = (z_next - denoised_2) / sigma_next
-                
-                # NOTE: 两次导数求均值完成校正。
-                z_t = z_t + (d + d_2) / 2 * (sigma_next - sigma_t)
-            else:
-                # NOTE: 欧拉（Euler）一阶法速度快但精度较低。
-                z_t = z_t + d * (sigma_next - sigma_t)
-        
-        return z_t
+                return self._call_multimodal_model(
+                    condition_voxel,
+                    meta,
+                    sigma_batch,
+                    z_t,
+                )
+            model_input = torch.cat([z_t, z_cond], dim=1)
+            return self.model(model_input, sigma_batch)
+
+        try:
+            return sample_karras_ode(
+                z_T,
+                sigmas,
+                denoise,
+                sampler=sampler,
+                step_callback=(
+                    (lambda _step, _total: progress.update(1))
+                    if progress is not None
+                    else None
+                ),
+            )
+        finally:
+            if progress is not None:
+                progress.close()
     
     def _get_sigmas(self, steps):
         """生成噪声水平调度"""
-        rho = self.denoiser.rho
-        sigma_min = self.denoiser.sigma_min
-        sigma_max = self.denoiser.sigma_max
-        
-        step_indices = torch.arange(steps + 1, device=self.device)
-        t = step_indices / steps
-        sigmas = (sigma_max ** (1 / rho) + t * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
-        
-        return sigmas
+        return karras_sigma_schedule(
+            steps=steps,
+            sigma_min=self.denoiser.sigma_min,
+            sigma_max=self.denoiser.sigma_max,
+            rho=self.denoiser.rho,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
 
 def set_random_seed(seed: int):
@@ -1525,8 +1573,24 @@ def load_radar_voxel_as_tensor(
     allow_legacy_radar_units=False,
 ):
     """按训练一致的物理重采样和冻结 artifact 加载 Radar 条件。"""
+    resize_statistics = None
+    resize_aggregation = RADAR_RESIZE_AGGREGATION_V1
     if path.endswith('.npz'):
-        radar_voxel = load_sparse_voxel(path)
+        radar_voxel, summary = load_sparse_radar_voxel(path)
+        if summary is not None and summary["protocol"] == RADAR_STATISTICS_PROTOCOL:
+            radar_voxel, fields, _summary = (
+                load_sparse_radar_voxel_with_statistics(path)
+            )
+            resize_statistics = {"protocol": fields["protocol"]}
+            for name in (
+                "point_count",
+                "intensity_valid_count",
+                "doppler_valid_count",
+            ):
+                resize_statistics[name] = torch.from_numpy(
+                    np.asarray(fields[name])
+                ).permute(2, 0, 1)
+            resize_aggregation = RADAR_RESIZE_AGGREGATION
     else:
         radar_voxel = np.load(path).astype(np.float32)
 
@@ -1534,7 +1598,25 @@ def load_radar_voxel_as_tensor(
     if model_pc_range is None:
         model_pc_range = source_pc_range
     radar_tensor = crop_voxel_channels_to_pc_range(radar_tensor, source_pc_range, model_pc_range)
-    radar_tensor = resize_radar_voxel_channels(radar_tensor, target_size)
+    if resize_statistics is not None:
+        cropped_statistics = {"protocol": resize_statistics["protocol"]}
+        for name in (
+            "point_count",
+            "intensity_valid_count",
+            "doppler_valid_count",
+        ):
+            count = crop_voxel_channels_to_pc_range(
+                resize_statistics[name].unsqueeze(0),
+                source_pc_range,
+                model_pc_range,
+            )
+            cropped_statistics[name] = count.squeeze(0)
+        resize_statistics = cropped_statistics
+    radar_tensor = resize_radar_voxel_channels(
+        radar_tensor,
+        target_size,
+        statistics=resize_statistics,
+    )
     if radar_normalization is None:
         if not allow_legacy_radar_units:
             raise RadarNormalizationError(
@@ -1553,6 +1635,15 @@ def load_radar_voxel_as_tensor(
             radar_normalization_sha256,
             context="逐文件推理 Radar normalization",
         )
+        artifact_resize_aggregation = radar_normalization["variance"][
+            "aggregation"
+        ]
+        if artifact_resize_aggregation != resize_aggregation:
+            raise RadarNormalizationError(
+                "推理 Radar normalization resize aggregation 与输入统计协议不一致: "
+                f"artifact={artifact_resize_aggregation!r}, "
+                f"input={resize_aggregation!r}"
+            )
         radar_tensor = apply_radar_normalization(radar_tensor, radar_normalization)
 
     return radar_tensor.to(device)

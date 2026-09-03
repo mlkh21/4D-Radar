@@ -32,9 +32,19 @@ from diffusion_consistency_radar.cm.evaluation_metrics import (  # noqa: E402
     uncertainty_calibration_metrics,
 )
 from diffusion_consistency_radar.dataset_manifest import sha256_file  # noqa: E402
+from diffusion_consistency_radar.occupancy_3d_metrics import (  # noqa: E402
+    accumulate_occupancy_3d_counts,
+    build_occupancy_3d_stratification,
+    empty_occupancy_3d_counts,
+    finalize_occupancy_3d_metrics,
+    occupancy_3d_confusion_counts,
+)
 from diffusion_consistency_radar.observed_artifact_protocol import (  # noqa: E402
     RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL,
     observed_mask_records_digest as _observed_mask_records_digest,
+)
+from diffusion_consistency_radar.occupancy_threshold_artifact import (  # noqa: E402
+    validate_threshold_artifact_metadata,
 )
 
 try:
@@ -72,6 +82,11 @@ FORMAL_METRIC_FIELDS = (
     "near_bev_iou",
     "near_nn_mean",
     "near_match_ratio_2",
+    "occupied_3d_precision",
+    "occupied_3d_recall",
+    "occupied_3d_iou",
+    "free_3d_recall",
+    "ground_false_positive_rate",
     "uncertainty_ece",
     "uncertainty_brier",
     "uncertainty_nll",
@@ -107,6 +122,11 @@ FRAME_FIELDS = [
     "near_bev_iou",
     "near_nn_mean",
     "near_match_ratio_2",
+    "occupied_3d_precision",
+    "occupied_3d_recall",
+    "occupied_3d_iou",
+    "free_3d_recall",
+    "ground_false_positive_rate",
     "uncertainty_ece",
     "uncertainty_brier",
     "uncertainty_nll",
@@ -212,14 +232,19 @@ def _resolve_parameters(
             "occupancy_threshold_artifact_sha256"
         )
         if (
-            not isinstance(threshold_artifact, dict)
-            or threshold_artifact.get("protocol")
-            != "occupancy_threshold_validation_artifact_v1"
-            or metadata.get("occ_threshold_source") != "validation_artifact"
+            metadata.get("occ_threshold_source") != "validation_artifact"
             or not isinstance(threshold_artifact_sha256, str)
-            or len(threshold_artifact_sha256) != 64
+            or re.fullmatch(r"[0-9a-f]{64}", threshold_artifact_sha256) is None
         ):
             raise ValueError("正式评价缺少完整 validation threshold artifact 合同")
+        try:
+            threshold_artifact = validate_threshold_artifact_metadata(
+                threshold_artifact
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "正式评价缺少完整 validation threshold artifact 合同"
+            ) from exc
         if float(threshold_artifact.get("selected_threshold")) != float(
             metadata_threshold
         ):
@@ -685,6 +710,12 @@ def evaluate_saved_predictions(
 
     os.makedirs(output_dir, exist_ok=True)
     rows: List[dict] = []
+    occupancy_stratification = build_occupancy_3d_stratification(
+        resolved["model_pc_range"]
+    )
+    occupancy_3d_counts = empty_occupancy_3d_counts(
+        occupancy_stratification
+    )
     for frame_id in frame_ids:
         pred = _load_prediction(predictions[frame_id], resolved["target_size"])
         radar = _load_source_as_czxy(
@@ -759,6 +790,22 @@ def evaluate_saved_predictions(
             near_pred, near_target, resolved["model_pc_range"], cell_size=0.5
         )
         nn = nearest_neighbor_metrics(near_pred, near_target, thresholds=(2.0,))
+        frame_3d_counts = occupancy_3d_confusion_counts(
+            pred[0] >= float(resolved["occ_threshold"]),
+            target[0] >= float(target_threshold),
+            observed_domain,
+            stratification=occupancy_stratification,
+        )
+        accumulate_occupancy_3d_counts(
+            occupancy_3d_counts,
+            frame_3d_counts,
+        )
+        frame_3d_metrics = finalize_occupancy_3d_metrics(
+            frame_3d_counts,
+            stratification=occupancy_stratification,
+        )
+        frame_global_3d = frame_3d_metrics["global"]
+        frame_ground_3d = frame_3d_metrics["ground_band"]
 
         lidar_path = lidar_mapping.get(frame_id, "")
         lidar_points = _load_array(lidar_path) if lidar_path else np.zeros((0, 3))
@@ -805,6 +852,15 @@ def evaluate_saved_predictions(
             "near_bev_iou": iou["bev_iou"],
             "near_nn_mean": nn["nn_mean"],
             "near_match_ratio_2": nn["match_ratio_2"],
+            "occupied_3d_precision": frame_global_3d["occupied_precision"],
+            "occupied_3d_recall": frame_global_3d["occupied_recall"],
+            "occupied_3d_iou": frame_global_3d["occupied_iou"],
+            "free_3d_recall": frame_global_3d["free_recall"],
+            "ground_false_positive_rate": (
+                frame_ground_3d["ground_false_positive_rate"]
+                if frame_ground_3d is not None
+                else None
+            ),
             "uncertainty_ece": float("nan"),
             "uncertainty_brier": float("nan"),
             "uncertainty_nll": float("nan"),
@@ -885,6 +941,13 @@ def evaluate_saved_predictions(
         "occupancy_threshold_artifact_sha256": resolved["metadata"].get(
             "occupancy_threshold_artifact_sha256"
         ),
+        "threshold_safety_recall_qualification": (
+            resolved["metadata"]
+            .get("occupancy_threshold_artifact", {})
+            .get("safety_recall_qualification")
+            if resolved["formal_run"]
+            else None
+        ),
         "target_threshold": float(target_threshold),
         "target_size": [int(value) for value in resolved["target_size"]],
         "source_pc_range": [float(value) for value in resolved["source_pc_range"]],
@@ -910,6 +973,10 @@ def evaluate_saved_predictions(
             }
             if resolved["formal_run"]
             else {}
+        ),
+        "occupancy_3d_metrics": finalize_occupancy_3d_metrics(
+            occupancy_3d_counts,
+            stratification=occupancy_stratification,
         ),
         "metrics": aggregate_metrics,
     }

@@ -7,7 +7,8 @@ import os
 from typing import Dict, Mapping, Tuple
 
 
-RADAR_FIELD_SCHEMA_PROTOCOL = "radar_raw_field_semantics_v1"
+LEGACY_RADAR_FIELD_SCHEMA_PROTOCOL = "radar_raw_field_semantics_v1"
+RADAR_FIELD_SCHEMA_PROTOCOL = "radar_raw_field_semantics_v2"
 RADAR_DOPPLER_POSITIVE_DIRECTIONS = frozenset(
     {"toward_sensor", "away_from_sensor"}
 )
@@ -33,6 +34,14 @@ _SUPPORTED_RETURN_UNITS = frozenset(
         "linear_power",
         "m2",
         "linear_ratio",
+        "dB",
+    }
+)
+_SUPPORTED_POINT_COORDINATE_FRAMES = frozenset({"radar", "lidar", "base_link"})
+_HEADER_FRAME_RELATIONSHIPS = frozenset(
+    {
+        "matches_physical_coordinate_frame",
+        "header_label_only_points_in_sensor_frame",
     }
 )
 
@@ -61,15 +70,32 @@ def validate_radar_field_schema(
     value: Mapping[str, object],
     *,
     require_verified: bool = False,
+    expected_protocol: str = "",
 ) -> Dict[str, object]:
     """严格验证字段合同；正式路径只接受可追溯的 verified artifact。"""
+    if not isinstance(value, Mapping):
+        raise ValueError("Radar field schema 必须是 JSON 对象")
+    protocol = value.get("protocol")
+    if protocol not in {
+        LEGACY_RADAR_FIELD_SCHEMA_PROTOCOL,
+        RADAR_FIELD_SCHEMA_PROTOCOL,
+    }:
+        raise ValueError("Radar field schema protocol 不匹配")
+    if expected_protocol and protocol != expected_protocol:
+        raise ValueError(
+            "Radar field schema protocol 与调用方要求不匹配: "
+            f"{protocol!r} != {expected_protocol!r}"
+        )
+    is_v2 = protocol == RADAR_FIELD_SCHEMA_PROTOCOL
     schema = _exact_mapping(
         value,
-        {"protocol", "storage", "fields", "verification"},
+        (
+            {"protocol", "storage", "ros_transport", "fields", "verification"}
+            if is_v2
+            else {"protocol", "storage", "fields", "verification"}
+        ),
         "Radar field schema",
     )
-    if schema.get("protocol") != RADAR_FIELD_SCHEMA_PROTOCOL:
-        raise ValueError("Radar field schema protocol 不匹配")
 
     storage = _exact_mapping(
         schema.get("storage"),
@@ -79,6 +105,25 @@ def validate_radar_field_schema(
     if storage != {"format": "npy", "dtype": "float32", "column_count": 5}:
         raise ValueError("Radar field schema storage 必须是五列 float32 NPY")
 
+    ros_transport = None
+    if is_v2:
+        ros_transport = _exact_mapping(
+            schema.get("ros_transport"),
+            {"topic", "message_type", "header_frame_id"},
+            "Radar field schema.ros_transport",
+        )
+        topic = _nonempty_string(ros_transport.get("topic"), "ros_transport.topic")
+        if not topic.startswith("/"):
+            raise ValueError("ros_transport.topic 必须是绝对 ROS topic")
+        _nonempty_string(
+            ros_transport.get("message_type"),
+            "ros_transport.message_type",
+        )
+        _nonempty_string(
+            ros_transport.get("header_frame_id"),
+            "ros_transport.header_frame_id",
+        )
+
     fields = _exact_mapping(
         schema.get("fields"),
         {"xyz", "return_strength", "doppler"},
@@ -86,13 +131,39 @@ def validate_radar_field_schema(
     )
     xyz = _exact_mapping(
         fields.get("xyz"),
-        {"column_indices", "unit", "coordinate_frame"},
+        (
+            {
+                "column_indices",
+                "unit",
+                "physical_coordinate_frame",
+                "header_frame_relationship",
+            }
+            if is_v2
+            else {"column_indices", "unit", "coordinate_frame"}
+        ),
         "Radar field schema.fields.xyz",
     )
     if xyz.get("column_indices") != [0, 1, 2] or xyz.get("unit") != "m":
         raise ValueError("Radar XYZ 必须固定为 0/1/2 列且单位为 m")
-    if xyz.get("coordinate_frame") != "radar":
-        raise ValueError("Radar raw XYZ coordinate_frame 必须为 radar")
+    if is_v2:
+        physical_frame = xyz.get("physical_coordinate_frame")
+        relationship = xyz.get("header_frame_relationship")
+        if physical_frame not in _SUPPORTED_POINT_COORDINATE_FRAMES:
+            raise ValueError("Radar raw XYZ physical_coordinate_frame 不支持")
+        if relationship not in _HEADER_FRAME_RELATIONSHIPS:
+            raise ValueError("Radar raw XYZ header_frame_relationship 不支持")
+        if (
+            relationship == "matches_physical_coordinate_frame"
+            and ros_transport.get("header_frame_id") != physical_frame
+        ):
+            raise ValueError("ROS header frame 与物理点坐标系声明矛盾")
+        if (
+            relationship == "header_label_only_points_in_sensor_frame"
+            and physical_frame != "radar"
+        ):
+            raise ValueError("header label-only 合同只允许点仍位于 radar sensor frame")
+    elif xyz.get("coordinate_frame") != "radar":
+        raise ValueError("legacy Radar raw XYZ coordinate_frame 必须为 radar")
 
     return_strength = _exact_mapping(
         fields.get("return_strength"),
@@ -138,12 +209,23 @@ def validate_radar_field_schema(
         raise ValueError("Radar field schema verification.status 不支持")
     if require_verified and status != "verified":
         raise ValueError("Radar field schema 未通过权威验证，禁止用于正式链")
+    if (
+        require_verified
+        and not is_v2
+        and expected_protocol != LEGACY_RADAR_FIELD_SCHEMA_PROTOCOL
+    ):
+        raise ValueError("正式 verified Radar field schema 必须使用 v2 坐标合同")
 
     if status == "verified":
         _nonempty_string(return_strength.get("source_field"), "return source_field")
         _nonempty_string(doppler.get("source_field"), "Doppler source_field")
         if return_strength.get("unit") not in _SUPPORTED_RETURN_UNITS:
             raise ValueError("verified Radar return strength unit 不支持")
+        if is_v2 and (
+            (return_strength.get("quantity") == "signal_to_noise_ratio")
+            != (return_strength.get("unit") == "dB")
+        ):
+            raise ValueError("verified dB return strength 必须明确为 signal_to_noise_ratio")
         if doppler.get("unit") != "m/s":
             raise ValueError("verified Radar Doppler unit 必须为 m/s")
         if doppler.get("positive_direction") not in RADAR_DOPPLER_POSITIVE_DIRECTIONS:
@@ -168,6 +250,7 @@ def load_radar_field_schema_artifact(
     path: str,
     *,
     require_verified: bool = False,
+    expected_protocol: str = "",
 ) -> Tuple[Dict[str, object], str]:
     """加载普通 JSON 文件，返回严格 schema 与文件内容 SHA-256。"""
     artifact_path = os.path.abspath(os.fspath(path))
@@ -183,6 +266,7 @@ def load_radar_field_schema_artifact(
     schema = validate_radar_field_schema(
         value,
         require_verified=require_verified,
+        expected_protocol=expected_protocol,
     )
     if schema["verification"]["status"] == "verified":
         artifact_dir = os.path.dirname(artifact_path)
@@ -210,9 +294,25 @@ def validate_radar_layout_schema(
     radar_field_schema: Mapping[str, object],
 ) -> Dict[str, object]:
     """交叉核对解包列布局与经验证的物理字段身份。"""
+    field_protocol = radar_field_schema.get("protocol")
+    is_v2 = field_protocol == RADAR_FIELD_SCHEMA_PROTOCOL
     layout = _exact_mapping(
         value,
-        {
+        ({
+            "schema_version",
+            "storage_format",
+            "ros_transport",
+            "columns",
+            "column_indices",
+            "source_fields",
+            "selected_fields",
+            "field_mapping",
+            "missing_fields",
+            "physical_semantics_status",
+            "missing_value_encoding",
+            "shape",
+            "dtype",
+        } if is_v2 else {
             "schema_version",
             "storage_format",
             "columns",
@@ -225,10 +325,11 @@ def validate_radar_layout_schema(
             "missing_value_encoding",
             "shape",
             "dtype",
-        },
+        }),
         "Radar pointcloud layout schema",
     )
-    if layout.get("schema_version") != 1:
+    expected_layout_version = 2 if is_v2 else 1
+    if layout.get("schema_version") != expected_layout_version:
         raise ValueError("Radar pointcloud layout schema_version 不支持")
     if layout.get("storage_format") != "npy" or layout.get("dtype") != "float32":
         raise ValueError("Radar pointcloud layout 必须是 float32 NPY")
@@ -256,6 +357,8 @@ def validate_radar_layout_schema(
         raise ValueError("Radar pointcloud layout shape 必须为 [N,5]")
 
     validated_fields = radar_field_schema["fields"]
+    if is_v2 and layout.get("ros_transport") != radar_field_schema.get("ros_transport"):
+        raise ValueError("Radar layout ROS transport/topic/type/frame 与字段合同不一致")
     expected_mapping = {
         "x": "x",
         "y": "y",
@@ -297,6 +400,7 @@ def load_radar_layout_schema(
 
 
 __all__ = [
+    "LEGACY_RADAR_FIELD_SCHEMA_PROTOCOL",
     "RADAR_DOPPLER_POSITIVE_DIRECTIONS",
     "RADAR_FIELD_SCHEMA_PROTOCOL",
     "load_radar_field_schema_artifact",

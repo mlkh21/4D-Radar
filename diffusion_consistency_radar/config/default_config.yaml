@@ -11,7 +11,7 @@ data:
   require_real_ir: true
   require_real_calibration: true
   require_persisted_observed_mask: true
-  # 统计只作为审计 metadata；当前模型输入仍为原四通道 Radar voxel。
+  # 逐字段计数参与 resize 聚合；模型输入接口仍保持四通道 Radar voxel。
   require_radar_statistics: true
   voxel_coordinate_frame: "lidar"
   checkpoint_protocol: "formal_chain_v2"
@@ -22,7 +22,8 @@ data:
   num_workers: 4
   train_split: 0.8 # 仅 legacy 入口使用；formal v2 消费唯一 split artifact。
   alignment_size: 32
-  use_augmentation: true
+  # 正式协议没有已验证的传感器噪声模型，禁止物理通道抖动和共享强度缩放。
+  use_augmentation: false
   # 显式冻结训练/推理共用网格，必须与 normalization artifact 一致。
   target_size: [32, 128, 128]
   source_pc_range: [0, -20, -6, 80, 20, 10]
@@ -79,11 +80,21 @@ ldm:
   sigma_max: 80.0
   sigma_min: 0.002
   rho: 7.0
-  # 每轮独立验证使用固定单步去噪代理；最终模型仍须通过离线固定帧生成门禁。
+  # 局部去噪只保留为训练诊断，不参与 checkpoint 或 threshold 选优。
   validation_seed: 42
   validation_sigma: 0.5
   validation_occupancy_threshold: 0.5
   validation_threshold_candidates: [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+  # 每轮在 validation suffix 的固定前缀上执行部署一致的 40-step Heun 完整采样。
+  deployment_validation_frames_per_scene: 16
+  deployment_validation_seed: 42
+  deployment_validation_steps: 40
+  deployment_validation_sampler: "heun"
+  deployment_validation_occupancy_threshold: 0.5
+  deployment_validation_threshold_candidates: [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+  # 未获得权威最低召回率时保持 null/空字符串；artifact 将明确标记为未通过安全召回资格。
+  deployment_validation_min_occupied_recall: null
+  deployment_validation_recall_constraint_authority: ""
   decoded_loss_weight: 0.05
   decoded_false_positive_weight: 0.10
   decoded_mass_weight: 0.05
@@ -98,25 +109,40 @@ ldm:
   save_every: 10 # 每 N 个时期保存检查点
   save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/ldm"
 
-# --- LDM 初始化的 EMA consistency 配置 ---
+# --- LDM 初始化、边界锚定的 EMA consistency 配置 ---
 cd:
   initialization_model_path: "" # LDM 只用于初始化 CD/EMA
   teacher_model_path: "" # legacy 配置别名；新配置保持为空
-  training_semantics: "ldm_initialized_ema_consistency_v1"
+  training_semantics: "ldm_initialized_boundary_anchored_ema_consistency_v2"
   num_scales: 40
   ema_rate: 0.999
   sigma_min: 0.002
   sigma_max: 80.0
   rho: 7.0
+  consistency_loss_weight: 1.0
+  # 仅在 persisted observed latent 域约束一步输出回到真实 target，排除常数解。
+  reconstruction_anchor_weight: 0.1
+  # 严格检测完全不随条件变化的输出；若需数值容差必须显式改配置并进入收据。
+  collapse_guard_epsilon: 0.0
   # Training parameters
   epochs: 20
   train_frames_per_epoch: 3210
-  # 每轮在固定 validation suffix 上以相同噪声比较 online/EMA。
+  # 局部去噪只保留为 online/EMA 诊断，不参与部署权重选优。
   validation_frames_per_epoch: 774
   validation_seed: 42
   validation_sigma: 0.5
   validation_occupancy_threshold: 0.5
   validation_threshold_candidates: [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+  # 固定子集从 sigma_max 纯噪声执行一步部署采样，决定 online/EMA、checkpoint 和 threshold。
+  deployment_validation_frames_per_scene: 16
+  deployment_validation_seed: 42
+  deployment_validation_steps: 1
+  deployment_validation_sampler: "one_step"
+  deployment_validation_occupancy_threshold: 0.5
+  deployment_validation_threshold_candidates: [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+  # 未获得权威最低召回率时保持 null/空字符串；artifact 将明确标记为未通过安全召回资格。
+  deployment_validation_min_occupied_recall: null
+  deployment_validation_recall_constraint_authority: ""
   lr: 5.0e-5
   save_every: 10 # Save checkpoint every N epochs
   save_dir: "./Result/train_results/formal_v2_80m_86p8_v1/cd"

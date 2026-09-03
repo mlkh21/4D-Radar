@@ -168,6 +168,36 @@ case "${MODE}" in
         ;;
 esac
 
+# 在任何数据扫描或训练进程启动前验证 LDM/CD 的完整部署采样与阈值门禁配置。
+python - "${ROOT_DIR}" "${DEFAULT_CONFIG_PATH}" <<'PY'
+import json
+import sys
+import yaml
+
+root_dir, config_path = sys.argv[1:3]
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+
+from diffusion_consistency_radar.deployment_validation import (
+    resolve_deployment_validation_config,
+)
+
+with open(config_path, "r", encoding="utf-8") as handle:
+    config = yaml.safe_load(handle) or {}
+
+receipts = {}
+for stage in ("ldm", "cd"):
+    resolved = resolve_deployment_validation_config(
+        config.get(stage) or {},
+        stage=stage,
+    )
+    receipts[stage] = resolved["threshold_selection_constraints"]
+print(
+    "Deployment validation threshold constraints: "
+    + json.dumps(receipts, ensure_ascii=False, sort_keys=True)
+)
+PY
+
 stage_output_has_entries() {
     local stage_dir="$1"
     [ -d "${stage_dir}" ] \
@@ -314,16 +344,29 @@ python - \
     "${PREPROCESSED_ROOT}" \
     "${DATA_PROTOCOL_ARTIFACT}" \
     "${TEMPORAL_SPLIT_ARTIFACT}" \
-    "$(IFS=,; echo "${TRAIN_SCENES[*]}")" <<'PY'
+    "$(IFS=,; echo "${TRAIN_SCENES[*]}")" \
+    "${RADAR_NORMALIZATION_ARTIFACT}" \
+    "${EXPECTED_ARTIFACT_SHA256}" <<'PY'
 import json
 import os
 import sys
 
-root_dir, dataset_dir, protocol_path, split_path, scenes_csv = sys.argv[1:6]
+(
+    root_dir,
+    dataset_dir,
+    protocol_path,
+    split_path,
+    scenes_csv,
+    normalization_path,
+    expected_normalization_sha256,
+) = sys.argv[1:8]
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-from diffusion_consistency_radar.dataset_manifest import validate_scene_manifest
+from diffusion_consistency_radar.dataset_manifest import (
+    sha256_file,
+    validate_scene_manifest,
+)
 from diffusion_consistency_radar.formal_data_protocol import (
     load_formal_data_protocol_artifact,
 )
@@ -331,6 +374,10 @@ from diffusion_consistency_radar.radar_statistics import (
     RADAR_STATISTICS_PROTOCOL,
     SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
     validate_sparse_radar_statistics,
+)
+from diffusion_consistency_radar.radar_normalization import (
+    assert_radar_normalization_input_contract,
+    load_radar_normalization_artifact,
 )
 
 scenes = [scene for scene in scenes_csv.split(',') if scene]
@@ -384,11 +431,23 @@ _protocol, protocol_sha256 = load_formal_data_protocol_artifact(
     split_artifact_path=split_path,
     stage="vae",
 )
-if _protocol["protocol"] == "formal_data_v3" and any(
+normalization, normalization_sha256 = load_radar_normalization_artifact(
+    normalization_path,
+    target_size=(32, 128, 128),
+    source_pc_range=(0, -20, -6, 80, 20, 10),
+    model_pc_range=(0, -20, -6, 80, 20, 10),
+    doppler_scale_mps=86.8,
+    require_formal=True,
+    expected_split_artifact_sha256=sha256_file(split_path),
+)
+if normalization_sha256 != expected_normalization_sha256:
+    raise RuntimeError("Radar normalization 在联合合同预检期间发生身份变化")
+assert_radar_normalization_input_contract(normalization, _protocol)
+if _protocol["protocol"] in {"formal_data_v3", "formal_data_v4"} and any(
     protocol != RADAR_STATISTICS_PROTOCOL
     for protocol in scene_statistics_protocols.values()
 ):
-    raise RuntimeError("formal_data_v3 只允许 Radar statistics finite-count v2")
+    raise RuntimeError("formal_data_v3/v4 只允许 Radar statistics finite-count v2")
 print(
     json.dumps(
         {
@@ -402,7 +461,8 @@ print(
             "total_intensity_valid_count": intensity_valid_count,
             "formal_data_protocol_sha256": protocol_sha256,
             "formal_data_protocol": _protocol["protocol"],
-            "model_consumed": False,
+            "source_policy_model_consumed": False,
+            "resize_model_consumed": True,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -448,7 +508,8 @@ python - \
     "${CD_TRAIN_FRAMES_PER_EPOCH}" \
     "${CD_VALIDATION_FRAMES_PER_EPOCH}" \
     "${CUDA_DEVICES}" \
-    "${GPU_COUNT}" <<'PY'
+    "${GPU_COUNT}" \
+    "${EXPECTED_ARTIFACT_SHA256}" <<'PY'
 import os
 import sys
 import yaml
@@ -475,7 +536,8 @@ import yaml
     cd_validation_frames,
     cuda_devices,
     gpu_count,
-) = sys.argv[1:22]
+    expected_artifact_sha256,
+) = sys.argv[1:23]
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 from diffusion_consistency_radar.distributed_training import (
@@ -516,6 +578,7 @@ cfg['data']['target_size'] = [32, 128, 128]
 cfg['data']['source_pc_range'] = [0, -20, -6, 80, 20, 10]
 cfg['data']['model_pc_range'] = [0, -20, -6, 80, 20, 10]
 cfg['data']['radar_normalization_path'] = artifact_path
+cfg['data']['radar_normalization_sha256'] = expected_artifact_sha256
 cfg['data']['doppler_scale_mps'] = 86.8
 cfg.setdefault('optimization', {})
 cfg['optimization']['gradient_accumulation_steps'] = batch_plan.gradient_accumulation_steps

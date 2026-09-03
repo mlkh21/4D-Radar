@@ -15,8 +15,20 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+try:
+    from .radar_statistics import (
+        RADAR_RESIZE_AGGREGATION,
+        RADAR_RESIZE_AGGREGATION_V1,
+    )
+except ImportError:  # 兼容把包目录直接加入 sys.path 的旧脚本
+    from radar_statistics import (  # type: ignore
+        RADAR_RESIZE_AGGREGATION,
+        RADAR_RESIZE_AGGREGATION_V1,
+    )
+
 
 RADAR_NORMALIZATION_PROTOCOL = "radar_normalization_v1"
+RADAR_NORMALIZATION_PROTOCOL_V2 = "radar_normalization_v2"
 LEGACY_RADAR_NORMALIZATION_PROTOCOL = "legacy_identity"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TOP_LEVEL_KEYS = {
@@ -126,12 +138,16 @@ def validate_radar_normalization_spec(
     require_formal: bool = True,
     expected_split_artifact_sha256: Optional[str] = None,
 ) -> dict:
-    """严格验证 normalization v1，并返回不共享可变对象的副本。"""
+    """严格验证 normalization v1/v2，并返回不共享可变对象的副本。"""
     mapping = _require_exact_keys(spec, _TOP_LEVEL_KEYS, "radar_normalization")
-    if mapping.get("protocol") != RADAR_NORMALIZATION_PROTOCOL:
+    protocol = mapping.get("protocol")
+    if protocol not in {
+        RADAR_NORMALIZATION_PROTOCOL,
+        RADAR_NORMALIZATION_PROTOCOL_V2,
+    }:
         raise RadarNormalizationError(
-            "radar_normalization protocol 必须为 "
-            f"{RADAR_NORMALIZATION_PROTOCOL!r}"
+            "radar_normalization protocol 不支持: "
+            f"{protocol!r}"
         )
     formal = mapping.get("formal")
     if type(formal) is not bool:
@@ -190,17 +206,35 @@ def validate_radar_normalization_spec(
     if not _same_numeric_sequence(artifact_model, expected_model):
         raise RadarNormalizationError("normalization model_pc_range 与运行网格不一致")
 
-    intensity = _require_exact_keys(
-        mapping.get("intensity"),
-        {"transform", "log_median", "log_iqr", "clip"},
-        "intensity",
-    )
-    if intensity.get("transform") != "log1p_robust_zscore":
-        raise RadarNormalizationError("intensity transform 不支持")
-    _finite_number(intensity.get("log_median"), "intensity.log_median")
-    log_iqr = _finite_number(intensity.get("log_iqr"), "intensity.log_iqr")
-    if log_iqr <= 0.0:
-        raise RadarNormalizationError("intensity.log_iqr/IQR 必须是正有限数")
+    if protocol == RADAR_NORMALIZATION_PROTOCOL:
+        intensity = _require_exact_keys(
+            mapping.get("intensity"),
+            {"transform", "log_median", "log_iqr", "clip"},
+            "intensity",
+        )
+        if intensity.get("transform") != "log1p_robust_zscore":
+            raise RadarNormalizationError("normalization v1 intensity transform 不支持")
+        _finite_number(intensity.get("log_median"), "intensity.log_median")
+        intensity_iqr = _finite_number(
+            intensity.get("log_iqr"),
+            "intensity.log_iqr",
+        )
+    else:
+        intensity = _require_exact_keys(
+            mapping.get("intensity"),
+            {"transform", "quantity", "unit", "median", "iqr", "clip"},
+            "intensity",
+        )
+        if intensity.get("transform") != "identity_robust_zscore":
+            raise RadarNormalizationError("normalization v2 intensity transform 不支持")
+        if intensity.get("quantity") != "signal_to_noise_ratio":
+            raise RadarNormalizationError("normalization v2 intensity quantity 必须为 SNR")
+        if intensity.get("unit") != "dB":
+            raise RadarNormalizationError("normalization v2 intensity unit 必须为 dB")
+        _finite_number(intensity.get("median"), "intensity.median")
+        intensity_iqr = _finite_number(intensity.get("iqr"), "intensity.iqr")
+    if intensity_iqr <= 0.0:
+        raise RadarNormalizationError("intensity IQR 必须是正有限数")
     intensity_clip = _finite_sequence(intensity.get("clip"), "intensity.clip", 2)
     if intensity_clip[0] >= intensity_clip[1]:
         raise RadarNormalizationError("intensity.clip 上下界无效")
@@ -240,7 +274,10 @@ def validate_radar_normalization_spec(
         raise RadarNormalizationError("variance transform 必须为 identity")
     if variance.get("unit") != "m2_s2":
         raise RadarNormalizationError("variance unit 必须为 m2_s2")
-    if variance.get("aggregation") != "occupied_voxel_equal_weight_total_variance":
+    if variance.get("aggregation") not in {
+        RADAR_RESIZE_AGGREGATION_V1,
+        RADAR_RESIZE_AGGREGATION,
+    }:
         raise RadarNormalizationError("variance aggregation 不符合协议")
 
     provenance = _require_mapping(
@@ -360,12 +397,16 @@ def apply_radar_normalization(radar_tensor: torch.Tensor, spec: Mapping) -> torc
     if torch.any((result[3:4] < 0) & occupied):
         raise RadarNormalizationError("occupied Radar variance 不得为负")
     intensity = validated["intensity"]
+    if validated["protocol"] == RADAR_NORMALIZATION_PROTOCOL:
+        intensity_values = torch.log1p(result[1:2].clamp_min(0.0))
+        intensity_center = float(intensity["log_median"])
+        intensity_iqr = float(intensity["log_iqr"])
+    else:
+        intensity_values = result[1:2]
+        intensity_center = float(intensity["median"])
+        intensity_iqr = float(intensity["iqr"])
     result[1:2] = torch.clamp(
-        (
-            torch.log1p(result[1:2].clamp_min(0.0))
-            - float(intensity["log_median"])
-        )
-        / float(intensity["log_iqr"]),
+        (intensity_values - intensity_center) / intensity_iqr,
         min=float(intensity["clip"][0]),
         max=float(intensity["clip"][1]),
     )
@@ -376,6 +417,52 @@ def apply_radar_normalization(radar_tensor: torch.Tensor, spec: Mapping) -> torc
         max=float(doppler["clip"][1]),
     )
     return torch.where(occupied.expand_as(result), result, torch.zeros_like(result))
+
+
+def assert_radar_normalization_input_contract(
+    spec: Mapping[str, Any],
+    data_protocol: Mapping[str, Any],
+) -> None:
+    """交叉核对 formal data 的 Radar 物理量与 normalization 变换身份。"""
+    normalization = _require_mapping(spec, "radar_normalization")
+    protocol = normalization.get("protocol")
+    if protocol == RADAR_NORMALIZATION_PROTOCOL:
+        expected_return_strength = {
+            "quantity": "intensity",
+            "unit": "sensor_native_linear_nonnegative",
+        }
+    elif protocol == RADAR_NORMALIZATION_PROTOCOL_V2:
+        expected_return_strength = {
+            "quantity": "signal_to_noise_ratio",
+            "unit": "dB",
+        }
+    else:
+        raise RadarNormalizationError(
+            f"Radar normalization protocol 不支持: {protocol!r}"
+        )
+
+    data_mapping = _require_mapping(data_protocol, "formal data protocol")
+    radar_input_contract = data_mapping.get("radar_input_contract")
+    if radar_input_contract is None:
+        return
+    contract = _require_mapping(
+        radar_input_contract,
+        "formal data protocol.radar_input_contract",
+    )
+    return_strength = _require_mapping(
+        contract.get("return_strength"),
+        "formal data protocol.radar_input_contract.return_strength",
+    )
+    actual_return_strength = {
+        "quantity": return_strength.get("quantity"),
+        "unit": return_strength.get("unit"),
+    }
+    if actual_return_strength != expected_return_strength:
+        raise RadarNormalizationError(
+            "Radar normalization 与 formal data return-strength 物理语义不匹配: "
+            f"normalization={expected_return_strength!r}, "
+            f"data={actual_return_strength!r}"
+        )
 
 
 def radar_normalization_from_checkpoint(
@@ -496,8 +583,10 @@ def assert_same_radar_normalization(
 __all__ = [
     "LEGACY_RADAR_NORMALIZATION_PROTOCOL",
     "RADAR_NORMALIZATION_PROTOCOL",
+    "RADAR_NORMALIZATION_PROTOCOL_V2",
     "RadarNormalizationError",
     "apply_radar_normalization",
+    "assert_radar_normalization_input_contract",
     "assert_checkpoint_radar_normalization",
     "assert_same_radar_normalization",
     "load_radar_normalization_artifact",

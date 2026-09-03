@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 文件功能：在全新目录中生成带字段权威证据、解包收据和 formal-data-v3 身份的正式数据链。
+# 文件功能：在全新目录中生成带字段权威证据、解包收据和 formal-data-v4 身份的正式数据链。
 
 set -euo pipefail
 
@@ -14,8 +14,8 @@ DEPLOY_ROOT="${FORMAL_V3_DEPLOY_ROOT:-$ROOT/Data/NTU4DRadLM_Deploy_formal_v3_80m
 RADAR_FIELD_SCHEMA="${RADAR_FIELD_SCHEMA:-}"
 
 SPLIT_ARTIFACT="$NEW_ROOT/temporal_split_garden_train80_purge3s_v1.json"
-DATA_PROTOCOL_ARTIFACT="$NEW_ROOT/formal_data_protocol_garden_train80_purge3s_v3.json"
-NORMALIZATION_ARTIFACT="${FORMAL_V3_NORMALIZATION_ARTIFACT:-$ROOT/diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_formal_v3_v1.json}"
+DATA_PROTOCOL_ARTIFACT="$NEW_ROOT/formal_data_protocol_garden_train80_purge3s_v4.json"
+NORMALIZATION_ARTIFACT="${FORMAL_V3_NORMALIZATION_ARTIFACT:-$ROOT/diffusion_consistency_radar/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_formal_v3_db_snr_v2.json}"
 
 DOPPLER_SCALE_MPS="${DOPPLER_SCALE_MPS:-86.8}"
 TARGET_SIZE=(32 128 128)
@@ -129,16 +129,19 @@ echo "步骤 7/9：仅使用 split.train 生成 normalization artifact"
     --source_pc_range "${PC_RANGE[@]}" \
     --model_pc_range "${PC_RANGE[@]}" \
     --doppler_scale_mps "$DOPPLER_SCALE_MPS" \
+    --intensity_transform identity_robust_zscore \
+    --intensity_quantity signal_to_noise_ratio \
+    --intensity_unit dB \
     --split_artifact "$SPLIT_ARTIFACT" \
     --max_frames 0
 
-echo "步骤 8/9：生成 formal-data-v3 身份 artifact"
+echo "步骤 8/9：生成绑定 schema v2 的 formal-data-v4 身份 artifact"
 "${PY[@]}" diffusion_consistency_radar/scripts/build_formal_data_protocol.py \
     --dataset_dir "$NEW_ROOT" \
     --scene garden \
     --split_artifact "$SPLIT_ARTIFACT" \
     --output "$DATA_PROTOCOL_ARTIFACT" \
-    --protocol_version v3
+    --protocol_version v4
 
 echo "步骤 9/9：从 loop3 生成严格 deployment 视图"
 "${PY[@]}" diffusion_consistency_radar/scripts/build_deployment_view.py create \
@@ -149,7 +152,7 @@ echo "步骤 9/9：从 loop3 生成严格 deployment 视图"
     --scene loop3 \
     --link_mode hardlink
 
-echo "formal v3 预处理完成。"
+echo "formal v3 数据链与 formal-data-v4 合同生成完成。"
 echo "Raw data: $RAW_ROOT"
 echo "Training data: $NEW_ROOT"
 echo "Deployment data: $DEPLOY_ROOT"

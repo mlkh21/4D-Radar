@@ -99,7 +99,14 @@ def _write_pointcloud_schema(save_dir, schema):
     os.replace(temp_path, schema_path)
 
 
-def _build_pointcloud_layout_schema(source_field_names, field_mapping):
+def _build_pointcloud_layout_schema(
+    source_field_names,
+    field_mapping,
+    *,
+    topic,
+    message_type,
+    header_frame_id,
+):
     """构建只证明列布局、不声明物理单位或符号的解包收据。"""
     selected_fields = [
         field_mapping[name]
@@ -107,8 +114,13 @@ def _build_pointcloud_layout_schema(source_field_names, field_mapping):
         if field_mapping[name] is not None
     ]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "storage_format": "npy",
+        "ros_transport": {
+            "topic": str(topic),
+            "message_type": str(message_type),
+            "header_frame_id": str(header_frame_id),
+        },
         "columns": list(POINTCLOUD_COLUMNS),
         "column_indices": {
             name: index for index, name in enumerate(POINTCLOUD_COLUMNS)
@@ -125,7 +137,7 @@ def _build_pointcloud_layout_schema(source_field_names, field_mapping):
     }
 
 
-def _read_pointcloud2_fixed_columns(msg):
+def _read_pointcloud2_fixed_columns(msg, *, ros_transport):
     """按字段名读取 PointCloud2，并构造固定的 ``[x,y,z,intensity,doppler]``。"""
     source_field_names = [str(field.name) for field in msg.fields]
     field_mapping = {
@@ -176,8 +188,24 @@ def _read_pointcloud2_fixed_columns(msg):
                 point[column_index] = float(values[selected_indices[column_name]])
         points.append(point.tolist())
 
-    schema = _build_pointcloud_layout_schema(source_field_names, field_mapping)
+    schema = _build_pointcloud_layout_schema(
+        source_field_names,
+        field_mapping,
+        **ros_transport,
+    )
     return points, schema
+
+
+def _pointcloud_transport(msg, *, topic, message_type):
+    """提取参与跨帧、跨 bag 漂移检查的 ROS transport 身份。"""
+    declared_type = message_type or getattr(msg, "_type", type(msg).__name__)
+    header = getattr(msg, "header", None)
+    frame_id = getattr(header, "frame_id", "") if header is not None else ""
+    return {
+        "topic": str(topic or ""),
+        "message_type": str(declared_type),
+        "header_frame_id": str(frame_id or ""),
+    }
 
 
 def _topic_key(topic_name: str) -> str:
@@ -210,7 +238,14 @@ def get_scene_name(bag_path):
     scene_name = filename.split('_')[0]
     return scene_name
 
-def save_pointcloud(msg, save_dir, timestamp):
+def save_pointcloud(
+    msg,
+    save_dir,
+    timestamp,
+    *,
+    topic="",
+    message_type=None,
+):
     """
     保存点云为 .npy 文件，保留所有关键属性。
     Livox: [x, y, z, reflectivity]
@@ -218,6 +253,11 @@ def save_pointcloud(msg, save_dir, timestamp):
     """
     points_list = []
     schema = None
+    ros_transport = _pointcloud_transport(
+        msg,
+        topic=topic,
+        message_type=message_type,
+    )
 
     # NOTE: 1) Livox CustomMsg
     # 结构: x, y, z, reflectivity, tag, line
@@ -228,7 +268,10 @@ def save_pointcloud(msg, save_dir, timestamp):
 
     # NOTE: 2) 标准 PointCloud2
     elif hasattr(msg, 'width'): # Duck typing for PointCloud2
-        points_list, schema = _read_pointcloud2_fixed_columns(msg)
+        points_list, schema = _read_pointcloud2_fixed_columns(
+            msg,
+            ros_transport=ros_transport,
+        )
 
     # NOTE: 3) 标准 PointCloud (v1) - 常见于 4D Radar
     # 结构: points[], channels[name, values[]]
@@ -264,6 +307,7 @@ def save_pointcloud(msg, save_dir, timestamp):
                 "intensity": intensity_field,
                 "doppler": doppler_field,
             },
+            **ros_transport,
         )
 
         for i, point in enumerate(msg.points):
@@ -408,7 +452,13 @@ def process_ntu_dataset(input_root, output_root):
                     )
                     if "PointCloud" in msg_type or "CustomMsg" in msg_type:
                         os.makedirs(topic_dir, exist_ok=True)
-                        save_pointcloud(msg, topic_dir, timestamp)
+                        save_pointcloud(
+                            msg,
+                            topic_dir,
+                            timestamp,
+                            topic=topic,
+                            message_type=msg_type,
+                        )
                         record_extraction_success(receipt, topic_key)
                     elif "CompressedImage" in msg_type:
                         os.makedirs(topic_dir, exist_ok=True)

@@ -1,51 +1,86 @@
+# =========================
+# 通用 / 编辑器
+# =========================
 *.log
 .vscode/
+.DS_Store
+Thumbs.db
+
+# =========================
+# 本地辅助目录
+# =========================
 .codex/
-./agents/
-./docs/
+.planning/
+.agents/
+
+# =========================
+# 服务器同步脚本
+# =========================
 pull-to-server.sh
 pull-from-server.sh
 
-# Python
-*.pyc
-__pycache__/
-*.py[cod]
-*.so
-.Python
-*.egg-info/
+# =========================
+# 说明 / 计划 / 文档
+# =========================
+AGENTS.md
+TODO/
+docs/
 
-# 训练、推理输出
-Result
+# =========================
+# Python
+# =========================
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+__pycache__/
+*.so
+*.egg-info/
+.Python
 *.pth
 
-# 数据
+# =========================
+# 数据 / 训练结果 / 生成产物
+# =========================
 Data/
+Result/
+
 *.npy
 *.npz
+*.h5
+*.mat
+*.csv
+*.jsonl
 
-# 测试（临时）
-test/*
-!test/*.py
-!test/*.md
-!test/mini-test/
-test/mini-test/*
-!test/mini-test/*.sh
-!test/mini-test/*.md
+# =========================
+# 测试目录
+# =========================
+test/
+# test/result/
+# test/**/__pycache__/
+# test/**/*.py[cod]
+# test/**/*.log
+# test/**/*.npy
+# test/**/*.npz
+# test/**/*.pth
+# test/**/*.pt
 
-# 测试源码分类目录
-!test/unit/
-!test/unit/**
-!test/evaluation/
-!test/evaluation/**
-!test/diagnostics/
-!test/diagnostics/**
-!test/ablation/
-!test/ablation/**
-!test/visualization/
-!test/visualization/**
-!test/utils/
-!test/utils/**
-
-# 分类目录内的 Python 生成缓存仍不纳入 Git
-test/**/__pycache__/
-test/**/*.py[cod]
+# # 允许保留测试源码
+# !test/
+# !test/*.py
+# !test/*.md
+# !test/mini-test/
+# !test/mini-test/*.sh
+# !test/mini-test/*.md
+# !test/unit/
+# !test/unit/**
+# !test/evaluation/
+# !test/evaluation/**
+# !test/diagnostics/
+# !test/diagnostics/**
+# !test/ablation/
+# !test/ablation/**
+# !test/visualization/
+# !test/visualization/**
+# !test/utils/
+# !test/utils/**

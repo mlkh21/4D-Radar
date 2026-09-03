@@ -68,10 +68,14 @@ from diffusion_consistency_radar.cm.multimodal_fusion import (
 from diffusion_consistency_radar.scripts.cd_train_optimized import (
     ConsistencyDistillationTrainer,
 )
+from diffusion_consistency_radar.cd_training_protocol import (
+    CD_TRAINING_SEMANTICS,
+)
 from diffusion_consistency_radar.checkpoint_chain import (
     FORMAL_CHECKPOINT_PROTOCOL,
     FORMAL_MINI_CHECKPOINT_PROTOCOL,
     assert_checkpoint_training_identity,
+    build_vae_validation_receipt,
     build_formal_mini_selection,
     build_formal_stage_training_selection,
     resolve_training_checkpoint_protocol,
@@ -84,6 +88,7 @@ from diffusion_consistency_radar.radar_normalization import (
     LEGACY_RADAR_NORMALIZATION_PROTOCOL,
     RadarNormalizationError,
     assert_checkpoint_radar_normalization,
+    assert_radar_normalization_input_contract,
     assert_same_radar_normalization,
     load_radar_normalization_artifact,
     radar_normalization_from_checkpoint,
@@ -102,7 +107,10 @@ from diffusion_consistency_radar.dataset_manifest import (
 from diffusion_consistency_radar.formal_data_protocol import (
     load_formal_data_protocol_artifact,
 )
-from diffusion_consistency_radar.observed_mask import OBSERVED_MASK_PROTOCOL
+from diffusion_consistency_radar.observed_mask import (
+    OBSERVED_MASK_PROTOCOL,
+    PERSISTED_OBSERVED_MASK_SOURCE,
+)
 from diffusion_consistency_radar.radar_statistics import (
     RADAR_STATISTICS_PROTOCOL,
     SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
@@ -114,6 +122,16 @@ from diffusion_consistency_radar.occupancy_threshold_artifact import (
     threshold_sweep_metrics,
     validate_checkpoint_threshold_sweep,
     validate_threshold_candidates,
+)
+from diffusion_consistency_radar.deployment_validation import (
+    DEPLOYMENT_VALIDATION_PROTOCOL,
+    LDM_DEPLOYMENT_VALIDATION_SELECTOR,
+    build_deployment_validation_selection,
+    deployment_metrics_are_improved,
+    karras_sigma_schedule,
+    resolve_deployment_validation_config,
+    sample_karras_ode,
+    validate_deployment_metrics,
 )
 from diffusion_consistency_radar.distributed_training import (
     DistributedContext,
@@ -341,6 +359,21 @@ def is_formal_multimodal_training(
     )
 
 
+def assert_formal_augmentation_disabled(
+    data_config: Dict[str, Any],
+    *,
+    formal_multimodal: bool,
+) -> None:
+    """正式协议在没有权威噪声模型时禁止任意训练增强。"""
+    if type(formal_multimodal) is not bool:
+        raise ValueError("formal_multimodal 必须是 bool")
+    if formal_multimodal and (data_config or {}).get("use_augmentation") is not False:
+        raise RuntimeError(
+            "formal 训练必须显式设置 data.use_augmentation=false；"
+            "当前 augmentation 缺少传感器噪声依据"
+        )
+
+
 def assert_formal_dataset_preflight(
     dataset,
     *,
@@ -412,14 +445,14 @@ def assert_formal_dataset_preflight(
         raise RuntimeError("formal dataset preflight 检测到 mock calibration")
     if metadata.get("extrinsic_source_frame") != "lidar":
         raise RuntimeError("formal dataset IR 外参 source frame 必须为 lidar")
-    if metadata.get("occupancy_observed_mask_source") != "persisted_lidar_ray_v1":
+    if metadata.get("occupancy_observed_mask_source") != PERSISTED_OBSERVED_MASK_SOURCE:
         raise RuntimeError("formal dataset 必须使用持久化 observed mask")
     if data_protocol.get("observed_mask_protocol") != OBSERVED_MASK_PROTOCOL:
         raise RuntimeError("formal data protocol 的 observed mask protocol 不匹配")
     radar_statistics = metadata.get("radar_statistics")
     expected_radar_statistics_protocols = (
         {RADAR_STATISTICS_PROTOCOL}
-        if data_protocol.get("protocol") == "formal_data_v3"
+        if data_protocol.get("protocol") in {"formal_data_v3", "formal_data_v4"}
         else SUPPORTED_RADAR_STATISTICS_PROTOCOLS
     )
     if (
@@ -1081,11 +1114,10 @@ LDM_META_COMPONENT_NAMES = (
     "mock_calib_ratio",
     "ir_frustum_voxel_ratio",
 )
-LDM_VALIDATION_PROTOCOL = "ldm_denoising_validation_v1"
-LDM_VALIDATION_SELECTOR = (
-    "max_val_denoising_occupancy_iou_then_min_val_denoising_latent_loss_v1"
-)
+LDM_VALIDATION_PROTOCOL = DEPLOYMENT_VALIDATION_PROTOCOL
+LDM_VALIDATION_SELECTOR = LDM_DEPLOYMENT_VALIDATION_SELECTOR
 LDM_VALIDATION_SPLIT = "temporal_block_validation_suffix"
+LDM_DENOISING_DIAGNOSTIC_PROTOCOL = "ldm_target_latent_denoising_diagnostic_v1"
 LDM_METRICS_HEADER = (
     "epoch",
     "step",
@@ -1094,15 +1126,24 @@ LDM_METRICS_HEADER = (
     *LDM_META_COMPONENT_NAMES,
     "effective_column_positive_weight",
     "effective_column_negative_weight",
-    "val_denoising_latent_loss",
-    "val_denoising_occupancy_iou",
+    "val_deployment_latent_loss",
+    "val_deployment_occupancy_iou",
+    "diagnostic_denoising_latent_loss",
+    "diagnostic_denoising_occupancy_iou",
     "lr",
     "time_seconds",
 )
 
 
 def resolve_ldm_validation_config(ldm_config: Dict[str, Any]) -> Dict[str, Any]:
-    """解析固定训练期 denoising 验证协议，拒绝隐式随机配置。"""
+    """解析决定 checkpoint/threshold 的完整部署采样验证协议。"""
+    return resolve_deployment_validation_config(ldm_config, stage="ldm")
+
+
+def resolve_ldm_denoising_diagnostic_config(
+    ldm_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """解析保留但不得参与选优的 target-latent 局部去噪诊断。"""
     seed = ldm_config.get("validation_seed", 42)
     if type(seed) is not int or seed < 0:
         raise ValueError("ldm.validation_seed 必须是非负整数")
@@ -1134,9 +1175,9 @@ def resolve_ldm_validation_config(ldm_config: Dict[str, Any]) -> Dict[str, Any]:
     if not 0.0 < resolved["occupancy_threshold"] < 1.0:
         raise ValueError("ldm.validation_occupancy_threshold 必须严格位于 (0,1)")
     return {
-        "protocol": LDM_VALIDATION_PROTOCOL,
+        "protocol": LDM_DENOISING_DIAGNOSTIC_PROTOCOL,
         "split": LDM_VALIDATION_SPLIT,
-        "noise_identity": "scene_frame_sha256_v1",
+        "noise_identity": "sha256_sample_id_seed_v1",
         "seed": seed,
         "threshold_candidates": list(
             validate_threshold_candidates(
@@ -1153,50 +1194,16 @@ def resolve_ldm_validation_config(ldm_config: Dict[str, Any]) -> Dict[str, Any]:
 def _validated_ldm_validation_metrics(
     metrics: Dict[str, Any],
 ) -> Dict[str, float]:
-    """严格验证训练期 LDM validation 指标。"""
-    required = {
-        "denoising_latent_loss",
-        "denoising_occupancy_iou",
-    }
-    if not isinstance(metrics, dict) or set(metrics) != required:
-        raise ValueError(
-            "LDM validation metrics 必须精确包含 "
-            "denoising_latent_loss/denoising_occupancy_iou"
-        )
-    validated = {}
-    for name in sorted(required):
-        raw = metrics[name]
-        if isinstance(raw, bool):
-            raise ValueError(f"LDM validation {name} 必须是有限数")
-        try:
-            value = float(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"LDM validation {name} 必须是有限数") from exc
-        if not math.isfinite(value):
-            raise ValueError(f"LDM validation {name} 必须是有限数")
-        validated[name] = value
-    if validated["denoising_latent_loss"] < 0.0:
-        raise ValueError("LDM validation denoising_latent_loss 必须非负")
-    if not 0.0 <= validated["denoising_occupancy_iou"] <= 1.0:
-        raise ValueError("LDM validation denoising_occupancy_iou 必须位于 [0,1]")
-    return validated
+    """严格验证决定 LDM checkpoint 的完整采样指标。"""
+    return validate_deployment_metrics(metrics, source="LDM")
 
 
 def ldm_validation_is_improved(
     current: Dict[str, Any],
     best: Dict[str, Any],
 ) -> bool:
-    """按 occupancy IoU 优先、latent loss 次优先比较验证状态。"""
-    current_metrics = _validated_ldm_validation_metrics(current)
-    best_metrics = _validated_ldm_validation_metrics(best)
-    current_iou = current_metrics["denoising_occupancy_iou"]
-    best_iou = best_metrics["denoising_occupancy_iou"]
-    if current_iou != best_iou:
-        return current_iou > best_iou
-    return (
-        current_metrics["denoising_latent_loss"]
-        < best_metrics["denoising_latent_loss"]
-    )
+    """按完整采样 occupancy IoU/loss 比较验证状态。"""
+    return deployment_metrics_are_improved(current, best)
 
 
 def archive_legacy_metrics_csv(csv_file: str):
@@ -1615,6 +1622,9 @@ class OptimizedVAETrainer:
         self.checkpoint_protocol = resolve_training_checkpoint_protocol(
             config.get("data.checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
         )
+        self.require_persisted_observed_mask = bool(
+            config.get("data.require_persisted_observed_mask", False)
+        )
         self.data_protocol = resolve_training_data_protocol(
             config.get("data", {}) or {},
             "vae",
@@ -1857,6 +1867,14 @@ class OptimizedVAETrainer:
             with autocast('cuda', enabled=self.memory_opt.use_amp):
                 recon, (mean, logvar) = self.model(target)
                 observed_mask = meta_dict.get("occupancy_observed_mask")
+                has_observed_mask = observed_mask is not None
+                if (
+                    self.require_persisted_observed_mask
+                    and not all_ranks_true(has_observed_mask, distributed)
+                ):
+                    raise RuntimeError(
+                        "正式 VAE 训练 batch 缺少 persisted observed mask"
+                    )
                 if torch.is_tensor(observed_mask):
                     observed_mask = observed_mask.to(
                         self.device,
@@ -1991,7 +2009,7 @@ class OptimizedVAETrainer:
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """使用确定性编码在完整验证集上计算 threshold=0.5 微平均指标。"""
+        """使用确定性编码在 authoritative observed domain 计算微平均指标。"""
         distributed = _trainer_distributed_context(self)
         self.model.eval()
         counts = {
@@ -2003,8 +2021,31 @@ class OptimizedVAETrainer:
         batch_count = 0
         model = unwrap_model(self.model)
         for batch in val_loader:
-            target, _condition, _meta = unpack_training_batch(batch)
+            target, _condition, meta_dict = unpack_training_batch(batch)
             target = target.to(self.device, non_blocking=True)
+            observed_mask = meta_dict.get("occupancy_observed_mask")
+            has_observed_mask = observed_mask is not None
+            if (
+                getattr(self, "require_persisted_observed_mask", False)
+                and not all_ranks_true(has_observed_mask, distributed)
+            ):
+                raise RuntimeError(
+                    "正式 VAE validation batch 缺少 persisted observed mask"
+                )
+            resolved_observed_mask = resolve_ldm_observed_mask(
+                observed_mask,
+                target,
+            )
+            if (
+                getattr(self, "require_persisted_observed_mask", False)
+                and not all_ranks_true(
+                    bool(resolved_observed_mask.any().item()),
+                    distributed,
+                )
+            ):
+                raise RuntimeError(
+                    "正式 VAE validation batch 的 persisted observed domain 为空"
+                )
             latent, _posterior = model.encode(target, deterministic=True)
             reconstruction = model.decode(latent)
             probability = (
@@ -2013,7 +2054,10 @@ class OptimizedVAETrainer:
                 else reconstruction[:, 0:1]
             )
             batch_counts = micro_occupancy_metrics(
-                probability, target[:, 0:1], threshold=0.5
+                probability,
+                target[:, 0:1],
+                threshold=0.5,
+                observed_mask=resolved_observed_mask,
             )
             for key, value in batch_counts.items():
                 counts[key] += value
@@ -2059,6 +2103,7 @@ class OptimizedVAETrainer:
             ),
             "stage": "vae",
             "data_protocol": dict(self.data_protocol),
+            "vae_validation": build_vae_validation_receipt(),
         }
         if getattr(self, "stage_training_selection", None) is not None:
             payload["stage_training_selection"] = dict(
@@ -2228,7 +2273,13 @@ class OptimizedLDMTrainer:
         ldm_config: Dict[str, Any] = config.get('ldm', {}) or {}
         self.ldm_config = ldm_config
         self.validation_config = resolve_ldm_validation_config(ldm_config)
+        self.denoising_diagnostic_config = (
+            resolve_ldm_denoising_diagnostic_config(ldm_config)
+        )
         self.validation_selector = LDM_VALIDATION_SELECTOR
+        self.deployment_validation_selection = config.get(
+            "data.deployment_validation_selection"
+        )
         self.observation_supervision_protocol = (
             LDM_OBSERVATION_SUPERVISION_PROTOCOL
         )
@@ -2389,6 +2440,7 @@ class OptimizedLDMTrainer:
             sigma_data=ldm_config.get('sigma_data', 0.5),
             sigma_max=ldm_config.get('sigma_max', 80.0),
             sigma_min=ldm_config.get('sigma_min', 0.002),
+            rho=ldm_config.get('rho', 7.0),
             loss_norm='l2',
             device=self.device,
         )
@@ -2465,6 +2517,7 @@ class OptimizedLDMTrainer:
         self.best_val_loss = float('inf')
         self.last_validation_metrics = None
         self.last_validation_threshold_sweep = None
+        self.last_denoising_diagnostic_metrics = None
         self.is_resumed = False
         self.last_effective_column_weights = (
             self.decoded_column_positive_weight,
@@ -2710,17 +2763,23 @@ class OptimizedLDMTrainer:
             print(resume_message)
 
     def _restore_ldm_validation_state(self, checkpoint: Dict[str, Any]):
-        """恢复并严格校验新协议验证状态；旧 checkpoint 由首轮验证升级。"""
+        """恢复完整部署采样状态；formal 旧局部去噪 checkpoint fail-closed。"""
         saved = checkpoint.get("ldm_validation")
         if saved is None:
+            if self.radar_normalization is not None:
+                raise ValueError("formal checkpoint 缺少完整采样 ldm_validation")
             return
         if not isinstance(saved, dict):
             raise ValueError("checkpoint ldm_validation 必须是字典")
 
         expected_text = {
             "protocol": self.validation_config["protocol"],
+            "stage": self.validation_config["stage"],
             "split": self.validation_config["split"],
+            "selection_strategy": self.validation_config["selection_strategy"],
             "selector": self.validation_selector,
+            "initial_latent": self.validation_config["initial_latent"],
+            "sampler": self.validation_config["sampler"],
         }
         noise_identity = self.validation_config.get("noise_identity")
         if noise_identity is not None:
@@ -2732,14 +2791,16 @@ class OptimizedLDMTrainer:
                     f"checkpoint={saved.get(field)!r}, current={expected!r}"
                 )
 
-        saved_seed = saved.get("seed")
-        if type(saved_seed) is not int or saved_seed != self.validation_config["seed"]:
-            raise ValueError(
-                "checkpoint LDM validation seed 与当前配置不一致："
-                f"checkpoint={saved_seed!r}, "
-                f"current={self.validation_config['seed']!r}"
-            )
-        for field in ("sigma", "occupancy_threshold"):
+        for field in ("seed", "steps", "frames_per_scene"):
+            saved_value = saved.get(field)
+            if (
+                type(saved_value) is not int
+                or saved_value != self.validation_config[field]
+            ):
+                raise ValueError(
+                    f"checkpoint LDM validation {field} 与当前配置不一致"
+                )
+        for field in ("sigma_min", "sigma_max", "rho", "occupancy_threshold"):
             raw = saved.get(field)
             if isinstance(raw, bool):
                 raise ValueError(f"checkpoint LDM validation {field} 必须是有限数")
@@ -2765,6 +2826,16 @@ class OptimizedLDMTrainer:
             raise ValueError(
                 "checkpoint LDM validation threshold_candidates 与当前配置不一致"
             )
+        if saved.get("threshold_selection_constraints") != self.validation_config[
+            "threshold_selection_constraints"
+        ]:
+            raise ValueError(
+                "checkpoint LDM validation threshold selection constraints 与当前配置不一致"
+            )
+        if saved.get("selection") != self.deployment_validation_selection:
+            raise ValueError(
+                "checkpoint LDM deployment validation selection 与当前配置不一致"
+            )
 
         current_metrics = _validated_ldm_validation_metrics(saved.get("current"))
         best_metrics = _validated_ldm_validation_metrics(saved.get("best"))
@@ -2773,8 +2844,13 @@ class OptimizedLDMTrainer:
                 "checkpoint LDM validation best 状态劣于 current，无法安全恢复"
             )
         self.last_validation_metrics = current_metrics
-        self.best_val_iou = best_metrics["denoising_occupancy_iou"]
-        self.best_val_loss = best_metrics["denoising_latent_loss"]
+        self.best_val_iou = best_metrics["deployment_occupancy_iou"]
+        self.best_val_loss = best_metrics["deployment_latent_loss"]
+        diagnostic = saved.get("denoising_diagnostic")
+        if diagnostic is not None:
+            self.last_denoising_diagnostic_metrics = dict(
+                diagnostic.get("current") or {}
+            )
         threshold_validation = checkpoint.get("occupancy_threshold_validation")
         if self.radar_normalization is not None or threshold_validation is not None:
             threshold_validation = validate_checkpoint_threshold_sweep(
@@ -2800,6 +2876,9 @@ class OptimizedLDMTrainer:
         components = getattr(self, "last_epoch_loss_components", {})
         meta_components = getattr(self, "last_epoch_meta_components", {})
         validation = _validated_ldm_validation_metrics(validation_metrics)
+        diagnostic = getattr(self, "last_denoising_diagnostic_metrics", None)
+        if not isinstance(diagnostic, dict):
+            raise RuntimeError("LDM metrics 写入前缺少 denoising diagnostic")
         with open(self.csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -2816,8 +2895,10 @@ class OptimizedLDMTrainer:
                 ],
                 f'{self.last_effective_column_weights[0]:.6f}',
                 f'{self.last_effective_column_weights[1]:.6f}',
-                f'{validation["denoising_latent_loss"]:.6f}',
-                f'{validation["denoising_occupancy_iou"]:.6f}',
+                f'{validation["deployment_latent_loss"]:.6f}',
+                f'{validation["deployment_occupancy_iou"]:.6f}',
+                f'{float(diagnostic["denoising_latent_loss"]):.6f}',
+                f'{float(diagnostic["denoising_occupancy_iou"]):.6f}',
                 f'{self.optimizer.param_groups[0]["lr"]:.8f}',
                 f'{epoch_time:.2f}'
             ])
@@ -3057,8 +3138,11 @@ class OptimizedLDMTrainer:
         return totals["loss"] / global_batch_count
 
     @torch.no_grad()
-    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """在独立时间块上用固定噪声计算单步去噪代理指标。"""
+    def validate_denoising_diagnostic(
+        self,
+        val_loader: DataLoader,
+    ) -> Dict[str, float]:
+        """保留 target-latent 小噪声诊断；该结果不得参与 checkpoint 选优。"""
         distributed = _trainer_distributed_context(self)
         if len(val_loader) == 0 and not distributed.initialized:
             raise RuntimeError("LDM 验证 DataLoader 为空")
@@ -3072,11 +3156,6 @@ class OptimizedLDMTrainer:
             "union": 0,
             "target_positive": 0,
             "predicted_positive": 0,
-        }
-        threshold_counts = {
-            f"threshold_{index:03d}_{name}": 0
-            for index in range(len(self.validation_config["threshold_candidates"]))
-            for name in ("tp", "fp", "fn")
         }
         validation_model = unwrap_model(self.model)
         try:
@@ -3111,7 +3190,7 @@ class OptimizedLDMTrainer:
 
                 sigmas = torch.full(
                     (z_target.shape[0],),
-                    self.validation_config["sigma"],
+                    self.denoising_diagnostic_config["sigma"],
                     device=z_target.device,
                     dtype=z_target.dtype,
                 )
@@ -3119,7 +3198,9 @@ class OptimizedLDMTrainer:
                 if sample_ids is None:
                     # legacy/单元测试继续保留固定 batch seed。
                     generator = torch.Generator(device=z_target.device)
-                    generator.manual_seed(self.validation_config["seed"])
+                    generator.manual_seed(
+                        self.denoising_diagnostic_config["seed"]
+                    )
                     noise = torch.randn(
                         z_target.shape,
                         generator=generator,
@@ -3134,7 +3215,7 @@ class OptimizedLDMTrainer:
                     noise = deterministic_noise_from_sample_ids(
                         z_target,
                         sample_ids,
-                        seed=self.validation_config["seed"],
+                        seed=self.denoising_diagnostic_config["seed"],
                     )
                 noised_z = z_target + noise * sigmas.view(-1, 1, 1, 1, 1)
 
@@ -3192,13 +3273,208 @@ class OptimizedLDMTrainer:
                 batch_counts = micro_occupancy_metrics(
                     decoded_occupancy,
                     target[:, 0:1],
+                    threshold=self.denoising_diagnostic_config[
+                        "occupancy_threshold"
+                    ],
+                    observed_mask=voxel_observed,
+                )
+                for name, value in batch_counts.items():
+                    occupancy_counts[name] += value
+        finally:
+            self.model.train(was_training)
+
+        reduced = reduce_named_sums(
+            {
+                "latent_squared_error": latent_squared_error,
+                "latent_element_count": latent_element_count,
+                **occupancy_counts,
+            },
+            distributed,
+        )
+        if reduced["latent_element_count"] == 0:
+            raise RuntimeError("LDM 验证集没有可计算的 latent 元素")
+        result = {
+            "denoising_latent_loss": (
+                reduced["latent_squared_error"]
+                / reduced["latent_element_count"]
+            ),
+            "denoising_occupancy_iou": (
+                reduced["intersection"]
+                / max(reduced["union"], 1)
+            ),
+        }
+        self.last_denoising_diagnostic_metrics = result
+        return result
+
+    @torch.no_grad()
+    def validate_deployment_sampling(
+        self,
+        val_loader: DataLoader,
+    ) -> Dict[str, float]:
+        """从 sigma_max 纯噪声执行与部署一致的完整 LDM 条件采样。"""
+        distributed = _trainer_distributed_context(self)
+        if len(val_loader) == 0 and not distributed.initialized:
+            raise RuntimeError("LDM deployment validation DataLoader 为空")
+        if (
+            self.radar_normalization is not None
+            and not isinstance(
+                getattr(self, "deployment_validation_selection", None),
+                dict,
+            )
+        ):
+            raise RuntimeError(
+                "formal LDM 缺少固定 deployment validation selection"
+            )
+
+        was_training = self.model.training
+        self.model.eval()
+        latent_squared_error = 0.0
+        latent_element_count = 0
+        occupancy_counts = {
+            "intersection": 0,
+            "union": 0,
+            "target_positive": 0,
+            "predicted_positive": 0,
+        }
+        threshold_counts = {
+            f"threshold_{index:03d}_{name}": 0
+            for index in range(
+                len(self.validation_config["threshold_candidates"])
+            )
+            for name in ("tp", "fp", "fn")
+        }
+        validation_model = unwrap_model(self.model)
+        try:
+            for batch in val_loader:
+                target, cond, meta_dict = unpack_training_batch(batch)
+                target = target.to(self.device, non_blocking=True)
+                cond = cond.to(self.device, non_blocking=True)
+                meta_dict = move_meta_to_device(meta_dict, self.device)
+                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                if (
+                    raw_observed_mask is None
+                    and self.require_persisted_observed_mask
+                ):
+                    raise RuntimeError(
+                        "formal LDM deployment validation 缺少 persisted "
+                        "occupancy_observed_mask"
+                    )
+                voxel_observed = resolve_ldm_observed_mask(
+                    raw_observed_mask,
+                    target,
+                )
+                z_target, z_cond = encode_ldm_training_latents(
+                    self.vae,
+                    target,
+                    cond,
+                    meta_dict,
+                )
+                sample_ids = meta_dict.get("sample_id")
+                if sample_ids is None:
+                    if self.radar_normalization is not None:
+                        raise RuntimeError(
+                            "formal LDM deployment validation 缺少 sample_id"
+                        )
+                    generator = torch.Generator(device=z_target.device)
+                    generator.manual_seed(self.validation_config["seed"])
+                    noise = torch.randn(
+                        z_target.shape,
+                        generator=generator,
+                        device=z_target.device,
+                        dtype=z_target.dtype,
+                    )
+                else:
+                    noise = deterministic_noise_from_sample_ids(
+                        z_target,
+                        sample_ids,
+                        seed=self.validation_config["seed"],
+                    )
+                initial_latent = noise * self.validation_config["sigma_max"]
+                sigmas = karras_sigma_schedule(
+                    steps=self.validation_config["steps"],
+                    sigma_min=self.validation_config["sigma_min"],
+                    sigma_max=self.validation_config["sigma_max"],
+                    rho=self.validation_config["rho"],
+                    device=z_target.device,
+                    dtype=z_target.dtype,
+                )
+
+                def denoise(latent, sigma_batch):
+                    if has_multimodal_meta(meta_dict):
+                        model_out = validation_model(
+                            cond,
+                            meta_dict["ir_img"],
+                            meta_dict["r_mat"],
+                            meta_dict["t_vec"],
+                            meta_dict["k_mat"],
+                            sigma_batch,
+                            noised_latent=latent,
+                            odom_cov_trace=meta_dict.get("odom_cov_trace"),
+                            is_mock_ir=meta_dict.get("is_mock_ir"),
+                            is_mock_calib=meta_dict.get("is_mock_calib"),
+                            return_uncertainty=False,
+                        )
+                        return (
+                            model_out[0]
+                            if isinstance(model_out, tuple)
+                            else model_out
+                        )
+                    if z_cond is None:
+                        raise RuntimeError(
+                            "legacy LDM deployment validation 缺少 condition latent"
+                        )
+                    model_input = pad_ldm_input_to_sixteen_channels(
+                        torch.cat([latent, z_cond], dim=1)
+                    )
+                    return validation_model.unet_3d(
+                        model_input,
+                        sigma_batch,
+                    )
+
+                with autocast('cuda', enabled=self.memory_opt.use_amp):
+                    generated_latent = sample_karras_ode(
+                        initial_latent,
+                        sigmas,
+                        denoise,
+                        sampler=self.validation_config["sampler"],
+                    )
+                    decoded = self.vae.decode(generated_latent)
+
+                latent_observed = build_ldm_latent_observed_mask(
+                    voxel_observed,
+                    z_target,
+                )
+                latent_error = torch.square(
+                    generated_latent.float() - z_target.float()
+                )
+                if latent_observed is None:
+                    latent_squared_error += float(latent_error.sum().item())
+                    latent_element_count += latent_error.numel()
+                else:
+                    expanded = latent_observed.expand_as(latent_error)
+                    latent_squared_error += float(
+                        latent_error[expanded].sum().item()
+                    )
+                    latent_element_count += int(expanded.sum().item())
+
+                probability = decoded[:, 0:1]
+                if self.occupancy_activation == "sigmoid":
+                    probability = torch.sigmoid(probability)
+                elif self.occupancy_activation != "raw":
+                    raise ValueError(
+                        "LDM deployment validation 不支持 occupancy activation: "
+                        f"{self.occupancy_activation!r}"
+                    )
+                batch_counts = micro_occupancy_metrics(
+                    probability,
+                    target[:, 0:1],
                     threshold=self.validation_config["occupancy_threshold"],
                     observed_mask=voxel_observed,
                 )
                 for name, value in batch_counts.items():
                     occupancy_counts[name] += value
                 batch_threshold_counts = threshold_sweep_batch_counts(
-                    decoded_occupancy,
+                    probability,
                     target[:, 0:1],
                     voxel_observed,
                     self.validation_config["threshold_candidates"],
@@ -3218,19 +3494,20 @@ class OptimizedLDMTrainer:
             distributed,
         )
         if reduced["latent_element_count"] == 0:
-            raise RuntimeError("LDM 验证集没有可计算的 latent 元素")
+            raise RuntimeError(
+                "LDM deployment validation 没有可计算的 latent 元素"
+            )
         self.last_validation_threshold_sweep = threshold_sweep_metrics(
             reduced,
             self.validation_config["threshold_candidates"],
         )
         return _validated_ldm_validation_metrics({
-            "denoising_latent_loss": (
+            "deployment_latent_loss": (
                 reduced["latent_squared_error"]
                 / reduced["latent_element_count"]
             ),
-            "denoising_occupancy_iou": (
-                reduced["intersection"]
-                / max(reduced["union"], 1)
+            "deployment_occupancy_iou": (
+                reduced["intersection"] / max(reduced["union"], 1)
             ),
         })
 
@@ -3243,14 +3520,14 @@ class OptimizedLDMTrainer:
             improved = ldm_validation_is_improved(
                 current,
                 {
-                    "denoising_latent_loss": self.best_val_loss,
-                    "denoising_occupancy_iou": self.best_val_iou,
+                    "deployment_latent_loss": self.best_val_loss,
+                    "deployment_occupancy_iou": self.best_val_iou,
                 },
             )
         self.last_validation_metrics = current
         if improved:
-            self.best_val_loss = current["denoising_latent_loss"]
-            self.best_val_iou = current["denoising_occupancy_iou"]
+            self.best_val_loss = current["deployment_latent_loss"]
+            self.best_val_iou = current["deployment_occupancy_iou"]
         return improved
 
     def _checkpoint_payload(self, epoch: int, loss: float, best_loss: float) -> Dict[str, Any]:
@@ -3262,6 +3539,13 @@ class OptimizedLDMTrainer:
             and not getattr(self, "last_validation_threshold_sweep", None)
         ):
             raise RuntimeError("正式 LDM checkpoint 保存前必须完成 threshold sweep")
+        if (
+            self.radar_normalization is not None
+            and not isinstance(self.deployment_validation_selection, dict)
+        ):
+            raise RuntimeError(
+                "正式 LDM checkpoint 缺少 deployment validation selection"
+            )
         payload = {
             "epoch": epoch,
             "step": self.global_step,
@@ -3303,12 +3587,20 @@ class OptimizedLDMTrainer:
             payload["ldm_validation"] = {
                 **dict(self.validation_config),
                 "selector": self.validation_selector,
+                "selection": dict(self.deployment_validation_selection or {}),
                 "current": _validated_ldm_validation_metrics(
                     self.last_validation_metrics
                 ),
                 "best": {
-                    "denoising_latent_loss": float(self.best_val_loss),
-                    "denoising_occupancy_iou": float(self.best_val_iou),
+                    "deployment_latent_loss": float(self.best_val_loss),
+                    "deployment_occupancy_iou": float(self.best_val_iou),
+                },
+                "denoising_diagnostic": {
+                    **dict(self.denoising_diagnostic_config),
+                    "role": "diagnostic_only_not_checkpoint_selector",
+                    "current": dict(
+                        self.last_denoising_diagnostic_metrics or {}
+                    ),
                 },
             }
             if self.radar_normalization is not None:
@@ -3316,9 +3608,20 @@ class OptimizedLDMTrainer:
                     "protocol": THRESHOLD_SWEEP_PROTOCOL,
                     "split": self.validation_config["split"],
                     "observation_domain": "persisted_observed_mask_v1",
+                    "sampling_protocol": LDM_VALIDATION_PROTOCOL,
+                    "deployment_validation_selection_sha256": (
+                        self.deployment_validation_selection[
+                            "selection_sha256"
+                        ]
+                    ),
                     "deployment_weight_source": "model_state_dict",
                     "candidate_thresholds": list(
                         self.validation_config["threshold_candidates"]
+                    ),
+                    "selection_constraints": dict(
+                        self.validation_config[
+                            "threshold_selection_constraints"
+                        ]
                     ),
                     "metrics_by_threshold": [
                         dict(record)
@@ -3334,10 +3637,24 @@ class OptimizedLDMTrainer:
             payload["radar_normalization_sha256"] = self.radar_normalization_sha256
         if hasattr(self, "distributed_training"):
             payload["distributed_training"] = dict(self.distributed_training)
+        if self.radar_normalization is not None:
+            validate_checkpoint_threshold_sweep(
+                payload,
+                expected_stage="ldm",
+                expected_weight_source="model_state_dict",
+                expected_candidates=self.validation_config[
+                    "threshold_candidates"
+                ],
+            )
         return payload
     
-    def train(self, train_loader: DataLoader, val_loader: DataLoader):
-        """使用独立训练/验证 DataLoader 完成 LDM 训练。"""
+    def train(
+        self,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        deployment_val_loader: Optional[DataLoader] = None,
+    ):
+        """局部去噪仅诊断；完整 deployment loader 决定 LDM 选优。"""
         distributed = _trainer_distributed_context(self)
         batch_plan, self.distributed_training = _trainer_runtime_metadata(
             self,
@@ -3354,6 +3671,15 @@ class OptimizedLDMTrainer:
         val_dataset = getattr(val_loader, "dataset", None)
         if train_dataset is not None and train_dataset is val_dataset:
             raise ValueError("LDM 训练与验证不能复用同一个 Dataset")
+        if (
+            getattr(self, "radar_normalization", None) is not None
+            and deployment_val_loader is None
+        ):
+            raise RuntimeError(
+                "formal LDM 训练必须提供固定 deployment validation DataLoader"
+            )
+        if deployment_val_loader is None:
+            deployment_val_loader = val_loader
 
         epochs = self.ldm_config.get('epochs', 200)
         save_every = self.ldm_config.get('save_every', 5000)
@@ -3366,6 +3692,10 @@ class OptimizedLDMTrainer:
         msg += f"  Total epochs: {epochs}\n"
         msg += f"  Batches per epoch: {len(train_loader)}\n"
         msg += f"  Validation batches per epoch: {len(val_loader)}\n"
+        msg += (
+            "  Deployment validation batches per epoch: "
+            f"{len(deployment_val_loader)}\n"
+        )
         msg += f"  Validation protocol: {self.validation_config['protocol']}\n"
         msg += f"  Best selector: {self.validation_selector}\n"
         msg += f"  Estimated total steps: {estimated_total_steps:,}\n"
@@ -3389,7 +3719,10 @@ class OptimizedLDMTrainer:
             epoch_start = time.time()
             loss = self.train_epoch(epoch, train_loader)
             self.global_step += len(train_loader)
-            validation_metrics = self.validate(val_loader)
+            self.validate_denoising_diagnostic(val_loader)
+            validation_metrics = self.validate_deployment_sampling(
+                deployment_val_loader
+            )
             validation_improved = self._update_best_validation(validation_metrics)
             self.best_loss = min(self.best_loss, loss)
             epoch_time = time.time() - epoch_start
@@ -3406,10 +3739,10 @@ class OptimizedLDMTrainer:
             
             summary = (
                 f"\n[Epoch {epoch}/{epochs}] Train loss: {loss:.4f} | "
-                f"Val latent loss: "
-                f"{validation_metrics['denoising_latent_loss']:.4f} | "
-                f"Val occupancy IoU: "
-                f"{validation_metrics['denoising_occupancy_iou']:.4f} | "
+                f"Deployment latent loss: "
+                f"{validation_metrics['deployment_latent_loss']:.4f} | "
+                f"Deployment occupancy IoU: "
+                f"{validation_metrics['deployment_occupancy_iou']:.4f} | "
                 f"Step: {self.global_step} | Time: {epoch_time:.1f}s"
             )
             if distributed.is_main_process:
@@ -3447,8 +3780,8 @@ class OptimizedLDMTrainer:
         final_msg = "\n" + "=" * 70 + "\n"
         final_msg += f"Training completed in {total_time/3600:.2f} hours\n"
         final_msg += f"Best train loss: {self.best_loss:.4f}\n"
-        final_msg += f"Best validation occupancy IoU: {self.best_val_iou:.4f}\n"
-        final_msg += f"Best validation latent loss: {self.best_val_loss:.4f}\n"
+        final_msg += f"Best deployment occupancy IoU: {self.best_val_iou:.4f}\n"
+        final_msg += f"Best deployment latent loss: {self.best_val_loss:.4f}\n"
         final_msg += "=" * 70
         if distributed.is_main_process:
             print(final_msg)
@@ -3513,6 +3846,10 @@ def main():
         checkpoint_protocol,
         allow_legacy_radar_units=args.allow_legacy_radar_units,
     )
+    assert_formal_augmentation_disabled(
+        data_config,
+        formal_multimodal=formal_multimodal,
+    )
     scene_names = data_config.get("scene_names")
     if formal_multimodal:
         if not isinstance(scene_names, list) or not scene_names:
@@ -3538,6 +3875,8 @@ def main():
 
     train_frame_ids_by_scene = None
     val_frame_ids_by_scene = None
+    deployment_validation_frame_ids_by_scene = None
+    deployment_validation_selection = None
     stage_training_selection = None
     split_artifact_sha256 = None
     if formal_multimodal:
@@ -3615,6 +3954,30 @@ def main():
                     "strategy=ordered_prefix_per_scene"
                 )
 
+        if args.mode in {"ldm", "cd"}:
+            deployment_validation_config = resolve_deployment_validation_config(
+                config.get(args.mode, {}) or {},
+                stage=args.mode,
+            )
+            (
+                deployment_validation_frame_ids_by_scene,
+                deployment_validation_selection,
+            ) = build_deployment_validation_selection(
+                val_frame_ids_by_scene,
+                frames_per_scene=deployment_validation_config[
+                    "frames_per_scene"
+                ],
+            )
+            data_config["deployment_validation_selection"] = (
+                deployment_validation_selection
+            )
+            if distributed.is_main_process:
+                print(
+                    f"Formal {args.mode} deployment validation selection: "
+                    f"frames={deployment_validation_selection['selected_frames']}, "
+                    "strategy=ordered_prefix_per_scene"
+                )
+
     # 创建数据加载器
     target_size, source_pc_range, model_pc_range = resolve_data_grid_config(data_config)
     align_ldm_grid_config(config, target_size, model_pc_range)
@@ -3628,6 +3991,11 @@ def main():
             expected_split_artifact_sha256=split_artifact_sha256,
         )
     )
+    if radar_normalization is not None:
+        assert_radar_normalization_input_contract(
+            radar_normalization,
+            data_protocol,
+        )
     train_dataset_base = NTU4DRadLM_VoxelDataset(
         root_dir=data_config.get('dataset_dir'),
         split='train',
@@ -3683,6 +4051,36 @@ def main():
             "voxel_coordinate_frame", "lidar"
         ),
     )
+    deployment_val_dataset = None
+    if formal_multimodal and args.mode in {"ldm", "cd"}:
+        deployment_val_dataset = NTU4DRadLM_VoxelDataset(
+            root_dir=data_config.get('dataset_dir'),
+            split='train',
+            return_path=True,
+            use_augmentation=False,
+            target_size=target_size,
+            source_pc_range=source_pc_range,
+            model_pc_range=model_pc_range,
+            radar_normalization=radar_normalization,
+            radar_normalization_sha256=radar_normalization_sha256,
+            allow_legacy_radar_units=args.allow_legacy_radar_units,
+            scene_names=scene_names,
+            calibration_dir=data_config.get("calibration_dir"),
+            require_real_ir=bool(data_config.get("require_real_ir", False)),
+            require_real_calibration=bool(
+                data_config.get("require_real_calibration", False)
+            ),
+            require_persisted_observed_mask=bool(
+                data_config.get("require_persisted_observed_mask", False)
+            ),
+            require_radar_statistics=bool(
+                data_config.get("require_radar_statistics", False)
+            ),
+            frame_ids_by_scene=deployment_validation_frame_ids_by_scene,
+            voxel_coordinate_frame=data_config.get(
+                "voxel_coordinate_frame", "lidar"
+            ),
+        )
     if formal_multimodal:
         assert_formal_dataset_preflight(
             train_dataset_base,
@@ -3704,6 +4102,7 @@ def main():
         val_dataset = Subset(val_dataset_base, val_indices)
     train_sampler = None
     val_sampler = None
+    deployment_val_sampler = None
     if distributed.initialized:
         train_sampler = DistributedSampler(
             train_dataset,
@@ -3718,6 +4117,12 @@ def main():
             num_replicas=distributed.world_size,
             rank=distributed.rank,
         )
+        if deployment_val_dataset is not None:
+            deployment_val_sampler = DistributedEvalSampler(
+                deployment_val_dataset,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+            )
     train_loader = DataLoader(
         train_dataset,
         batch_size=data_config.get('batch_size', 2),
@@ -3737,6 +4142,17 @@ def main():
         pin_memory=False,
         collate_fn=collate_voxel_samples,
     )
+    deployment_val_loader = None
+    if deployment_val_dataset is not None:
+        deployment_val_loader = DataLoader(
+            deployment_val_dataset,
+            batch_size=data_config.get('batch_size', 2),
+            shuffle=False,
+            sampler=deployment_val_sampler,
+            num_workers=data_config.get('num_workers', 4),
+            pin_memory=False,
+            collate_fn=collate_voxel_samples,
+        )
     
     # VAE 训练
     if args.mode == "vae":
@@ -3803,7 +4219,7 @@ def main():
             allow_legacy_radar_units=args.allow_legacy_radar_units,
             distributed=distributed,
         )
-        trainer.train(train_loader, val_loader)
+        trainer.train(train_loader, val_loader, deployment_val_loader)
 
     # CD 训练
     elif args.mode == "cd":
@@ -3856,6 +4272,9 @@ def main():
                 ),
                 'data_protocol': data_protocol,
                 'stage_training_selection': stage_training_selection,
+                'deployment_validation_selection': (
+                    deployment_validation_selection
+                ),
                 'distributed_context': distributed,
                 'expected_effective_global_batch_size': (
                     runtime_batch_plan.effective_global_batch_size
@@ -3868,19 +4287,63 @@ def main():
                 'validation_occupancy_threshold': cd_cfg.get(
                     'validation_occupancy_threshold', 0.5
                 ),
+                'validation_threshold_candidates': cd_cfg.get(
+                    'validation_threshold_candidates',
+                    DEFAULT_THRESHOLD_CANDIDATES,
+                ),
+                'deployment_validation_frames_per_scene': cd_cfg.get(
+                    'deployment_validation_frames_per_scene', 16
+                ),
+                'deployment_validation_seed': cd_cfg.get(
+                    'deployment_validation_seed',
+                    cd_cfg.get('validation_seed', 42),
+                ),
+                'deployment_validation_steps': cd_cfg.get(
+                    'deployment_validation_steps', 1
+                ),
+                'deployment_validation_sampler': cd_cfg.get(
+                    'deployment_validation_sampler', 'one_step'
+                ),
+                'deployment_validation_occupancy_threshold': cd_cfg.get(
+                    'deployment_validation_occupancy_threshold',
+                    cd_cfg.get('validation_occupancy_threshold', 0.5),
+                ),
+                'deployment_validation_threshold_candidates': cd_cfg.get(
+                    'deployment_validation_threshold_candidates',
+                    cd_cfg.get(
+                        'validation_threshold_candidates',
+                        DEFAULT_THRESHOLD_CANDIDATES,
+                    ),
+                ),
+                'deployment_validation_min_occupied_recall': cd_cfg.get(
+                    'deployment_validation_min_occupied_recall'
+                ),
+                'deployment_validation_recall_constraint_authority': cd_cfg.get(
+                    'deployment_validation_recall_constraint_authority', ''
+                ),
                 'training_semantics': cd_cfg.get(
-                    'training_semantics', 'ldm_initialized_ema_consistency_v1'
+                    'training_semantics', CD_TRAINING_SEMANTICS
                 ),
                 'num_scales': cd_cfg.get('num_scales', 40),
                 'ema_rate': cd_cfg.get('ema_rate', 0.999),
                 'sigma_min': cd_cfg.get('sigma_min', 0.002),
                 'sigma_max': cd_cfg.get('sigma_max', 80.0),
                 'rho': cd_cfg.get('rho', 7.0),
+                'consistency_loss_weight': cd_cfg.get(
+                    'consistency_loss_weight', 1.0
+                ),
+                'reconstruction_anchor_weight': cd_cfg.get(
+                    'reconstruction_anchor_weight', 0.1
+                ),
+                'collapse_guard_epsilon': cd_cfg.get(
+                    'collapse_guard_epsilon', 0.0
+                ),
             },
         )
         trainer.train(
             train_loader,
             val_loader,
+            deployment_val_loader,
             num_epochs=cd_cfg.get('epochs', 100),
             save_every=cd_cfg.get('save_every', 10),
             grad_accum_steps=opt_cfg.get('gradient_accumulation_steps', 8),
