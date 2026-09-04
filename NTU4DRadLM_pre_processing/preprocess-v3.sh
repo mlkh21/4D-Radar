@@ -11,7 +11,7 @@ INPUT_ROOT="${INPUT_ROOT:-$ROOT/Data/NTU4DRadLM}"
 RAW_ROOT="${FORMAL_V3_RAW_ROOT:-$ROOT/Data/NTU4DRadLM_Raw_formal_v3_80m_86p8_v1}"
 NEW_ROOT="${FORMAL_V3_PREPROCESSED_ROOT:-$ROOT/Data/NTU4DRadLM_Pre_formal_v3_80m_86p8_v1}"
 DEPLOY_ROOT="${FORMAL_V3_DEPLOY_ROOT:-$ROOT/Data/NTU4DRadLM_Deploy_formal_v3_80m_86p8_v1}"
-RADAR_FIELD_SCHEMA="${RADAR_FIELD_SCHEMA:-}"
+RADAR_FIELD_SCHEMA="${RADAR_FIELD_SCHEMA:-$ROOT/diffusion_consistency_radar/config/radar_field_schema_ntu4dradlm_eagle_v2.json}"
 
 SPLIT_ARTIFACT="$NEW_ROOT/temporal_split_garden_train80_purge3s_v1.json"
 DATA_PROTOCOL_ARTIFACT="$NEW_ROOT/formal_data_protocol_garden_train80_purge3s_v4.json"
@@ -27,8 +27,8 @@ if [[ ! -d "$INPUT_ROOT" ]]; then
     echo "错误：原始 rosbag 数据目录不存在：$INPUT_ROOT"
     exit 1
 fi
-if [[ -z "$RADAR_FIELD_SCHEMA" || ! -f "$RADAR_FIELD_SCHEMA" ]]; then
-    echo "错误：formal v3 必须通过 RADAR_FIELD_SCHEMA 指定带权威证据的普通 JSON 文件。"
+if [[ ! -f "$RADAR_FIELD_SCHEMA" ]]; then
+    echo "错误：formal v3 Radar 字段合同不存在：$RADAR_FIELD_SCHEMA"
     exit 1
 fi
 for file in \

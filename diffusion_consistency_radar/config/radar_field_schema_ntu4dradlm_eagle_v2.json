@@ -1,0 +1,44 @@
+{
+  "protocol": "radar_raw_field_semantics_v2",
+  "storage": {
+    "format": "npy",
+    "dtype": "float32",
+    "column_count": 5
+  },
+  "ros_transport": {
+    "topic": "/radar_pcl",
+    "message_type": "sensor_msgs/PointCloud",
+    "header_frame_id": "base_link"
+  },
+  "fields": {
+    "xyz": {
+      "column_indices": [0, 1, 2],
+      "unit": "m",
+      "physical_coordinate_frame": "radar",
+      "header_frame_relationship": "header_label_only_points_in_sensor_frame"
+    },
+    "return_strength": {
+      "column_index": 3,
+      "source_field": "Power",
+      "quantity": "signal_to_noise_ratio",
+      "unit": "dB",
+      "missing_value": "nan"
+    },
+    "doppler": {
+      "column_index": 4,
+      "source_field": "Doppler",
+      "quantity": "radial_velocity",
+      "unit": "m/s",
+      "reference": "sensor_relative",
+      "positive_direction": "away_from_sensor",
+      "missing_value": "nan"
+    }
+  },
+  "verification": {
+    "status": "verified",
+    "authority_type": "dataset_provider_documentation",
+    "reference": "Oculii Eagle manuals plus NTU4DRadLM and 4DRadarSLAM public contracts, reviewed 2026-09-03",
+    "evidence_file": "radar_field_schema_ntu4dradlm_eagle_v2.evidence.md",
+    "sha256": "e01db7a99a4623a15c5d4b6e9e988ebbdab0f2e421f4fd49d42441298e41ea42"
+  }
+}

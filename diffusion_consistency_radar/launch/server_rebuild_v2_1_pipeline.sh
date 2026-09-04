@@ -14,7 +14,7 @@ trap 'on_error "${LINENO}"' ERR
 ROOT="${PROJECT_ROOT:-/home/ps/zxj_workspace/src/4D-Radar}"
 CONDA_ENV="${CONDA_ENV:-Radar}"
 CUDA_DEVICES="${CUDA_DEVICES:-0,1}"
-RADAR_FIELD_SCHEMA="${RADAR_FIELD_SCHEMA:-${ROOT}/Data/config/radar_field_schema_v2.json}"
+RADAR_FIELD_SCHEMA="${RADAR_FIELD_SCHEMA:-${ROOT}/diffusion_consistency_radar/config/radar_field_schema_ntu4dradlm_eagle_v2.json}"
 
 CONFIRM_DELETE_OLD_V2="${CONFIRM_DELETE_OLD_V2:-NO}"
 CONFIRM_FULL_TRAINING="${CONFIRM_FULL_TRAINING:-NO}"
@@ -220,4 +220,3 @@ echo "v2.1 training 数据：${NEW_PRE_ROOT}"
 echo "v2.1 deployment 数据：${NEW_DEPLOY_ROOT}"
 echo "smoke 结果：${SMOKE_RESULTS}"
 echo "正式训练结果：${FORMAL_RESULTS}"
-

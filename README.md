@@ -296,18 +296,20 @@ sampler 可能补齐少量重复访问，补齐数量会独立写入 checkpoint�
 ### Formal v3 预处理边界
 
 `NTU4DRadLM_pre_processing/preprocess-v3.sh` 是独立的未来正式入口，不会覆盖 v2
-Raw、training、deployment 或 normalization 输出。它在解包前强制读取
-`RADAR_FIELD_SCHEMA`，并校验 schema 引用的权威 evidence 内容；随后要求每个场景具有
-complete extraction receipt，最终生成 `formal_data_v3`。v3 checkpoint data identity
+Raw、training、deployment 或 normalization 输出。它在解包前强制读取仓库内默认的
+`radar_field_schema_ntu4dradlm_eagle_v2.json`（也可用 `RADAR_FIELD_SCHEMA` 覆盖），并校验
+schema 引用的 evidence 内容；随后要求每个场景具有 complete extraction receipt，最终生成
+`formal_data_v4`。v3 checkpoint data identity
 还绑定逐字段 finite statistics、实际 PointCloud layout、field schema、receipt 和 Doppler
 物理方向。
 
-当前没有 Radar 消息字段单位及 Doppler 正方向的权威材料时，不要运行或手写伪造 v3
-schema；继续使用已经验收的 formal-v2 服务器数据和训练入口。v2 默认配置、已有 artifact
-及 checkpoint 链保持兼容。取得权威材料后才可在全新数据根显式运行：
+当前默认合同基于 Oculii Eagle 设备手册、NTU4DRadLM/4DRadarSLAM 数据提供方资料和原始
+bag 只读交叉检查：Power 为 dB SNR，Doppler 为 m/s 且正值表示远离传感器，XYZ 物理上
+仍在 Radar frame，`base_link` 仅是该数据流的 header 标签。证据和反证边界记录在同目录
+`radar_field_schema_ntu4dradlm_eagle_v2.evidence.md`。确认输入仍是 NTU4DRadLM 原始
+`/radar_pcl` 后，可在全新数据根运行：
 
 ```bash
-RADAR_FIELD_SCHEMA=/absolute/path/radar_field_schema.json \
 CONDA_ENV=Radar-Diffusion \
 bash NTU4DRadLM_pre_processing/preprocess-v3.sh
 ```
