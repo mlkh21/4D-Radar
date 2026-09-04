@@ -85,6 +85,7 @@ from diffusion_consistency_radar.cd_validation_protocol import (
 )
 from diffusion_consistency_radar.deployment_validation import (
     build_deployment_validation_selection,
+    karras_sigma_schedule,
     resolve_deployment_validation_config,
     validate_deployment_metrics,
 )
@@ -1311,22 +1312,17 @@ class ConsistencyDistillationTrainer:
         # NOTE: 随机采样相邻时间步对 (t_n, t_{n+1})，覆盖不同噪声区间。
         indices = torch.randint(0, num_scales - 1, (batch_size,), device=device)
         
-        # 计算噪声水平
-        t_n = (
-            self.denoiser.sigma_max ** (1 / self.denoiser.rho) +
-            indices / (num_scales - 1) * (
-                self.denoiser.sigma_min ** (1 / self.denoiser.rho) -
-                self.denoiser.sigma_max ** (1 / self.denoiser.rho)
-            )
-        ) ** self.denoiser.rho
-        
-        t_next = (
-            self.denoiser.sigma_max ** (1 / self.denoiser.rho) +
-            (indices + 1) / (num_scales - 1) * (
-                self.denoiser.sigma_min ** (1 / self.denoiser.rho) -
-                self.denoiser.sigma_max ** (1 / self.denoiser.rho)
-            )
-        ) ** self.denoiser.rho
+        # 训练与部署共用同一调度器，确保理论端点不会因浮点舍入越界。
+        sigma_schedule = karras_sigma_schedule(
+            steps=num_scales - 1,
+            sigma_min=self.denoiser.sigma_min,
+            sigma_max=self.denoiser.sigma_max,
+            rho=self.denoiser.rho,
+            device=device,
+            dtype=z_target.dtype,
+        )
+        t_n = sigma_schedule[indices]
+        t_next = sigma_schedule[indices + 1]
         
         # 生成带噪数据 x(t_n)
         noise = torch.randn_like(z_target)
@@ -2355,13 +2351,13 @@ def main():
                 train_frame_ids_by_scene = limit_frame_ids_by_scene(
                     train_frame_ids_by_scene,
                     train_limit,
-                    partition="cd train",
+                    partition="train",
                 )
             if validation_limit > 0:
                 validation_frame_ids_by_scene = limit_frame_ids_by_scene(
                     validation_frame_ids_by_scene,
                     validation_limit,
-                    partition="cd validation",
+                    partition="validation",
                 )
             stage_training_selection = build_formal_stage_training_selection(
                 stage="cd",

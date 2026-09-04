@@ -352,7 +352,7 @@ def karras_sigma_schedule(
         dtype=dtype,
     )
     t = step_indices / resolved_steps
-    return (
+    sigmas = (
         resolved_max ** (1.0 / resolved_rho)
         + t
         * (
@@ -360,6 +360,24 @@ def karras_sigma_schedule(
             - resolved_max ** (1.0 / resolved_rho)
         )
     ) ** resolved_rho
+    # 浮点幂运算会让理论首尾端点略微越界；显式钉住合同端点。
+    represented_min = torch.as_tensor(
+        resolved_min,
+        device=device,
+        dtype=sigmas.dtype,
+    )
+    represented_max = torch.as_tensor(
+        resolved_max,
+        device=device,
+        dtype=sigmas.dtype,
+    )
+    sigmas = torch.minimum(
+        torch.maximum(sigmas, represented_min),
+        represented_max,
+    )
+    sigmas[0] = represented_max
+    sigmas[-1] = represented_min
+    return sigmas
 
 
 def sample_karras_ode(

@@ -3929,13 +3929,13 @@ def main():
                 train_frame_ids_by_scene = limit_frame_ids_by_scene(
                     train_frame_ids_by_scene,
                     train_frame_limit,
-                    partition=f"{args.mode} train",
+                    partition="train",
                 )
             if validation_frame_limit > 0:
                 val_frame_ids_by_scene = limit_frame_ids_by_scene(
                     val_frame_ids_by_scene,
                     validation_frame_limit,
-                    partition=f"{args.mode} validation",
+                    partition="validation",
                 )
             stage_training_selection = build_formal_stage_training_selection(
                 stage=args.mode,

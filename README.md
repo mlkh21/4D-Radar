@@ -1,391 +1,316 @@
 # 4D Radar Diffusion
 
-面向 4D Radar 点云稠密化的离线训练、推理、诊断与对比仓库。当前主流程围绕 NTU4DRadLM 数据集展开，支持：
+面向机载 4D Radar 与热红外条件融合的单帧 3D Occupancy 生成研究代码。当前代码包含 NTU4DRadLM 数据预处理、VAE、latent diffusion、LDM 初始化的 EMA consistency、离线推理、评价和概率地图回放原型。
 
-- 预处理：原始 Radar / LiDAR 点云对齐、体素化、训练目标构建
-- 训练：`VAE -> LDM -> CD`
-- 推理：逐文件生成点云并输出指标
-- 诊断：生成质量分析、阈值扫描、可视化对比
-- 隔离测试：`test/mini-test/` 下的小规模快速验证流程
+> 当前能力边界：代码已经实现 Radar–IR 特征级融合和不依赖 LiDAR 的 prediction forward，但尚未形成 ROS1/PX4 实时感知—规划—控制闭环。`streaming_map_update.py` 是文件序列回放工具，不是已部署的在线节点。
+
+详细代码审计与逐文件证据见 [当前工程数据流与网络结构](./docs/current_architecture.md)。
+
+## 当前状态先读
+
+当前仓库同时存在三套名称相近、但不能混用的数据入口：
+
+| 入口 | 实际输出/默认绑定 | 状态 |
+|---|---|---|
+| `NTU4DRadLM_pre_processing/preprocess.sh` | `formal_v2_80m_86p8_v1` | 旧服务器绑定脚本，硬编码 `/home/ps/...` 和 Conda 环境 `Radar` |
+| `NTU4DRadLM_pre_processing/preprocess-v2.sh` | `formal_v2_1_80m_86p8_db_snr_v1`、formal-data-v4 | 可生成全新候选数据，但没有自动接入默认训练/部署路径 |
+| `NTU4DRadLM_pre_processing/preprocess-v3.sh` | `formal_v3_80m_86p8_v1`、formal-data-v4 | 带 verified field schema/extraction receipt 的新链，也没有接入默认训练/部署路径 |
+| `default_config.yaml` 与正式 train/inference launcher | `formal_v2_80m_86p8_v1` | 当前默认运行绑定 |
+
+默认链还有一个必须先处理的阻断点：
+
+- 默认 YAML 指向 `radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json`；
+- 该文件内部实际是 `radar_normalization_v1`，variance aggregation 为旧的 `occupied_voxel_equal_weight_total_variance`；
+- 当前 preprocessor 固定写 `radar_point_count_field_validity_v2`，Dataset 要求 `field_valid_count_weighted_total_variance_v2`；
+- 两者一起使用时，Dataset 会在模型 forward 前抛出 `RadarNormalizationError`。
+
+因此，不应把“无环境变量覆盖的默认预处理 → 默认训练 → 默认推理”描述为已贯通。开始正式训练前，必须让数据根、split、data protocol、normalization artifact、其 SHA-256 和 `PROTOCOL_TAG` 成套一致，并先执行 `PREFLIGHT_ONLY=1`。
+
+正式 inference launcher 还有一个独立阻断：`inference_ldm.sh`、`inference_cd.sh` 和 `inference_uniified.sh` 都调用 `diffusion_consistency_radar/scripts/diagnose_checkpoint_chain.py`，但该文件当前不在仓库中。因此这三个脚本表达了正式部署合同，却会在 checkpoint-chain 预检阶段失败；恢复该正式脚本之前，不能称为当前 checkout 可一键运行的入口。
+
+## 真实数据流
+
+```mermaid
+flowchart LR
+    A[NTU4DRadLM ROS bag] --> B[解包 Radar / LiDAR / thermal]
+    B --> C[Radar-LiDAR <=45 ms<br/>Radar-IR <=25 ms]
+    C --> D[Radar 对齐到 LiDAR frame<br/>formal: velocity_mode=none]
+    D --> E[Radar voxel<br/>Occ / SNR / Doppler / Var]
+    B --> F[LiDAR 去地面]
+    F --> G[target + observed mask]
+    B --> H[IR 灰度 3 通道]
+    E --> I[Dataset]
+    G --> I
+    H --> I
+    I --> J[Radar encoder + IR 2D backbone]
+    J --> K[R/T/K 几何投影 + IR gate]
+    K --> L[16ch fused condition + noisy latent]
+    L --> M[3D latent UNet]
+    M --> N[VAE decoder]
+    N --> O[4ch prediction]
+```
+
+formal v2/v3 launcher 的空间范围均为 `[x:0..80, y:-20..20, z:-6..10] m`，原始 voxel 分辨率为 `0.2 m`；Dataset 最终输出 `(Z,X,Y)=(32,128,128)`。当前实现是单帧 Dataset，`sequence_length != 1` 会失败。
+
+## 数据与张量合同
+
+### Radar 输入
+
+原始 Radar 固定布局为 `[x,y,z,Power,Doppler]`。在 verified schema 中，`Power` 是 dB SNR，`Doppler` 是 m/s、相对传感器径向速度、远离传感器为正。
+
+网络接收 `(B,4,32,128,128)`：
+
+| 通道 | 物理/统计语义 | 是否进入网络 |
+|---:|---|---|
+| 0 | Radar occupancy | 是 |
+| 1 | 体素内有限 Power/SNR 均值 | 是 |
+| 2 | 体素内有限 Doppler 均值 | 是 |
+| 3 | `clip(E[v²]-E[v]²,0,50)` Doppler 方差 | 是，也用于物理置信度 |
+
+`x/y/z` 决定体素空间位置和 occupancy，但不是额外输入通道。`point_count`、`intensity_valid_count`、`doppler_valid_count` 只控制 resize 聚合，不进入网络。
+
+当前正式 launcher 使用 `velocity_mode=none`，所以不能把 ch2 描述为已做机体自运动补偿的 Doppler。
+
+### IR 输入
+
+thermal image 在预处理时转为灰度、resize 到 `640×480`、除以 255，并复制为三个相同通道。Dataset 返回 IR 和 LiDAR-frame→thermal 的 `R/T/K`。
+
+IR 在网络中经过：
+
+```text
+IR (3×480×640)
+  → ResNet-18 conv1..layer2（weights=None；torchvision 不可用时为 fallback CNN）
+  → 1×1 Conv 得到 32ch
+  → R/T/K 投影到 3D voxel + frustum mask
+  → [Radar16, IR32, confidence1] 的 49ch IR gate
+  → 49ch fusion Conv
+  → 16ch 3D condition
+```
+
+IR 不是只用于可视化，也不是在 Dataset 中提前拼到 Radar voxel；实际融合发生在 `CompleteDualModalityPerceptionNet.forward()` 内、3D diffusion UNet 之前。
+
+### LiDAR 监督
+
+四通道 target 为：
+
+| 通道 | 来源 | 语义 |
+|---:|---|---|
+| 0 | 去地面 LiDAR | occupancy |
+| 1 | 去地面 LiDAR | reflectivity/return-strength 均值 |
+| 2 | Radar | LiDAR target 位置附近的 Radar Doppler 均值 |
+| 3 | Radar | Doppler-valid mask |
+
+LiDAR 还通过 endpoint 到传感器原点的 free-space ray 生成 authoritative `observed_mask`。VAE 直接重建 target；LDM/CD 使用 VAE 编码后的 target latent 作为真值。LiDAR voxel 不传入多模态 model forward。
+
+## 当前网络结构
+
+### VAE
+
+- 输入/输出 4ch，latent 4ch；默认 `ultra_lightweight`。
+- `(4,32,128,128)` 经 encoder 得到 `(4,16,32,32)` latent。
+- LDM/CD 使用 posterior mean 作为确定性 target latent。
+
+### Radar–IR 融合
+
+- Radar encoder：`Conv3d 4→16 → GN → SiLU → Conv3d 16→16 → GN → SiLU`。
+- IR feature：32ch，经标定投影到 `(32,128,128)` voxel grid。
+- confidence：主要来自 Radar ch3，`confidence=1/(1+variance/10)`。
+- gate：49ch → `Conv3d 49→32 + Sigmoid`，逐通道门控 IR。
+- fusion：49ch → `Conv3d 49→16 + ReLU`。
+- fused condition 插值到 latent 空间后，4ch noisy latent 逐元素加到 fused 的前四通道，不是 concat。
+
+### 3D latent UNet
+
+- 输入 16ch、输出 4ch，base channel 32。
+- channel level：32 → 64 → 96。
+- 空间层级：`(16,32,32) → (8,16,16) → (4,8,8)`。
+- 各分辨率 attention 关闭，但 middle block 仍有 linear attention。
+- decoder 使用 skip concat 并恢复 4ch latent。
+
+## 训练目标
+
+### VAE
+
+正式 VAE 只在 persisted observed domain（并强制保留 target positive）计算：
+
+```text
+L_VAE = BCEWithLogits(ch0)
+      + soft Dice(ch0)
+      + SmoothL1(ch1..3, continuous-valid voxels)
+      + 1e-6 * KL
+```
+
+### LDM
+
+LDM 以 `z_noisy=z_target+sigma*noise` 训练。主项是 observed latent 域内的普通 MSE，不是当前代码中未被调用的 EDM sigma-weighted training loss。默认非零辅助项为：
+
+- decoded occupancy weighted-MSE：0.05；
+- observed-free false positive：0.10；
+- occupancy mass：0.05；
+- height distribution：0.02；
+- vertical continuity：0.02；
+- heteroscedastic Gaussian NLL：0.05。
+
+### EMA consistency（历史名 CD）
+
+CD 用 LDM 初始化 online 与 EMA 模型，训练期没有持续调用冻结 LDM teacher：
+
+```text
+L_CD = 1.0 * MSE(student, stopgrad(EMA target))
+     + 0.1 * MSE(student, target latent)
+```
+
+两项都受 observed latent mask 约束；第二项用于排除输入无关的常数解。
 
 ## 项目结构
 
 ```text
-NTU4DRadLM_pre_processing/          # 原始数据预处理
+NTU4DRadLM_pre_processing/          # rosbag 解包、同步、体素与监督构建
 diffusion_consistency_radar/
-  cm/                               # 模型、损失、数据加载
-  config/                           # YAML 配置
-  launch/                           # 正式训练 / 推理 / 诊断入口
-  scripts/                          # 训练、推理、评估、可视化脚本
-test/
-  mini-test/                        # 隔离的小规模 train / infer / diagnose 流程
-Data/                               # 原始数据与预处理数据
-Result/                             # 正式训练和推理输出
+  cm/                               # Dataset、VAE、UNet、多模态融合
+  config/                           # 数据、训练、schema 与 normalization 配置
+  launch/                           # 正式 train/inference/evaluation 入口
+  scripts/                          # 训练、推理、评价、地图与诊断实现
+docs/current_architecture.md        # 当前架构代码审计
+test/                               # unit、mini-test 与结果目录
+Data/                               # 原始/预处理数据，默认不纳入 Git
+Result/                             # 正式训练/推理产物，默认不纳入 Git
 ```
 
-## 数据约定
+## 环境
 
-- 原始数据目录：`Data/NTU4DRadLM_Raw/<scene>/`
-- 预处理数据目录：`Data/NTU4DRadLM_Pre/<scene>/`
-- 默认训练场景 / 测试场景：见 [data_loading_config.yml](./diffusion_consistency_radar/config/data_loading_config.yml)
-- 默认点云范围：`[0, -20, -6, 120, 20, 10]`
-- 原始体素分辨率：`0.2m x 0.2m x 0.2m`
-
-当前训练输入输出的通道定义：
-
-- `radar_voxel`: `Occ / Int / Dop / Var`
-- `target_voxel`: `Occ / Int / Dop / Mask`
-
-其中：
-
-- `Occ` 和 `Mask` 在训练前会使用保结构的缩放逻辑
-- `Dop` 监督不再要求 Radar 和 LiDAR 在同一细体素严格重叠，而是在 LiDAR 占据位置的局部 Radar 邻域内聚合
-
-## 环境准备
-
-仓库默认按已有 Conda 环境使用，常见环境名是 `Radar-Diffusion`。最少需要：
+项目环境名为 `Radar-Diffusion`：
 
 ```bash
 conda activate Radar-Diffusion
 pip install -e diffusion_consistency_radar
 ```
 
-如果你只做脚本检查，也可以直接使用系统 Python；但训练 / 推理 / 诊断通常需要项目环境中的 `torch`、`scipy`、`matplotlib`、`pypatchworkpp`。
-
-## 正式流程
-
-### 1. 预处理
-
-从原始 Radar / LiDAR 数据生成 `radar_voxel`、`lidar_voxel`、`target_voxel`：
+也可以避免激活环境，直接运行：
 
 ```bash
-python NTU4DRadLM_pre_processing/NTU4DRadLM_pre_processing.py
+conda run -n Radar-Diffusion python <script.py>
 ```
 
-关键逻辑在：
+## 数据准备
 
-- [NTU4DRadLM_pre_processing.py](./NTU4DRadLM_pre_processing/NTU4DRadLM_pre_processing.py)
-- 标定文件：[calib_radar_to_livox.txt](./Data/config/calib_radar_to_livox.txt)
+不要无参数直调 `NTU4DRadLM_pre_processing.py`。正式数据链需要 launcher 提供同步阈值、全部标定、空间范围、监督 policy、schema 和 receipt 参数。
 
-注意：
-
-- 预处理默认会做 Radar -> LiDAR 坐标变换
-- LiDAR 会经过地面滤除
-- 运动补偿默认是 `none`，不会静默使用固定 `50 m/s`；如确有可靠的机体系速度，可显式设置 `VELOCITY_MODE=fixed`，或使用 `VELOCITY_MODE=recorded` 加载 `timestamp,vx,vy,vz` 速度表
-- 速度表必须与 Radar 文件名时间戳使用相同秒单位，默认最近邻时间差不得超过 `0.02s`；速度向量默认在 Radar 坐标系，预处理只用标定旋转转换到最终共享坐标系，不会把平移量加入速度
-- 若标定文件缺失，脚本会直接报错；只有显式设置 `ALLOW_IDENTITY_CALIB=1` 才允许回退单位矩阵
-
-### 2. 训练
-
-正式训练入口是 [train_unified.sh](./diffusion_consistency_radar/launch/train_unified.sh)。
-
-只训练 VAE：
+新的 verified 数据候选可在全新输出目录运行：
 
 ```bash
+# formal-v2.1 候选；全量解包/预处理，耗时且占用大量磁盘
+bash NTU4DRadLM_pre_processing/preprocess-v2.sh
+
+# 或 formal-v3 候选；同样是长任务
+bash NTU4DRadLM_pre_processing/preprocess-v3.sh
+```
+
+两个脚本都拒绝覆盖已有 Raw、training、deployment 和 normalization 输出。它们的输出 tag 与默认训练 tag 不同，运行后仍需成套设置训练/推理 override。
+
+## 训练
+
+正式训练入口是 [train_unified.sh](./diffusion_consistency_radar/launch/train_unified.sh)。在修正数据/artifact 绑定后，先只读预检：
+
+```bash
+PREFLIGHT_ONLY=1 \
 conda run --no-capture-output -n Radar-Diffusion bash \
   diffusion_consistency_radar/launch/train_unified.sh vae
 ```
 
-只训练 LDM：
+预检通过后才按依赖顺序运行：
 
 ```bash
 conda run --no-capture-output -n Radar-Diffusion bash \
+  diffusion_consistency_radar/launch/train_unified.sh vae
+
+conda run --no-capture-output -n Radar-Diffusion bash \
   diffusion_consistency_radar/launch/train_unified.sh ldm
-```
 
-LDM 初始化的 EMA consistency CD：
-
-```bash
 conda run --no-capture-output -n Radar-Diffusion bash \
   diffusion_consistency_radar/launch/train_unified.sh cd
 ```
 
-完整流程：
+`all` 会按 VAE → LDM → CD 串行执行。已有结果默认拒绝覆盖；只有确认 checkpoint 与同一数据协议完全一致后才可设置 `ALLOW_RESUME=1`。
 
-```bash
-conda run --no-capture-output -n Radar-Diffusion bash \
-  diffusion_consistency_radar/launch/train_unified.sh all
+若使用 v2.1/v3 新数据，至少需要成套覆盖以下变量，不能只改数据路径：
+
+```text
+PROTOCOL_TAG
+PREPROCESSED_ROOT
+RADAR_NORMALIZATION_ARTIFACT
+EXPECTED_ARTIFACT_SHA256
+TEMPORAL_SPLIT_ARTIFACT
+DATA_PROTOCOL_ARTIFACT
 ```
 
-默认输出目录：
+默认训练配置见 [default_config.yaml](./diffusion_consistency_radar/config/default_config.yaml)，场景划分见 [data_loading_config.yml](./diffusion_consistency_radar/config/data_loading_config.yml)。当前 YAML 默认使用两张卡 `CUDA_DEVICES=0,1`，可在单次运行中显式覆盖 1–4 个不重复 GPU 编号。
 
-- `Result/train_results/formal_v2_80m_86p8_v1/vae/`
-- `Result/train_results/formal_v2_80m_86p8_v1/ldm/`
-- `Result/train_results/formal_v2_80m_86p8_v1/cd/`
+## 正式推理
 
-正式入口固定使用：
+正式 prediction 需要 Radar、IR、真实标定、VAE/model checkpoint、checkpoint 内嵌 normalization 和 validation threshold artifact；**不需要 LiDAR 或 target**。
 
-- 数据：`Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1/`
-- Radar normalization：`radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json`
-- Doppler 物理量程：`86.8 m/s`
-
-已有结果目录默认拒绝隐式续训。确认恢复的是同一正式协议后，显式执行：
-
-```bash
-ALLOW_RESUME=1 conda run --no-capture-output -n Radar-Diffusion bash \
-  diffusion_consistency_radar/launch/train_unified.sh <vae|ldm|cd|all>
-```
-
-训练配置文件：
-
-- 主配置：[default_config.yaml](./diffusion_consistency_radar/config/default_config.yaml)
-- 训练场景配置：[data_loading_config.yml](./diffusion_consistency_radar/config/data_loading_config.yml)
-
-### 3. 推理
-
-LDM 推理：
+设计上的独立正式入口是：
 
 ```bash
 bash diffusion_consistency_radar/launch/inference_ldm.sh
-```
-
-CD 推理：
-
-```bash
 bash diffusion_consistency_radar/launch/inference_cd.sh
 ```
 
-这两个脚本会先校验正式 VAE/LDM/CD checkpoint 链与 candidate manifest，再按
-`data_loading_config.yml` 里的 `data.test` 场景逐文件推理，并输出：
+当前 checkout 缺少上述 launcher 调用的 `scripts/diagnose_checkpoint_chain.py`，所以命令会在生成前失败。此处保留它们是为了准确说明正式合同，不表示本次已验证可运行。
 
-- LDM：`Result/inference_results/<scene>_formal_p1_04_full120_86p8_v1_ldm_deploy/`
-- CD：`Result/inference_results/<scene>_formal_p1_04_full120_86p8_v1_cd_1step_deploy/`
-- 运行协议：`inference_run.json`、`inference_runtime.csv`；正式 `inference_run.json`
-  同时逐帧绑定 prediction voxel 与 observed mask 的文件名、SHA-256、CZXY shape
-  和 dtype。prediction artifact v2 还声明 ch0 是 `[0,1]` occupancy probability，
-  ch1--3 仅为非地图辅助重建；严格地图以外部 observed mask 为权威边界，不接受
-  缺少任一内容收据或仍使用 artifact v1 的旧推理目录
-- 预测产物：`*_voxel.npy`、`*_pcl.npy` 和可用的 `*_uncertainty.npy`
+- LDM：40-step Heun。
+- CD：1-step Euler，并应用训练一致的 boundary parameterization。
 
-如果你想直接调用 Python 入口：
+一次运行 LDM、CD 1-step 和当前实验性 CD 4-step 的入口是：
 
 ```bash
-python diffusion_consistency_radar/scripts/inference.py \
-  --vae_ckpt Result/train_results/formal_p1_04_full120_86p8_v1/vae/vae_best.pt \
-  --model_ckpt Result/train_results/formal_p1_04_full120_86p8_v1/ldm/ldm_best.pt \
-  --model_type ldm \
-  --steps 40 \
-  --sampler heun \
-  --radar_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/loop3/radar_voxel \
-  --require_real_ir \
-  --save_voxel \
-  --save_pointcloud \
-  --save_uncertainty \
-  --output_dir Result/inference_results/loop3_formal_p1_04_full120_86p8_v1_ldm_deploy
+bash diffusion_consistency_radar/launch/inference_uniified.sh
 ```
 
-正式指标评价与生成解耦，在预测保存完成后执行：
+文件名中的 `uniified` 是仓库当前保留的实际拼写。CD 4-step 会走 `_ldm_sample()` 的 Euler 路径，不会在每一步应用 CD boundary，不能等同于四次标准 CD 一步采样，也没有代码证据保证它比 1-step 质量更高。
+
+完整参数、产物和故障门禁见 [推理使用指南](./INFERENCE_GUIDE.md)。
+
+## 输出与离线评价
+
+正式 prediction voxel 为 `(4,Z,X,Y)`：
+
+| 通道 | prediction 语义 |
+|---:|---|
+| 0 | occupancy probability；正式 sigmoid 协议只对该通道概率化 |
+| 1 | LiDAR return-strength 的生成重建值 |
+| 2 | Radar-neighborhood Doppler 的生成重建值 |
+| 3 | Doppler-valid target 的生成重建值 |
+
+不确定性不是 ch3，而是单独的 `*_uncertainty.npy`。点云 `*_pcl.npy` 为 `(N,4)`，列是 `x,y,z,prediction_ch1`。
+
+生成和评价严格解耦。默认 formal-v2 保存完成后执行：
 
 ```bash
 bash diffusion_consistency_radar/launch/evaluate_inference.sh ldm
+bash diffusion_consistency_radar/launch/evaluate_inference.sh cd
+bash diffusion_consistency_radar/launch/evaluate_inference.sh cd4
 ```
 
-该入口是唯一正式评价入口：它验证 inference metadata、validation threshold
-artifact、prediction/observed 内容收据与帧配对，并在外部权威 observed mask 内
-统一计算预测/target 指标；`evaluation_summary.json` 使用
-`formal_saved_prediction_observed_domain_evaluation_v1`。原始 LiDAR Chamfer
-仅作为未裁剪的辅助诊断参考，不列入 `formal_metrics`。
+该 launcher 当前固定 formal-v2 路径；v2.1/v3 结果必须显式调用 `evaluate_saved_predictions.py` 并提供完全匹配的 prediction、Radar、target、run metadata 和可选 raw LiDAR 路径。
 
-### 4. 诊断与对比
+## Mini Test 与诊断
 
-生成质量诊断：
-
-```bash
-bash diffusion_consistency_radar/launch/diagnose.sh
-```
-
-或直接调用：
-
-```bash
-python diffusion_consistency_radar/scripts/diagnose_generation_quality.py \
-  --radar_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/loop3/radar_voxel \
-  --target_voxel_dir Data/NTU4DRadLM_Pre_sensor_aware_p1_04_candidate/loop3/target_voxel \
-  --pred_dir Result/inference_results/loop3_formal_p1_04_full120_86p8_v1_ldm_deploy \
-  --output_dir Result/diagnosis_results/loop3_formal_p1_04_full120_86p8_v1_ldm_deploy \
-  --max_files 20 \
-  --pred_kind pcl \
-  --occ_threshold 0.1
-```
-
-输出包括：
-
-- `frames/*.png`
-- `diagnosis_metrics.csv`
-- `diagnosis_report.md`
-
-Legacy diagnostic-only Radar / LiDAR 结果图像对比：
-
-```bash
-bash diffusion_consistency_radar/launch/compare.sh
-```
-
-阈值扫描：
-
-```bash
-python diffusion_consistency_radar/scripts/sweep_occ_threshold.py --help
-```
-
-Legacy diagnostic-only 点云指标（仅按同名 `.npy` 配对，不验证正式协议）：
-
-```bash
-python diffusion_consistency_radar/scripts/evaluate.py \
-  --pred_path <pred_dir> \
-  --gt_path <gt_dir> \
-  --output_path <output_json>
-```
-
-## Formal v2 训练入口
-
-当前正式训练合同为 0--80 m、Doppler scale 86.8 m/s、持久化 observed mask、
-temporal purge split、train-only normalization 和 Radar point-count/Doppler-validity
-统计。旧 full120 数据、artifact 与 mini checkpoint 仅用于 legacy/diagnostic，不能与
-formal v2 结果混用。
-
-正式 VAE 的准备与启动顺序如下：
-
-```bash
-# 1. fresh 全量重建；脚本会拒绝覆盖任何已有正式输出
-bash NTU4DRadLM_pre_processing/preprocess-v2.sh
-
-# 2. 在训练机器上只读预检；不会写训练配置，也不会启动 GPU 训练
-PREFLIGHT_ONLY=1 \
-conda run --no-capture-output -n Radar-Diffusion bash \
-  diffusion_consistency_radar/launch/train_unified.sh vae
-
-# 3. 只在具备长期训练条件的服务器上启动完整正式链
-conda run --no-capture-output -n Radar-Diffusion bash \
-  diffusion_consistency_radar/launch/train_unified.sh all
-```
-
-默认 epoch、每场景每 epoch 的 train/validation 帧数、GPU 列表以及 normalization
-SHA-256 都位于 `diffusion_consistency_radar/config/default_config.yaml`。当前默认分别为
-VAE/LDM/CD `20/20/20` epoch、各阶段 `3210/774` 帧和 `CUDA_DEVICES=0,1,2,3`。
-阶段帧数的 `0` 表示消费对应 temporal partition 的全部帧。
-
-临时覆盖优先级为“阶段专用环境变量 > `FORMAL_*` 通用环境变量 > YAML”。例如：
-
-```bash
-CUDA_DEVICES=0,1 \
-FORMAL_EPOCHS=10 \
-VAE_EPOCHS=5 \
-FORMAL_TRAIN_FRAMES_PER_EPOCH=1000 \
-VAE_VALIDATION_FRAMES_PER_EPOCH=200 \
-conda run --no-capture-output -n Radar-Diffusion bash \
-  diffusion_consistency_radar/launch/train_unified.sh vae
-```
-
-可用的阶段前缀为 `VAE_`、`LDM_`、`CD_`，帧数后缀为
-`TRAIN_FRAMES_PER_EPOCH` 和 `VALIDATION_FRAMES_PER_EPOCH`。`EXPECTED_ARTIFACT_SHA256`
-仍可临时覆盖 YAML 中的固定 artifact 身份。
-
-`CUDA_DEVICES` 接受 1--4 个不重复 GPU 编号，例如 `0`、`0,1` 或 `0,1,2,3`。
-多卡时 launcher 会为 VAE、LDM、CD 分别启动一个单机 DDP 作业，`all` 仍按父 checkpoint
-依赖顺序串行执行三个阶段。1/2/4 GPU 的有效全局 batch 均为 16；3 GPU 因整数梯度累积
-限制显式使用 18，配置、日志和 checkpoint 都会记录该差异，因此 16 与 18 之间不能直接
-resume。8 GB RTX 4070 Laptop 只建议执行预检和短时 CPU/接口验证，不建议承担 formal v2
-全量 VAE 长训练。已有同协议结果时 launcher 默认拒绝覆盖；只有确认 checkpoint 与协议
-一致后才能显式设置 `ALLOW_RESUME=1`。
-正式服务器 launcher 默认 VAE/LDM/CD 各 20 epoch；garden 完整 temporal split 为
-3210 train / 774 validation。若临时缩小帧数，实际有序 frame ID、数量和 SHA-256 会写入
-阶段 checkpoint，同阶段 resume 必须保持一致。正式阶段仍应按 `vae → ldm → cd`
-顺序执行和验收，不能把笔记本的 400/100 checkpoint 接入正式链。本地没有完成真实
-2--4 GPU NCCL 训练验证，服务器正式长训前仍需先执行预检和短时多卡 smoke。
-这里的帧数表示每场景每轮选择的唯一 frame 数；DDP 为保持各 rank 迭代步数一致，训练
-sampler 可能补齐少量重复访问，补齐数量会独立写入 checkpoint，不会伪装成新的唯一帧。
-
-### Formal v3 预处理边界
-
-`NTU4DRadLM_pre_processing/preprocess-v3.sh` 是独立的未来正式入口，不会覆盖 v2
-Raw、training、deployment 或 normalization 输出。它在解包前强制读取仓库内默认的
-`radar_field_schema_ntu4dradlm_eagle_v2.json`（也可用 `RADAR_FIELD_SCHEMA` 覆盖），并校验
-schema 引用的 evidence 内容；随后要求每个场景具有 complete extraction receipt，最终生成
-`formal_data_v4`。v3 checkpoint data identity
-还绑定逐字段 finite statistics、实际 PointCloud layout、field schema、receipt 和 Doppler
-物理方向。
-
-当前默认合同基于 Oculii Eagle 设备手册、NTU4DRadLM/4DRadarSLAM 数据提供方资料和原始
-bag 只读交叉检查：Power 为 dB SNR，Doppler 为 m/s 且正值表示远离传感器，XYZ 物理上
-仍在 Radar frame，`base_link` 仅是该数据流的 header 标签。证据和反证边界记录在同目录
-`radar_field_schema_ntu4dradlm_eagle_v2.evidence.md`。确认输入仍是 NTU4DRadLM 原始
-`/radar_pcl` 后，可在全新数据根运行：
-
-```bash
-CONDA_ENV=Radar-Diffusion \
-bash NTU4DRadLM_pre_processing/preprocess-v3.sh
-```
-
-该命令会执行全量解包和预处理，耗时且占用大量磁盘；本次代码验证只覆盖 fail-closed、
-协议、接口和临时目录单元测试，没有实际运行这条长链。
-
-## Mini Test
-
-`test/mini-test/` 是隔离的小规模验证区，用来快速做 train / infer / diagnose，不污染正式 `Result/` 目录。
-
-文档见：
+短测试与实验入口位于 `test/`，不要把 mini checkpoint 接入正式部署链：
 
 - [test/README.md](./test/README.md)
 - [test/mini-test/README.md](./test/mini-test/README.md)
 
-常用命令：
+legacy/diagnostic 入口包括 `launch/compare.sh`、`launch/diagnose.sh` 和 `scripts/evaluate.py`。它们不等同于带 manifest、checkpoint-chain、observed-domain 和 threshold receipt 的正式评价。
 
-```bash
-# 当前 formal v2：先只读预检，再由用户显式启动 8/4 帧 VAE mini
-MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae
-bash test/mini-test/run_formal_mini_8gb.sh vae
+## 已知限制
 
-# 1 epoch smoke 验收后，可在独立目录预检/运行 fresh 3 epoch VAE
-MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae short_train
-bash test/mini-test/run_formal_mini_8gb.sh vae short_train
-
-# RTX 4070 Laptop 中型质量筛查：固定 400 train + 100 validation、每阶段 20 epoch
-MINI_PREFLIGHT_ONLY=1 bash test/mini-test/run_formal_mini_8gb.sh vae medium_train
-bash test/mini-test/run_formal_mini_8gb.sh vae medium_train
-
-# 历史 legacy mini
-bash test/mini-test/train_minimal.sh all
-bash test/mini-test/inference_minimal.sh ldm
-bash test/mini-test/diagnose_minimal.sh
-```
-
-默认输出位置：
-
-- `test/result/formal_mini_v2_80m_8gb_v1/`（8 GB formal v2 mini）
-- `test/result/formal_mini_v2_80m_8gb_short_v1/`（fresh 3 epoch VAE short profile）
-- `test/result/formal_medium_v2_80m_laptop_500f_20ep_v2/`（RTX 4070 Laptop 500 帧中型筛查；稳定 CUDA allocator）
-- `test/result/formal_medium_v2_80m_laptop_500f_20ep_v1/`（失败现场，只用于 allocator 诊断，不续训）
-- `test/mini-test/train_results_mini/`
-- `test/mini-test/inference_results_mini/`
-- `test/mini-test/diagnostics/`
-
-## 当前推荐使用的方法
-
-如果你要做正式实验，推荐顺序是：
-
-1. 运行 `preprocess-v2.sh`，生成正式 training/deployment 数据与全部 artifact
-2. 记录 normalization SHA-256，并用 `PREFLIGHT_ONLY=1` 完成无训练验收
-3. 在服务器训练 `vae`
-4. VAE 验收后训练 `ldm`
-5. 使用 deployment v3 数据运行 `inference_ldm.sh`
-6. 运行独立诊断与评价入口
-7. 需要更快推理时再单独训练 `cd`
-
-如果你只是想验证当前 formal v2 数据合同，可先使用预检和 `test/unit/` 聚焦测试；
-需要验证 backward/checkpoint 时再分阶段运行 8 GB mini。它直接读取 0--80 m 正式数据，
-按正式 split 取每场景 8 个 train 和 4 个 validation 帧，并写出
-`formal_mini_chain_v2`。该 checkpoint 只用于接口 smoke，不能替代正式训练结果或进入
-正式部署链。完整保护门禁见 [test/mini-test/README.md](./test/mini-test/README.md)。
-formal mini 的 LDM/CD 无训练预检会在创建配置和输出前验证父 checkpoint 的
-stage/protocol/data identity；short VAE 的后续阶段必须显式复用同一 short 结果根。
-`medium_train` 是独立的 400/100、20 epoch 链，三阶段均需使用该 profile 和同一结果根。
-VAE/LDM 会逐 epoch 使用 100 帧 validation；当前 CD 训练器只消费 400 帧 train，100 帧
-留出集用于 CD 完成后的独立推理/评价。该中型结果可用于初步判断训练趋势和指标是否接近
-需求，但不能替代服务器 full split 的正式训练与评价。
-
-## 已知说明
-
-- 当前主流程是离线训练和离线推理，不包含 ROS 实时闭环
-- `streaming_map_update.py` 也是离线文件回放；严格数据合同通过不代表 ROS1/PX4 机载避障已实现
-- 严格地图使用 body/LiDAR 锚定 rolling window；只有提供精确逐帧 `local_trajectory_frames_v1` artifact 时才启用轨迹走廊查询，否则仅做当前位姿原点查询
-- `launch/` 目录下只应视为正式入口；快速实验请放在 `test/`
-- `.npy`、`.npz`、训练结果和推理结果默认不会纳入 Git 跟踪
-- 某些历史脚本名或旧文档中提到的入口，已经不再是当前推荐路径
+- 当前为单帧 Radar–IR 条件生成，不是时序传感器融合网络。
+- formal 默认不做 Radar egomotion/Doppler 补偿。
+- default formal-v2 normalization 与当前 statistics-v2 输入合同冲突，需先修正 artifact 绑定。
+- 三个正式 inference launcher 引用的 `scripts/diagnose_checkpoint_chain.py` 当前缺失，恢复前无法一键执行。
+- formal-v2.1/v3 数据链尚未成为 train/deploy launcher 默认值。
+- 无条件聚合样本模式对多模态 checkpoint 使用零 Radar 与 mock IR/标定，只能用于诊断。
+- 训练完成、checkpoint 可加载、GPU 精度/吞吐和服务器 artifact 存在性必须在目标机器上验证。
+- 概率地图模块仍是离线回放原型；ROS1/PX4 action/service 闭环尚未由当前调用链证明。
