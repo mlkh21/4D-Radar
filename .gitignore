@@ -23,6 +23,9 @@ pull-from-server.sh
 # 说明 / 计划 / 文档
 # =========================
 AGENTS.md
+INFERENCE_GUIDE.md
+PROMPTS.md
+README_SETUP.md
 TODO/
 docs/
 
