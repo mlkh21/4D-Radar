@@ -486,7 +486,7 @@ def validate_deployment_view(scene_dir: str, scene: str) -> Dict[str, object]:
         ],
         "calibration_sha256": {
             key: shared_deployment_provenance[key]["sha256"]
-            for key in ("lidar_to_thermal", "thermal_intrinsics")
+            for key in CALIBRATION_FILENAMES
         },
         "voxel_coordinate_frame": manifest["voxel_coordinate_frame"],
         "materialization_mode_at_creation": receipt[

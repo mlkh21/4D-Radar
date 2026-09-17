@@ -173,10 +173,13 @@ try:
     from diffusion_consistency_radar.dataset_manifest import (
         sha256_file,
     )
-    from diffusion_consistency_radar.deployment_view import validate_deployment_view
+    from diffusion_consistency_radar.deployment_view import (
+        CALIBRATION_FILENAMES,
+        validate_deployment_view,
+    )
 except ImportError:
     from dataset_manifest import sha256_file
-    from deployment_view import validate_deployment_view
+    from deployment_view import CALIBRATION_FILENAMES, validate_deployment_view
 
 try:
     from diffusion_consistency_radar.geometry_protocol import load_extrinsic_transform
@@ -550,12 +553,8 @@ def assert_formal_deployment_identity(
 
     calibration_dir = os.path.abspath(os.fspath(calibration_dir))
     calibration_files = {
-        "lidar_to_thermal": os.path.join(
-            calibration_dir, "calib_livox_to_thermal.txt"
-        ),
-        "thermal_intrinsics": os.path.join(
-            calibration_dir, "calib_cam_thermal.txt"
-        ),
+        key: os.path.join(calibration_dir, filename)
+        for key, filename in CALIBRATION_FILENAMES.items()
     }
     actual_calibration = {}
     for key, path in calibration_files.items():
@@ -564,7 +563,11 @@ def assert_formal_deployment_identity(
         actual_calibration[key] = sha256_file(path)
 
     checkpoint_calibration = (data_protocol or {}).get("calibration_sha256")
-    if actual_calibration != checkpoint_calibration:
+    model_calibration = {
+        key: actual_calibration[key]
+        for key in ("lidar_to_thermal", "thermal_intrinsics")
+    }
+    if model_calibration != checkpoint_calibration:
         raise ValueError("当前 deployment 标定 SHA-256 与 checkpoint data_protocol 不一致")
     if view_identity.get("calibration_sha256") != actual_calibration:
         raise ValueError("deployment view 标定 SHA-256 与当前 calibration_dir 不一致")
