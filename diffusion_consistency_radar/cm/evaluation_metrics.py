@@ -76,7 +76,9 @@ def uncertainty_calibration_metrics(
         if np.any(mask):
             ece += float(np.mean(mask)) * abs(float(np.mean(error_probability[mask])) - float(np.mean(binary_error[mask])))
 
-    flat_unc = variance.reshape(-1)
+    # 相关系数必须与 Brier/NLL/ECE 使用同一个权威 observed 域；否则正式
+    # 稀疏 mask 会造成完整网格 uncertainty 与域内 error 的样本数不一致。
+    flat_unc = variance[domain].reshape(-1)
     flat_error = binary_error.reshape(-1)
     if np.std(flat_unc) < eps or np.std(flat_error) < eps:
         correlation = float("nan")
