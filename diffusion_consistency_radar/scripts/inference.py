@@ -19,7 +19,11 @@ import numpy as np
 from tqdm import tqdm
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 try:
     from diffusion_consistency_radar.cm.vae_3d import VAE3D, build_vae_from_checkpoint, resolve_checkpoint_grid_config

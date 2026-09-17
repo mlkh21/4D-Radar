@@ -302,7 +302,7 @@ bash diffusion_consistency_radar/launch/evaluate_inference.sh cd4
 - [test/README.md](./test/README.md)
 - [test/mini-test/README.md](./test/mini-test/README.md)
 
-legacy/diagnostic 入口包括 `launch/compare.sh`、`launch/diagnose.sh` 和 `scripts/evaluate.py`。它们不等同于带 manifest、checkpoint-chain、observed-domain 和 threshold receipt 的正式评价。
+legacy/diagnostic 入口包括 `launch/compare.sh`、`launch/diagnose.sh` 和 `test/evaluation/ldm/evaluate.py`。它们不等同于带 manifest、checkpoint-chain、observed-domain 和 threshold receipt 的正式评价。
 
 ## 已知限制
 
