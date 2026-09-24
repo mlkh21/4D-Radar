@@ -402,7 +402,15 @@ def build_inference_run_metadata(
         "frame_count": int(frame_count),
         "voxel_coordinate_frame": "lidar",
         "observed_mask": observed_metadata,
+        "observed_mask_role": "mapping_visibility_not_pointcloud_or_evaluation_domain",
         "prediction_voxel": prediction_metadata,
+        "task_spatial_domain": getattr(generator, "task_spatial_domain", None),
+        "pointcloud_domain": (
+            "full_task_domain_prediction"
+            if getattr(generator, "task_spatial_domain", None) is not None
+            else "full_grid_legacy_diagnostic"
+        ),
+        "prediction_voxel_domain": "full_grid_probabilities_unknown_not_free",
         "time_alignment_compensation": "preprocessing_signed_delta_only",
         "deployment_identity": getattr(generator, "deployment_identity", None),
     }
@@ -1710,7 +1718,7 @@ def find_matching_voxel_file(folder, frame_id):
     return ""
 
 
-def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.1, empty_fallback_topk=0):
+def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.1, empty_fallback_topk=0, valid_mask=None):
     # TODO:  occ_threshold 的默认值需要根据训练时的体素化参数进行调整，过高可能导致生成点云过于稀疏，过低则可能引入大量噪声点。
     # NOTE: 输入 voxel 形状为 (C, Z, H, W)。
     occ = voxel[0]
@@ -1725,17 +1733,23 @@ def voxel_to_pointcloud(voxel, voxel_size, pc_range, occ_threshold=0.1, empty_fa
             (pc_range[5] - pc_range[2]) / max(occ.shape[0], 1),
         ]
 
-    occ_mask = occ > occ_threshold
+    # NOTE: 保留原始概率；unknown 仅在点云导出时排除，不写成 free。
+    valid = np.ones(occ.shape, dtype=bool) if valid_mask is None else np.asarray(valid_mask)
+    if valid.shape != occ.shape or not np.isin(valid, (0, 1)).all():
+        raise ValueError("pointcloud valid_mask 必须是同网格的二值 ZXY mask")
+    valid = valid.astype(bool)
+    occ_mask = (occ >= occ_threshold) & valid
     used_topk_fallback = False
     if not np.any(occ_mask):
-        if empty_fallback_topk <= 0:
+        if empty_fallback_topk <= 0 or not valid.any():
             return np.zeros((0, 4), dtype=np.float32), used_topk_fallback
 
         # HACK: 当阈值筛选后为空点云时，回退到 top-k 占据体素避免评估中断。
         used_topk_fallback = True
         flat_occ = occ.reshape(-1)
-        k = int(min(max(empty_fallback_topk, 1), flat_occ.shape[0]))
-        topk_idx = np.argpartition(flat_occ, -k)[-k:]
+        candidates = np.flatnonzero(valid)
+        k = int(min(max(empty_fallback_topk, 1), candidates.size))
+        topk_idx = candidates[np.argpartition(flat_occ[candidates], -k)[-k:]]
         z_idx, x_idx, y_idx = np.unravel_index(topk_idx, occ.shape)
         x = pc_range[0] + (x_idx + 0.5) * voxel_size[0]
         y = pc_range[1] + (y_idx + 0.5) * voxel_size[1]
@@ -1965,6 +1979,7 @@ def main():
                 with open(args.lidar_index_file, 'r', encoding='utf-8') as f:
                     lidar_indices = [int(line.strip()) for line in f.readlines()]
 
+        deployment_task_mask = None
         if args.require_real_ir:
             if generator.data_protocol is None:
                 raise RuntimeError(
@@ -1975,6 +1990,18 @@ def main():
                 radar_voxel_dir=args.radar_voxel_dir,
                 calibration_dir=args.calibration_dir,
                 data_protocol=generator.data_protocol,
+            )
+            # NOTE: policy 已由 deployment identity 校验绑定；只读取任务边界，
+            # 正式推理不引入 LiDAR target 或 LiDAR observed mask。
+            from diffusion_consistency_radar.observed_mask import (
+                load_task_spatial_domain, task_domain_zxy,
+            )
+            generator.task_spatial_domain = load_task_spatial_domain(
+                os.path.join(args.deployment_scene_dir, "preprocess_policy.json"),
+                args.source_pc_range,
+            )
+            deployment_task_mask = task_domain_zxy(
+                args.target_size, args.pc_range, generator.task_spatial_domain,
             )
             preflight_real_ir_inputs(
                 generator.model,
@@ -2093,6 +2120,7 @@ def main():
                         "radar_origin_lidar_m"
                     ],
                 )
+                deployment_observed_mask &= deployment_task_mask.astype(np.uint8)
             radar_point_count = ""
             if raw_radar_files:
                 radar_raw_file = None
@@ -2202,6 +2230,8 @@ def main():
                     pc_range=args.pc_range,
                     occ_threshold=effective_occ_threshold,
                     empty_fallback_topk=args.empty_fallback_topk,
+                    # 点云保留整个任务域的模型预测；Radar 射线仅供既有地图合同消费。
+                    valid_mask=deployment_task_mask,
                 )
                 if used_topk_fallback:
                     fallback_count += 1

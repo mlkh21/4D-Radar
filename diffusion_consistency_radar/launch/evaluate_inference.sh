@@ -110,6 +110,8 @@ for SCENE in "${TEST_SCENES[@]}"; do
     --pred_voxel_dir "${PRED_DIR}" \
     --radar_voxel_dir "${RADAR_VOXEL_DIR}" \
     --target_voxel_dir "${TARGET_VOXEL_DIR}" \
+    --target_observed_mask_dir "${SCENE_DIR}/observed_mask" \
+    --preprocess_policy_path "${SCENE_DIR}/preprocess_policy.json" \
     --output_dir "${OUTPUT_DIR}" \
     --run_metadata_path "${RUN_METADATA_PATH}" \
     --raw_livox_dir "${RAW_LIVOX_DIR}" \

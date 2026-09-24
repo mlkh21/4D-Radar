@@ -93,6 +93,7 @@ for file in \
     "${CD_CKPT}" \
     "${LDM_THRESHOLD}" \
     "${CD_THRESHOLD}" \
+    "${LOOP3_TRAIN}/preprocess_policy.json" \
     "${LOOP3_RAW}/lidar_index_sequence.txt" \
     "${INFERENCE_SCRIPT}" \
     "${EVALUATION_SCRIPT}" \
@@ -104,6 +105,7 @@ for directory in \
     "${LOOP3_DEPLOY}/radar_voxel" \
     "${LOOP3_TRAIN}/radar_voxel" \
     "${LOOP3_TRAIN}/target_voxel" \
+    "${LOOP3_TRAIN}/observed_mask" \
     "${LOOP3_RAW}/livox_lidar" \
     "${CALIBRATION_DIR}"; do
     require_dir "${directory}"
@@ -227,6 +229,8 @@ run_evaluation() {
         --pred_voxel_dir "${prediction_dir}" \
         --radar_voxel_dir "${LOOP3_TRAIN}/radar_voxel" \
         --target_voxel_dir "${LOOP3_TRAIN}/target_voxel" \
+        --target_observed_mask_dir "${LOOP3_TRAIN}/observed_mask" \
+        --preprocess_policy_path "${LOOP3_TRAIN}/preprocess_policy.json" \
         --output_dir "${output_dir}" \
         --run_metadata_path "${prediction_dir}/inference_run.json" \
         --raw_livox_dir "${LOOP3_RAW}/livox_lidar" \

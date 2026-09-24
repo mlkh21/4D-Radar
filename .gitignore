@@ -41,6 +41,7 @@ __pycache__/
 *.egg-info/
 .Python
 *.pth
+.pytest_cache/
 
 # =========================
 # 数据 / 训练结果 / 生成产物

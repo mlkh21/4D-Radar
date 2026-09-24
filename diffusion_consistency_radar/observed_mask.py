@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """文件功能：构建、持久化并严格加载 LiDAR 射线可观测体素掩码。"""
 
+import json
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -9,6 +10,38 @@ import numpy as np
 OBSERVED_MASK_PROTOCOL = "lidar_ray_observed_target_domain_v2"
 PERSISTED_OBSERVED_MASK_SOURCE = "persisted_lidar_ray_target_domain_v2"
 OBSERVED_MASK_SPATIAL_DOMAIN = "target_z_min_x_max_voxel_centers_v1"
+
+
+def load_task_spatial_domain(path: str, expected_pc_range: Sequence[float]) -> dict:
+    """读取既有预处理任务域；不推测默认高度，不加载 LiDAR，不新增哈希。"""
+    with open(path, "r", encoding="utf-8") as handle:
+        policy = json.load(handle)
+    if not isinstance(policy, dict) or not {"z_min", "x_max", "pc_range"} <= set(policy):
+        raise ValueError("preprocess policy 缺少显式任务域 z_min/x_max/pc_range")
+    if (policy.get("observed_mask_protocol") != OBSERVED_MASK_PROTOCOL
+            or policy.get("observed_mask_spatial_domain") != OBSERVED_MASK_SPATIAL_DOMAIN):
+        raise ValueError("preprocess policy 的 observed target domain 协议不匹配")
+    bounds = _validate_pc_range(policy["pc_range"])
+    if not np.allclose(bounds, _validate_pc_range(expected_pc_range), rtol=0, atol=1e-6):
+        raise ValueError("preprocess policy pc_range 与 source_pc_range 不一致")
+    result = {"protocol": OBSERVED_MASK_SPATIAL_DOMAIN, "pc_range": list(bounds)}
+    for name in ("z_min", "x_max"):
+        value = policy[name]
+        if value is not None and (isinstance(value, bool) or not np.isfinite(float(value))):
+            raise ValueError(f"任务域 {name} 必须是有限数或 None")
+        result[name] = None if value is None else float(value)
+    return result
+
+
+def task_domain_zxy(target_size: Sequence[int], pc_range: Sequence[float], policy: dict) -> np.ndarray:
+    """在模型网格上按体素中心构建任务域；输入/输出采用 ZXY 轴序。"""
+    if policy.get("protocol") != OBSERVED_MASK_SPATIAL_DOMAIN:
+        raise ValueError("task spatial domain protocol 不匹配")
+    z_size, x_size, y_size = target_size
+    return build_spatial_valid_domain(
+        (x_size, y_size, z_size), pc_range,
+        z_min=policy["z_min"], x_max=policy["x_max"],
+    ).transpose(2, 0, 1)
 
 
 def _validate_pc_range(pc_range: Sequence[float]) -> Tuple[float, ...]:

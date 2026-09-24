@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""正式离线评价已保存预测；指标在权威 observed 域内计算。"""
+"""正式离线评价已保存预测；主指标仅在 LiDAR 标签有效域与任务域交集计算。"""
 
 import argparse
 import csv
@@ -31,7 +31,6 @@ from diffusion_consistency_radar.cm.evaluation_metrics import (  # noqa: E402
     occupancy_prf,
     uncertainty_calibration_metrics,
 )
-from diffusion_consistency_radar.dataset_manifest import sha256_file  # noqa: E402
 from diffusion_consistency_radar.occupancy_3d_metrics import (  # noqa: E402
     accumulate_occupancy_3d_counts,
     build_occupancy_3d_stratification,
@@ -39,12 +38,14 @@ from diffusion_consistency_radar.occupancy_3d_metrics import (  # noqa: E402
     finalize_occupancy_3d_metrics,
     occupancy_3d_confusion_counts,
 )
-from diffusion_consistency_radar.observed_artifact_protocol import (  # noqa: E402
-    RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL,
-    observed_mask_records_digest as _observed_mask_records_digest,
-)
 from diffusion_consistency_radar.occupancy_threshold_artifact import (  # noqa: E402
     validate_threshold_artifact_metadata,
+)
+from diffusion_consistency_radar.observed_mask import (  # noqa: E402
+    OBSERVED_MASK_PROTOCOL,
+    load_observed_mask,
+    load_task_spatial_domain,
+    task_domain_zxy,
 )
 
 try:
@@ -66,7 +67,7 @@ ALLOWED_AUXILIARY_FILES = {
 }
 
 FORMAL_SAVED_EVALUATION_PROTOCOL = (
-    "formal_saved_prediction_observed_domain_evaluation_v1"
+    "formal_saved_prediction_lidar_label_domain_evaluation_v3"
 )
 DIAGNOSTIC_SAVED_EVALUATION_PROTOCOL = "saved_prediction_diagnostic_evaluation_v1"
 FORMAL_METRIC_FIELDS = (
@@ -101,6 +102,7 @@ FRAME_FIELDS = [
     "lidar_file",
     "observed_mask_file",
     "observed_voxels",
+    "label_observed_mask_file",
     "effective_occ_threshold",
     "target_threshold",
     "pred_point_count",
@@ -332,7 +334,7 @@ def _discover_prediction_frames(
             uncertainties[frame_id] = path
         elif observed_match:
             frame_id = observed_match.group(1)
-            _require_regular_file(path, "observed mask")
+            # 地图用 Radar 射线附件不参与离线评价/重导出，不读取或校验其内容。
             observed_masks[frame_id] = path
         elif POINTCLOUD_PATTERN.fullmatch(name) or name in ALLOWED_AUXILIARY_FILES:
             continue
@@ -343,88 +345,7 @@ def _discover_prediction_frames(
     unknown_uncertainty = sorted(set(uncertainties) - set(predictions))
     if unknown_uncertainty:
         raise ValueError(f"uncertainty 存在未知帧: {unknown_uncertainty}")
-    unknown_observed = sorted(set(observed_masks) - set(predictions))
-    if unknown_observed:
-        raise ValueError(f"observed mask 存在未知 frame: {unknown_observed}")
     return predictions, uncertainties, observed_masks
-
-
-def _validate_observed_mask_contract(
-    observed_masks: Dict[str, str],
-    metadata: dict,
-    predictions: Dict[str, str],
-    target_size: Sequence[int],
-) -> Optional[dict]:
-    """校验 inference_run 声明与逐帧 Radar observed mask 内容一致。"""
-    contract = metadata.get("observed_mask")
-    require_formal = bool(
-        metadata.get("formal_protocol") is True or metadata.get("require_real_ir")
-    )
-    if contract is None:
-        if observed_masks:
-            raise ValueError("observed mask 文件缺少 inference_run metadata 绑定")
-        if require_formal:
-            raise ValueError("formal inference metadata 缺少 observed mask 合同")
-        return None
-    if not isinstance(contract, dict):
-        raise ValueError("observed mask metadata 必须是 object")
-    if contract.get("protocol") != RADAR_ENDPOINT_RAY_OBSERVED_PROTOCOL:
-        raise ValueError("observed mask protocol 不匹配")
-    records = contract.get("records")
-    if not isinstance(records, list):
-        raise ValueError("observed mask metadata 缺少 records")
-    if int(contract.get("frame_count", -1)) != len(records):
-        raise ValueError("observed mask frame_count 与 records 不一致")
-
-    normalized_records = []
-    record_ids = set()
-    total_observed = 0
-    expected_shape = tuple(int(value) for value in target_size)
-    for record in records:
-        if not isinstance(record, dict):
-            raise ValueError("observed mask record 必须是 object")
-        frame_id = str(record.get("frame_id", ""))
-        file_name = str(record.get("file", ""))
-        if frame_id in record_ids or file_name != f"{frame_id}_observed_mask.npy":
-            raise ValueError("observed mask record frame/file 无效或重复")
-        record_ids.add(frame_id)
-        path = observed_masks.get(frame_id)
-        if path is None or os.path.basename(path) != file_name:
-            raise ValueError(f"observed mask frame 缺失: {frame_id}")
-        array = _load_array(path)
-        if array.ndim != 3 or tuple(array.shape) != expected_shape:
-            raise ValueError(
-                f"observed mask shape 必须为 {expected_shape}: {path} -> {array.shape}"
-            )
-        if not np.logical_or(array == 0, array == 1).all():
-            raise ValueError(f"observed mask 必须严格为 0/1: {path}")
-        actual_sha256 = sha256_file(path)
-        actual_count = int(np.count_nonzero(array))
-        if require_formal and actual_count <= 0:
-            raise ValueError(f"正式 observed mask 不得为空域: {path}")
-        if str(record.get("sha256", "")) != actual_sha256:
-            raise ValueError(f"observed mask SHA-256 不匹配: {path}")
-        if int(record.get("observed_voxels", -1)) != actual_count:
-            raise ValueError(f"observed mask voxel count 不匹配: {path}")
-        normalized_records.append(
-            {
-                "frame_id": frame_id,
-                "file": file_name,
-                "sha256": actual_sha256,
-                "observed_voxels": actual_count,
-            }
-        )
-        total_observed += actual_count
-
-    if record_ids != set(predictions) or set(observed_masks) != set(predictions):
-        raise ValueError("observed mask frame 集合与 prediction 不一致")
-    if int(contract.get("observed_voxels", -1)) != total_observed:
-        raise ValueError("observed mask 总 voxel count 不一致")
-    if contract.get("files_sha256") != _observed_mask_records_digest(
-        normalized_records
-    ):
-        raise ValueError("observed mask records digest 不匹配")
-    return contract
 
 
 def _discover_source_frames(folder: str, label: str) -> Dict[str, str]:
@@ -506,7 +427,7 @@ def _voxel_czxy_to_points(
     voxel_size: Optional[Sequence[float]] = None,
 ) -> np.ndarray:
     occ = np.asarray(voxel, dtype=np.float32)[0]
-    indices = np.argwhere(occ > float(threshold))
+    indices = np.argwhere(occ >= float(threshold))
     if indices.shape[0] == 0:
         return np.zeros((0, 3), dtype=np.float32)
     z_count, x_count, y_count = occ.shape
@@ -611,6 +532,26 @@ def _write_json_atomic(path: str, payload: dict) -> None:
     os.replace(temp_path, path)
 
 
+def load_label_observed_domain(mask_path: str, target_path: str, resolved: dict,
+                               task_mask: np.ndarray) -> np.ndarray:
+    """按训练相同的裁剪和 any-pooling 读取标签域，禁止从 target==0 推测 free。"""
+    if target_path.endswith(".npz"):
+        with np.load(target_path, allow_pickle=False) as data:
+            source_shape = tuple(int(value) for value in data["shape"])
+    else:
+        source_shape = np.load(target_path, mmap_mode="r", allow_pickle=False).shape
+    mask = load_observed_mask(
+        mask_path, expected_shape=source_shape[:3],
+        expected_pc_range=resolved["source_pc_range"],
+    )
+    tensor = torch.from_numpy(mask.astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
+    tensor = crop_voxel_channels_to_pc_range(
+        tensor, resolved["source_pc_range"], resolved["model_pc_range"],
+    )
+    resized = resize_voxel_channels(tensor, resolved["target_size"], mask_channel=0)
+    return (resized[0].numpy() > 0.5) & task_mask
+
+
 def evaluate_saved_predictions(
     pred_voxel_dir: str,
     radar_voxel_dir: str,
@@ -625,6 +566,8 @@ def evaluate_saved_predictions(
     model_pc_range: Optional[Sequence[float]] = None,
     target_size: Optional[Sequence[int]] = None,
     max_files: int = 0,
+    target_observed_mask_dir: str = "",
+    preprocess_policy_path: str = "",
 ) -> dict:
     """严格配对并评价已保存 voxel；全部输入通过 preflight 后才写输出。"""
     _require_directory(pred_voxel_dir, "prediction")
@@ -644,14 +587,26 @@ def evaluate_saved_predictions(
         model_pc_range,
         target_size,
     )
-    predictions, uncertainties, observed_masks = _discover_prediction_frames(
+    # NOTE: 新旧预测均可复用，但正式评价必须提供真实标签域；缺失时 fail closed。
+    scene_dir = os.path.dirname(os.path.abspath(target_voxel_dir))
+    policy_path = preprocess_policy_path or os.path.join(scene_dir, "preprocess_policy.json")
+    label_dir = target_observed_mask_dir or os.path.join(scene_dir, "observed_mask")
+    use_label_domain = bool(resolved["formal_run"] or target_observed_mask_dir
+                            or preprocess_policy_path or os.path.isdir(label_dir))
+    task_policy = None
+    task_mask = np.ones(tuple(resolved["target_size"]), dtype=bool)
+    label_frames = {}
+    if use_label_domain:
+        _require_directory(label_dir, "LiDAR label observed mask")
+        _require_regular_file(policy_path, "target preprocess policy")
+        task_policy = load_task_spatial_domain(policy_path, resolved["source_pc_range"])
+        stored_task_policy = resolved["metadata"].get("task_spatial_domain")
+        if stored_task_policy is not None and stored_task_policy != task_policy:
+            raise ValueError("prediction 与 target 的 task spatial domain 不一致")
+        task_mask = task_domain_zxy(resolved["target_size"], resolved["model_pc_range"], task_policy)
+        label_frames = _discover_source_frames(label_dir, "LiDAR label observed mask")
+    predictions, uncertainties, _ = _discover_prediction_frames(
         pred_voxel_dir
-    )
-    observed_contract = _validate_observed_mask_contract(
-        observed_masks,
-        resolved["metadata"],
-        predictions,
-        resolved["target_size"],
     )
     radar_frames = _discover_source_frames(radar_voxel_dir, "radar")
     target_frames = _discover_source_frames(target_voxel_dir, "target")
@@ -664,17 +619,22 @@ def evaluate_saved_predictions(
             "run metadata frame_count 与 prediction frame 数不一致: "
             f"{metadata_frame_count} != {len(all_frame_ids)}"
         )
-    missing_radar = sorted(set(all_frame_ids) - set(radar_frames))
-    missing_target = sorted(set(all_frame_ids) - set(target_frames))
+    frame_ids = (
+        all_frame_ids[: int(max_files)] if int(max_files) > 0 else all_frame_ids
+    )
+    # 预测清单仍需自洽；外部标签只要求本次选中的帧，支持部分同步后的 smoke 复评。
+    missing_radar = sorted(set(frame_ids) - set(radar_frames))
+    missing_target = sorted(set(frame_ids) - set(target_frames))
     if missing_radar or missing_target:
         raise ValueError(
             f"frame 帧配对失败: missing_radar={missing_radar}, "
             f"missing_target={missing_target}"
         )
 
-    frame_ids = (
-        all_frame_ids[: int(max_files)] if int(max_files) > 0 else all_frame_ids
-    )
+    missing_labels = sorted(set(frame_ids) - set(label_frames)) if use_label_domain else []
+    if missing_labels:
+        raise ValueError(f"LiDAR label observed mask 缺少对应帧: {missing_labels}")
+
     lidar_mapping = _read_lidar_mapping(
         raw_livox_dir,
         lidar_index_file,
@@ -691,7 +651,7 @@ def evaluate_saved_predictions(
             resolved["model_pc_range"],
             is_target=False,
         )
-        _load_source_as_czxy(
+        preflight_target = _load_source_as_czxy(
             target_frames[frame_id],
             resolved["target_size"],
             resolved["source_pc_range"],
@@ -705,8 +665,12 @@ def evaluate_saved_predictions(
                     f"uncertainty shape 必须可压缩为 3D: "
                     f"{uncertainties[frame_id]} -> {uncertainty.shape}"
                 )
-        if frame_id in observed_masks:
-            _load_array(observed_masks[frame_id])
+        if use_label_domain:
+            label_domain = load_label_observed_domain(
+                label_frames[frame_id], target_frames[frame_id], resolved, task_mask,
+            )
+            if ((preflight_target[0] >= target_threshold) & task_mask & ~label_domain).any():
+                raise ValueError(f"target occupied 不在 LiDAR label observed 域内: {frame_id}")
 
     os.makedirs(output_dir, exist_ok=True)
     rows: List[dict] = []
@@ -732,23 +696,18 @@ def evaluate_saved_predictions(
             resolved["model_pc_range"],
             is_target=True,
         )
-        if frame_id in observed_masks:
-            observed_domain = _load_array(observed_masks[frame_id]).squeeze() > 0.5
-            if observed_domain.shape != tuple(resolved["target_size"]):
-                raise ValueError(
-                    f"observed mask shape 与 target_size 不一致: {frame_id} -> "
-                    f"{observed_domain.shape}"
-                )
-        else:
-            observed_domain = np.ones(tuple(resolved["target_size"]), dtype=bool)
+        observed_domain = (
+            load_label_observed_domain(label_frames[frame_id], target_frames[frame_id], resolved, task_mask)
+            if use_label_domain else task_mask
+        )
 
-        # NOTE: ch0 是唯一 occupancy 通道；正式点云/占用指标只消费权威 observed 域。
+        # ch0 是唯一 occupancy 通道；标签未知处不计分，但不能用 Radar 射线隐藏已知漏检。
         pred_for_metrics = pred.copy()
         radar_for_metrics = radar.copy()
         target_for_metrics = target.copy()
-        pred_for_metrics[0] = np.where(observed_domain, pred[0], 0.0)
-        radar_for_metrics[0] = np.where(observed_domain, radar[0], 0.0)
-        target_for_metrics[0] = np.where(observed_domain, target[0], 0.0)
+        pred_for_metrics[0] = np.where(observed_domain, pred[0], -np.inf)
+        radar_for_metrics[0] = np.where(observed_domain, radar[0], -np.inf)
+        target_for_metrics[0] = np.where(observed_domain, target[0], -np.inf)
         pred_points = _voxel_czxy_to_points(
             pred_for_metrics,
             resolved["model_pc_range"],
@@ -816,15 +775,12 @@ def evaluate_saved_predictions(
             "target_file": os.path.basename(target_frames[frame_id]),
             "lidar_file": os.path.basename(lidar_path) if lidar_path else "",
             "observed_mask_file": (
-                os.path.basename(observed_masks[frame_id])
-                if frame_id in observed_masks
+                os.path.basename(label_frames[frame_id])
+                if use_label_domain
                 else ""
             ),
-            "observed_voxels": (
-                int(np.count_nonzero(_load_array(observed_masks[frame_id])))
-                if frame_id in observed_masks
-                else ""
-            ),
+            "observed_voxels": int(observed_domain.sum()),
+            "label_observed_mask_file": os.path.basename(label_frames[frame_id]) if use_label_domain else "",
             "effective_occ_threshold": float(resolved["occ_threshold"]),
             "target_threshold": float(target_threshold),
             "pred_point_count": int(pred_points.shape[0]),
@@ -870,7 +826,7 @@ def evaluate_saved_predictions(
             uncertainty = _load_array(uncertainties[frame_id])
             calibration = uncertainty_calibration_metrics(
                 pred[0],
-                (target[0] > float(target_threshold)).astype(np.float32),
+                (target[0] >= float(target_threshold)).astype(np.float32),
                 uncertainty,
                 occ_threshold=float(resolved["occ_threshold"]),
                 observed_mask=observed_domain,
@@ -902,6 +858,7 @@ def evaluate_saved_predictions(
             "target_file",
             "lidar_file",
             "observed_mask_file",
+            "label_observed_mask_file",
         }
     ]
     aggregate_metrics = {
@@ -918,22 +875,25 @@ def evaluate_saved_predictions(
         "stage": "offline_evaluation",
         "prediction_unchanged": True,
         "occupancy_metric_domain": (
-            "external_authoritative_observed_mask"
-            if observed_contract
+            "lidar_label_intersect_task_domain" if use_label_domain
             else "full_grid_diagnostic"
         ),
+        "task_spatial_domain": task_policy,
+        "target_observed_mask_dir": os.path.abspath(label_dir) if use_label_domain else "",
+        "target_observed_mask_protocol": OBSERVED_MASK_PROTOCOL if use_label_domain else None,
+        "preprocess_policy_path": os.path.abspath(policy_path) if use_label_domain else "",
         "metric_aggregation": "finite_per_frame_macro_mean_v1",
         "auxiliary_metric_domain": {
-            "radar_baseline": "same_authoritative_observed_mask",
+            "radar_baseline": "same_evaluation_domain",
             "raw_lidar_chamfer": "unmasked_raw_lidar_diagnostic_reference",
         },
         "frame_count": len(frame_ids),
         "prediction_frame_count": len(all_frame_ids),
         "observed_mask_protocol": (
-            observed_contract.get("protocol") if observed_contract else None
+            OBSERVED_MASK_PROTOCOL if use_label_domain else None
         ),
         "observed_mask_frame_count": (
-            int(observed_contract["frame_count"]) if observed_contract else 0
+            len(frame_ids) if use_label_domain else 0
         ),
         "selected_frame_ids": list(frame_ids),
         "occ_threshold": float(resolved["occ_threshold"]),
@@ -1004,6 +964,10 @@ def main() -> None:
     parser.add_argument("--model_pc_range", type=float, nargs=6, default=None)
     parser.add_argument("--target_size", type=int, nargs=3, default=None)
     parser.add_argument("--max_files", type=int, default=0)
+    parser.add_argument("--target_observed_mask_dir", default="",
+                        help="LiDAR 标签有效域；默认 target_voxel 同级 observed_mask，正式评价必需")
+    parser.add_argument("--preprocess_policy_path", default="",
+                        help="默认 target_voxel 同级 preprocess_policy.json，不允许猜测任务高度")
     args = parser.parse_args()
     try:
         summary = evaluate_saved_predictions(**vars(args))
