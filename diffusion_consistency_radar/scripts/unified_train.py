@@ -111,6 +111,15 @@ from diffusion_consistency_radar.observed_mask import (
     OBSERVED_MASK_PROTOCOL,
     PERSISTED_OBSERVED_MASK_SOURCE,
 )
+from diffusion_consistency_radar.observation_supervision import (
+    LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+    assert_checkpoint_supervision_protocol,
+    select_training_supervision_mask,
+    pool_latent_supervision_mask,
+    threshold_observation_domain,
+    validate_observation_supervision_protocol,
+    uses_reliable_free_supervision,
+)
 from diffusion_consistency_radar.radar_statistics import (
     RADAR_STATISTICS_PROTOCOL,
     SUPPORTED_RADAR_STATISTICS_PROTOCOLS,
@@ -525,8 +534,25 @@ def seed_training_run(training_seed: int) -> torch.Generator:
 
 
 LDM_OBSERVATION_SUPERVISION_PROTOCOL = (
-    "persisted_voxel_and_adaptive_latent_any_v1"
+    LEGACY_OBSERVATION_SUPERVISION_PROTOCOL
 )
+
+
+def resolve_training_supervision_mask(
+    metadata: Dict[str, Any],
+    target: torch.Tensor,
+    protocol: Optional[str],
+) -> Optional[torch.Tensor]:
+    """按训练协议选择 legacy observed 或 occupied/reliable-free 监督域。"""
+    mask = select_training_supervision_mask(metadata, protocol)
+    if mask is None:
+        return None
+    # 旧协议原样交给既有损失函数，保持旧单测/接口张量类型。
+    return (
+        resolve_ldm_observed_mask(mask, target)
+        if uses_reliable_free_supervision(protocol)
+        else mask
+    )
 
 
 def resolve_ldm_observed_mask(
@@ -568,16 +594,20 @@ def resolve_ldm_observed_mask(
 def build_ldm_latent_observed_mask(
     voxel_observed_mask: Optional[torch.Tensor],
     latent: torch.Tensor,
+    target: Optional[torch.Tensor] = None,
+    observation_supervision_protocol: Optional[str] = None,
 ) -> Optional[torch.Tensor]:
     """将体素 observed mask 规约为 latent 块可观测域。"""
     if voxel_observed_mask is None:
         return None
     if latent.ndim != 5:
         raise ValueError(f"latent 必须是 [B,C,D,H,W]，实际为 {tuple(latent.shape)}")
-    latent_mask = torch.nn.functional.adaptive_max_pool3d(
-        voxel_observed_mask.float(),
-        output_size=latent.shape[-3:],
-    ).bool()
+    if uses_reliable_free_supervision(observation_supervision_protocol) and target is None:
+        raise ValueError("三态 latent 监督必须提供 target 正例")
+    latent_mask = pool_latent_supervision_mask(
+        voxel_observed_mask, target, latent.shape[-3:],
+        observation_supervision_protocol,
+    )
     if latent_mask.shape[0] != latent.shape[0]:
         raise ValueError("latent observed mask 的 batch 与 latent 不一致")
     if not latent_mask.any():
@@ -1271,10 +1301,13 @@ def compute_ldm_loss_components(
     decoded_column_negative_weight: float = 0.0,
     decoded_column_temperature: float = 1.0,
     observed_mask: Optional[torch.Tensor] = None,
+    observation_supervision_protocol: Optional[str] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """汇总 LDM 主损失和解码辅助监督组件，必要时只解码一次。"""
     voxel_observed = resolve_ldm_observed_mask(observed_mask, target)
-    latent_observed = build_ldm_latent_observed_mask(voxel_observed, z_target)
+    latent_observed = build_ldm_latent_observed_mask(
+        voxel_observed, z_target, target, observation_supervision_protocol
+    )
     latent_loss = _masked_tensor_mean(
         torch.square(denoised - z_target),
         latent_observed,
@@ -1625,6 +1658,12 @@ class OptimizedVAETrainer:
         self.require_persisted_observed_mask = bool(
             config.get("data.require_persisted_observed_mask", False)
         )
+        self.observation_supervision_protocol = validate_observation_supervision_protocol(
+            config.get(
+                "data.observation_supervision_protocol",
+                LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+            )
+        )
         self.data_protocol = resolve_training_data_protocol(
             config.get("data", {}) or {},
             "vae",
@@ -1762,6 +1801,11 @@ class OptimizedVAETrainer:
                 self, "stage_training_selection", None
             ),
         )
+        assert_checkpoint_supervision_protocol(
+            ckpt,
+            getattr(self, "observation_supervision_protocol", LDM_OBSERVATION_SUPERVISION_PROTOCOL),
+            "VAE resume",
+        )
         # 单元测试可能通过 __new__ 构造最小 trainer；正式入口始终具备两项配置。
         if hasattr(self, "config") and hasattr(self, "memory_opt"):
             assert_resume_distributed_compatible(
@@ -1866,7 +1910,11 @@ class OptimizedVAETrainer:
             # NOTE: 前向阶段使用 autocast，配合梯度累积降低显存峰值。
             with autocast('cuda', enabled=self.memory_opt.use_amp):
                 recon, (mean, logvar) = self.model(target)
-                observed_mask = meta_dict.get("occupancy_observed_mask")
+                observed_mask = resolve_training_supervision_mask(
+                    meta_dict,
+                    target,
+                    getattr(self, "observation_supervision_protocol", None),
+                )
                 has_observed_mask = observed_mask is not None
                 if (
                     self.require_persisted_observed_mask
@@ -2023,7 +2071,11 @@ class OptimizedVAETrainer:
         for batch in val_loader:
             target, _condition, meta_dict = unpack_training_batch(batch)
             target = target.to(self.device, non_blocking=True)
-            observed_mask = meta_dict.get("occupancy_observed_mask")
+            observed_mask = resolve_training_supervision_mask(
+                meta_dict,
+                target,
+                getattr(self, "observation_supervision_protocol", None),
+            )
             has_observed_mask = observed_mask is not None
             if (
                 getattr(self, "require_persisted_observed_mask", False)
@@ -2105,6 +2157,9 @@ class OptimizedVAETrainer:
             "data_protocol": dict(self.data_protocol),
             "vae_validation": build_vae_validation_receipt(),
         }
+        payload["observation_supervision_protocol"] = getattr(
+            self, "observation_supervision_protocol", LDM_OBSERVATION_SUPERVISION_PROTOCOL
+        )
         if getattr(self, "stage_training_selection", None) is not None:
             payload["stage_training_selection"] = dict(
                 self.stage_training_selection
@@ -2281,7 +2336,12 @@ class OptimizedLDMTrainer:
             "data.deployment_validation_selection"
         )
         self.observation_supervision_protocol = (
-            LDM_OBSERVATION_SUPERVISION_PROTOCOL
+            validate_observation_supervision_protocol(
+                config.get(
+                    "data.observation_supervision_protocol",
+                    LDM_OBSERVATION_SUPERVISION_PROTOCOL,
+                )
+            )
         )
         self.require_persisted_observed_mask = bool(
             config.get("data.require_persisted_observed_mask", False)
@@ -2931,7 +2991,11 @@ class OptimizedLDMTrainer:
             target = target.to(self.device)
             cond = cond.to(self.device)
             meta_dict = move_meta_to_device(meta_dict, self.device)
-            observed_mask = meta_dict.get("occupancy_observed_mask")
+            observed_mask = resolve_training_supervision_mask(
+                meta_dict,
+                target,
+                self.observation_supervision_protocol,
+            )
             if observed_mask is None and getattr(
                 self,
                 "require_persisted_observed_mask",
@@ -3030,6 +3094,7 @@ class OptimizedLDMTrainer:
                     decoded_column_negative_weight=effective_negative_weight,
                     decoded_column_temperature=self.decoded_column_temperature,
                     observed_mask=observed_mask,
+                    observation_supervision_protocol=self.observation_supervision_protocol,
                 )
                 scaled_loss = loss / self.memory_opt.grad_accum_steps
             
@@ -3164,7 +3229,11 @@ class OptimizedLDMTrainer:
                 target = target.to(self.device, non_blocking=True)
                 cond = cond.to(self.device, non_blocking=True)
                 meta_dict = move_meta_to_device(meta_dict, self.device)
-                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                raw_observed_mask = resolve_training_supervision_mask(
+                    meta_dict,
+                    target,
+                    self.observation_supervision_protocol,
+                )
                 if (
                     raw_observed_mask is None
                     and getattr(
@@ -3250,6 +3319,8 @@ class OptimizedLDMTrainer:
                 latent_observed = build_ldm_latent_observed_mask(
                     voxel_observed,
                     z_target,
+                    target,
+                    self.observation_supervision_protocol,
                 )
                 latent_error = torch.square(
                     denoised.float() - z_target.float()
@@ -3350,7 +3421,11 @@ class OptimizedLDMTrainer:
                 target = target.to(self.device, non_blocking=True)
                 cond = cond.to(self.device, non_blocking=True)
                 meta_dict = move_meta_to_device(meta_dict, self.device)
-                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                raw_observed_mask = resolve_training_supervision_mask(
+                    meta_dict,
+                    target,
+                    self.observation_supervision_protocol,
+                )
                 if (
                     raw_observed_mask is None
                     and self.require_persisted_observed_mask
@@ -3443,6 +3518,8 @@ class OptimizedLDMTrainer:
                 latent_observed = build_ldm_latent_observed_mask(
                     voxel_observed,
                     z_target,
+                    target,
+                    self.observation_supervision_protocol,
                 )
                 latent_error = torch.square(
                     generated_latent.float() - z_target.float()
@@ -3607,7 +3684,9 @@ class OptimizedLDMTrainer:
                 payload["occupancy_threshold_validation"] = {
                     "protocol": THRESHOLD_SWEEP_PROTOCOL,
                     "split": self.validation_config["split"],
-                    "observation_domain": "persisted_observed_mask_v1",
+                    "observation_domain": threshold_observation_domain(
+                        self.observation_supervision_protocol
+                    ),
                     "sampling_protocol": LDM_VALIDATION_PROTOCOL,
                     "deployment_validation_selection_sha256": (
                         self.deployment_validation_selection[
@@ -4022,6 +4101,10 @@ def main():
         voxel_coordinate_frame=data_config.get(
             "voxel_coordinate_frame", "lidar"
         ),
+        observation_supervision_protocol=data_config.get(
+            "observation_supervision_protocol",
+            LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+        ),
     )
     val_dataset_base = NTU4DRadLM_VoxelDataset(
         root_dir=data_config.get('dataset_dir'),
@@ -4049,6 +4132,10 @@ def main():
         frame_ids_by_scene=val_frame_ids_by_scene,
         voxel_coordinate_frame=data_config.get(
             "voxel_coordinate_frame", "lidar"
+        ),
+        observation_supervision_protocol=data_config.get(
+            "observation_supervision_protocol",
+            LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
         ),
     )
     deployment_val_dataset = None
@@ -4079,6 +4166,10 @@ def main():
             frame_ids_by_scene=deployment_validation_frame_ids_by_scene,
             voxel_coordinate_frame=data_config.get(
                 "voxel_coordinate_frame", "lidar"
+            ),
+            observation_supervision_protocol=data_config.get(
+                "observation_supervision_protocol",
+                LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
             ),
         )
     if formal_multimodal:
@@ -4204,6 +4295,9 @@ def main():
             ),
             data_protocol=data_protocol,
         )
+        assert_checkpoint_supervision_protocol(
+            ckpt, data_config.get("observation_supervision_protocol"), "LDM parent VAE"
+        )
         vae, _vae_metadata = build_vae_from_checkpoint(
             ckpt, fallback_config_type=vae_type
         )
@@ -4241,6 +4335,9 @@ def main():
                 data_config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
             ),
             data_protocol=data_protocol,
+        )
+        assert_checkpoint_supervision_protocol(
+            ckpt, data_config.get("observation_supervision_protocol"), "CD parent VAE"
         )
         vae, _vae_metadata = build_vae_from_checkpoint(
             ckpt, fallback_config_type=vae_type
@@ -4281,6 +4378,10 @@ def main():
                 ),
                 'require_persisted_observed_mask': bool(
                     data_config.get("require_persisted_observed_mask", False)
+                ),
+                'observation_supervision_protocol': data_config.get(
+                    'observation_supervision_protocol',
+                    LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
                 ),
                 'validation_seed': cd_cfg.get('validation_seed', 42),
                 'validation_sigma': cd_cfg.get('validation_sigma', 0.5),

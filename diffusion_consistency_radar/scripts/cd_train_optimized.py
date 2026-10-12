@@ -54,6 +54,14 @@ from diffusion_consistency_radar.cm.dataset_loader import (
     NTU4DRadLM_VoxelDataset,
     collate_voxel_samples,
 )
+from diffusion_consistency_radar.observation_supervision import (
+    LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+    assert_checkpoint_supervision_protocol,
+    select_training_supervision_mask,
+    pool_latent_supervision_mask,
+    threshold_observation_domain,
+    validate_observation_supervision_protocol,
+)
 from diffusion_consistency_radar.checkpoint_chain import (
     FORMAL_CHECKPOINT_PROTOCOL,
     FORMAL_MINI_CHECKPOINT_PROTOCOL,
@@ -313,6 +321,7 @@ def resolve_cd_observed_masks(
     observed_mask: Optional[torch.Tensor],
     target: torch.Tensor,
     latent: torch.Tensor,
+    observation_supervision_protocol: Optional[str] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """校验 persisted mask，并生成 voxel/latent 两级 observed domain。"""
     if observed_mask is None:
@@ -334,10 +343,10 @@ def resolve_cd_observed_masks(
     if not torch.logical_or(mask == 0, mask == 1).all():
         raise ValueError("CD observed_mask 必须是严格 0/1")
     voxel_observed = mask.bool() | (target[:, 0:1] > 0.5)
-    latent_observed = F.adaptive_max_pool3d(
-        voxel_observed.float(),
-        output_size=latent.shape[-3:],
-    ).bool()
+    latent_observed = pool_latent_supervision_mask(
+        voxel_observed, target, latent.shape[-3:],
+        observation_supervision_protocol,
+    )
     if not latent_observed.any():
         raise ValueError("CD observed domain 为空")
     return voxel_observed, latent_observed
@@ -806,6 +815,9 @@ class ConsistencyDistillationTrainer:
         self.require_persisted_observed_mask = bool(
             self.config.get("require_persisted_observed_mask", False)
         )
+        self.observation_supervision_protocol = validate_observation_supervision_protocol(
+            self.config.get("observation_supervision_protocol")
+        )
         self.validation_config = resolve_cd_validation_config(self.config)
         self.denoising_diagnostic_config = (
             resolve_cd_denoising_diagnostic_config(self.config)
@@ -842,6 +854,9 @@ class ConsistencyDistillationTrainer:
             ldm_ckpt_path,
             map_location="cpu",
         )
+        assert_checkpoint_supervision_protocol(
+            initialization_checkpoint, self.observation_supervision_protocol, "CD parent LDM"
+        )
         if not self.allow_legacy_radar_units:
             assert_checkpoint_training_identity(
                 initialization_checkpoint,
@@ -866,6 +881,9 @@ class ConsistencyDistillationTrainer:
         resume_path = self.config.get('resume_path')
         if resume_path and os.path.exists(resume_path):
             resume_checkpoint = safe_torch_load(resume_path, map_location="cpu")
+            assert_checkpoint_supervision_protocol(
+                resume_checkpoint, self.observation_supervision_protocol, "CD resume"
+            )
             if not self.allow_legacy_radar_units:
                 assert_checkpoint_training_identity(
                     resume_checkpoint,
@@ -1408,7 +1426,10 @@ class ConsistencyDistillationTrainer:
                     cond,
                     meta_dict,
                 )
-                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                raw_observed_mask = select_training_supervision_mask(
+                    meta_dict,
+                    getattr(self, "observation_supervision_protocol", None),
+                )
                 if (
                     raw_observed_mask is None
                     and self.require_persisted_observed_mask
@@ -1421,6 +1442,7 @@ class ConsistencyDistillationTrainer:
                     raw_observed_mask,
                     target,
                     z_target,
+                    getattr(self, "observation_supervision_protocol", None),
                 )
             
             # 计算损失
@@ -1488,7 +1510,10 @@ class ConsistencyDistillationTrainer:
                 target = target.to(self.device, non_blocking=True)
                 radar = radar.to(self.device, non_blocking=True)
                 meta_dict = move_meta_to_device(meta_dict, self.device)
-                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                raw_observed_mask = select_training_supervision_mask(
+                    meta_dict,
+                    getattr(self, "observation_supervision_protocol", None),
+                )
                 if (
                     raw_observed_mask is None
                     and self.require_persisted_observed_mask
@@ -1507,6 +1532,7 @@ class ConsistencyDistillationTrainer:
                     raw_observed_mask,
                     target,
                     z_target,
+                    getattr(self, "observation_supervision_protocol", None),
                 )
                 sigma = torch.full(
                     (z_target.shape[0],),
@@ -1644,7 +1670,10 @@ class ConsistencyDistillationTrainer:
                 target = target.to(self.device, non_blocking=True)
                 radar = radar.to(self.device, non_blocking=True)
                 meta_dict = move_meta_to_device(meta_dict, self.device)
-                raw_observed_mask = meta_dict.get("occupancy_observed_mask")
+                raw_observed_mask = select_training_supervision_mask(
+                    meta_dict,
+                    getattr(self, "observation_supervision_protocol", None),
+                )
                 if (
                     raw_observed_mask is None
                     and self.require_persisted_observed_mask
@@ -1663,6 +1692,7 @@ class ConsistencyDistillationTrainer:
                     raw_observed_mask,
                     target,
                     z_target,
+                    getattr(self, "observation_supervision_protocol", None),
                 )
                 sample_ids = meta_dict.get("sample_id")
                 if sample_ids is None:
@@ -2010,6 +2040,9 @@ class ConsistencyDistillationTrainer:
             "ema_update_protocol": CD_EMA_UPDATE_PROTOCOL,
             "data_protocol": dict(self.data_protocol),
         }
+        payload["observation_supervision_protocol"] = getattr(
+            self, "observation_supervision_protocol", LEGACY_OBSERVATION_SUPERVISION_PROTOCOL
+        )
         if validation_metrics is not None:
             payload["deployment_weight_source"] = deployment_weight_source
             payload["cd_validation"] = {
@@ -2042,7 +2075,9 @@ class ConsistencyDistillationTrainer:
                 payload["occupancy_threshold_validation"] = {
                     "protocol": THRESHOLD_SWEEP_PROTOCOL,
                     "split": self.validation_config["split"],
-                    "observation_domain": "persisted_observed_mask_v1",
+                    "observation_domain": threshold_observation_domain(
+                        getattr(self, "observation_supervision_protocol", None)
+                    ),
                     "sampling_protocol": CD_VALIDATION_PROTOCOL,
                     "deployment_validation_selection_sha256": (
                         self.deployment_validation_selection[
@@ -2414,6 +2449,9 @@ def main():
         checkpoint_protocol=checkpoint_protocol,
         data_protocol=data_protocol,
     )
+    assert_checkpoint_supervision_protocol(
+        ckpt, data_config.get("observation_supervision_protocol"), "CD parent VAE"
+    )
     vae_config = config.get("vae", {}) if isinstance(config.get("vae", {}), dict) else {}
     vae, _vae_metadata = build_cd_vae_from_checkpoint(
         ckpt,
@@ -2445,6 +2483,9 @@ def main():
         ),
         frame_ids_by_scene=train_frame_ids_by_scene,
         voxel_coordinate_frame=data_config.get("voxel_coordinate_frame", "lidar"),
+        observation_supervision_protocol=data_config.get(
+            "observation_supervision_protocol", LEGACY_OBSERVATION_SUPERVISION_PROTOCOL
+        ),
     )
     train_sampler = None
     if distributed.initialized:
@@ -2495,6 +2536,9 @@ def main():
             voxel_coordinate_frame=data_config.get(
                 "voxel_coordinate_frame", "lidar"
             ),
+            observation_supervision_protocol=data_config.get(
+                "observation_supervision_protocol", LEGACY_OBSERVATION_SUPERVISION_PROTOCOL
+            ),
         )
         validation_sampler = None
         if distributed.initialized:
@@ -2538,6 +2582,9 @@ def main():
             frame_ids_by_scene=deployment_validation_frame_ids_by_scene,
             voxel_coordinate_frame=data_config.get(
                 "voxel_coordinate_frame", "lidar"
+            ),
+            observation_supervision_protocol=data_config.get(
+                "observation_supervision_protocol", LEGACY_OBSERVATION_SUPERVISION_PROTOCOL
             ),
         )
         deployment_validation_sampler = None
@@ -2595,6 +2642,9 @@ def main():
             ),
             'require_persisted_observed_mask': bool(
                 data_config.get("require_persisted_observed_mask", False)
+            ),
+            'observation_supervision_protocol': data_config.get(
+                'observation_supervision_protocol', LEGACY_OBSERVATION_SUPERVISION_PROTOCOL
             ),
             'validation_seed': cd_config.get('validation_seed', 42),
             'validation_sigma': cd_config.get('validation_sigma', 0.5),

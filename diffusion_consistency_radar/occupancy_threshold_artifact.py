@@ -8,6 +8,11 @@ import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
+from diffusion_consistency_radar.observation_supervision import (
+    RELIABLE_FREE_OBSERVATION_SUPERVISION_PROTOCOL,
+    threshold_observation_domain,
+    validate_observation_supervision_protocol,
+)
 
 
 THRESHOLD_SWEEP_PROTOCOL = "observed_micro_occupancy_threshold_sweep_v2"
@@ -305,7 +310,9 @@ def validate_checkpoint_threshold_sweep(
     )
     if sweep.get("split") != "temporal_block_validation_suffix":
         raise ValueError("checkpoint threshold validation split 不匹配")
-    if sweep.get("observation_domain") != "persisted_observed_mask_v1":
+    if sweep.get("observation_domain") != threshold_observation_domain(
+        checkpoint.get("observation_supervision_protocol")
+    ):
         raise ValueError("checkpoint threshold observation domain 不匹配")
     if sweep.get("sampling_protocol") != THRESHOLD_SAMPLING_PROTOCOL:
         raise ValueError("checkpoint threshold 必须来自完整 deployment sampling")
@@ -360,7 +367,7 @@ def build_threshold_artifact(
             "threshold sweep 与 deployment validation 子集身份不一致"
         )
     checkpoint_sha256 = sha256_file(checkpoint_path)
-    return {
+    artifact = {
         "schema_version": 2,
         "protocol": THRESHOLD_ARTIFACT_PROTOCOL,
         "formal": True,
@@ -390,6 +397,15 @@ def build_threshold_artifact(
         "selected_metrics": selected,
         "metrics_by_threshold": [dict(record) for record in records],
     }
+    if (
+        validate_observation_supervision_protocol(
+            checkpoint.get("observation_supervision_protocol")
+        ) == RELIABLE_FREE_OBSERVATION_SUPERVISION_PROTOCOL
+    ):
+        artifact["observation_supervision_protocol"] = (
+            RELIABLE_FREE_OBSERVATION_SUPERVISION_PROTOCOL
+        )
+    return artifact
 
 
 def validate_threshold_artifact_metadata(
@@ -421,7 +437,9 @@ def validate_threshold_artifact_metadata(
         raise ValueError("occupancy threshold artifact checkpoint protocol 不匹配")
     if artifact.get("validation_split") != "temporal_block_validation_suffix":
         raise ValueError("occupancy threshold artifact validation split 不匹配")
-    if artifact.get("observation_domain") != "persisted_observed_mask_v1":
+    if artifact.get("observation_domain") != threshold_observation_domain(
+        artifact.get("observation_supervision_protocol")
+    ):
         raise ValueError("occupancy threshold artifact observation domain 不匹配")
     records = artifact.get("metrics_by_threshold")
     if not isinstance(records, list) or len(records) != len(candidates):

@@ -11,6 +11,8 @@ data:
   require_real_ir: true
   require_real_calibration: true
   require_persisted_observed_mask: true
+  # 保持旧正式实验默认；新三态实验必须使用隔离的 PROTOCOL_TAG 和完整 VAE→LDM→CD 父链。
+  observation_supervision_protocol: "persisted_voxel_and_adaptive_latent_any_v1"
   # 逐字段计数参与 resize 聚合；模型输入接口仍保持四通道 Radar voxel。
   require_radar_statistics: true
   voxel_coordinate_frame: "lidar"

@@ -23,6 +23,19 @@ except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加�
     )
 
 try:
+    from ..observation_supervision import (
+        LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+        validate_observation_supervision_protocol,
+        uses_reliable_free_supervision,
+    )
+except (ImportError, ValueError):  # 兼容把 diffusion_consistency_radar 加入 sys.path 的旧脚本
+    from observation_supervision import (  # type: ignore
+        LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+        validate_observation_supervision_protocol,
+        uses_reliable_free_supervision,
+    )
+
+try:
     from ..radar_normalization import (
         LEGACY_RADAR_NORMALIZATION_PROTOCOL,
         RADAR_NORMALIZATION_PROTOCOL,
@@ -392,6 +405,42 @@ def resize_voxel_channels(voxel_tensor: torch.Tensor, target_size, mask_channel:
     return torch.cat(outputs, dim=1).squeeze(0)
 
 
+def derive_reliable_free_supervision_masks(
+    cropped_observed_mask: torch.Tensor,
+    cropped_target: torch.Tensor,
+    target_size,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """从裁剪后的细体素计算 coarse any-observed、可靠 free 与三态监督域。
+
+    ``adaptive_max_pool3d`` 的 any-observed 结果只表示块内至少有一个
+    LiDAR 射线交集；只有块内所有细体素都被观测且没有占用体素时，才将其
+    标为 reliable free。其余区域保持 unknown。返回值均为 ``[1,Z,X,Y]``。
+    """
+    if cropped_observed_mask.ndim != 4 or cropped_observed_mask.shape[0] != 1:
+        raise ValueError(
+            "cropped_observed_mask 必须是 [1,Z,X,Y]，实际为 "
+            f"{tuple(cropped_observed_mask.shape)}"
+        )
+    if cropped_target.ndim != 4 or cropped_target.shape[0] < 1:
+        raise ValueError(
+            "cropped_target 必须是 [C,Z,X,Y]，实际为 "
+            f"{tuple(cropped_target.shape)}"
+        )
+    observed = cropped_observed_mask.float().unsqueeze(0)
+    occupied = (cropped_target[0:1] > 0.5).float().unsqueeze(0)
+    any_observed = F.adaptive_max_pool3d(observed, target_size) > 0.5
+    not_observed = F.adaptive_max_pool3d(1.0 - observed, target_size) > 0.5
+    all_observed = ~not_observed
+    coarse_occupied = F.adaptive_max_pool3d(occupied, target_size) > 0.5
+    reliable_free = all_observed & ~coarse_occupied
+    supervision = reliable_free | coarse_occupied
+    return (
+        any_observed.squeeze(0).float(),
+        reliable_free.squeeze(0).float(),
+        supervision.squeeze(0).float(),
+    )
+
+
 def resize_radar_voxel_channels(
     voxel_tensor: torch.Tensor,
     target_size,
@@ -727,7 +776,8 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                  require_persisted_observed_mask=False,
                  require_radar_statistics=False,
                  frame_ids_by_scene=None,
-                 voxel_coordinate_frame="lidar"):
+                 voxel_coordinate_frame="lidar",
+                 observation_supervision_protocol=LEGACY_OBSERVATION_SUPERVISION_PROTOCOL):
         """加载单帧 Radar/IR 条件及 LiDAR 离线监督合同。"""
         self.root_dir = root_dir
         self.return_path = return_path
@@ -745,6 +795,9 @@ class NTU4DRadLM_VoxelDataset(Dataset):
         self.require_real_calibration = bool(require_real_calibration)
         self.require_persisted_observed_mask = bool(
             require_persisted_observed_mask
+        )
+        self.observation_supervision_protocol = validate_observation_supervision_protocol(
+            observation_supervision_protocol
         )
         if type(require_radar_statistics) is not bool:
             raise ValueError("require_radar_statistics 必须是 bool")
@@ -839,6 +892,10 @@ class NTU4DRadLM_VoxelDataset(Dataset):
                 default_config.update(augmentation_config)
             self.augmentation = ComposedAugmentation([VoxelAugmentation(**default_config)])
             logger.info(f"数据增强已启用: {default_config}")
+        if uses_reliable_free_supervision(self.observation_supervision_protocol) and self.augmentation is not None:
+            raise ValueError(
+                "三态监督要求 use_augmentation=False；当前增强器不保证三个监督域同步"
+            )
 
         if not os.path.exists(root_dir):
             print(f"Warning: Root dir {root_dir} does not exist.")
@@ -1099,28 +1156,55 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             # 不把 target 空白自动解释为可见 free。
             observed_mask_np = target_voxel[..., 0] > 0.5
             observed_mask_source = "occupied_only_fallback"
+        if (
+            uses_reliable_free_supervision(self.observation_supervision_protocol)
+            and observed_mask_source != PERSISTED_OBSERVED_MASK_SOURCE
+        ):
+            raise ValueError(
+                "三态监督必须使用持久化 LiDAR observed mask，"
+                f"禁止回退到 {observed_mask_source!r}"
+            )
 
         # 完美对齐物理原版轴向重塑: (H, W, Z, C) -> (C, Z, H, W)
         target_tensor = torch.from_numpy(target_voxel).permute(3, 2, 0, 1)
-        target_tensor = crop_voxel_channels_to_pc_range(
+        cropped_target_tensor = crop_voxel_channels_to_pc_range(
             target_tensor, self.source_pc_range, self.model_pc_range
         )
-        target_tensor = resize_voxel_channels(target_tensor, self.target_size, mask_channel=3)
+        target_tensor = resize_voxel_channels(
+            cropped_target_tensor,
+            self.target_size,
+            mask_channel=3,
+        )
 
         observed_mask_tensor = torch.from_numpy(
             observed_mask_np.astype(np.float32)
         ).permute(2, 0, 1).unsqueeze(0)
-        observed_mask_tensor = crop_voxel_channels_to_pc_range(
+        cropped_observed_mask_tensor = crop_voxel_channels_to_pc_range(
             observed_mask_tensor,
             self.source_pc_range,
             self.model_pc_range,
         )
-        observed_mask_tensor = resize_voxel_channels(
-            observed_mask_tensor,
-            self.target_size,
-            mask_channel=0,
+        three_state = uses_reliable_free_supervision(
+            self.observation_supervision_protocol
         )
-        observed_mask_tensor = (observed_mask_tensor > 0.5).float()
+        if three_state:
+            (
+                observed_mask_tensor,
+                reliable_free_mask,
+                supervision_mask,
+            ) = derive_reliable_free_supervision_masks(
+                cropped_observed_mask_tensor,
+                cropped_target_tensor,
+                self.target_size,
+            )
+        else:
+            # 保持正式旧协议的原池化路径及计算开销不变。
+            observed_mask_tensor = resize_voxel_channels(
+                cropped_observed_mask_tensor,
+                self.target_size,
+                mask_channel=0,
+            )
+            observed_mask_tensor = (observed_mask_tensor > 0.5).float()
 
         # 2. 加载与监督时刻同名的单帧 Radar 条件。
         radar_statistics = []
@@ -1278,6 +1362,17 @@ class NTU4DRadLM_VoxelDataset(Dataset):
             "radar_normalization_sha256": self.radar_normalization_sha256,
             "legacy_radar_units": self.legacy_radar_units,
         }
+        if three_state:
+            meta_dict.update({
+                "occupancy_reliable_free_mask": reliable_free_mask,
+                "occupancy_supervision_mask": supervision_mask,
+                "observation_supervision_protocol": (
+                    self.observation_supervision_protocol
+                ),
+                "occupancy_reliable_free_mask_source": (
+                    "model_block_all_observed_no_occupied_v1"
+                ),
+            })
 
         if self.return_path:
             return target_tensor, radar_tensor, meta_dict, target_path

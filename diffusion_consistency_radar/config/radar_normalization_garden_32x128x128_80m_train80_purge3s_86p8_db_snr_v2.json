@@ -1,0 +1,59 @@
+{
+  "doppler": {
+    "clip": [
+      -1.0,
+      1.0
+    ],
+    "scale_mps": 86.8,
+    "transform": "symmetric_physical_scale"
+  },
+  "formal": true,
+  "frame_count": 3210,
+  "input_provenance": {
+    "dataset_manifest_sha256": {
+      "garden": "d3a275efbd2dfdeea365dddac2f616b0c7c2fa858ca4f6bb57f81488292cf057"
+    },
+    "split_artifact_sha256": "01546ef0a679d84a04ec58aa604df3483916a56488c1737c8da8ac40576823c3"
+  },
+  "intensity": {
+    "clip": [
+      -5.0,
+      5.0
+    ],
+    "iqr": 3.932499885559082,
+    "median": 11.479999542236328,
+    "quantity": "signal_to_noise_ratio",
+    "transform": "identity_robust_zscore",
+    "unit": "dB"
+  },
+  "model_pc_range": [
+    0.0,
+    -20.0,
+    -6.0,
+    80.0,
+    20.0,
+    10.0
+  ],
+  "protocol": "radar_normalization_v2",
+  "source_pc_range": [
+    0.0,
+    -20.0,
+    -6.0,
+    80.0,
+    20.0,
+    10.0
+  ],
+  "target_size": [
+    32,
+    128,
+    128
+  ],
+  "training_scenes": [
+    "garden"
+  ],
+  "variance": {
+    "aggregation": "field_valid_count_weighted_total_variance_v2",
+    "transform": "identity",
+    "unit": "m2_s2"
+  }
+}

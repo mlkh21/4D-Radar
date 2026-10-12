@@ -21,8 +21,14 @@ if PROJECT_ROOT not in sys.path:
 
 from diffusion_consistency_radar.cm.dataset_loader import (  # noqa: E402
     crop_voxel_channels_to_pc_range,
+    derive_reliable_free_supervision_masks,
     load_sparse_voxel,
     resize_voxel_channels,
+)
+from diffusion_consistency_radar.observation_supervision import (  # noqa: E402
+    LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+    validate_observation_supervision_protocol,
+    uses_reliable_free_supervision,
 )
 from diffusion_consistency_radar.cm.evaluation_metrics import (  # noqa: E402
     bev_iou,
@@ -533,8 +539,12 @@ def _write_json_atomic(path: str, payload: dict) -> None:
 
 
 def load_label_observed_domain(mask_path: str, target_path: str, resolved: dict,
-                               task_mask: np.ndarray) -> np.ndarray:
-    """按训练相同的裁剪和 any-pooling 读取标签域，禁止从 target==0 推测 free。"""
+                               task_mask: np.ndarray,
+                               observation_supervision_protocol: str = LEGACY_OBSERVATION_SUPERVISION_PROTOCOL) -> np.ndarray:
+    """按训练协议读取标签域；新协议只对全细体素观测块计 free。"""
+    protocol = validate_observation_supervision_protocol(
+        observation_supervision_protocol
+    )
     if target_path.endswith(".npz"):
         with np.load(target_path, allow_pickle=False) as data:
             source_shape = tuple(int(value) for value in data["shape"])
@@ -548,6 +558,16 @@ def load_label_observed_domain(mask_path: str, target_path: str, resolved: dict,
     tensor = crop_voxel_channels_to_pc_range(
         tensor, resolved["source_pc_range"], resolved["model_pc_range"],
     )
+    if uses_reliable_free_supervision(protocol):
+        source_target = _load_array(target_path)
+        target_tensor = torch.from_numpy(source_target).permute(3, 2, 0, 1)
+        target_tensor = crop_voxel_channels_to_pc_range(
+            target_tensor, resolved["source_pc_range"], resolved["model_pc_range"]
+        )
+        _any_observed, _reliable_free, supervised = derive_reliable_free_supervision_masks(
+            tensor, target_tensor, resolved["target_size"]
+        )
+        return supervised[0].numpy().astype(bool) & task_mask
     resized = resize_voxel_channels(tensor, resolved["target_size"], mask_channel=0)
     return (resized[0].numpy() > 0.5) & task_mask
 
@@ -568,6 +588,7 @@ def evaluate_saved_predictions(
     max_files: int = 0,
     target_observed_mask_dir: str = "",
     preprocess_policy_path: str = "",
+    observation_supervision_protocol: str = LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
 ) -> dict:
     """严格配对并评价已保存 voxel；全部输入通过 preflight 后才写输出。"""
     _require_directory(pred_voxel_dir, "prediction")
@@ -578,6 +599,9 @@ def evaluate_saved_predictions(
         raise ValueError(f"target_threshold 含非有限值: {target_threshold}")
     if int(max_files) < 0:
         raise ValueError("max_files must be >= 0")
+    observation_supervision_protocol = validate_observation_supervision_protocol(
+        observation_supervision_protocol
+    )
 
     resolved = _resolve_parameters(
         pred_voxel_dir,
@@ -593,6 +617,15 @@ def evaluate_saved_predictions(
     label_dir = target_observed_mask_dir or os.path.join(scene_dir, "observed_mask")
     use_label_domain = bool(resolved["formal_run"] or target_observed_mask_dir
                             or preprocess_policy_path or os.path.isdir(label_dir))
+    if uses_reliable_free_supervision(observation_supervision_protocol) and not use_label_domain:
+        raise ValueError("三态离线评价必须提供 LiDAR label observed mask")
+    prediction_protocol = validate_observation_supervision_protocol(
+        resolved["metadata"].get("observation_supervision_protocol")
+    )
+    formally_comparable = bool(
+        resolved["formal_run"]
+        and prediction_protocol == observation_supervision_protocol
+    )
     task_policy = None
     task_mask = np.ones(tuple(resolved["target_size"]), dtype=bool)
     label_frames = {}
@@ -668,6 +701,7 @@ def evaluate_saved_predictions(
         if use_label_domain:
             label_domain = load_label_observed_domain(
                 label_frames[frame_id], target_frames[frame_id], resolved, task_mask,
+                observation_supervision_protocol,
             )
             if ((preflight_target[0] >= target_threshold) & task_mask & ~label_domain).any():
                 raise ValueError(f"target occupied 不在 LiDAR label observed 域内: {frame_id}")
@@ -697,7 +731,10 @@ def evaluate_saved_predictions(
             is_target=True,
         )
         observed_domain = (
-            load_label_observed_domain(label_frames[frame_id], target_frames[frame_id], resolved, task_mask)
+            load_label_observed_domain(
+                label_frames[frame_id], target_frames[frame_id], resolved, task_mask,
+                observation_supervision_protocol,
+            )
             if use_label_domain else task_mask
         )
 
@@ -868,14 +905,21 @@ def evaluate_saved_predictions(
     summary = {
         "protocol": (
             FORMAL_SAVED_EVALUATION_PROTOCOL
-            if resolved["formal_run"]
+            if formally_comparable
             else DIAGNOSTIC_SAVED_EVALUATION_PROTOCOL
         ),
-        "formal_protocol": bool(resolved["formal_run"]),
+        "formal_protocol": formally_comparable,
+        "observation_supervision_protocol": observation_supervision_protocol,
+        "prediction_supervision_protocol": prediction_protocol,
+        "posthoc_relabeling_only": bool(
+            resolved["formal_run"] and not formally_comparable
+        ),
         "stage": "offline_evaluation",
         "prediction_unchanged": True,
         "occupancy_metric_domain": (
-            "lidar_label_intersect_task_domain" if use_label_domain
+            ("occupied_reliable_free_intersect_task_domain"
+             if uses_reliable_free_supervision(observation_supervision_protocol)
+             else "lidar_label_intersect_task_domain") if use_label_domain
             else "full_grid_diagnostic"
         ),
         "task_spatial_domain": task_policy,
@@ -931,7 +975,7 @@ def evaluate_saved_predictions(
                 f"mean_{field}": aggregate_metrics[f"mean_{field}"]
                 for field in FORMAL_METRIC_FIELDS
             }
-            if resolved["formal_run"]
+            if formally_comparable
             else {}
         ),
         "occupancy_3d_metrics": finalize_occupancy_3d_metrics(
@@ -968,6 +1012,11 @@ def main() -> None:
                         help="LiDAR 标签有效域；默认 target_voxel 同级 observed_mask，正式评价必需")
     parser.add_argument("--preprocess_policy_path", default="",
                         help="默认 target_voxel 同级 preprocess_policy.json，不允许猜测任务高度")
+    parser.add_argument(
+        "--observation_supervision_protocol",
+        default=LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+        help="可选三态监督域；与预测训练协议不同时仅输出诊断性重评分",
+    )
     args = parser.parse_args()
     try:
         summary = evaluate_saved_predictions(**vars(args))

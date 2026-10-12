@@ -133,6 +133,19 @@ except ImportError:
     )
 
 try:
+    from diffusion_consistency_radar.observation_supervision import (
+        LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+        assert_checkpoint_supervision_protocol,
+        validate_observation_supervision_protocol,
+    )
+except ImportError:
+    from observation_supervision import (  # type: ignore
+        LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+        assert_checkpoint_supervision_protocol,
+        validate_observation_supervision_protocol,
+    )
+
+try:
     from diffusion_consistency_radar.cd_training_protocol import (
         apply_cd_boundary_parameterization,
         resolve_cd_consistency_config,
@@ -391,6 +404,10 @@ def build_inference_run_metadata(
         "radar_normalization_sha256": generator.radar_normalization_sha256,
         "allow_legacy_radar_units": bool(generator.allow_legacy_radar_units),
         "checkpoint_protocol": getattr(generator, "checkpoint_protocol", None),
+        "observation_supervision_protocol": getattr(
+            generator, "observation_supervision_protocol",
+            LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+        ),
         "formal_protocol": (
             getattr(generator, "checkpoint_protocol", None)
             == FORMAL_CHECKPOINT_PROTOCOL
@@ -534,6 +551,17 @@ def resolve_formal_inference_data_protocol(
     )
     if vae_data is not None and model_data is not None and vae_data != model_data:
         errors.append("VAE 与生成模型 data_protocol 不一致")
+    try:
+        assert_checkpoint_supervision_protocol(
+            vae_checkpoint if isinstance(vae_checkpoint, dict) else {},
+            (
+                model_checkpoint.get("observation_supervision_protocol")
+                if isinstance(model_checkpoint, dict) else None
+            ),
+            "inference parent VAE",
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
     if errors:
         raise CheckpointChainError(errors)
     return dict(model_data)
@@ -1149,6 +1177,9 @@ class RadarGenerator:
             ),
         )
         self.model_checkpoint_metadata = ckpt if isinstance(ckpt, dict) else {}
+        self.observation_supervision_protocol = validate_observation_supervision_protocol(
+            self.model_checkpoint_metadata.get("observation_supervision_protocol")
+        )
         self.data_protocol = resolve_formal_inference_data_protocol(
             getattr(self, "vae_checkpoint_payload", {}),
             self.model_checkpoint_metadata,
