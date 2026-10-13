@@ -9,11 +9,16 @@ from collections.abc import Mapping
 from typing import Any, Dict
 
 import torch
+from diffusion_consistency_radar.observation_supervision import (
+    RELIABLE_FREE_OBSERVATION_SUPERVISION_PROTOCOL,
+    validate_observation_supervision_protocol,
+)
 
 
 CD_CONSISTENCY_CONFIG_PROTOCOL = (
     "boundary_anchored_ema_consistency_training_config_v2"
 )
+CD_DECODED_RELIABLE_FREE_AUXILIARY_PROTOCOL = "cd_decoded_reliable_free_auxiliary_v1"
 CD_TRAINING_SEMANTICS = (
     "ldm_initialized_boundary_anchored_ema_consistency_v2"
 )
@@ -153,6 +158,53 @@ def validate_cd_consistency_receipt(value: Any) -> Dict[str, Any]:
     if dict(value) != resolved:
         raise ValueError("consistency_training_config 值与 EMA consistency 协议不一致")
     return resolved
+
+
+def resolve_cd_decoded_reliable_free_auxiliary(
+    config: Mapping[str, Any] | None, observation_protocol: str | None
+) -> Dict[str, Any]:
+    """读取独立的可靠 free 解码损失配置；零权重保持历史 CD 行为。"""
+    if config is not None and not isinstance(config, Mapping):
+        raise ValueError("CD decoded reliable-free 配置必须是对象")
+    raw_weight = (config or {}).get("decoded_reliable_free_weight", 0.0)
+    if type(raw_weight) is bool:
+        raise ValueError("CD decoded reliable-free 权重不能为布尔值")
+    try:
+        weight = float(raw_weight)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("CD decoded reliable-free 权重必须为数值") from exc
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError("CD decoded reliable-free 权重必须为非负有限数")
+    protocol = validate_observation_supervision_protocol(observation_protocol)
+    if weight > 0 and protocol != RELIABLE_FREE_OBSERVATION_SUPERVISION_PROTOCOL:
+        raise ValueError("CD decoded reliable-free 只允许三态监督协议")
+    return {
+        "protocol": CD_DECODED_RELIABLE_FREE_AUXILIARY_PROTOCOL,
+        "observation_supervision_protocol": protocol,
+        "weight": weight,
+    }
+
+
+def assert_cd_decoded_reliable_free_auxiliary(
+    checkpoint: Mapping[str, Any], expected: Mapping[str, Any]
+) -> None:
+    """拒绝 A/B 辅助损失不一致的 CD checkpoint；历史零权重可兼容。"""
+    recorded = checkpoint.get("cd_decoded_reliable_free_auxiliary")
+    if (
+        recorded is None
+        and expected["weight"] == 0.0
+        and expected["observation_supervision_protocol"]
+        != RELIABLE_FREE_OBSERVATION_SUPERVISION_PROTOCOL
+    ):
+        return
+    if not isinstance(recorded, Mapping) or set(recorded) != set(expected):
+        raise ValueError("CD resume decoded reliable-free 辅助损失收据不匹配")
+    validated = resolve_cd_decoded_reliable_free_auxiliary(
+        {"decoded_reliable_free_weight": recorded.get("weight")},
+        recorded.get("observation_supervision_protocol"),
+    )
+    if validated != dict(recorded) or validated != dict(expected):
+        raise ValueError("CD resume decoded reliable-free 辅助损失收据不匹配")
 
 
 def apply_cd_boundary_parameterization(
@@ -300,6 +352,8 @@ def validate_cd_collapse_diagnostics_receipt(value: Any) -> Dict[str, Any]:
 
 __all__ = [
     "CD_CONSISTENCY_CONFIG_PROTOCOL",
+    "CD_DECODED_RELIABLE_FREE_AUXILIARY_PROTOCOL",
+    "assert_cd_decoded_reliable_free_auxiliary",
     "CD_CONSISTENCY_LOSS",
     "CD_CONSISTENCY_TARGET_SOURCE",
     "CD_DENOISING_PARAMETERIZATION",
@@ -313,6 +367,7 @@ __all__ = [
     "build_cd_collapse_diagnostic",
     "build_cd_collapse_diagnostics_receipt",
     "resolve_cd_consistency_config",
+    "resolve_cd_decoded_reliable_free_auxiliary",
     "validate_cd_collapse_diagnostic",
     "validate_cd_collapse_diagnostics_receipt",
     "validate_cd_consistency_receipt",

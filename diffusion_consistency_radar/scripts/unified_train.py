@@ -4383,6 +4383,10 @@ def main():
                     'observation_supervision_protocol',
                     LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
                 ),
+                # 仅三态 CD B 组启用；A 组和默认训练维持零权重。
+                'decoded_reliable_free_weight': cd_cfg.get(
+                    'decoded_reliable_free_weight', 0.0
+                ),
                 'validation_seed': cd_cfg.get('validation_seed', 42),
                 'validation_sigma': cd_cfg.get('validation_sigma', 0.5),
                 'validation_occupancy_threshold': cd_cfg.get(

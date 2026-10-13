@@ -124,6 +124,8 @@ cd:
   consistency_loss_weight: 1.0
   # 仅在 persisted observed latent 域约束一步输出回到真实 target，排除常数解。
   reconstruction_anchor_weight: 0.1
+  # 消融专用：默认零；非零时只监督三态协议中的可靠 free 体素。
+  decoded_reliable_free_weight: 0.0
   # 严格检测完全不随条件变化的输出；若需数值容差必须显式改配置并进入收据。
   collapse_guard_epsilon: 0.0
   # Training parameters

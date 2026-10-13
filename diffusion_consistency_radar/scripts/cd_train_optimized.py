@@ -56,6 +56,7 @@ from diffusion_consistency_radar.cm.dataset_loader import (
 )
 from diffusion_consistency_radar.observation_supervision import (
     LEGACY_OBSERVATION_SUPERVISION_PROTOCOL,
+    RELIABLE_FREE_OBSERVATION_SUPERVISION_PROTOCOL,
     assert_checkpoint_supervision_protocol,
     select_training_supervision_mask,
     pool_latent_supervision_mask,
@@ -100,10 +101,12 @@ from diffusion_consistency_radar.deployment_validation import (
 from diffusion_consistency_radar.cd_training_protocol import (
     CD_DENOISING_PARAMETERIZATION,
     CD_TRAINING_SEMANTICS,
+    assert_cd_decoded_reliable_free_auxiliary,
     apply_cd_boundary_parameterization,
     build_cd_collapse_diagnostic,
     build_cd_collapse_diagnostics_receipt,
     resolve_cd_consistency_config,
+    resolve_cd_decoded_reliable_free_auxiliary,
     validate_cd_consistency_receipt,
 )
 from diffusion_consistency_radar.occupancy_threshold_artifact import (
@@ -373,6 +376,41 @@ def _masked_latent_mse(
     if not expanded.any():
         raise ValueError("CD latent observed domain 为空")
     return squared_error[expanded].mean()
+
+
+def decoded_reliable_free_occupancy_loss(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    voxel_supervised: torch.Tensor,
+    occupancy_activation: str,
+) -> Tuple[torch.Tensor, int]:
+    """只惩罚三态监督的可靠空体素；occupied/unknown 均不施加负例梯度。"""
+    if (
+        decoded.ndim != 5
+        or target.ndim != 5
+        or voxel_supervised.ndim != 5
+        or decoded.shape[1] < 1
+        or target.shape[1] < 1
+        or voxel_supervised.shape[1] != 1
+        or decoded.shape[0] != target.shape[0]
+        or tuple(decoded.shape[-3:]) != tuple(target.shape[-3:])
+        or tuple(voxel_supervised.shape) != tuple(target[:, 0:1].shape)
+    ):
+        raise ValueError("CD decoded reliable-free 与 target/supervision 的 B/Z/X/Y 不一致")
+    if occupancy_activation not in {"raw", "sigmoid"}:
+        raise ValueError("CD decoded reliable-free occupancy activation 无效")
+    if not torch.logical_or(voxel_supervised == 0, voxel_supervised == 1).all():
+        raise ValueError("CD decoded reliable-free supervision 必须为二值")
+    free = voxel_supervised.bool() & ~(target[:, 0:1] > 0.5)
+    free_count = int(free.sum().item())
+    occupancy = decoded[:, 0:1].float()
+    if free_count == 0:
+        return occupancy.sum() * 0.0, 0
+    if occupancy_activation == "sigmoid":
+        occupancy = torch.sigmoid(occupancy)
+    else:
+        occupancy = torch.relu(occupancy)
+    return occupancy.square()[free].mean(), free_count
 
 
 def compute_cd_training_losses(
@@ -830,6 +868,9 @@ class ConsistencyDistillationTrainer:
                 self.deployment_validation_selection
             )
         self.consistency_config = resolve_cd_consistency_config(self.config)
+        self.decoded_reliable_free_auxiliary = resolve_cd_decoded_reliable_free_auxiliary(
+            self.config, self.observation_supervision_protocol
+        )
         self.checkpoint_protocol = resolve_training_checkpoint_protocol(
             self.config.get("checkpoint_protocol", FORMAL_CHECKPOINT_PROTOCOL)
         )
@@ -883,6 +924,9 @@ class ConsistencyDistillationTrainer:
             resume_checkpoint = safe_torch_load(resume_path, map_location="cpu")
             assert_checkpoint_supervision_protocol(
                 resume_checkpoint, self.observation_supervision_protocol, "CD resume"
+            )
+            assert_cd_decoded_reliable_free_auxiliary(
+                resume_checkpoint, self.decoded_reliable_free_auxiliary
             )
             if not self.allow_legacy_radar_units:
                 assert_checkpoint_training_identity(
@@ -1146,6 +1190,9 @@ class ConsistencyDistillationTrainer:
             ),
         )
         saved_consistency_config = ckpt.get("consistency_training_config")
+        assert_cd_decoded_reliable_free_auxiliary(
+            ckpt, self.decoded_reliable_free_auxiliary
+        )
         if saved_consistency_config is None:
             if self.use_multimodal and self.radar_normalization is not None:
                 raise ValueError("formal CD resume 缺少 consistency training config")
@@ -1312,6 +1359,8 @@ class ConsistencyDistillationTrainer:
         radar_voxel: Optional[torch.Tensor] = None,
         meta_dict: Optional[Dict[str, Any]] = None,
         latent_observed_mask: Optional[torch.Tensor] = None,
+        voxel_target: Optional[torch.Tensor] = None,
+        voxel_supervision_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         单个 LDM-initialized EMA consistency 训练步骤
@@ -1389,6 +1438,20 @@ class ConsistencyDistillationTrainer:
             latent_observed_mask,
             self.consistency_config,
         )
+        weight = getattr(
+            self, "decoded_reliable_free_auxiliary", {"weight": 0.0}
+        )["weight"]
+        if weight > 0.0:
+            if voxel_target is None or voxel_supervision_mask is None:
+                raise ValueError("CD decoded reliable-free 缺少体素目标或监督域")
+            decoded = self.vae.decode(student_denoised)
+            free_loss, free_count = decoded_reliable_free_occupancy_loss(
+                decoded, voxel_target, voxel_supervision_mask,
+                getattr(self.vae, "occupancy_activation", "raw"),
+            )
+            loss = loss + weight * free_loss
+            components["decoded_reliable_free_loss"] = float(free_loss.detach().item())
+            components["decoded_reliable_free_count"] = free_count
         self.last_train_step_loss_components = components
         
         return loss
@@ -1438,7 +1501,7 @@ class ConsistencyDistillationTrainer:
                         "formal CD training batch 缺少 persisted "
                         "occupancy_observed_mask"
                     )
-                _, latent_observed = resolve_cd_observed_masks(
+                voxel_observed, latent_observed = resolve_cd_observed_masks(
                     raw_observed_mask,
                     target,
                     z_target,
@@ -1453,6 +1516,8 @@ class ConsistencyDistillationTrainer:
                 radar_voxel=cond,
                 meta_dict=meta_dict,
                 latent_observed_mask=latent_observed,
+                voxel_target=target,
+                voxel_supervision_mask=voxel_observed,
             )
             loss = loss / grad_accum_steps
             
@@ -2043,6 +2108,18 @@ class ConsistencyDistillationTrainer:
         payload["observation_supervision_protocol"] = getattr(
             self, "observation_supervision_protocol", LEGACY_OBSERVATION_SUPERVISION_PROTOCOL
         )
+        if (
+            payload["observation_supervision_protocol"]
+            == RELIABLE_FREE_OBSERVATION_SUPERVISION_PROTOCOL
+        ):
+            payload["cd_decoded_reliable_free_auxiliary"] = dict(
+                getattr(
+                    self, "decoded_reliable_free_auxiliary",
+                    resolve_cd_decoded_reliable_free_auxiliary(
+                        {}, payload["observation_supervision_protocol"]
+                    ),
+                )
+            )
         if validation_metrics is not None:
             payload["deployment_weight_source"] = deployment_weight_source
             payload["cd_validation"] = {
@@ -2698,6 +2775,9 @@ def main():
             ),
             'reconstruction_anchor_weight': cd_config.get(
                 'reconstruction_anchor_weight', 0.1
+            ),
+            'decoded_reliable_free_weight': cd_config.get(
+                'decoded_reliable_free_weight', 0.0
             ),
             'collapse_guard_epsilon': cd_config.get(
                 'collapse_guard_epsilon', 0.0

@@ -66,6 +66,9 @@ YAML_CUDA_DEVICES="${YAML_TRAINING_DEFAULTS[9]}"
 YAML_EXPECTED_ARTIFACT_SHA256="${YAML_TRAINING_DEFAULTS[10]}"
 
 PROTOCOL_TAG="${PROTOCOL_TAG:-formal_v2_80m_86p8_v1}"
+OBSERVATION_SUPERVISION_PROTOCOL="${OBSERVATION_SUPERVISION_PROTOCOL:-}"
+CD_DECODED_RELIABLE_FREE_WEIGHT="${CD_DECODED_RELIABLE_FREE_WEIGHT:-0}"
+CD_PARENT_TAG="${CD_PARENT_TAG:-}"
 PREPROCESSED_ROOT="${PREPROCESSED_ROOT:-${ROOT_DIR}/Data/NTU4DRadLM_Pre_formal_v2_80m_86p8_v1}"
 RADAR_NORMALIZATION_ARTIFACT="${RADAR_NORMALIZATION_ARTIFACT:-${PROJECT_DIR}/config/radar_normalization_garden_32x128x128_80m_train80_purge3s_86p8_v2.json}"
 EXPECTED_ARTIFACT_SHA256="${EXPECTED_ARTIFACT_SHA256:-${YAML_EXPECTED_ARTIFACT_SHA256}}"
@@ -167,6 +170,63 @@ case "${MODE}" in
         exit 2
         ;;
 esac
+
+# 三态对照只写独立 tag 的配置/结果；绝不隐式继承正式模型 checkpoint。
+if [[ ! "${PROTOCOL_TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+    echo "错误：PROTOCOL_TAG 必须是安全的单层目录名"
+    exit 2
+fi
+if [ -n "${CD_PARENT_TAG}" ]; then
+    if [[ ! "${CD_PARENT_TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+        || [ "${MODE}" != "cd" ] || [ "${CD_PARENT_TAG}" = "${PROTOCOL_TAG}" ]; then
+        echo "错误：CD_PARENT_TAG 仅可用于 cd 且须为不同的安全父实验 tag"
+        exit 2
+    fi
+fi
+
+# 在全量数据预检前拒绝错误协议/权重组合，默认路径不被实验开关影响。
+python - "${ROOT_DIR}" "${DEFAULT_CONFIG_PATH}" \
+    "${OBSERVATION_SUPERVISION_PROTOCOL}" \
+    "${CD_DECODED_RELIABLE_FREE_WEIGHT}" "${MODE}" <<'PY'
+import sys
+import yaml
+
+root_dir, config_path, requested_protocol, raw_weight, mode = sys.argv[1:6]
+sys.path.insert(0, root_dir)
+from diffusion_consistency_radar.cd_training_protocol import (
+    resolve_cd_decoded_reliable_free_auxiliary,
+)
+from diffusion_consistency_radar.observation_supervision import (
+    validate_observation_supervision_protocol,
+)
+
+with open(config_path, encoding="utf-8") as handle:
+    config = yaml.safe_load(handle) or {}
+protocol = validate_observation_supervision_protocol(
+    requested_protocol or (config.get("data") or {}).get("observation_supervision_protocol")
+)
+auxiliary = resolve_cd_decoded_reliable_free_auxiliary(
+    {"decoded_reliable_free_weight": raw_weight}, protocol
+)
+if auxiliary["weight"] > 0 and mode != "cd":
+    raise ValueError("非零 CD_DECODED_RELIABLE_FREE_WEIGHT 仅限 cd 阶段")
+print(f"训练监督协议: {protocol}; CD decoded reliable-free 权重: {auxiliary['weight']}")
+PY
+if [ "${OBSERVATION_SUPERVISION_PROTOCOL}" = "occupied_reliable_free_unknown_v1" ]; then
+    if [[ "${PROTOCOL_TAG}" != *three_state* ]]; then
+        echo "错误：三态实验 PROTOCOL_TAG 必须包含 three_state，隔离旧正式输出"
+        exit 2
+    fi
+    CONFIG_PATH="${PROJECT_DIR}/config/.default_config.train_override.${PROTOCOL_TAG}.yaml"
+fi
+if [ -n "${CD_PARENT_TAG}" ]; then
+    if [ "${OBSERVATION_SUPERVISION_PROTOCOL}" != "occupied_reliable_free_unknown_v1" ] \
+        || [[ "${CD_PARENT_TAG}" != *three_state* ]]; then
+        echo "错误：CD_PARENT_TAG 只能指向三态 VAE/LDM 父实验"
+        exit 2
+    fi
+fi
+export OBSERVATION_SUPERVISION_PROTOCOL CD_DECODED_RELIABLE_FREE_WEIGHT
 
 # 在任何数据扫描或训练进程启动前验证 LDM/CD 的完整部署采样与阈值门禁配置。
 python - "${ROOT_DIR}" "${DEFAULT_CONFIG_PATH}" <<'PY'
@@ -580,6 +640,12 @@ cfg['data']['model_pc_range'] = [0, -20, -6, 80, 20, 10]
 cfg['data']['radar_normalization_path'] = artifact_path
 cfg['data']['radar_normalization_sha256'] = expected_artifact_sha256
 cfg['data']['doppler_scale_mps'] = 86.8
+observation_override = os.environ.get('OBSERVATION_SUPERVISION_PROTOCOL', '')
+if observation_override:
+    cfg['data']['observation_supervision_protocol'] = observation_override
+cfg.setdefault('cd', {})['decoded_reliable_free_weight'] = float(
+    os.environ['CD_DECODED_RELIABLE_FREE_WEIGHT']
+)
 cfg.setdefault('optimization', {})
 cfg['optimization']['gradient_accumulation_steps'] = batch_plan.gradient_accumulation_steps
 stage_values = {
@@ -698,8 +764,10 @@ case "$MODE" in
         echo "Stage 3: LDM-initialized EMA Consistency"
         echo "=========================================="
         
-        VAE_CKPT="${RESULTS_DIR}/vae/vae_best.pt"
-        LDM_CKPT="${RESULTS_DIR}/ldm/ldm_best.pt"
+        # A/B 的 CD 输出独立，但始终读取同一份新三态 VAE/LDM 父链。
+        PARENT_RESULTS_DIR="${ROOT_DIR}/Result/train_results/${CD_PARENT_TAG:-${PROTOCOL_TAG}}"
+        VAE_CKPT="${PARENT_RESULTS_DIR}/vae/vae_best.pt"
+        LDM_CKPT="${PARENT_RESULTS_DIR}/ldm/ldm_best.pt"
         
         if [ ! -f "$VAE_CKPT" ]; then
             echo "Error: VAE checkpoint not found at $VAE_CKPT"
